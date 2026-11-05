@@ -11701,7 +11701,13 @@ fn add_proposed_repo(path: &Path, identity: &str) -> Result<bool, String> {
         return Ok(false);
     }
     repos.push(identity);
-    std::fs::write(path, doc.to_string()).map_err(|e| e.to_string())?;
+    // Write a sibling temp file and rename it over the target: rename replaces
+    // a symlink planted after the read instead of following it, so the write
+    // cannot be redirected outside the repository.
+    let dir = path.parent().ok_or("no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut tmp, doc.to_string().as_bytes()).map_err(|e| e.to_string())?;
+    tmp.persist(path).map_err(|e| e.to_string())?;
     Ok(true)
 }
 

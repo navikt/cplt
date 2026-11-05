@@ -6304,6 +6304,52 @@ paths = [
         );
     }
 
+    /// #981: `--propose` refuses a `.cplt.toml` that is a symlink or a FIFO,
+    /// and writes nothing through it.
+    #[test]
+    fn e2e_link_propose_refuses_symlink_and_fifo() {
+        let project = temp_repo("navikt/e2e-prop-c");
+        let lib = temp_repo("navikt/e2e-prop-d");
+        let cfg = tempfile::tempdir().unwrap();
+        let config_file = cfg.path().join("config.toml");
+        let outside = cfg.path().join("outside.toml");
+        std::fs::write(&outside, "# outside\n").unwrap();
+        let toml = project.path().join(".cplt.toml");
+        let run = || {
+            trust_cmd(project.path(), &config_file)
+                .args([
+                    "link",
+                    "navikt/e2e-prop-d",
+                    lib.path().to_str().unwrap(),
+                    "--propose",
+                ])
+                .output()
+                .expect("link runs")
+        };
+
+        std::os::unix::fs::symlink(&outside, &toml).unwrap();
+        let out = run();
+        assert!(!out.status.success(), "symlink accepted");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
+        assert!(
+            std::fs::symlink_metadata(&toml)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        std::fs::remove_file(&toml).unwrap();
+        let fifo = std::ffi::CString::new(toml.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let out = run();
+        assert!(!out.status.success(), "fifo accepted");
+        assert!(
+            !std::fs::read_to_string(&outside)
+                .unwrap()
+                .contains("e2e-prop-d")
+        );
+    }
+
     /// #491, the whole loop: a repository proposes another repository by name,
     /// approving resolves and links it, and revoking removes exactly what the
     /// approval created — never a root the user added themselves.
