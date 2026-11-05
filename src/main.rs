@@ -2617,13 +2617,16 @@ fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
 /// #820: configs from `cplt config init` turn proxy-side token injection on;
 /// older configs never had the key. Nudge those, never flip them. An explicit
 /// `false` silences it.
+const INJECT_GITHUB_TOKEN_NUDGE: &str =
+    "proxy.inject_github_token is not set, so the agent gets your real GitHub token.";
+
 fn inject_github_token_nudge(resolved: &config::Resolved) -> Option<cplt::doctor::Finding> {
     let unset =
         resolved.bool_layer("proxy", "inject_github_token") == Some(config::ConfigLayer::Baseline);
     (unset && resolved.with_proxy).then(|| {
-        cplt::doctor::Finding::info(
-            "proxy.inject_github_token is not set, so the agent gets your real GitHub token. \
-             New configs turn it on: the agent gets a placeholder and the proxy adds the token \
+        cplt::doctor::Finding::warning(
+            INJECT_GITHUB_TOKEN_NUDGE.to_string()
+                + " New configs turn it on: the agent gets a placeholder and the proxy adds the token \
              for GitHub hosts only.",
             Some(
                 "`cplt config set proxy.inject_github_token true`, or `false` to keep the token \
@@ -9570,14 +9573,25 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let can_force = sandbox::available_abi_version().is_some_and(|abi| abi >= 4);
     #[cfg(not(target_os = "linux"))]
     let can_force = true;
-    findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
-    findings.extend(doctor::copilot_persistence_nudge(&resolved, active_agent));
-    findings.extend(config_findings(
+    // #1005: the "new configs" nudges are for an existing config. A user
+    // with none gets one pointer to `cplt config init` instead of five.
+    let has_config = config_path.is_some();
+    if has_config {
+        findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
+        findings.extend(doctor::copilot_persistence_nudge(&resolved, active_agent));
+    } else {
+        findings.push(doctor::no_user_config_finding());
+    }
+    let mut cfg_findings = config_findings(
         &resolved,
         active_agent,
         cfg!(target_os = "macos"),
         gh_exec_token_available(&resolved, active_agent, keychain_substitute.as_ref()),
-    ));
+    );
+    if !has_config {
+        cfg_findings.retain(|f| !f.message.starts_with(INJECT_GITHUB_TOKEN_NUDGE));
+    }
+    findings.extend(cfg_findings);
 
     // ── enforcement: the regime, and why ──
     // After the policy: bubblewrap is probed with the wrapper the launch would
@@ -9596,16 +9610,19 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         &unmasked,
     ));
     #[cfg(target_os = "linux")]
-    findings.extend(doctor::git_config_write_nudge(
-        &resolved,
-        matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
-    ));
-    findings.extend(doctor::brief_nudge(&resolved));
-    #[cfg(target_os = "linux")]
-    findings.extend(doctor::mask_missing_deny_paths_nudge(
-        &resolved,
-        matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
-    ));
+    if has_config {
+        findings.extend(doctor::git_config_write_nudge(
+            &resolved,
+            matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
+        ));
+        findings.extend(doctor::mask_missing_deny_paths_nudge(
+            &resolved,
+            matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
+        ));
+    }
+    if has_config {
+        findings.extend(doctor::brief_nudge(&resolved));
+    }
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {

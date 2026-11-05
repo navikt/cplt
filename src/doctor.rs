@@ -1243,10 +1243,6 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
     (keychain, auth, finding)
 }
 
-/// Nudges that fire on an unset key alone are Info, like `brief_nudge`: a
-/// brand-new user has no config and would otherwise get them as warnings
-/// on day one (#1005). Nudges tied to a present risk stay warnings.
-///
 /// The nudge for an install from before forced proxy became the default for
 /// new configs (#822). Shown only while no layer and no preset set
 /// `proxy.forced`; setting it either way silences it. Never changes anything.
@@ -1257,7 +1253,7 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
     }
     let unset = r.bool_layer("proxy", "forced") == Some(crate::config::ConfigLayer::Baseline);
     (unset && r.preset.is_none() && !r.proxy_forced).then(|| {
-        Finding::info(
+        Finding::warning(
             "proxy.forced is off, so a tool that ignores HTTPS_PROXY can connect around the \
              proxy. New configs turn it on. With it on, direct connects fail, and on Linux \
              DNS and UDP are blocked too (see docs/known-impacts.md).",
@@ -1313,7 +1309,7 @@ pub fn copilot_persistence_nudge(
     let unset = r.bool_layer("sandbox", "allow_copilot_host_persistence")
         == Some(crate::config::ConfigLayer::Baseline);
     (agent == crate::agent::Agent::Copilot && unset).then(|| {
-        Finding::info(
+        Finding::warning(
             "The sandbox can write ~/.copilot/agents/ and permissions-config.json. A custom \
              agent there can run a command when a later host session selects it, and saved \
              approvals skip prompts there. New configs deny both (see SECURITY.md).",
@@ -1337,7 +1333,7 @@ pub fn mask_missing_deny_paths_nudge(
 ) -> Option<Finding> {
     let layer = r.bool_layer("sandbox", "mask_missing_deny_paths");
     (bwrap_usable && layer == Some(crate::config::ConfigLayer::Baseline)).then(|| {
-        Finding::info(
+        Finding::warning(
             "A host-persistence directory that does not exist yet (~/.copilot/agents/, Pi's \
              extensions/) is not protected: the agent can create it, and a later host session \
              loads it. New configs mount an empty read-only directory there.",
@@ -1375,7 +1371,7 @@ pub fn git_config_write_nudge(r: &crate::config::Resolved, bwrap_usable: bool) -
     // Never suggest what would refuse every launch.
     let layer = r.bool_layer("sandbox", "allow_git_config_write");
     (bwrap_usable && layer == Some(crate::config::ConfigLayer::Baseline)).then(|| {
-        Finding::info(
+        Finding::warning(
             "The agent can write .git/config, so it can set core.hooksPath or \
              core.fsmonitor, which run unsandboxed on your next git command. New configs \
              make it read-only (needs Bubblewrap); in-session `git config` and `git remote` \
@@ -1387,6 +1383,17 @@ pub fn git_config_write_nudge(r: &crate::config::Resolved, bwrap_usable: bool) -
             ),
         )
     })
+}
+
+/// #1005: with no user config, the per-key "new configs" nudges would all
+/// fire on day one. One pointer to `cplt config init` replaces them.
+#[must_use]
+pub fn no_user_config_finding() -> Finding {
+    Finding::warning(
+        "No cplt config yet, so cplt runs with the older defaults. `cplt config init` \
+         writes a config with the secure defaults.",
+        Some("cplt config init".to_string()),
+    )
 }
 
 /// Exit non-zero iff something is blocking — the contract the old doctor had

@@ -1610,3 +1610,36 @@ fn golden_doctor_reports_launch_refusals_and_ignored_repo_keys() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #1005: a user with no config gets one pointer to `cplt config init`, not
+/// the per-key "New configs" nudges meant for an existing config, which
+/// still get them.
+#[test]
+fn golden_doctor_new_user_gets_one_config_init_pointer() {
+    let home = make_config_home("golden-doctor-new-user");
+    let repo = temp_repo("navikt/probe");
+
+    let (out, err, _) = launch(&home, repo.path(), &["--with-proxy", "doctor"]);
+    assert!(
+        out.contains("No cplt config yet"),
+        "a new user must be pointed at `cplt config init`:\n{out}{err}"
+    );
+    assert!(
+        !out.contains("New configs"),
+        "a new user must not get the existing-config nudges:\n{out}{err}"
+    );
+
+    let cfg = home.join(".config/cplt");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "# an older config\n").unwrap();
+    let (out, err, _) = launch(&home, repo.path(), &["--with-proxy", "doctor"]);
+    assert!(
+        !out.contains("No cplt config yet"),
+        "an existing config must not be told it has none:\n{out}{err}"
+    );
+    assert!(
+        out.contains("proxy.inject_github_token is not set"),
+        "an existing config keeps its nudge as a warning:\n{out}{err}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
