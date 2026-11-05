@@ -276,7 +276,7 @@ fn find_in(dirs: &[&str], roots: &[&str], name: &str) -> Option<PathBuf> {
 /// Deliberately no `PATH` fallback: a fallback would restore the exact lookup
 /// this exists to remove, and would do so precisely on the machines where the
 /// attacker's directory is the only match.
-pub(crate) fn trusted_binary(name: &str) -> Option<PathBuf> {
+pub fn trusted_binary(name: &str) -> Option<PathBuf> {
     find_in(TRUSTED_BIN_DIRS, TRUSTED_BIN_ROOTS, name)
 }
 
@@ -585,7 +585,26 @@ const GIT_ENV_CLEARED: &[&str] = &[
     "GIT_PROXY_COMMAND",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_ATTR_SOURCE",
+    // Swap the git helper programs (`git-remote-https` and friends).
+    "GIT_EXEC_PATH",
 ];
+
+/// Remove every `GIT_*` variable from `cmd`: the named list unconditionally,
+/// so the removal is assertable, plus a sweep of whatever else is set.
+///
+/// Public for spawns that are not git but run git, such as `gh repo clone`.
+/// Removes rather than blanks `GIT_CONFIG_GLOBAL`, so the user's own global
+/// config (and gh's credential helper in it) still applies.
+pub fn clear_git_env(cmd: &mut Command) {
+    for name in GIT_ENV_CLEARED {
+        cmd.env_remove(name);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(key);
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -604,18 +623,8 @@ fn harden(cmd: &mut Command) {
     #[cfg(test)]
     HARDENED_COMMANDS.with(|n| n.set(n.get() + 1));
 
-    // Cleared unconditionally, so the removal is recorded on the Command (and
-    // therefore assertable) whether or not the variable happens to be set.
-    for name in GIT_ENV_CLEARED {
-        cmd.env_remove(name);
-    }
-    // Catch-all sweep for the rest of the GIT_* namespace. Same reasoning as
-    // `gh_proxy::detect_current_repo`, which already does this.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
-            cmd.env_remove(key);
-        }
-    }
+    // Same reasoning as `gh_proxy::detect_current_repo`, which also sweeps.
+    clear_git_env(cmd);
     cmd
         // Skip /etc/gitconfig. Matches the sandboxed child's hardening
         // (`sandbox_policy::HARDENING_ENV_VARS`). Cost: a site-wide
