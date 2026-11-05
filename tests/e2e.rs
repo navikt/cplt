@@ -7754,6 +7754,43 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A legacy entry (no per-key hashes) that still matches migrates on a
+    /// bare `cplt trust accept`, even with nothing pending or to link.
+    #[test]
+    fn e2e_trust_bare_accept_migrates_a_legacy_entry() {
+        let (repo, config_file) =
+            make_trust_repo("per-key-migrate", "[propose]\nallow_localhost_any = true\n");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(out.status.success(), "{out:?}");
+        let files = trust_store_files(&config_file);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let mut entry: cplt::trust::TrustEntry = toml::from_str(&files[0].1).unwrap();
+        assert!(!entry.accepted.key_hashes.is_empty());
+        entry.accepted.key_hashes.clear();
+        std::fs::write(&files[0].0, toml::to_string(&entry).unwrap()).unwrap();
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept"])
+            .output()
+            .expect("accept should run");
+        assert!(out.status.success(), "{out:?}");
+        let after: cplt::trust::TrustEntry =
+            toml::from_str(&trust_store_files(&config_file)[0].1).unwrap();
+        assert!(
+            after
+                .accepted
+                .key_hashes
+                .contains_key("allow_localhost_any"),
+            "{after:?}"
+        );
+        assert_eq!(after.accepted.keys, ["allow_localhost_any"]);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// The #1002 smoke test: proposing one more repository puts only `repos`
     /// back to pending. The other keys keep their approval.
     #[test]

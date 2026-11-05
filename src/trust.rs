@@ -396,8 +396,12 @@ fn sha256_hex(s: &str) -> String {
 /// [`proposal_content_hash`]; the key name is part of the input so two keys
 /// with equal values never share a hash.
 #[must_use]
-pub fn key_value_hash(propose: &crate::repo_config::ProposeSection, key: &str) -> String {
-    let value = serde_json::to_value(normalized(propose)).unwrap_or_default();
+pub fn key_value_hash(propose: &crate::repo_config::ProposeSection, key: &str) -> Option<String> {
+    // Fail closed: a value that cannot be serialized or found at its path
+    // (null, e.g. a lost name-to-path mapping) has no hash, and a key with no
+    // hash is never approved. Hashing null instead would let any later value
+    // match.
+    let value = serde_json::to_value(normalized(propose)).ok()?;
     // `sandbox.pass_env` is the one key not spelled as its `[propose]` path.
     let field = if key == "sandbox.pass_env" {
         "pass_env"
@@ -405,8 +409,8 @@ pub fn key_value_hash(propose: &crate::repo_config::ProposeSection, key: &str) -
         key
     };
     let pointer = format!("/{}", field.replace('.', "/"));
-    let v = value.pointer(&pointer).cloned().unwrap_or_default();
-    sha256_hex(&format!("cplt-key-v1\0{key}\0{v}"))
+    let v = value.pointer(&pointer).filter(|v| !v.is_null())?;
+    Some(sha256_hex(&format!("cplt-key-v1\0{key}\0{v}")))
 }
 
 /// The keys of `entry` that apply to `propose` as it stands now.
@@ -436,7 +440,7 @@ pub fn approved_for(
         .iter()
         .filter(|k| {
             proposed.contains(&k.as_str())
-                && a.key_hashes.get(*k) == Some(&key_value_hash(propose, k))
+                && key_value_hash(propose, k).is_some_and(|h| a.key_hashes.get(*k) == Some(&h))
         })
         .cloned()
         .collect()
@@ -449,11 +453,15 @@ pub fn pin_keys(
     keys: Vec<String>,
     propose: &crate::repo_config::ProposeSection,
 ) {
+    // A key with no hash is not recorded at all, so it stays pending.
     accepted.key_hashes = keys
         .iter()
-        .map(|k| (k.clone(), key_value_hash(propose, k)))
+        .filter_map(|k| Some((k.clone(), key_value_hash(propose, k)?)))
         .collect();
     accepted.keys = keys;
+    accepted
+        .keys
+        .retain(|k| accepted.key_hashes.contains_key(k));
     accepted.keys.sort_unstable();
     accepted.keys.dedup();
     accepted.content_hash = proposal_content_hash(propose);
@@ -840,6 +848,50 @@ mod tests {
         } else {
             entry.accepted.keys.clone()
         }
+    }
+
+    /// Every proposable key resolves to its own value: its hash exists, and
+    /// changes when the value does. A lost name-to-path mapping must fail
+    /// closed, never hash null and match any later value.
+    #[test]
+    fn every_proposed_key_hashes_its_own_value() {
+        let parse = |body: &str| {
+            toml::from_str::<crate::repo_config::RepoConfig>(body)
+                .unwrap()
+                .propose
+        };
+        let bools: String = crate::config::PROPOSE_BOOLS
+            .iter()
+            .filter(|r| !r.tighten_only)
+            .map(|r| format!("{} = true\n", r.key))
+            .collect();
+        let lists = |v: &str, n: u16| {
+            format!(
+                "[propose]\n{bools}pass_env = [\"{v}\"]\nrepos = [\"o/{v}\"]\n\
+                 [propose.allow]\nread = [\"~/{v}\"]\nwrite = [\"~/{v}\"]\n\
+                 socket = [\"/tmp/{v}\"]\nports = [{n}]\nlocalhost = [{n}]\n\
+                 domains = [\"{v}.example\"]\n\
+                 [propose.proxy]\nallow_private_domains = [\"{v}.internal\"]\n"
+            )
+        };
+        let a = parse(&lists("a", 1001));
+        let b = parse(&lists("b", 1002));
+        let keys = crate::repo_config::proposed_keys(&a);
+        assert!(keys.contains(&"sandbox.pass_env"), "{keys:?}");
+        assert_eq!(keys.len(), crate::repo_config::proposed_keys(&b).len());
+        for key in keys {
+            let ha = key_value_hash(&a, key).unwrap_or_else(|| panic!("{key} has no hash"));
+            if !key.contains('.') && key != "repos" {
+                continue; // booleans: the only proposable value is `true`
+            }
+            let hb = key_value_hash(&b, key).unwrap();
+            assert_ne!(ha, hb, "{key}: hash ignores its value");
+        }
+        // A key whose path resolves to nothing is unhashable, so never approved.
+        assert_eq!(key_value_hash(&a, "allow.nonexistent"), None);
+        let mut entry = TrustEntry::default();
+        pin_keys(&mut entry.accepted, vec!["allow.nonexistent".into()], &a);
+        assert!(entry.accepted.keys.is_empty());
     }
 
     #[test]

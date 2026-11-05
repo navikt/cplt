@@ -12999,6 +12999,18 @@ matched against these proposal values. Only the keys approved now are kept.",
                 }
                 return ExitCode::SUCCESS;
             }
+            // A legacy entry still matching as a whole migrates to per-key
+            // hashes here (#1002); otherwise it would never migrate until
+            // something changed, and then everything would lapse at once.
+            if let Some(c) = carried.as_ref().filter(|c| {
+                stored
+                    .as_ref()
+                    .is_some_and(|t| t.accepted.key_hashes != c.accepted.key_hashes)
+            }) && let Err(e) = trust::save_trust(project_dir, c)
+            {
+                ui::error(&format!("Failed to save trust: {e}"));
+                return ExitCode::FAILURE;
+            }
             ui::info("All permissions are already approved.");
             return ExitCode::SUCCESS;
         }
@@ -13215,6 +13227,7 @@ fn trust_revoke(
     // Remove keys
     let before_len = entry.accepted.keys.len();
     entry.accepted.keys.retain(|k| !keys.contains(k));
+    entry.accepted.key_hashes.retain(|k, _| !keys.contains(k));
     let removed = before_len - entry.accepted.keys.len();
 
     // `repos` acts on the linked record even when no key matched: an entry
