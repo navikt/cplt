@@ -6970,6 +6970,56 @@ paths = [
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    /// #998: an empty project with a linked repository still gets the
+    /// `[propose] repos` suggestion; the preview writes nothing, `--write` does.
+    #[test]
+    fn e2e_init_empty_project_suggests_linked_repos() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo("init-empty-linked", "");
+        let parent = repo.parent().expect("parent").to_path_buf();
+        make_origin_repo(&parent.join("e2e-init-b"), "navikt/e2e-init-b");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["link", "navikt/e2e-init-b"])
+            .output()
+            .expect("link runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let want = "[propose]\n# Repositories linked in this checkout (cplt link)\nrepos = [\"navikt/e2e-init-b\"]";
+        let out = trust_cmd(&repo, &config_file)
+            .args(["init"])
+            .output()
+            .expect("init runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains(want), "{stdout}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cplt.toml")).unwrap(),
+            ""
+        );
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["init", "--write", "--force"])
+            .output()
+            .expect("init --write runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(written.contains(want), "{written}");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     /// #984/#980: a `repos` proposal whose repositories are all linked in this
     /// checkout's local config is satisfied and not nagged about. Satisfied
     /// grants nothing: no trust approval is recorded and no root is added.
