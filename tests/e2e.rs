@@ -6676,19 +6676,6 @@ paths = [
         let (_, roots) = run(&["config", "get", "sandbox.repo_dirs"]);
         assert!(roots.contains("e2e-part"), "{roots}");
 
-        // An uncommitted edit has its `[propose]` dropped; that is not a removal.
-        std::fs::write(
-            repo.join(".cplt.toml"),
-            "[propose]\nallow_localhost_any = true\nrepos = [\"navikt/e2e-part\"]\n# wip\n",
-        )
-        .expect("write");
-        let (_, shown) = run(&["trust"]);
-        assert!(!shown.contains("removed since last approval"), "{shown}");
-        git_cmd(&repo)
-            .args(["checkout", "--", ".cplt.toml"])
-            .output()
-            .expect("restore");
-
         let (ok, out) = run(&["link", "--unlink", "navikt/e2e-part"]);
         assert!(ok, "{out}");
         let (_, shown) = run(&["trust"]);
@@ -6724,6 +6711,20 @@ paths = [
             shown.contains("repos: - navikt/e2e-part (removed since last approval)"),
             "{shown}"
         );
+
+        // An uncommitted `.cplt.toml` has its `[propose]` dropped. That is not
+        // a removal, so no `-` line may claim one.
+        git_cmd(&repo)
+            .args(["rm", "-q", "--cached", ".cplt.toml"])
+            .output()
+            .expect("untrack");
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "commit", "-qm", "untrack"])
+            .output()
+            .expect("commit");
+        let (_, shown) = run(&["trust"]);
+        assert!(shown.contains("ignored while it is uncommitted"), "{shown}");
+        assert!(!shown.contains("removed since last approval"), "{shown}");
 
         let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));
         let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
