@@ -90,6 +90,19 @@ pub struct AcceptedProposals {
     /// approvals are invalidated (user must re-approve).
     #[serde(default)]
     pub content_hash: String,
+
+    /// SHA-256 of each approved key's own normalized value (#1002), so a
+    /// change to one key re-asks for that key only. A key applies only while
+    /// its hash here matches its current value ([`approved_for`]).
+    ///
+    /// Empty means a legacy entry: [`approved_for`] then falls back to
+    /// `content_hash` over the whole proposal, as before. `content_hash` is
+    /// still written, and `keys` only ever holds keys whose value matched at
+    /// write time, so a cplt that predates this field (and ignores it) grants
+    /// `keys` exactly when nothing changed since, and nothing otherwise: never
+    /// more than this version would.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub key_hashes: std::collections::BTreeMap<String, String>,
 }
 
 /// One repository linked by an approval: the identity that was approved, and
@@ -361,8 +374,100 @@ pub fn now_iso8601() -> String {
 ///   approval for `pass_env = ["TZ"]` survive into
 ///   `pass_env = ["AWS_SECRET_ACCESS_KEY"]` (#492).
 pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> String {
-    use sha2::{Digest, Sha256};
+    let normalized = normalized(propose);
+    // The fallback cannot collide with a real serialization: it is tagged, and
+    // it carries the error. `ProposeSection` is plain data, so this is not
+    // reachable today — but a hash that silently changed format would be a
+    // security boundary failing quietly, which is the one thing it must not do.
+    let canonical = serde_json::to_string(&normalized)
+        .unwrap_or_else(|e| format!("cplt-proposal-hash-fallback:{e}:{normalized:?}"));
+    sha256_hex(&canonical)
+}
 
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(s.as_bytes());
+    // Full SHA-256 hex (64 chars) — collision-resistant content pinning
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hash of one proposed key's normalized value (#1002), pinning the approval
+/// of that key to the exact value reviewed. Same normalization as
+/// [`proposal_content_hash`]; the key name is part of the input so two keys
+/// with equal values never share a hash.
+#[must_use]
+pub fn key_value_hash(propose: &crate::repo_config::ProposeSection, key: &str) -> Option<String> {
+    // Fail closed: a value that cannot be serialized or found at its path
+    // (null, e.g. a lost name-to-path mapping) has no hash, and a key with no
+    // hash is never approved. Hashing null instead would let any later value
+    // match.
+    let value = serde_json::to_value(normalized(propose)).ok()?;
+    // `sandbox.pass_env` is the one key not spelled as its `[propose]` path.
+    let field = if key == "sandbox.pass_env" {
+        "pass_env"
+    } else {
+        key
+    };
+    let pointer = format!("/{}", field.replace('.', "/"));
+    let v = value.pointer(&pointer).filter(|v| !v.is_null())?;
+    Some(sha256_hex(&format!("cplt-key-v1\0{key}\0{v}")))
+}
+
+/// The keys of `entry` that apply to `propose` as it stands now.
+///
+/// Per-key entry: a key applies only while it is proposed and its stored
+/// hash equals the hash of its current value. A key in `keys` with no stored
+/// hash never applies. Legacy entry (no per-key hashes): all of `keys`, but
+/// only while the whole-proposal hash matches, as before #1002.
+///
+/// Does not check which repository the entry is bound to; callers do that
+/// ([`verdict`], [`approved_path_matches`]).
+#[must_use]
+pub fn approved_for(
+    entry: &TrustEntry,
+    propose: &crate::repo_config::ProposeSection,
+) -> Vec<String> {
+    let a = &entry.accepted;
+    if a.key_hashes.is_empty() {
+        return if approval_is_stale(&a.content_hash, &proposal_content_hash(propose)) {
+            Vec::new()
+        } else {
+            a.keys.clone()
+        };
+    }
+    let proposed = crate::repo_config::proposed_keys(propose);
+    a.keys
+        .iter()
+        .filter(|k| {
+            proposed.contains(&k.as_str())
+                && key_value_hash(propose, k).is_some_and(|h| a.key_hashes.get(*k) == Some(&h))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Record `keys` as approved for `propose` as it stands now: per-key hashes
+/// for exactly these keys, plus the whole-proposal hash for older cplt.
+pub fn pin_keys(
+    accepted: &mut AcceptedProposals,
+    keys: Vec<String>,
+    propose: &crate::repo_config::ProposeSection,
+) {
+    // A key with no hash is not recorded at all, so it stays pending.
+    accepted.key_hashes = keys
+        .iter()
+        .filter_map(|k| Some((k.clone(), key_value_hash(propose, k)?)))
+        .collect();
+    accepted.keys = keys;
+    accepted
+        .keys
+        .retain(|k| accepted.key_hashes.contains_key(k));
+    accepted.keys.sort_unstable();
+    accepted.keys.dedup();
+    accepted.content_hash = proposal_content_hash(propose);
+}
+
+fn normalized(propose: &crate::repo_config::ProposeSection) -> crate::repo_config::ProposeSection {
     // Serialized whole, never field by field. The hand-written version listed
     // the fields it knew about, and `pass_env` was added to `[propose]` in #443
     // and never added here: an approval granted for `pass_env = ["TZ"]` went on
@@ -392,19 +497,7 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
     normalized.allow.localhost.sort_unstable();
     normalized.allow.domains.sort_unstable();
     normalized.proxy.allow_private_domains.sort_unstable();
-
-    // The fallback cannot collide with a real serialization: it is tagged, and
-    // it carries the error. `ProposeSection` is plain data, so this is not
-    // reachable today — but a hash that silently changed format would be a
-    // security boundary failing quietly, which is the one thing it must not do.
-    let canonical = serde_json::to_string(&normalized)
-        .unwrap_or_else(|e| format!("cplt-proposal-hash-fallback:{e}:{normalized:?}"));
-
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    let hash = hasher.finalize();
-    // Full SHA-256 hex (64 chars) — collision-resistant content pinning
-    hash.iter().map(|b| format!("{b:02x}")).collect()
+    normalized
 }
 
 /// Decide whether a stored approval is stale relative to the current proposal
@@ -423,9 +516,10 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
 /// How a stored approval relates to the proposal in front of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalStatus {
-    /// Pinned to these exact proposal values; its keys may apply.
+    /// The whole proposal is unchanged since the last accept.
     Current,
-    /// The proposal changed since the approval; re-approve.
+    /// The proposal changed since the last accept. Keys whose own value is
+    /// unchanged still apply ([`approved_for`]); the rest are pending.
     Changed,
     /// Stale, and there is nothing left to approve: the proposal the entry was
     /// granted for no longer exists (#560). Reporting this as "changed" sent
@@ -439,8 +533,8 @@ pub enum ApprovalStatus {
 /// "nothing reached us": a `[propose]` stripped from an uncommitted file is a
 /// proposal waiting for a commit, not one that is gone.
 ///
-/// Only `Current` may apply keys. `Outlived` is as stale as `Changed` — the
-/// split exists for the message, never for the grant.
+/// `Outlived` never applies keys. What `Current` and `Changed` apply is
+/// decided per key by [`granted_keys`].
 #[must_use]
 pub fn approval_status(
     entry: &TrustEntry,
@@ -488,12 +582,19 @@ pub fn verdict(
     Verdict::Status(approval_status(t, &current_hash, nothing_proposed))
 }
 
-/// The keys the launch applies under `verdict`: only a current approval bound
-/// to this repository grants anything.
+/// The keys the launch applies under `verdict`: only an approval bound to
+/// this repository grants anything, and only for keys whose value is unchanged
+/// since they were approved ([`approved_for`]).
 #[must_use]
-pub fn granted_keys(entry: Option<&TrustEntry>, verdict: Verdict) -> Vec<String> {
+pub fn granted_keys(
+    entry: Option<&TrustEntry>,
+    verdict: Verdict,
+    propose: &crate::repo_config::ProposeSection,
+) -> Vec<String> {
     match (entry, verdict) {
-        (Some(t), Verdict::Status(ApprovalStatus::Current)) => t.accepted.keys.clone(),
+        (Some(t), Verdict::Status(ApprovalStatus::Current | ApprovalStatus::Changed)) => {
+            approved_for(t, propose)
+        }
         _ => Vec::new(),
     }
 }
@@ -520,6 +621,7 @@ pub fn retire_outlived(entry: TrustEntry, current_hash: &str) -> Option<TrustEnt
             linked: entry.accepted.linked,
             repos: entry.accepted.repos,
             content_hash: current_hash.to_string(),
+            key_hashes: std::collections::BTreeMap::new(),
         },
     })
 }
@@ -711,6 +813,188 @@ mod tests {
             None,
             "not its own sibling"
         );
+    }
+
+    fn smoke_proposal(repos: &[&str]) -> crate::repo_config::ProposeSection {
+        toml::from_str::<crate::repo_config::RepoConfig>(&format!(
+            "[propose]\nallow_localhost_any = true\nallow_jvm_attach = true\nrepos = {repos:?}\n\
+             [propose.allow]\nlocalhost = [8080]\nread = [\"~/.gradle\"]\n"
+        ))
+        .unwrap()
+        .propose
+    }
+
+    fn pinned(propose: &crate::repo_config::ProposeSection) -> TrustEntry {
+        let mut entry = TrustEntry::default();
+        let keys = crate::repo_config::proposed_keys(propose)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        pin_keys(&mut entry.accepted, keys, propose);
+        entry
+    }
+
+    /// What a cplt that predates `key_hashes` grants: `keys` while the whole
+    /// hash matches, nothing otherwise.
+    fn old_cplt_grants(
+        entry: &TrustEntry,
+        propose: &crate::repo_config::ProposeSection,
+    ) -> Vec<String> {
+        if approval_is_stale(
+            &entry.accepted.content_hash,
+            &proposal_content_hash(propose),
+        ) {
+            Vec::new()
+        } else {
+            entry.accepted.keys.clone()
+        }
+    }
+
+    /// Every proposable key resolves to its own value: its hash exists, and
+    /// changes when the value does. A lost name-to-path mapping must fail
+    /// closed, never hash null and match any later value.
+    #[test]
+    fn every_proposed_key_hashes_its_own_value() {
+        let parse = |body: &str| {
+            toml::from_str::<crate::repo_config::RepoConfig>(body)
+                .unwrap()
+                .propose
+        };
+        let bools: String = crate::config::PROPOSE_BOOLS
+            .iter()
+            .filter(|r| !r.tighten_only)
+            .map(|r| format!("{} = true\n", r.key))
+            .collect();
+        let lists = |v: &str, n: u16| {
+            format!(
+                "[propose]\n{bools}pass_env = [\"{v}\"]\nrepos = [\"o/{v}\"]\n\
+                 [propose.allow]\nread = [\"~/{v}\"]\nwrite = [\"~/{v}\"]\n\
+                 socket = [\"/tmp/{v}\"]\nports = [{n}]\nlocalhost = [{n}]\n\
+                 domains = [\"{v}.example\"]\n\
+                 [propose.proxy]\nallow_private_domains = [\"{v}.internal\"]\n"
+            )
+        };
+        let a = parse(&lists("a", 1001));
+        let b = parse(&lists("b", 1002));
+        let keys = crate::repo_config::proposed_keys(&a);
+        assert!(keys.contains(&"sandbox.pass_env"), "{keys:?}");
+        assert_eq!(keys.len(), crate::repo_config::proposed_keys(&b).len());
+        for key in keys {
+            let ha = key_value_hash(&a, key).unwrap_or_else(|| panic!("{key} has no hash"));
+            if !key.contains('.') && key != "repos" {
+                continue; // booleans: the only proposable value is `true`
+            }
+            let hb = key_value_hash(&b, key).unwrap();
+            assert_ne!(ha, hb, "{key}: hash ignores its value");
+        }
+        // A key whose path resolves to nothing is unhashable, so never approved.
+        assert_eq!(key_value_hash(&a, "allow.nonexistent"), None);
+        let mut entry = TrustEntry::default();
+        pin_keys(&mut entry.accepted, vec!["allow.nonexistent".into()], &a);
+        assert!(entry.accepted.keys.is_empty());
+    }
+
+    #[test]
+    fn changing_repos_leaves_other_keys_approved() {
+        let entry = pinned(&smoke_proposal(&["navikt/tbd-libs"]));
+        let now = smoke_proposal(&["navikt/tbd-libs", "navikt/rapids-and-rivers"]);
+        assert_eq!(
+            approved_for(&entry, &now),
+            [
+                "allow.localhost",
+                "allow.read",
+                "allow_jvm_attach",
+                "allow_localhost_any"
+            ]
+        );
+    }
+
+    #[test]
+    fn changing_one_value_makes_only_that_key_pending() {
+        let before = smoke_proposal(&["a/b"]);
+        let entry = pinned(&before);
+        let mut now = before.clone();
+        now.allow.read = vec!["~/.ssh".into()];
+        let granted = approved_for(&entry, &now);
+        assert!(!granted.iter().any(|k| k == "allow.read"), "{granted:?}");
+        assert_eq!(granted.len(), entry.accepted.keys.len() - 1, "{granted:?}");
+        // Reordering is not a change.
+        let mut reordered = before.clone();
+        reordered.allow.read = vec!["~/.gradle".into()];
+        reordered.repos.reverse();
+        assert_eq!(approved_for(&entry, &reordered), entry.accepted.keys);
+    }
+
+    #[test]
+    fn a_removed_key_drops_out() {
+        let before = smoke_proposal(&["a/b"]);
+        let entry = pinned(&before);
+        let mut now = before;
+        now.allow_jvm_attach = None;
+        assert!(
+            !approved_for(&entry, &now)
+                .iter()
+                .any(|k| k == "allow_jvm_attach")
+        );
+    }
+
+    #[test]
+    fn legacy_whole_hash_entry_keeps_working_and_migrates() {
+        let before = smoke_proposal(&["a/b"]);
+        let mut legacy = pinned(&before);
+        legacy.accepted.key_hashes.clear();
+        // Unchanged: every key approved, as before.
+        assert_eq!(approved_for(&legacy, &before), legacy.accepted.keys);
+        // Any change: nothing approved, as before.
+        let now = smoke_proposal(&["a/b", "c/d"]);
+        assert!(approved_for(&legacy, &now).is_empty());
+        // The next accept (here: of `repos`) migrates to per-key hashes.
+        let mut migrated = legacy.clone();
+        pin_keys(&mut migrated.accepted, vec!["repos".into()], &now);
+        assert_eq!(migrated.accepted.key_hashes.len(), 1);
+        assert_eq!(approved_for(&migrated, &now), ["repos"]);
+    }
+
+    /// Never approved: a value that differs from the pinned one, a key listed
+    /// without a hash, a hash someone edited, or a key no longer proposed.
+    /// And an older cplt reading a per-key entry never grants more than this one.
+    #[test]
+    fn a_changed_or_tampered_value_is_never_approved() {
+        let before = smoke_proposal(&["a/b"]);
+        let mut entry = pinned(&before);
+        let mut now = before.clone();
+        now.allow.read = vec!["~/.ssh".into()];
+        now.allow.localhost = vec![1];
+        let granted = approved_for(&entry, &now);
+        assert!(
+            !granted
+                .iter()
+                .any(|k| k == "allow.read" || k == "allow.localhost")
+        );
+
+        entry.accepted.key_hashes.remove("allow_jvm_attach");
+        entry
+            .accepted
+            .key_hashes
+            .insert("allow_localhost_any".into(), "0".repeat(64));
+        entry.accepted.keys.push("allow_docker".into());
+        let granted = approved_for(&entry, &before);
+        for k in ["allow_jvm_attach", "allow_localhost_any", "allow_docker"] {
+            assert!(!granted.iter().any(|g| g == k), "{k}: {granted:?}");
+        }
+
+        // Accepting one key after a change leaves only matching keys in
+        // `keys`, so an older cplt (whole hash + keys) grants no stale value.
+        let mut accepted = pinned(&before);
+        let keep = approved_for(&accepted, &now);
+        pin_keys(&mut accepted.accepted, keep, &now);
+        assert_eq!(
+            old_cplt_grants(&accepted, &now),
+            approved_for(&accepted, &now)
+        );
+        let mut later = now.clone();
+        later.repos.push("x/y".into());
+        assert!(old_cplt_grants(&accepted, &later).is_empty());
     }
 
     #[test]
@@ -1046,6 +1330,7 @@ mod tests {
                 approved_at: "2026-05-07T12:00:00Z".to_string(),
                 linked: Vec::new(),
                 repos: None,
+                key_hashes: [("allow_jvm_attach".to_string(), "ab".to_string())].into(),
                 content_hash: "a1b2c3d4e5f6a7b8".to_string(),
             },
         };

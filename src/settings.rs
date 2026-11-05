@@ -651,13 +651,10 @@ fn approved_repo_keys(project_dir: &Path, repo: &repo_config::RepoConfig) -> Vec
     let Some(entry) = trust::load_trust(project_dir) else {
         return Vec::new();
     };
-    let current_hash = trust::proposal_content_hash(&repo.propose);
-    if !trust::approved_path_matches(&entry, project_dir)
-        || trust::approval_is_stale(&entry.accepted.content_hash, &current_hash)
-    {
+    if !trust::approved_path_matches(&entry, project_dir) {
         return Vec::new();
     }
-    entry.accepted.keys
+    trust::approved_for(&entry, &repo.propose)
 }
 
 fn resolved_values(

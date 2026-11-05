@@ -6204,11 +6204,12 @@ paths = [
         let v = json();
         assert_eq!(v["state"], "changed", "{v}");
         assert_eq!(v["command"], "cplt trust accept", "{v}");
-        assert_eq!(json_unapproved(&v), ["allow.ports", "allow_localhost_any"]);
+        // Only the changed key is pending; the unchanged one stays approved (#1002).
+        assert_eq!(json_unapproved(&v), ["allow.ports"]);
         assert_eq!(json_unapproved(&v), launch_unapproved());
         let shown = config_show();
         assert!(
-            shown.contains("(pending approval)") && !shown.contains("✓ approved"),
+            shown.contains("(pending approval)"),
             "config show must not call a changed proposal approved:\n{shown}"
         );
 
@@ -7794,9 +7795,103 @@ paths = [
             !content.contains("allow.read"),
             "allow.read changed value and must NOT be renewed by a partial accept: {content}"
         );
+        // Its value did not change, so its approval stands (#1002).
         assert!(
-            !content.contains("allow_localhost_any"),
-            "approvals from the stale hash must not survive a partial accept: {content}"
+            content.contains("allow_localhost_any"),
+            "an unchanged key keeps its approval: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A legacy entry (no per-key hashes) that still matches migrates on a
+    /// bare `cplt trust accept`, even with nothing pending or to link.
+    #[test]
+    fn e2e_trust_bare_accept_migrates_a_legacy_entry() {
+        let (repo, config_file) =
+            make_trust_repo("per-key-migrate", "[propose]\nallow_localhost_any = true\n");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(out.status.success(), "{out:?}");
+        let files = trust_store_files(&config_file);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let mut entry: cplt::trust::TrustEntry = toml::from_str(&files[0].1).unwrap();
+        assert!(!entry.accepted.key_hashes.is_empty());
+        entry.accepted.key_hashes.clear();
+        std::fs::write(&files[0].0, toml::to_string(&entry).unwrap()).unwrap();
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept"])
+            .output()
+            .expect("accept should run");
+        assert!(out.status.success(), "{out:?}");
+        let after: cplt::trust::TrustEntry =
+            toml::from_str(&trust_store_files(&config_file)[0].1).unwrap();
+        assert!(
+            after
+                .accepted
+                .key_hashes
+                .contains_key("allow_localhost_any"),
+            "{after:?}"
+        );
+        assert_eq!(after.accepted.keys, ["allow_localhost_any"]);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The #1002 smoke test: proposing one more repository puts only `repos`
+    /// back to pending. The other keys keep their approval.
+    #[test]
+    fn e2e_trust_adding_a_repo_leaves_other_keys_approved() {
+        let (repo, config_file) = make_trust_repo(
+            "per-key-repos",
+            "[propose]\nallow_localhost_any = true\nallow_jvm_attach = true\nrepos = [\"navikt/tbd-libs\"]\n\n[propose.allow]\nlocalhost = [8080]\n",
+        );
+        let output = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(output.status.success(), "{output:?}");
+
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\nallow_jvm_attach = true\nrepos = [\"navikt/tbd-libs\", \"navikt/rapids-and-rivers\"]\n\n[propose.allow]\nlocalhost = [8080]\n",
+        )
+        .unwrap();
+        git_cmd(&repo).args(["add", ".cplt.toml"]).output().unwrap();
+        git_cmd(&repo)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "add repo",
+                "--quiet",
+            ])
+            .output()
+            .unwrap();
+
+        let output = trust_cmd(&repo, &config_file)
+            .args(["trust"])
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let status = |key: &str| {
+            stdout
+                .lines()
+                .find(|l| l.split_whitespace().nth(1) == Some(key))
+                .unwrap_or_else(|| panic!("no line for {key}: {stdout}"))
+                .to_string()
+        };
+        for key in ["allow_localhost_any", "allow_jvm_attach", "allow.localhost"] {
+            assert!(status(key).contains("approved"), "{key}: {stdout}");
+        }
+        assert!(status("repos").contains("pending"), "{stdout}");
+        assert!(
+            stdout.contains("+ navikt/rapids-and-rivers"),
+            "repos keeps its +/- diff: {stdout}"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
