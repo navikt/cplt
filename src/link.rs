@@ -501,9 +501,9 @@ pub fn unlinked_proposed_repos(
         let id = if let Some(id) = recorded.get(entry) {
             id.clone()
         } else {
-            let Some(id) = identity_of(&crate::config::expand_tilde(entry)) else {
-                continue;
-            };
+            // No origin is recorded as "", which matches nothing, so such an
+            // entry is not re-read on every launch.
+            let id = identity_of(&crate::config::expand_tilde(entry)).unwrap_or_default();
             record(entry, &id);
             id
         };
@@ -532,6 +532,29 @@ mod tests {
         );
         assert!(left.is_empty());
         assert_eq!(reads.get(), 0, "a recorded entry must not spawn git");
+    }
+
+    #[test]
+    fn entry_without_origin_is_recorded_as_no_match() {
+        let mut backfilled = Vec::new();
+        let left = unlinked_proposed_repos(
+            &["acme/libb".to_string()],
+            &["/s/plain".to_string()],
+            &std::collections::BTreeMap::new(),
+            |_| None,
+            |e, id| backfilled.push((e.to_string(), id.to_string())),
+        );
+        assert_eq!(left, ["acme/libb"]);
+        assert_eq!(backfilled, [("/s/plain".to_string(), String::new())]);
+        let recorded = [("/s/plain".to_string(), String::new())].into();
+        let left = unlinked_proposed_repos(
+            &["acme/libb".to_string()],
+            &["/s/plain".to_string()],
+            &recorded,
+            |_| panic!("a recorded no-origin entry must not be re-read"),
+            |_, _| {},
+        );
+        assert_eq!(left, ["acme/libb"]);
     }
 
     #[test]

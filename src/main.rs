@@ -3498,8 +3498,11 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // from a DIFFERENT one is NOT auto-trusted.
                         // Everything proposed is already linked here: nothing
                         // to approve, so nothing to say (#980).
-                        (Some(_), trust::Verdict::Foreign)
-                            if !loaded.propose_dropped && only_satisfied_repos => {}
+                        (
+                            Some(_),
+                            trust::Verdict::Foreign
+                            | trust::Verdict::Status(trust::ApprovalStatus::Changed),
+                        ) if !loaded.propose_dropped && only_satisfied_repos => {}
                         (Some(t), trust::Verdict::Foreign) => {
                             let current_hash = trust::proposal_content_hash(&loaded.config.propose);
                             let status = trust::approval_status(t, &current_hash, nothing_proposed);

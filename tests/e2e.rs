@@ -6555,6 +6555,52 @@ paths = [
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    /// #980 review: an approved checkout that later proposes one more
+    /// repository the user already linked is satisfied, not "changed".
+    #[test]
+    fn e2e_changed_repos_proposal_already_linked_is_quiet() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "propose-changed",
+            "[propose]\nrepos = [\"navikt/e2e-chg-a\"]\n",
+        );
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir").join("trust"));
+        let parent = repo.parent().expect("parent").to_path_buf();
+        make_origin_repo(&parent.join("e2e-chg-a"), "navikt/e2e-chg-a");
+        make_origin_repo(&parent.join("e2e-chg-b"), "navikt/e2e-chg-b");
+        let run = |args: &[&str]| {
+            let out = trust_cmd(&repo, &config_file)
+                .args(args)
+                .output()
+                .expect("runs");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["trust", "accept", "repos"]);
+        run(&["link", "navikt/e2e-chg-b"]);
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nrepos = [\"navikt/e2e-chg-a\", \"navikt/e2e-chg-b\"]\n",
+        )
+        .unwrap();
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "commit", "-qam", "more"])
+            .output()
+            .expect("commit");
+
+        let stderr = launch_stderr(&repo, &config_file);
+        assert!(
+            !stderr.contains("changed since the last approval"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("unapproved permission"), "{stderr}");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     /// #980: in a second checkout of an approved repository, `trust accept`
     /// refuses, so the launch must suggest `cplt link`, not accept.
     #[test]
