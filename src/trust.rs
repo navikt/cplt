@@ -79,6 +79,12 @@ pub struct AcceptedProposals {
     #[serde(default)]
     pub linked: Vec<LinkedRepo>,
 
+    /// The `[propose] repos` list as it stood when `repos` was last approved
+    /// (#982), so `cplt trust` can show which repository a later commit added.
+    /// `None` for entries written before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos: Option<Vec<String>>,
+
     /// SHA-256 hash of the proposal values at approval time.
     /// If the .cplt.toml proposals change, this hash won't match and
     /// approvals are invalidated (user must re-approve).
@@ -512,9 +518,32 @@ pub fn retire_outlived(entry: TrustEntry, current_hash: &str) -> Option<TrustEnt
             keys: Vec::new(),
             approved_at: now_iso8601(),
             linked: entry.accepted.linked,
+            repos: entry.accepted.repos,
             content_hash: current_hash.to_string(),
         },
     })
+}
+
+/// A checkout named after `identity` beside the project, found with one `stat`
+/// and no git spawn so launch can call it (#977). Not verified:
+/// `cplt trust accept repos` checks the origin before linking.
+pub fn sibling_checkout(project_dir: &Path, identity: &str) -> Option<PathBuf> {
+    let name = identity.rsplit('/').next().unwrap_or(identity);
+    let dir = project_dir.parent()?.join(name);
+    (dir != project_dir && dir.join(".git").exists()).then_some(dir)
+}
+
+/// Repositories in `now` but not in `before`, and the reverse (#982).
+pub fn repos_diff<'a>(before: &'a [String], now: &'a [String]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let added = now
+        .iter()
+        .filter(|r| !before.contains(r))
+        .map(String::as_str);
+    let removed = before
+        .iter()
+        .filter(|r| !now.contains(r))
+        .map(String::as_str);
+    (added.collect(), removed.collect())
 }
 
 /// Check whether a trust entry applies to the repository at `project_dir`.
@@ -642,6 +671,34 @@ pub fn approval_is_orphaned(entry: &TrustEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #977: a sibling checkout is found by name; the project is not its own.
+    #[test]
+    fn sibling_checkout_needs_a_git_dir_beside_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("libc/.git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("plain")).unwrap();
+        assert_eq!(
+            sibling_checkout(&project, "acme/libc"),
+            Some(tmp.path().join("libc"))
+        );
+        assert_eq!(sibling_checkout(&project, "acme/plain"), None, "no .git");
+        assert_eq!(sibling_checkout(&project, "acme/libb"), None);
+        assert_eq!(
+            sibling_checkout(&project, "acme/app"),
+            None,
+            "not its own sibling"
+        );
+    }
+
+    #[test]
+    fn repos_diff_names_added_and_removed() {
+        let before = vec!["a/old".to_string(), "a/libb".to_string()];
+        let now = vec!["a/libb".to_string(), "a/libc".to_string()];
+        assert_eq!(repos_diff(&before, &now), (vec!["a/libc"], vec!["a/old"]));
+    }
 
     /// An entry approved for `[propose.allow] read = ["~/Desktop"]` (#560).
     fn approved_for_desktop() -> (TrustEntry, String) {
@@ -968,6 +1025,7 @@ mod tests {
                 ],
                 approved_at: "2026-05-07T12:00:00Z".to_string(),
                 linked: Vec::new(),
+                repos: None,
                 content_hash: "a1b2c3d4e5f6a7b8".to_string(),
             },
         };

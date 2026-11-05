@@ -3421,33 +3421,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
             // Proposed repos this checkout's local config does not link yet.
             // Empty means `repos` is satisfied: approving it would add no root.
-            let unlinked_repos = if loaded.propose_dropped || loaded.config.propose.repos.is_empty()
-            {
-                Vec::new()
-            } else {
-                let (dirs, recorded) = local_cfg.as_ref().map_or_else(
-                    || (&[][..], std::collections::BTreeMap::default()),
-                    |l| {
-                        (
-                            &l.config.sandbox.repo_dirs[..],
-                            config::linked_identities(&l.raw),
-                        )
-                    },
-                );
-                cplt::link::unlinked_proposed_repos(
-                    &loaded.config.propose.repos,
-                    dirs,
-                    &recorded,
-                    |dir| {
-                        cplt::git::trusted_git()
-                            .and_then(|git| cplt::gh_proxy::detect_current_repo(git, dir).ok())
-                    },
-                    // Backfill for a legacy entry. Best effort: never fails a launch.
-                    |entry, id| {
-                        let _ = config::set_linked_identity(&project_dir, entry, Some(id));
-                    },
-                )
-            };
+            let unlinked_repos = proposed_unlinked(&project_dir, &loaded, local_cfg.as_ref());
             let link_hint = (!unlinked_repos.is_empty()).then(|| {
                 unlinked_repos
                     .iter()
@@ -3562,6 +3536,16 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // No trust entry: the "Untrusted .cplt.toml" notice
                         // below lists what is pending, so nothing to add here.
                         _ => {}
+                    }
+                }
+                if !resolved.quiet {
+                    for message in unlinked_proposed_repos_messages(
+                        &project_dir,
+                        &unlinked_repos,
+                        entry.as_ref(),
+                        verdict,
+                    ) {
+                        ui::warn(&message);
                     }
                 }
                 // A legacy empty stored hash is STALE (see approval_is_stale).
@@ -9885,6 +9869,24 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             &repo_paths,
         ))
         .chain(unlinked_child_repos_messages(&project_dir, &repo_paths))
+        .chain(
+            repo_config::load_repo_config(&project_dir)
+                .ok()
+                .flatten()
+                .map(|loaded| {
+                    let entry = trust::load_trust(&project_dir);
+                    let verdict = trust::verdict(entry.as_ref(), &project_dir, &loaded);
+                    let local = config::load_local(&project_dir).ok().flatten();
+                    let unlinked = proposed_unlinked(&project_dir, &loaded, local.as_ref());
+                    unlinked_proposed_repos_messages(
+                        &project_dir,
+                        &unlinked,
+                        entry.as_ref(),
+                        verdict,
+                    )
+                })
+                .unwrap_or_default(),
+        )
     {
         findings.push(Finding::warning(message, None));
     }
@@ -11859,6 +11861,59 @@ fn trust_state(
     }
 }
 
+/// The repositories `[propose] repos` names, each with its link state, and
+/// marked `+`/`-` against the list last approved (#982). The grant is
+/// read+write+exec on a whole tree, so the user must see which tree is new.
+fn proposed_repo_lines(
+    project_dir: &Path,
+    loaded: &repo_config::LoadedRepoConfig,
+    entry: Option<&trust::TrustEntry>,
+) -> Vec<String> {
+    let proposed = &loaded.config.propose.repos;
+    let local = config::load_local(project_dir).ok().flatten();
+    let recorded = local
+        .as_ref()
+        .map(|l| config::linked_identities(&l.raw))
+        .unwrap_or_default();
+    let unlinked = proposed_unlinked(project_dir, loaded, local.as_ref());
+    // Only an entry for this checkout says what was approved before.
+    let before = entry
+        .filter(|t| trust::approved_path_matches(t, project_dir))
+        .and_then(|t| t.accepted.repos.as_deref());
+    let (added, removed) =
+        before.map_or((Vec::new(), Vec::new()), |b| trust::repos_diff(b, proposed));
+    let mut lines: Vec<String> = proposed
+        .iter()
+        .map(|identity| {
+            let new = added.contains(&identity.as_str());
+            let where_ = if !unlinked.contains(identity) {
+                recorded
+                    .iter()
+                    .find(|(_, id)| cplt::gh_proxy::repos_match(id, identity))
+                    .map_or_else(
+                        || "linked".to_string(),
+                        |(dir, _)| format!("linked → {dir}"),
+                    )
+            } else if let Some(d) = trust::sibling_checkout(project_dir, identity) {
+                format!("not linked, found at {}", d.display())
+            } else {
+                "not linked, not found".to_string()
+            };
+            if new {
+                format!("+ {identity}: {where_} (new since last approval)")
+            } else {
+                format!("• {identity}: {where_}")
+            }
+        })
+        .collect();
+    lines.extend(
+        removed
+            .iter()
+            .map(|r| format!("- {r} (removed since last approval)")),
+    );
+    lines
+}
+
 /// `cplt trust show --json`. `version` lets a consumer refuse a shape it does
 /// not know.
 fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
@@ -12017,6 +12072,11 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             if !approved && let Some(cost) = repo_config::propose_key_cost(key) {
                 println!("{blue}[cplt]{nc}      {dim}{cost}{nc}");
             }
+            if key == "repos" {
+                for line in proposed_repo_lines(project_dir, loaded, trust_entry.as_ref()) {
+                    println!("{blue}[cplt]{nc}      {line}");
+                }
+            }
         }
     }
 
@@ -12119,6 +12179,75 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 struct ProposedLinks {
     linked: Vec<trust::LinkedRepo>,
     not_linked: Vec<String>,
+}
+
+/// Proposed repos this checkout's local config does not link yet (#980).
+/// Empty means `repos` is satisfied. Reads the `[linked]` identities recorded
+/// by `cplt link` and `trust accept`, so the common case spawns no git.
+fn proposed_unlinked(
+    project_dir: &Path,
+    loaded: &repo_config::LoadedRepoConfig,
+    local_cfg: Option<&config::LoadedConfig>,
+) -> Vec<String> {
+    if loaded.propose_dropped || loaded.config.propose.repos.is_empty() {
+        return Vec::new();
+    }
+    let (dirs, recorded) = local_cfg.map_or_else(
+        || (&[][..], std::collections::BTreeMap::default()),
+        |l| {
+            (
+                &l.config.sandbox.repo_dirs[..],
+                config::linked_identities(&l.raw),
+            )
+        },
+    );
+    cplt::link::unlinked_proposed_repos(
+        &loaded.config.propose.repos,
+        dirs,
+        &recorded,
+        |dir| {
+            cplt::git::trusted_git()
+                .and_then(|git| cplt::gh_proxy::detect_current_repo(git, dir).ok())
+        },
+        // Backfill for a legacy entry. Best effort: never fails a launch.
+        |entry, id| {
+            let _ = config::set_linked_identity(project_dir, entry, Some(id));
+        },
+    )
+}
+
+/// One line per repository an approved `[propose] repos` names but that is not
+/// linked (#977). Launch and `cplt doctor` print these: without them a
+/// repository approved before it was cloned stays out of scope with no hint.
+/// Takes the launch gate's `entry` and `verdict` so launch spawns no extra git.
+fn unlinked_proposed_repos_messages(
+    project_dir: &Path,
+    unlinked: &[String],
+    entry: Option<&trust::TrustEntry>,
+    verdict: trust::Verdict,
+) -> Vec<String> {
+    if unlinked.is_empty()
+        || !trust::granted_keys(entry, verdict)
+            .iter()
+            .any(|k| k == "repos")
+    {
+        return Vec::new();
+    }
+    unlinked
+        .iter()
+        .map(
+            |identity| match trust::sibling_checkout(project_dir, identity) {
+                Some(dir) => format!(
+                    "{identity} found at {}. Link it: cplt trust accept repos",
+                    dir.display()
+                ),
+                None => format!(
+                    "{identity} is proposed by .cplt.toml but not linked. Clone it, then run: \
+                 cplt trust accept repos"
+                ),
+            },
+        )
+        .collect()
 }
 
 /// Resolve and link the repositories a `.cplt.toml` proposes, and say what
@@ -12593,7 +12722,7 @@ fn trust_accept(
         .map(|t| t.accepted.linked.clone())
         .unwrap_or_default();
 
-    let carried = stored.filter(|t| {
+    let carried = stored.clone().filter(|t| {
         trust::approved_path_matches(t, project_dir)
             && !trust::approval_is_stale(&t.accepted.content_hash, &current_hash)
     });
@@ -12614,6 +12743,20 @@ no longer apply"
             ui::stdout_color(ui::YELLOW),
             ui::stdout_color(ui::RESET),
         );
+        // Which repository changed (#982): the grant is a whole tree.
+        if let Some(before) = stored
+            .as_ref()
+            .filter(|t| trust::approved_path_matches(t, project_dir))
+            .and_then(|t| t.accepted.repos.as_deref())
+        {
+            let (added, removed) = trust::repos_diff(before, &loaded.config.propose.repos);
+            for r in added {
+                println!("  + {r} (repos: new since last approval)");
+            }
+            for r in removed {
+                println!("  - {r} (repos: removed since last approval)");
+            }
+        }
         println!();
     }
 
@@ -12744,7 +12887,17 @@ no longer apply"
 
     // Start from the carried-forward entry, or a fresh one when nothing could be
     // carried — so the accepted set is then exactly `keys_to_accept`.
+    let prior_repos = stored
+        .as_ref()
+        .filter(|t| trust::approved_path_matches(t, project_dir))
+        .and_then(|t| t.accepted.repos.clone());
     let mut entry = carried.unwrap_or_default();
+    // A stale hash drops the carried entry, but the snapshot of what `repos`
+    // last approved must survive a partial approval of another key, or the
+    // next `cplt trust` cannot mark additions.
+    if entry.accepted.repos.is_none() {
+        entry.accepted.repos = prior_repos;
+    }
 
     // Set identity. The git dir is re-recorded on every approval, so an entry
     // whose repository moved is re-bound by the approval that follows.
@@ -12785,6 +12938,7 @@ no longer apply"
         let fresh = link_proposed_repos(project_dir, &loaded.config.propose.repos, &prior_linked);
         not_linked = fresh.not_linked;
         entry.accepted.linked = merge_linked(prior_linked, fresh.linked);
+        entry.accepted.repos = Some(loaded.config.propose.repos.clone());
     } else {
         entry.accepted.linked = prior_linked;
     }
