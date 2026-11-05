@@ -209,7 +209,7 @@ fn render(steps: &[Step], find: &dyn Fn(&str) -> Option<String>) -> String {
 
 /// Whether an answer to "[Y/n]" is a yes: only "", "y" or "yes". `None`
 /// (end of input, a read error) and anything else is a no.
-fn consents(answer: Option<&str>) -> bool {
+pub fn consents(answer: Option<&str>) -> bool {
     answer.is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "" | "y" | "yes"))
 }
 

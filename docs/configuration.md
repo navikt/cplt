@@ -269,10 +269,13 @@ $ cplt trust accept repos
 ```
 
 Each identity is resolved and origin-verified exactly as `cplt link` does, and
-one that is not on your machine is reported, never fetched: cloning a
-repository named by a config file is a much larger decision than linking one
-you already have. Approving again re-links anything missing, so a repository
-you clone later needs no re-approval dance.
+one that is not on your machine is never fetched on the config's say-so. At a
+terminal cplt asks, per repository, `Clone owner/name into <dir>? [Y/n]`, with
+`<dir>` beside this repository; the clone uses `gh` (or git over https) from the
+trusted system directories, and is origin-verified before it is linked. Without
+a terminal it prints the clone command and runs nothing. The summary says how
+many of the proposed repositories are linked. Approving again re-links anything
+missing, so a repository you clone later needs no re-approval dance.
 
 `cplt trust revoke repos` removes the roots recorded at approval time, matched
 by path — and only those. A root you added yourself with `cplt link` or

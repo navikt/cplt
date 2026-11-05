@@ -276,7 +276,7 @@ fn find_in(dirs: &[&str], roots: &[&str], name: &str) -> Option<PathBuf> {
 /// Deliberately no `PATH` fallback: a fallback would restore the exact lookup
 /// this exists to remove, and would do so precisely on the machines where the
 /// attacker's directory is the only match.
-pub(crate) fn trusted_binary(name: &str) -> Option<PathBuf> {
+pub fn trusted_binary(name: &str) -> Option<PathBuf> {
     find_in(TRUSTED_BIN_DIRS, TRUSTED_BIN_ROOTS, name)
 }
 

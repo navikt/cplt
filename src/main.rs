@@ -12113,6 +12113,14 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     ExitCode::SUCCESS
 }
 
+/// What [`link_proposed_repos`] did: the roots it created, and the identities
+/// that ended up with no root at all, so the summary can say how many of the
+/// proposed repositories are actually linked (#978).
+struct ProposedLinks {
+    linked: Vec<trust::LinkedRepo>,
+    not_linked: Vec<String>,
+}
+
 /// Resolve and link the repositories a `.cplt.toml` proposes, and say what
 /// happened to each.
 ///
@@ -12121,60 +12129,202 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 /// repository can put a *name* in front of the user and only a path the user
 /// approved ever grants access.
 ///
-/// A repository that is not on this machine is reported, not fetched: cloning a
-/// repository named by a config file is a much larger trust decision than
-/// linking one the user already has.
-fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::LinkedRepo> {
+/// A repository that is not on this machine is never fetched on the config's
+/// say-so. At a terminal the user is asked, per repository, whether to clone it
+/// beside this one (#979); anywhere else the clone command is printed and
+/// nothing runs. A clone is still verified by origin before it is linked.
+///
+/// `prior` is what earlier approvals recorded, so a root they made is not
+/// described as the user's own (#983).
+fn link_proposed_repos(
+    project_dir: &Path,
+    repos: &[String],
+    prior: &[trust::LinkedRepo],
+) -> ProposedLinks {
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
-    let mut linked = Vec::new();
+    let mut out = ProposedLinks {
+        linked: Vec::new(),
+        not_linked: Vec::new(),
+    };
 
     for identity in repos {
-        match cplt::link::resolve(project_dir, &home, identity) {
-            Ok(found) => {
-                let path = found.dir.to_string_lossy().into_owned();
-                let already = config::load_local(project_dir)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|l| l.config.sandbox.repo_dirs.contains(&path));
-                if already {
-                    // Recorded by nobody: the root was already there, so the
-                    // approval did not create it and revoking must not remove
-                    // it. Claiming it would make `trust revoke repos` delete a
-                    // root the user linked by hand (#496 review).
-                    println!("  • {identity} → {path} (already linked; left as yours)");
-                    let _ = config::set_linked_identity(project_dir, &path, Some(identity));
-                    continue;
-                } else if run_config_set(
-                    "sandbox.repo_dirs",
-                    &[path.as_str()],
-                    false,
-                    false,
-                    false,
-                    false,
-                    true,
-                ) != ExitCode::SUCCESS
-                {
-                    // The write said why. Not recorded as linked, because it is
-                    // not: an approval must not claim a grant that is not there.
-                    continue;
-                }
-                let _ = config::set_linked_identity(project_dir, &path, Some(identity));
-                linked.push(trust::LinkedRepo {
-                    identity: identity.clone(),
-                    path,
-                });
-            }
+        let found = match cplt::link::resolve(project_dir, &home, identity) {
+            Ok(found) => found,
             Err(e) => {
                 // One line per repository, then the reason indented: several
                 // failures in a row otherwise read as one paragraph.
                 ui::warn(&format!("{identity}: not linked"));
-                for line in e.to_string().lines() {
+                let not_found = matches!(e, cplt::link::ResolveError::NotFound { .. });
+                for line in e.to_string().replace("<owner>/<name>", identity).lines() {
                     eprintln!("  {line}");
                 }
+                let Some(found) = not_found
+                    .then(|| offer_clone(project_dir, identity))
+                    .flatten()
+                else {
+                    out.not_linked.push(identity.clone());
+                    continue;
+                };
+                found
             }
+        };
+        let path = found.dir.to_string_lossy().into_owned();
+        let already = config::load_local(project_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|l| l.config.sandbox.repo_dirs.contains(&path));
+        if already {
+            // Recorded by nobody new: the root was already there, so this
+            // approval did not create it. Claiming it would make `trust revoke
+            // repos` delete a root the user linked by hand (#496 review). A root
+            // an earlier approval made is still that approval's, and revoke
+            // removes it, so say which it is (#983).
+            if prior.iter().any(|l| l.path == path) {
+                println!("  • {identity} → {path} (already linked by an earlier approval)");
+            } else {
+                println!("  • {identity} → {path} (already linked; left as yours)");
+            }
+            let _ = config::set_linked_identity(project_dir, &path, Some(identity));
+            continue;
+        } else if run_config_set(
+            "sandbox.repo_dirs",
+            &[path.as_str()],
+            false,
+            false,
+            false,
+            false,
+            true,
+        ) != ExitCode::SUCCESS
+        {
+            // The write said why. Not recorded as linked, because it is
+            // not: an approval must not claim a grant that is not there.
+            out.not_linked.push(identity.clone());
+            continue;
+        }
+        let _ = config::set_linked_identity(project_dir, &path, Some(identity));
+        out.linked.push(trust::LinkedRepo {
+            identity: identity.clone(),
+            path,
+        });
+    }
+    out
+}
+
+/// The command that clones `identity` into `dest`: the trusted `gh` when there
+/// is one, else the trusted git over https. `None` when neither is installed
+/// anywhere the agent cannot reach. Never resolved through `PATH`.
+fn clone_command(identity: &str, dest: &Path) -> (Option<PathBuf>, Vec<String>) {
+    let dest = dest.to_string_lossy().into_owned();
+    if let Some(gh) = cplt::git::trusted_binary("gh") {
+        return (
+            Some(gh),
+            vec!["repo".into(), "clone".into(), identity.into(), dest],
+        );
+    }
+    let args = vec![
+        "clone".into(),
+        format!("https://github.com/{identity}"),
+        dest,
+    ];
+    (cplt::git::trusted_git().map(Path::to_path_buf), args)
+}
+
+/// Run a clone and report a failure. Split out so a test can hand it a fake
+/// binary: the real one comes only from the trusted directories.
+fn run_clone(bin: &Path, args: &[String]) -> bool {
+    #[allow(clippy::disallowed_methods)] // `bin` is already a resolved trusted path
+    let status = std::process::Command::new(bin).args(args).status();
+    match status {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            ui::error(&format!("Clone failed ({s}). Nothing was linked."));
+            false
+        }
+        Err(e) => {
+            ui::error(&format!(
+                "Could not run {}: {e}. Nothing was linked.",
+                bin.display()
+            ));
+            false
         }
     }
-    linked
+}
+
+/// Offer to clone a proposed repository that is not on this machine, beside
+/// the launch repository (#979).
+///
+/// Asked per repository and only at a terminal, defaulting to yes because the
+/// user has just chosen to approve `repos`. Without a terminal the command is
+/// printed and nothing runs: a script approving a committed config must not
+/// fetch whatever that config names. The clone runs in the unsandboxed parent
+/// and is then verified by origin like any named directory, so a clone that
+/// turns out to be something else is refused, not linked.
+fn offer_clone(project_dir: &Path, identity: &str) -> Option<cplt::link::Candidate> {
+    let name = identity.split_once('/')?.1;
+    let dest = project_dir.parent()?.join(name);
+    let (bin, args) = clone_command(identity, &dest);
+    let shown = format!(
+        "{} {}",
+        bin.as_deref()
+            .and_then(Path::file_name)
+            .map_or("git".into(), |n| n.to_string_lossy()),
+        args.join(" ")
+    );
+    let interactive = std::io::stdin().is_terminal();
+    if dest.exists() || bin.is_none() || !interactive {
+        if dest.exists() {
+            eprintln!(
+                "  {} exists but is not {identity}, so cplt will not clone into it.",
+                dest.display()
+            );
+        }
+        eprintln!("  Clone it beside this repository, then approve again:");
+        eprintln!("    {shown} && cplt trust accept repos");
+        return None;
+    }
+    eprint!("Clone {identity} into {}? [Y/n] ", dest.display());
+    let mut answer = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut answer)
+        .ok()
+        .filter(|&n| n > 0);
+    if !cplt::host_fix::consents(read.map(|_| answer.as_str())) {
+        return None;
+    }
+    if !run_clone(bin.as_deref()?, &args) {
+        return None;
+    }
+    match cplt::link::verify_named(&dest, project_dir, identity) {
+        Ok(found) => Some(found),
+        Err(e) => {
+            ui::error(&format!("{identity}: cloned, but not linked: {e}"));
+            None
+        }
+    }
+}
+
+/// The honest summary line for approving `repos`: how many of the proposed
+/// repositories are linked now, and which are not (#978). The approval itself
+/// stands either way, so a later clone needs no new decision.
+fn report_linked_count(total: usize, not_linked: &[String]) {
+    let line = linked_count_line(total, not_linked);
+    if not_linked.is_empty() {
+        println!("{line}");
+    } else {
+        ui::warn(&line);
+    }
+}
+
+fn linked_count_line(total: usize, not_linked: &[String]) -> String {
+    let linked = total.saturating_sub(not_linked.len());
+    if not_linked.is_empty() {
+        format!("Approved repos: {linked} of {total} linked")
+    } else {
+        format!(
+            "Approved repos: {linked} of {total} linked ({} not linked)",
+            not_linked.join(", ")
+        )
+    }
 }
 
 /// Union two sets of approval-created roots, keyed by path.
@@ -12485,9 +12635,10 @@ no longer apply"
                 .is_some_and(|t| trust::is_key_approved(t, "repos"))
                 && !unlinked_yet.is_empty()
             {
-                let fresh = link_proposed_repos(project_dir, &unlinked_yet);
                 let mut entry = carried.unwrap_or_default();
-                entry.accepted.linked = merge_linked(entry.accepted.linked.clone(), fresh);
+                let fresh = link_proposed_repos(project_dir, &unlinked_yet, &entry.accepted.linked);
+                report_linked_count(unlinked_yet.len(), &fresh.not_linked);
+                entry.accepted.linked = merge_linked(entry.accepted.linked.clone(), fresh.linked);
                 if let Err(e) = trust::save_trust(project_dir, &entry) {
                     ui::error(&format!("Failed to save trust: {e}"));
                     return ExitCode::FAILURE;
@@ -12594,9 +12745,11 @@ no longer apply"
     // can then withdraw (#496 review). Three ordinary events cause it: the
     // proposal shrinks, an identity stops resolving, or the hash goes stale and
     // the user approves some other key.
+    let mut not_linked = Vec::new();
     if keys_to_accept.iter().any(|k| k == "repos") {
-        let fresh = link_proposed_repos(project_dir, &loaded.config.propose.repos);
-        entry.accepted.linked = merge_linked(prior_linked, fresh);
+        let fresh = link_proposed_repos(project_dir, &loaded.config.propose.repos, &prior_linked);
+        not_linked = fresh.not_linked;
+        entry.accepted.linked = merge_linked(prior_linked, fresh.linked);
     } else {
         entry.accepted.linked = prior_linked;
     }
@@ -12607,14 +12760,24 @@ no longer apply"
         return ExitCode::FAILURE;
     }
 
+    // A check mark is all a skimming reader takes in, so it is only shown when
+    // every approved repository is actually linked (#978).
+    let (glyph, color) = if not_linked.is_empty() {
+        ("✓", ui::GREEN)
+    } else {
+        ("⚠", ui::YELLOW)
+    };
     println!(
-        "{}✓{} Approved {} permission(s) for this repository:",
-        ui::stdout_color(ui::GREEN),
+        "{}{glyph}{} Approved {} permission(s) for this repository:",
+        ui::stdout_color(color),
         ui::stdout_color(ui::RESET),
         keys_to_accept.len()
     );
     for key in &keys_to_accept {
         println!("  • {key}");
+    }
+    if keys_to_accept.iter().any(|k| k == "repos") {
+        report_linked_count(loaded.config.propose.repos.len(), &not_linked);
     }
     ExitCode::SUCCESS
 }
@@ -13840,6 +14003,52 @@ mod tests {
             temp_covered,
             "the system temp dirs are writable too: {roots:?}"
         );
+    }
+
+    /// #978: the summary counts what is linked, never just what is approved.
+    #[test]
+    fn linked_count_names_what_is_not_linked() {
+        assert_eq!(
+            super::linked_count_line(1, &[]),
+            "Approved repos: 1 of 1 linked"
+        );
+        assert_eq!(
+            super::linked_count_line(2, &["acme/libb".to_string()]),
+            "Approved repos: 1 of 2 linked (acme/libb not linked)"
+        );
+    }
+
+    /// #979: the clone runs the binary it is given with the real identity, and
+    /// a failing clone reports failure so nothing gets linked. A fake `gh` in a
+    /// scratch dir stands in for the trusted one.
+    #[cfg(unix)]
+    #[test]
+    fn run_clone_passes_the_identity_and_reports_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("args");
+        let write_fake = |name: &str, exit: i32| {
+            let bin = dir.path().join(name);
+            std::fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\necho \"$@\" > '{}'\nexit {exit}\n",
+                    log.display()
+                ),
+            )
+            .expect("write fake");
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            bin
+        };
+        let dest = dir.path().join("libb");
+        let (_, args) = super::clone_command("acme/libb", &dest);
+        assert!(args.iter().any(|a| a.contains("acme/libb")), "{args:?}");
+        assert!(args.last().is_some_and(|a| a.ends_with("libb")), "{args:?}");
+
+        assert!(super::run_clone(&write_fake("gh-ok", 0), &args));
+        let got = std::fs::read_to_string(&log).expect("fake ran");
+        assert!(got.contains("acme/libb"), "{got}");
+        assert!(!super::run_clone(&write_fake("gh-fail", 1), &args));
     }
 
     /// The record of what an approval linked is the only way `trust revoke

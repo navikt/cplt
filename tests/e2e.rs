@@ -6345,6 +6345,20 @@ paths = [
         assert!(after.contains("e2e-model"), "approval links it: {after}");
         assert!(after.contains("e2e-mine"), "and leaves mine alone: {after}");
 
+        // #983: a second approval must not call the first approval's root the
+        // user's, since revoke removes it.
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "repos"])
+            .output()
+            .expect("accept runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("e2e-model")
+                && stdout.contains("already linked by an earlier approval"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("left as yours"), "{stdout}");
+
         let out = trust_cmd(&repo, &config_file)
             .args(["trust", "revoke", "repos"])
             .output()
@@ -6367,6 +6381,75 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&model);
         let _ = std::fs::remove_dir_all(&mine);
+    }
+
+    /// #978/#979: approving a repository that is not on this machine, without
+    /// a terminal, prints a concrete clone command, clones nothing and does not
+    /// claim success. A fake `gh` and `git` first on PATH record any call; the
+    /// clone may only ever use the trusted binaries, and never runs here at all.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_approving_a_missing_repo_without_a_tty_prints_the_clone_and_runs_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, config_file) = make_trust_repo(
+            "propose-repos-absent",
+            "[propose]\nrepos = [\"navikt/e2e-absent\"]\n",
+        );
+        let parent = repo.parent().expect("parent").to_path_buf();
+        let home = parent.join("home");
+        let bin = parent.join("fakebin");
+        let marker = parent.join("fake-called");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&bin).expect("mkdir bin");
+        for name in ["gh", "git"] {
+            let p = bin.join(name);
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\necho {name} >> '{}'\nexit 0\n", marker.display()),
+            )
+            .expect("write fake");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "repos"])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("accept runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stdout.contains('✓'),
+            "no check mark when nothing linked: {stdout}"
+        );
+        assert!(
+            stderr.contains("0 of 1 linked (navikt/e2e-absent not linked)"),
+            "{stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("cplt link navikt/e2e-absent <dir>"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("clone navikt/e2e-absent")
+                || stderr.contains("clone https://github.com/navikt/e2e-absent"),
+            "concrete clone command: {stderr}"
+        );
+        assert!(!marker.exists(), "nothing on PATH may run");
+        assert!(!parent.join("e2e-absent").exists(), "and nothing is cloned");
+
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// The user linked it first; the project happens to propose the same
