@@ -11648,8 +11648,13 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
     // Best effort: without it the launch reads the origin once.
     let _ = config::set_linked_identity(&project_dir, &entry, Some(repo));
     if !propose {
+        // The explicit directory too: without it `--propose` resolves only
+        // siblings and the forge folder, and fails for a checkout elsewhere.
+        let dir_arg = dir
+            .map(|d| format!(" {}", sh_quote(&d.display().to_string())))
+            .unwrap_or_default();
         eprintln!(
-            "  {}Share it with the team: cplt link --propose {repo}{}",
+            "  {}Share it with the team: cplt link --propose {repo}{dir_arg}{}",
             ui::color(ui::DIM),
             ui::color(ui::RESET)
         );
@@ -11657,11 +11662,22 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
     }
     let path = project_dir.join(cplt::repo_config::REPO_CONFIG_FILE);
     match add_proposed_repo(&path, repo) {
-        Ok(true) => ui::info(&format!(
-            "Added {repo} to [propose] repos in {}. Commit it so teammates are offered it.",
-            cplt::repo_config::REPO_CONFIG_FILE
-        )),
-        Ok(false) => ui::info(&format!(
+        Ok(Some(others)) => {
+            ui::info(&format!(
+                "Added {repo} to [propose] repos in {}. Commit it so teammates are offered it.",
+                cplt::repo_config::REPO_CONFIG_FILE
+            ));
+            // The proposal hash changed, so an approval of the other keys no
+            // longer matches.
+            if others {
+                eprintln!(
+                    "  {}If you approved this repository's other proposals, approve them again: cplt trust accept --all{}",
+                    ui::color(ui::DIM),
+                    ui::color(ui::RESET)
+                );
+            }
+        }
+        Ok(None) => ui::info(&format!(
             "{repo} is already in [propose] repos in {}.",
             cplt::repo_config::REPO_CONFIG_FILE
         )),
@@ -11675,11 +11691,13 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
 
 /// Append `identity` to `[propose] repos` in `path`, creating the file or
 /// section if missing and keeping the rest of the document as written.
-/// Returns whether it was added (false: already listed).
+/// Returns `None` when already listed, else whether other keys are proposed.
+/// The edited file must pass the same schema and size checks as a load, or
+/// nothing is written.
 ///
 /// `.cplt.toml` is repository content the agent can write, so it is read with
 /// `read_untrusted`: no symlink, FIFO or oversized file is followed.
-fn add_proposed_repo(path: &Path, identity: &str) -> Result<bool, String> {
+fn add_proposed_repo(path: &Path, identity: &str) -> Result<Option<bool>, String> {
     let text = match cplt::untrusted::read_untrusted(path, 1024 * 1024) {
         Ok(Some(t)) => t,
         Ok(None) => return Err("not a regular file of at most 1 MiB (symlinks are refused)".into()),
@@ -11697,10 +11715,18 @@ fn add_proposed_repo(path: &Path, identity: &str) -> Result<bool, String> {
         .or_insert_with(|| toml_edit::value(toml_edit::Array::new()))
         .as_array_mut()
         .ok_or("[propose] repos is not an array")?;
-    if repos.iter().any(|v| v.as_str() == Some(identity)) {
-        return Ok(false);
+    // Case-insensitive, as identity verification is (`repos_match`).
+    if repos.iter().any(|v| {
+        v.as_str()
+            .is_some_and(|r| cplt::gh_proxy::repos_match(r, identity))
+    }) {
+        return Ok(None);
     }
     repos.push(identity);
+    let edited = cplt::repo_config::parse_and_validate(&doc.to_string())?;
+    let others = cplt::repo_config::proposed_keys(&edited.propose)
+        .iter()
+        .any(|&k| k != "repos");
     // Write a sibling temp file and rename it over the target: rename replaces
     // a symlink planted after the read instead of following it, so the write
     // cannot be redirected outside the repository.
@@ -11712,12 +11738,12 @@ fn add_proposed_repo(path: &Path, identity: &str) -> Result<bool, String> {
     let mode = std::fs::symlink_metadata(path)
         .ok()
         .filter(std::fs::Metadata::is_file)
-        .map_or(0o644, |m| m.permissions().mode() & 0o7777);
+        .map_or(0o644, |m| m.permissions().mode() & 0o777);
     tmp.as_file()
         .set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(|e| e.to_string())?;
     tmp.persist(path).map_err(|e| e.to_string())?;
-    Ok(true)
+    Ok(Some(others))
 }
 
 /// Remove the named root that is `identity`.

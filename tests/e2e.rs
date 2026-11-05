@@ -6284,8 +6284,11 @@ paths = [
 
         let err = link(&[]);
         assert!(
-            err.contains("cplt link --propose navikt/e2e-prop-b"),
-            "{err}"
+            err.contains(&format!(
+                "cplt link --propose navikt/e2e-prop-b '{}'",
+                lib.path().display()
+            )),
+            "the hint keeps the explicit directory: {err}"
         );
         assert!(!std::fs::read_to_string(&toml).unwrap().contains("repos"));
 
@@ -6295,7 +6298,20 @@ paths = [
         assert!(err.contains("Commit it"), "{err}");
         let mode = std::fs::metadata(&toml).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o640, "the rewrite keeps the file's mode");
+        assert!(!err.contains("approve them again"), "{err}");
         link(&["--propose"]);
+        // Same identity in another case: not a second entry.
+        let out = trust_cmd(project.path(), &config_file)
+            .args([
+                "link",
+                "Navikt/E2E-Prop-B",
+                lib.path().to_str().unwrap(),
+                "--propose",
+            ])
+            .output()
+            .expect("link runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("already in [propose] repos"), "{err}");
         let text = std::fs::read_to_string(&toml).unwrap();
         assert!(
             text.starts_with("# keep me\n[deny]\ngh_guard = true\n"),
@@ -6305,6 +6321,83 @@ paths = [
         assert!(
             text.contains("[propose]\nrepos = [\"navikt/e2e-prop-b\"]"),
             "{text}"
+        );
+    }
+
+    /// #994: the hint's directory is shell-quoted, so it pastes as one argument.
+    #[test]
+    fn e2e_link_hint_quotes_directory() {
+        let project = temp_repo("navikt/e2e-prop-g");
+        let lib = temp_repo("navikt/e2e-prop-h");
+        let cfg = tempfile::tempdir().unwrap();
+        let config_file = cfg.path().join("config.toml");
+        let spaced = cfg.path().join("lib dir");
+        std::fs::rename(lib.path(), &spaced).unwrap();
+        let out = trust_cmd(project.path(), &config_file)
+            .args(["link", "navikt/e2e-prop-h", spaced.to_str().unwrap()])
+            .output()
+            .expect("link runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(
+            err.contains(&format!(
+                "cplt link --propose navikt/e2e-prop-h '{}'",
+                spaced.display()
+            )),
+            "{err}"
+        );
+    }
+
+    /// #994: with other keys proposed, the author is told to approve again.
+    /// An edit that would break the schema or the 64 KiB limit is refused,
+    /// the file is untouched, the link stays, and the exit is non-zero.
+    #[test]
+    fn e2e_link_propose_reapproval_hint_and_validation() {
+        let project = temp_repo("navikt/e2e-prop-e");
+        let lib = temp_repo("navikt/e2e-prop-f");
+        let cfg = tempfile::tempdir().unwrap();
+        let config_file = cfg.path().join("config.toml");
+        let toml = project.path().join(".cplt.toml");
+        let link = || {
+            trust_cmd(project.path(), &config_file)
+                .args([
+                    "link",
+                    "navikt/e2e-prop-f",
+                    lib.path().to_str().unwrap(),
+                    "--propose",
+                ])
+                .output()
+                .expect("link runs")
+        };
+
+        std::fs::write(&toml, "[propose]\nallow_docker = true\n").unwrap();
+        let out = link();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(
+            err.contains("approve them again: cplt trust accept --all"),
+            "{err}"
+        );
+
+        // Just under the limit; the added entry pushes it over.
+        let pad = "#".repeat(64 * 1024 - 40);
+        let near = format!("{pad}\n[deny]\ngh_guard = true\n");
+        assert!(near.len() < 64 * 1024);
+        std::fs::write(&toml, &near).unwrap();
+        let out = link();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "oversized edit accepted: {err}");
+        assert!(err.contains("maximum size"), "{err}");
+        assert_eq!(std::fs::read_to_string(&toml).unwrap(), near);
+        let local = trust_cmd(project.path(), &config_file)
+            .args(["config", "get", "sandbox.repo_dirs"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&local.stdout)
+                .contains(lib.path().file_name().unwrap().to_str().unwrap()),
+            "the link stays: {}",
+            String::from_utf8_lossy(&local.stderr)
         );
     }
 
@@ -6340,6 +6433,16 @@ paths = [
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+        let local = trust_cmd(project.path(), &config_file)
+            .args(["config", "get", "sandbox.repo_dirs"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&local.stdout)
+                .contains(lib.path().file_name().unwrap().to_str().unwrap()),
+            "the link survives the refused edit: {}",
+            String::from_utf8_lossy(&local.stderr)
         );
 
         std::fs::remove_file(&toml).unwrap();
