@@ -113,7 +113,12 @@ fn only_propose_repos(raw: &str) -> bool {
     t.len() == 1
         && t.get("propose")
             .and_then(|p| p.as_table())
-            .is_some_and(|p| p.len() == 1 && p.contains_key("repos"))
+            .is_some_and(|p| {
+                p.len() == 1
+                    && p.get("repos")
+                        .and_then(toml::Value::as_array)
+                        .is_some_and(|a| a.iter().all(toml::Value::is_str))
+            })
 }
 
 /// `[propose] repos` from an existing `.cplt.toml`, tolerant of anything malformed.
@@ -1921,11 +1926,20 @@ git_push_prevention = true
             toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert_eq!(parsed.propose.repos, ["acme/liba"]);
 
-        std::fs::write(&cfg, "[propose]\nrepos = [\"acme/liba\"]\ndocker = true\n").unwrap();
-        assert!(matches!(
-            run_init(dir.path(), &report, &opts),
-            InitResult::AlreadyExists(_)
-        ));
+        for raw in [
+            "[propose]\nrepos = [\"acme/liba\"]\ndocker = true\n",
+            "[propose]\nrepos = \"acme/x\"\n",
+            "[propose]\nrepos = [1, 2]\n",
+        ] {
+            std::fs::write(&cfg, raw).unwrap();
+            assert!(
+                matches!(
+                    run_init(dir.path(), &report, &opts),
+                    InitResult::AlreadyExists(_)
+                ),
+                "{raw}"
+            );
+        }
     }
 
     fn init_with_links(dir: &Path, merge: bool, linked: &[&str]) -> String {
