@@ -61,7 +61,13 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
     // Note: init reads the working-tree file (not git HEAD) intentionally.
     // This is a local dev tool for authoring configs — the runtime config loader
     // in repo_config.rs reads from git HEAD for tamper-resistance.
-    let toml = if opts.merge && config_path.exists() {
+    // A file holding only `[propose] repos` is what `cplt link --propose`
+    // writes; `init` right after it merges rather than refusing (#1001).
+    let merge = opts.merge
+        || (!opts.force
+            && crate::untrusted::read_untrusted(&config_path, 1 << 20)
+                .is_ok_and(|raw| raw.is_some_and(|r| only_propose_repos(&r))));
+    let toml = if merge && config_path.exists() {
         let existing = match read_config(&config_path) {
             Ok(c) => c,
             Err(e) => return InitResult::WriteFailed(config_path, e),
@@ -79,7 +85,7 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
     };
 
     if opts.write {
-        if config_path.exists() && !opts.force && !opts.merge {
+        if config_path.exists() && !opts.force && !merge {
             return InitResult::AlreadyExists(config_path);
         }
         if let Err(e) = write_config(&config_path, &toml) {
@@ -97,6 +103,17 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
         path: config_path,
         written: false,
     }
+}
+
+/// Whether `raw` sets nothing but `[propose] repos`.
+fn only_propose_repos(raw: &str) -> bool {
+    let Ok(t) = raw.parse::<toml::Table>() else {
+        return false;
+    };
+    t.len() == 1
+        && t.get("propose")
+            .and_then(|p| p.as_table())
+            .is_some_and(|p| p.len() == 1 && p.contains_key("repos"))
 }
 
 /// `[propose] repos` from an existing `.cplt.toml`, tolerant of anything malformed.
@@ -1880,6 +1897,37 @@ git_push_prevention = true
         assert!(e.contains("not a regular file"), "{e}");
     }
 
+    /// #1001: `init --write` after `link --propose` merges into the file that
+    /// holds only `[propose] repos`, keeping them; any other file still refuses.
+    #[test]
+    fn init_write_merges_into_a_propose_repos_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let cfg = dir.path().join(".cplt.toml");
+        std::fs::write(&cfg, "[propose]\nrepos = [\"acme/liba\"]\n").unwrap();
+        let report = crate::detect::detect_project(dir.path());
+        let opts = InitOptions {
+            write: true,
+            force: false,
+            merge: false,
+            quiet: false,
+            linked_repos: vec![],
+        };
+        assert!(matches!(
+            run_init(dir.path(), &report, &opts),
+            InitResult::Generated { written: true, .. }
+        ));
+        let parsed: crate::repo_config::RepoConfig =
+            toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(parsed.propose.repos, ["acme/liba"]);
+
+        std::fs::write(&cfg, "[propose]\nrepos = [\"acme/liba\"]\ndocker = true\n").unwrap();
+        assert!(matches!(
+            run_init(dir.path(), &report, &opts),
+            InitResult::AlreadyExists(_)
+        ));
+    }
+
     fn init_with_links(dir: &Path, merge: bool, linked: &[&str]) -> String {
         let report = crate::detect::detect_project(dir);
         let opts = InitOptions {
@@ -1925,7 +1973,8 @@ git_push_prevention = true
         let parsed: crate::repo_config::RepoConfig = toml::from_str(&toml).expect(&toml);
         assert_eq!(parsed.propose.repos, ["acme/liba", "acme/old"], "{toml}");
 
-        assert!(!init_with_links(dir.path(), false, &[]).contains("repos ="));
+        // A repos-only file is merged without --merge too (#1001).
+        assert!(init_with_links(dir.path(), false, &[]).contains("acme/old"));
 
         // An unresolved root ("") is never suggested, and case variants dedupe.
         std::fs::remove_file(dir.path().join(".cplt.toml")).unwrap();

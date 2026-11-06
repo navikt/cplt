@@ -11440,7 +11440,9 @@ fn run_init_command(write: bool, force: bool, merge: bool, quiet: bool) -> ExitC
         }
         cplt::init::InitResult::AlreadyExists(path) => {
             eprintln!(
-                "error: {} already exists (use --force to overwrite)",
+                "error: {} already exists. Run `cplt init --write --merge` to add the detected \
+                 settings and keep everything it has, [propose] repos included. `--force` \
+                 replaces it.",
                 path.display()
             );
             ExitCode::FAILURE
@@ -11702,20 +11704,36 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
     // Verified above, so the launch can skip reading it again (#980).
     // Best effort: without it the launch reads the origin once.
     let _ = config::set_linked_identity(&project_dir, &entry, Some(repo));
+    let path = project_dir.join(cplt::repo_config::REPO_CONFIG_FILE);
     if !propose {
-        // The explicit directory too: without it `--propose` resolves only
-        // siblings and the forge folder, and fails for a checkout elsewhere.
-        let dir_arg = dir
-            .map(|d| format!(" {}", sh_quote(&d.display().to_string())))
-            .unwrap_or_default();
-        eprintln!(
-            "  {}Share it with the team: cplt link --propose {repo}{dir_arg}{}",
-            ui::color(ui::DIM),
-            ui::color(ui::RESET)
-        );
+        // Nothing to share when the committed file already proposes it (#1004).
+        // The working-tree file, as `--propose` itself edits; capped and
+        // symlink-refusing because the agent can write it.
+        let already = cplt::untrusted::read_untrusted(&path, 1 << 20)
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.parse::<toml::Table>().ok())
+            .and_then(|t| t.get("propose")?.get("repos")?.as_array().cloned())
+            .is_some_and(|repos| {
+                repos
+                    .iter()
+                    .filter_map(|r| r.as_str())
+                    .any(|r| cplt::gh_proxy::repos_match(r, repo))
+            });
+        if !already {
+            // Never the directory: this hint is about the team file, and a
+            // path is this machine only. `<dir>` keeps `--propose` able to
+            // re-verify a checkout outside the sibling/forge search.
+            let dir_arg = if dir.is_some() { " <dir>" } else { "" };
+            eprintln!(
+                "  {}Share it with the team (only the name goes in {}): cplt link --propose {repo}{dir_arg}{}",
+                ui::color(ui::DIM),
+                cplt::repo_config::REPO_CONFIG_FILE,
+                ui::color(ui::RESET)
+            );
+        }
         return code;
     }
-    let path = project_dir.join(cplt::repo_config::REPO_CONFIG_FILE);
     match add_proposed_repo(&path, repo) {
         Ok(Some(others)) => {
             ui::info(&format!(
@@ -12040,6 +12058,7 @@ fn proposed_repo_lines(
         .map(|l| config::linked_identities(&l.raw))
         .unwrap_or_default();
     let unlinked = proposed_unlinked(project_dir, loaded, local.as_ref());
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
     // Only an entry for this checkout says what was approved before.
     let before = entry
         .filter(|t| trust::approved_path_matches(t, project_dir))
@@ -12050,7 +12069,18 @@ fn proposed_repo_lines(
         .iter()
         .map(|identity| {
             let new = added.contains(&identity.as_str());
-            let where_ = if !unlinked.contains(identity) {
+            let where_ = if unlinked.contains(identity) {
+                // The same bounded, origin-verified search `trust accept repos`
+                // links with, so the preview never disagrees with it (#1003).
+                // Not on the launch path: `trust show` only.
+                match cplt::link::resolve(project_dir, &home, identity) {
+                    Ok(c) => format!("not linked, found at {}", c.dir.display()),
+                    Err(cplt::link::ResolveError::Ambiguous(_)) => {
+                        format!("not linked, several checkouts found; pick one: cplt link {identity} <dir>")
+                    }
+                    Err(_) => "not linked, not found".to_string(),
+                }
+            } else {
                 recorded
                     .iter()
                     .find(|(_, id)| cplt::gh_proxy::repos_match(id, identity))
@@ -12058,10 +12088,6 @@ fn proposed_repo_lines(
                         || "linked".to_string(),
                         |(dir, _)| format!("linked → {dir}"),
                     )
-            } else if let Some(d) = trust::sibling_checkout(project_dir, identity) {
-                format!("not linked, found at {}", d.display())
-            } else {
-                "not linked, not found".to_string()
             };
             if new {
                 format!("+ {identity}: {where_} (new since last approval)")
