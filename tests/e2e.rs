@@ -6760,7 +6760,10 @@ paths = [
             "propose-renamed",
             "[propose]\nrepos = [\"navikt/e2e-ren\"]\n",
         );
-        let clone = repo.parent().expect("parent").join("ren-fork-local");
+        let clone = repo
+            .parent()
+            .expect("parent")
+            .join("ren-fork\x1b[31m-local");
         std::fs::create_dir_all(&clone).expect("mkdir");
         for args in [
             vec!["init", "--quiet"],
@@ -6784,7 +6787,8 @@ paths = [
         );
         assert!(
             shown.contains("navikt/e2e-ren: not linked, found at")
-                && shown.contains("ren-fork-local"),
+                && shown.contains("ren-fork\\u{1b}[31m-local")
+                && !shown.contains('\x1b'),
             "{shown}"
         );
         let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));

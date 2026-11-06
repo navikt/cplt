@@ -12074,7 +12074,10 @@ fn proposed_repo_lines(
                 // links with, so the preview never disagrees with it (#1003).
                 // Not on the launch path: `trust show` only.
                 match cplt::link::resolve(project_dir, &home, identity) {
-                    Ok(c) => format!("not linked, found at {}", c.dir.display()),
+                    Ok(c) => format!(
+                        "not linked, found at {}",
+                        cplt::audit::escape_path(&c.dir.display().to_string())
+                    ),
                     Err(cplt::link::ResolveError::Ambiguous(_)) => {
                         format!("not linked, several checkouts found; pick one: cplt link {identity} <dir>")
                     }
@@ -12441,7 +12444,7 @@ fn unlinked_proposed_repos_messages(
             |identity| match trust::sibling_checkout(project_dir, identity) {
                 Some(dir) => format!(
                     "{identity} found at {}. Link it: cplt trust accept repos",
-                    dir.display()
+                    cplt::audit::escape_path(&dir.display().to_string())
                 ),
                 None => format!(
                     "{identity} is proposed by .cplt.toml but not linked. Clone it, then run: \
