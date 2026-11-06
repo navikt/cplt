@@ -6285,11 +6285,8 @@ paths = [
 
         let err = link(&[]);
         assert!(
-            err.contains(&format!(
-                "cplt link --propose navikt/e2e-prop-b '{}'",
-                lib.path().display()
-            )),
-            "the hint keeps the explicit directory: {err}"
+            err.contains("cplt link --propose navikt/e2e-prop-b <dir>"),
+            "the hint names a placeholder, never this machine's path: {err}"
         );
         assert!(!std::fs::read_to_string(&toml).unwrap().contains("repos"));
 
@@ -6325,28 +6322,37 @@ paths = [
         );
     }
 
-    /// #994: the hint's directory is shell-quoted, so it pastes as one argument.
+    /// #1004: the share hint never carries a local path, and is omitted for
+    /// a repository the file already proposes.
     #[test]
-    fn e2e_link_hint_quotes_directory() {
+    fn e2e_link_hint_has_no_path_and_skips_proposed_repo() {
         let project = temp_repo("navikt/e2e-prop-g");
         let lib = temp_repo("navikt/e2e-prop-h");
         let cfg = tempfile::tempdir().unwrap();
         let config_file = cfg.path().join("config.toml");
-        let spaced = cfg.path().join("lib dir");
-        std::fs::rename(lib.path(), &spaced).unwrap();
-        let out = trust_cmd(project.path(), &config_file)
-            .args(["link", "navikt/e2e-prop-h", spaced.to_str().unwrap()])
-            .output()
-            .expect("link runs");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{err}");
-        assert!(
-            err.contains(&format!(
-                "cplt link --propose navikt/e2e-prop-h '{}'",
-                spaced.display()
-            )),
-            "{err}"
-        );
+        let link = || {
+            let out = trust_cmd(project.path(), &config_file)
+                .args(["link", "navikt/e2e-prop-h", lib.path().to_str().unwrap()])
+                .output()
+                .expect("link runs");
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{err}");
+            err
+        };
+        let err = link();
+        let hint = err
+            .lines()
+            .find(|l| l.contains("Share it with the team"))
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(!hint.contains(&lib.path().display().to_string()), "{hint}");
+
+        std::fs::write(
+            project.path().join(".cplt.toml"),
+            "[propose]\nrepos = [\"navikt/e2e-prop-h\"]\n",
+        )
+        .unwrap();
+        let err = link();
+        assert!(!err.contains("Share it with the team"), "{err}");
     }
 
     /// #994: with other keys proposed, the author is told to approve again.
@@ -6705,10 +6711,17 @@ paths = [
         // Cloned later, beside the project.
         let late = repo.parent().expect("parent").join("e2e-late");
         std::fs::create_dir_all(&late).expect("mkdir");
-        git_cmd(&late)
-            .args(["init", "--quiet"])
-            .output()
-            .expect("git init");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:navikt/e2e-late.git",
+            ],
+        ] {
+            assert!(git_cmd(&late).args(&args).status().expect("git").success());
+        }
         let out = launch();
         assert!(
             out.contains("navikt/e2e-late found at ")
@@ -6734,6 +6747,50 @@ paths = [
         );
         assert!(shown.contains("• navikt/e2e-late:"), "{shown}");
 
+        let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
+    }
+
+    /// #1003: `cplt trust` finds a renamed clone by its origin, as
+    /// `trust accept repos` does, instead of reporting it not found.
+    #[test]
+    fn e2e_trust_show_finds_renamed_clone() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "propose-renamed",
+            "[propose]\nrepos = [\"navikt/e2e-ren\"]\n",
+        );
+        let clone = repo
+            .parent()
+            .expect("parent")
+            .join("ren-fork\x1b[31m-local");
+        std::fs::create_dir_all(&clone).expect("mkdir");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:navikt/e2e-ren.git",
+            ],
+        ] {
+            assert!(git_cmd(&clone).args(&args).status().expect("git").success());
+        }
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust"])
+            .output()
+            .expect("runs");
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            shown.contains("navikt/e2e-ren: not linked, found at")
+                && shown.contains("ren-fork\\u{1b}[31m-local")
+                && !shown.contains('\x1b'),
+            "{shown}"
+        );
         let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));
         let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
     }

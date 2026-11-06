@@ -189,7 +189,7 @@ pub fn classify_path(path: &str) -> Option<&'static str> {
 /// and zero-width formatters — everything a terminal control sequence needs.
 /// It is also injective, so escaping both sides of the before/after untracked
 /// comparison cannot make two distinct paths collide.
-pub(crate) fn escape_path(path: &str) -> String {
+pub fn escape_path(path: &str) -> String {
     path.escape_debug().to_string()
 }
 
