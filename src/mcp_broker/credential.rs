@@ -74,6 +74,18 @@ pub const MECHANISMS: &[Credential] = &[
     },
 ];
 
+/// Remote OAuth credential mechanism. Kept out of `MECHANISMS` so command
+/// specs still reject `credential: "oauth"`.
+pub static OAUTH: Credential = Credential {
+    name: "oauth",
+    command: None,
+    probe: None,
+    keychain: false,
+    write_dirs: &[],
+    linux_write_dirs: &[],
+    linux_read_paths: &[],
+};
+
 impl Credential {
     pub(crate) fn parse(name: &str) -> Result<&'static Self, String> {
         if name == "gh-token" {

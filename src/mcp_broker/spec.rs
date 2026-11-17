@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::credential::Credential;
-use super::{META_KEY, SCHEMA_VERSIONS, SPEC_LIMIT};
+use super::{META_KEY, OAUTH_GATE_ENV, SCHEMA_VERSIONS, SPEC_LIMIT};
+
+pub const OAUTH_CLIENT_ID: &str = "https://ki-utvikling.nav.no/cplt/oauth-client.json";
+pub const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:62471/callback";
 
 /// A spec that passed every check.
 #[derive(Clone, Debug)]
@@ -20,6 +23,7 @@ pub struct Spec {
     pub command: Vec<String>,
     /// `command[0]` resolved in the trusted dirs.
     pub program: PathBuf,
+    pub remote: Option<String>,
     pub egress_hosts: Vec<String>,
     pub allow: BTreeSet<String>,
     /// Tools whose `query` argument must pass [`graphql_read_only`].
@@ -101,6 +105,16 @@ pub(crate) struct Ext {
     arg_checks: BTreeMap<String, String>,
     #[serde(default)]
     login: Option<Login>,
+    #[serde(default)]
+    oauth: Option<OAuth>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OAuth {
+    resource: String,
+    client_id: String,
+    redirect_uri: String,
 }
 
 #[derive(Deserialize)]
@@ -134,12 +148,26 @@ pub fn file_name(id: &str) -> String {
     format!("{}.json", id.replace('/', "__"))
 }
 
+fn oauth_gate_enabled() -> bool {
+    std::env::var(OAUTH_GATE_ENV).as_deref() == Ok("1")
+}
+
 /// Validate one spec (invariants 1-6 of design section 5.3). `resolve` finds a
 /// bare command name in the trusted dirs.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn validate(
     text: &str,
     file: &str,
     resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<Spec, String> {
+    validate_gated(text, file, resolve, oauth_gate_enabled())
+}
+
+pub(crate) fn validate_gated(
+    text: &str,
+    file: &str,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+    oauth_gate: bool,
 ) -> Result<Spec, String> {
     let root: Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON ({e})"))?;
     let id = root
@@ -170,14 +198,18 @@ pub fn validate(
         ));
     }
     let ext: Ext = serde_json::from_value(ext.clone()).map_err(|e| format!("extension: {e}"))?;
-    // 4: only a host command is brokered; any remote upstream is refused, so
-    // nothing in `remotes[]` is read further.
-    if root
-        .get("remotes")
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-    {
+    let remotes = match root.get("remotes") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(a)) => a.as_slice(),
+        Some(_) => return Err("remotes must be an array".into()),
+    };
+    let has_remotes = !remotes.is_empty();
+    // 4: remote upstreams require both the feature gate and credential = "oauth".
+    if has_remotes && !(oauth_gate && ext.credential == "oauth") {
         return Err("remote upstreams are not brokered yet; only a host command".into());
+    }
+    if !has_remotes && ext.oauth.is_some() {
+        return Err("oauth block without an oauth remote".into());
     }
     // `packages[]` is never run (`command` is), but it is part of the spec
     // nav-pilot hands over, so invariants 2 and 6 still hold for it.
@@ -189,8 +221,21 @@ pub fn validate(
     collect_strings(&packages, &mut strings);
     strings.extend(ext.command.iter().map(String::as_str));
     strings.extend(ext.egress_hosts.iter().map(String::as_str));
+    if let Some(o) = &ext.oauth {
+        strings.push(o.resource.as_str());
+        strings.push(o.client_id.as_str());
+        strings.push(o.redirect_uri.as_str());
+    }
+    if has_remotes {
+        for r in remotes {
+            if let Some(u) = r.get("url").and_then(Value::as_str) {
+                strings.push(u);
+            }
+        }
+    }
     for s in &strings {
-        if looks_like_secret(s) {
+        // Per `/` segment: a token in a URL path (`/mcp/ghp_…`) is not a prefix.
+        if s.split('/').any(looks_like_secret) {
             return Err("the spec holds what looks like a secret value".into());
         }
         if s.contains('{') || s.contains("$(") || s.contains("${") {
@@ -211,28 +256,39 @@ pub fn validate(
         return Err("environmentVariables with isSecret: no cplt mechanism supplies them".into());
     }
 
-    // 1: the mechanism exists and fixes what may run.
-    let credential = Credential::parse(&ext.credential)?;
-    if ext.command.is_empty() {
-        return Err("no command".into());
-    }
-    if let Some(fixed) = credential.command
-        && ext.command != fixed
-    {
-        return Err(format!(
-            "credential {} runs only `{}`",
-            credential.name,
-            fixed.join(" ")
-        ));
-    }
-    if ext.command.iter().any(|a| a.chars().any(char::is_control)) {
-        return Err("control characters in command".into());
-    }
-    let name = &ext.command[0];
-    if name.contains('/') {
-        return Err("command[0] must be a bare name, resolved in the trusted dirs".into());
-    }
-    let program = resolve(name).ok_or_else(|| format!("{name} is not in the trusted dirs"))?;
+    // 1: the mechanism exists and fixes what may run or connect.
+    let (credential, command, program, remote) = if has_remotes {
+        let url = validate_oauth_remote(remotes, &ext)?;
+        (
+            &super::credential::OAUTH,
+            Vec::new(),
+            PathBuf::new(),
+            Some(url),
+        )
+    } else {
+        let credential = Credential::parse(&ext.credential)?;
+        if ext.command.is_empty() {
+            return Err("no command".into());
+        }
+        if let Some(fixed) = credential.command
+            && ext.command != fixed
+        {
+            return Err(format!(
+                "credential {} runs only `{}`",
+                credential.name,
+                fixed.join(" ")
+            ));
+        }
+        if ext.command.iter().any(|a| a.chars().any(char::is_control)) {
+            return Err("control characters in command".into());
+        }
+        let name = &ext.command[0];
+        if name.contains('/') {
+            return Err("command[0] must be a bare name, resolved in the trusted dirs".into());
+        }
+        let program = resolve(name).ok_or_else(|| format!("{name} is not in the trusted dirs"))?;
+        (credential, ext.command, program, None)
+    };
 
     for host in &ext.egress_hosts {
         check_host(host)?;
@@ -281,13 +337,100 @@ pub fn validate(
         id,
         file: PathBuf::new(),
         credential,
-        command: ext.command,
+        command,
         program,
+        remote,
         egress_hosts: ext.egress_hosts,
         allow: ext.tools.allow.into_iter().collect(),
         graphql,
         login,
     })
+}
+
+/// Printable ASCII, no query, fragment or dot segments: a prefix compare on
+/// such a URL is then a path compare. A token can still sit in a path
+/// segment; the per-segment `looks_like_secret` check in `validate` covers that.
+fn plain_https_url(url: &str, what: &str) -> Result<(), String> {
+    let ok = url.bytes().all(|b| b.is_ascii_graphic())
+        && !url.contains(['?', '#', '%', '\\'])
+        && !url.split('/').any(|seg| seg == "." || seg == "..");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} must be a plain https URL (printable ASCII, no query, fragment, escapes or dot segments)"
+        ))
+    }
+}
+
+fn validate_oauth_remote(remotes: &[Value], ext: &Ext) -> Result<String, String> {
+    if remotes.len() != 1 {
+        return Err("oauth spec must have exactly one remote".into());
+    }
+    let remote = remotes[0]
+        .as_object()
+        .ok_or("remote entry must be an object")?;
+    if remote.contains_key("headers") {
+        return Err("remote headers are not allowed on an oauth spec".into());
+    }
+    // Only type and url: any other key would escape the secret checks.
+    if let Some(k) = remote.keys().find(|k| *k != "type" && *k != "url") {
+        return Err(format!(
+            "unknown key {:?} on the oauth remote",
+            k.escape_debug().to_string()
+        ));
+    }
+    if remote.get("type").and_then(Value::as_str) != Some("streamable-http") {
+        return Err("oauth remote type must be streamable-http".into());
+    }
+    let url = remote
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or("oauth remote must have a url string")?;
+    plain_https_url(url, "remote url")?;
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or("oauth remote url must start with https://")?;
+    let host = rest.split('/').next().unwrap_or("");
+    if host.contains('@') || host.contains(':') {
+        return Err("oauth remote url must not contain userinfo or port".into());
+    }
+    check_host(host)?;
+    if !ext.egress_hosts.iter().any(|h| h == host) {
+        return Err(format!("oauth remote host {host} must be in egressHosts"));
+    }
+    if !ext.command.is_empty() {
+        return Err("oauth spec must not specify command".into());
+    }
+    let oauth = ext
+        .oauth
+        .as_ref()
+        .ok_or("oauth spec requires an oauth block")?;
+    plain_https_url(&oauth.resource, "oauth.resource")?;
+    let res_rest = oauth
+        .resource
+        .strip_prefix("https://")
+        .ok_or("oauth.resource must start with https://")?;
+    let res_host = res_rest.split('/').next().unwrap_or("");
+    // Compare parsed origin host as well as path boundary so `https://` or
+    // `https://host.evil` cannot pass as a prefix of `https://host/...`.
+    let same_origin_prefix = res_host == host
+        && (url == oauth.resource
+            || (url.starts_with(&oauth.resource)
+                && (oauth.resource.ends_with('/')
+                    || url.as_bytes().get(oauth.resource.len()) == Some(&b'/'))));
+    if !same_origin_prefix {
+        return Err(
+            "oauth.resource must equal the remote url or be a same-origin prefix of it".into(),
+        );
+    }
+    if oauth.client_id != OAUTH_CLIENT_ID {
+        return Err(format!("oauth.clientId must be {OAUTH_CLIENT_ID}"));
+    }
+    if oauth.redirect_uri != OAUTH_REDIRECT_URI {
+        return Err(format!("oauth.redirectUri must be {OAUTH_REDIRECT_URI}"));
+    }
+    Ok(url.to_string())
 }
 
 pub(crate) fn collect_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
@@ -385,6 +528,16 @@ pub(crate) fn load_with(
     disabled: &[String],
     resolve: impl Fn(&str) -> Option<PathBuf>,
 ) -> Detected {
+    load_with_gate(dir, writable, disabled, resolve, oauth_gate_enabled())
+}
+
+pub(crate) fn load_with_gate(
+    dir: &Path,
+    writable: &[PathBuf],
+    disabled: &[String],
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+    oauth_gate: bool,
+) -> Detected {
     let mut out = Detected::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -445,7 +598,15 @@ pub(crate) fn load_with(
                 format!("nav-pilot mcp enable {id}")
             };
             match crate::untrusted::read_untrusted(&path, SPEC_LIMIT) {
-                Ok(Some(text)) => validate(&text, &file, &resolve).map_err(|r| (r, enable())),
+                Ok(Some(text)) => match validate_gated(&text, &file, &resolve, oauth_gate) {
+                    Ok(spec) if spec.remote.is_some() => Err((
+                        "oauth remotes are validated but not served yet (no login in this cplt)"
+                            .into(),
+                        "remove the spec until cplt supports oauth login".into(),
+                    )),
+                    Ok(spec) => Ok(spec),
+                    Err(r) => Err((r, enable())),
+                },
                 Ok(None) => Err(("not a regular file, or too large".into(), enable())),
                 Err(e) => Err((format!("cannot read ({e})"), enable())),
             }
@@ -708,5 +869,204 @@ mod tests {
         std::fs::write(dir.path().join(FILE), "{").unwrap();
         let r = &load_test(dir.path(), &[], &[]).rejected[0];
         assert_eq!(r.fix, "nav-pilot mcp enable io.github.nais/nais-mcp");
+    }
+
+    fn oauth_root() -> Value {
+        let mut ext = base();
+        ext["credential"] = json!("oauth");
+        ext.as_object_mut().unwrap().remove("command");
+        ext["egressHosts"] = json!(["fgw.example"]);
+        ext["oauth"] = json!({
+            "resource": "https://fgw.example/mcp/nais",
+            "clientId": OAUTH_CLIENT_ID,
+            "redirectUri": OAUTH_REDIRECT_URI,
+        });
+        let mut root: Value = serde_json::from_str(&spec_json(ext)).unwrap();
+        root["remotes"] = json!([{
+            "type": "streamable-http",
+            "url": "https://fgw.example/mcp/nais",
+        }]);
+        root
+    }
+
+    fn check_oauth(root: &Value, gate: bool) -> Result<Spec, String> {
+        validate_gated(
+            &root.to_string(),
+            FILE,
+            |n| Some(PathBuf::from("/opt/homebrew/bin").join(n)),
+            gate,
+        )
+    }
+
+    #[test]
+    fn oauth_remote_accepted_when_gated_and_refused_when_off() {
+        let root = oauth_root();
+        let spec = check_oauth(&root, true).unwrap();
+        assert_eq!(spec.remote.as_deref(), Some("https://fgw.example/mcp/nais"));
+        assert_eq!(spec.credential.name, "oauth");
+        assert!(spec.command.is_empty());
+        assert!(spec.program.as_os_str().is_empty());
+        assert!(spec.graphql.contains("execute_graphql"));
+
+        // Same-origin prefixes are accepted.
+        for res in [
+            "https://fgw.example",
+            "https://fgw.example/",
+            "https://fgw.example/mcp",
+            "https://fgw.example/mcp/",
+        ] {
+            let mut r = oauth_root();
+            r["_meta"][META_KEY]["oauth"]["resource"] = json!(res);
+            assert!(check_oauth(&r, true).is_ok(), "{res}");
+        }
+
+        // Default-off gate refuses remotes.
+        assert!(
+            check_oauth(&root, false)
+                .unwrap_err()
+                .contains("not brokered")
+        );
+    }
+
+    #[test]
+    fn oauth_remote_rejects_invalid_fields() {
+        let mut r = oauth_root();
+        r["remotes"][0]["url"] = json!("http://fgw.example/mcp/nais");
+        assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["_meta"][META_KEY]["oauth"]["clientId"] = json!("https://other.example/client.json");
+        assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["_meta"][META_KEY]["oauth"]["redirectUri"] = json!("http://127.0.0.1:9999/callback");
+        assert!(check_oauth(&r, true).is_err());
+
+        for bad_res in [
+            "https://other.example/mcp/nais",
+            "https://fgw.example.evil/mcp/nais",
+            "https://fgw.example/m",
+            "https://",
+        ] {
+            let mut r = oauth_root();
+            r["_meta"][META_KEY]["oauth"]["resource"] = json!(bad_res);
+            assert!(check_oauth(&r, true).is_err(), "{bad_res}");
+        }
+
+        let mut r = oauth_root();
+        r["_meta"][META_KEY]["egressHosts"] = json!(["other.example"]);
+        assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["remotes"] = json!([
+            {"type": "streamable-http", "url": "https://fgw.example/mcp/nais"},
+            {"type": "streamable-http", "url": "https://fgw.example/mcp/other"}
+        ]);
+        assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["_meta"][META_KEY]["command"] = json!(["nais"]);
+        assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["_meta"][META_KEY]
+            .as_object_mut()
+            .unwrap()
+            .remove("oauth");
+        assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["remotes"][0]["headers"] = json!([]);
+        assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["remotes"][0]["token"] = json!("x");
+        assert!(check_oauth(&r, true).unwrap_err().contains("unknown key"));
+
+        for bad_url in [
+            "https://fgw.example/mcp/nais?token=abc",
+            "https://fgw.example/mcp/nais#x",
+            "https://fgw.example/mcp/nais/../other",
+            "https://fgw.example/mcp/%2e%2e/other",
+            "https://fgw.example/mcp/n\u{e6}is",
+            "https://u@fgw.example/mcp/nais",
+            "https://fgw.example:8443/mcp/nais",
+        ] {
+            let mut r = oauth_root();
+            r["remotes"][0]["url"] = json!(bad_url);
+            assert!(check_oauth(&r, true).is_err(), "{bad_url}");
+        }
+
+        let mut r = oauth_root();
+        r["remotes"] = json!({});
+        assert!(check_oauth(&r, true).unwrap_err().contains("array"));
+
+        // Shared policy checks still apply.
+        let mut r = oauth_root();
+        r["_meta"][META_KEY]["tools"]["classes"] = json!({"run": "host-exec"});
+        assert!(check_oauth(&r, true).unwrap_err().contains("host-exec"));
+
+        // Secrets/placeholders in remote url or oauth fields are refused.
+        let mut r = oauth_root();
+        r["remotes"][0]["url"] = json!("https://fgw.example/${TOKEN}");
+        assert!(check_oauth(&r, true).is_err());
+
+        // A token in a path segment is refused, in url and in resource.
+        for tok in ["ghp_abcdefghijklmnop", "eyJhbGciOiJIUzI1NiJ9"] {
+            let u = format!("https://fgw.example/mcp/{tok}");
+            let mut r = oauth_root();
+            r["remotes"][0]["url"] = json!(u);
+            r["_meta"][META_KEY]["oauth"]["resource"] = json!(u);
+            assert!(check_oauth(&r, true).unwrap_err().contains("secret"), "{u}");
+            let mut r = oauth_root();
+            r["_meta"][META_KEY]["oauth"]["resource"] = json!(format!("https://fgw.example/{tok}"));
+            assert!(
+                check_oauth(&r, true).unwrap_err().contains("secret"),
+                "{tok}"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_block_on_command_spec_is_refused() {
+        let mut ext = base();
+        ext["oauth"] = json!({
+            "resource": "https://fgw.example/mcp/nais",
+            "clientId": OAUTH_CLIENT_ID,
+            "redirectUri": OAUTH_REDIRECT_URI,
+        });
+        assert!(
+            validate_gated(
+                &spec_json(ext),
+                FILE,
+                |n| Some(PathBuf::from("/opt/homebrew/bin").join(n)),
+                true,
+            )
+            .unwrap_err()
+            .contains("oauth block without an oauth remote")
+        );
+    }
+
+    #[test]
+    fn load_rejects_validated_oauth_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), oauth_root().to_string()).unwrap();
+        let found = load_with_gate(
+            dir.path(),
+            &[],
+            &[],
+            |n| Some(PathBuf::from("/opt/homebrew/bin").join(n)),
+            true,
+        );
+        assert!(found.specs.is_empty());
+        assert_eq!(found.rejected.len(), 1);
+        assert_eq!(
+            found.rejected[0].reason,
+            "oauth remotes are validated but not served yet (no login in this cplt)"
+        );
+        assert_eq!(
+            found.rejected[0].fix,
+            "remove the spec until cplt supports oauth login"
+        );
     }
 }

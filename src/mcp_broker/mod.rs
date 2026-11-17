@@ -27,6 +27,8 @@ pub const STATUS_VERSION: u64 = 1;
 /// The variable naming the socket to `cplt mcp-stdio`. Set in the client's
 /// server entry, not the agent's environment.
 pub const SOCKET_ENV: &str = "CPLT_MCP_SOCKET";
+/// Default-off gate for remote OAuth MCP specs; active only when `"1"`.
+pub const OAUTH_GATE_ENV: &str = "CPLT_MCP_OAUTH_REMOTE";
 /// MCP versions that carry one JSON-RPC message per line on stdio.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
 const SPEC_LIMIT: u64 = 256 * 1024;
@@ -54,6 +56,7 @@ mod credential;
 mod egress;
 mod graphql;
 mod policy;
+mod retry;
 mod runtime;
 mod shim;
 mod spec;
