@@ -4391,7 +4391,7 @@ fn profile_allows_localhost_tcp_bind() {
         "Profile must allow inbound on all local addresses (for Java IPv4-mapped)"
     );
     assert!(
-        p.contains(r#"(deny network-bind (local ip "localhost:62471"))"#),
+        p.contains(r#"(deny network-bind (local ip "*:62471"))"#),
         "Profile must deny binding the fixed MCP OAuth callback port"
     );
 }
@@ -4412,7 +4412,7 @@ fn profile_denies_oauth_callback_port_bind_after_allow_and_with_localhost_any() 
         .find(r#"(allow network-bind (local ip "*:*"))"#)
         .expect("allow network-bind missing");
     let deny_pos = p
-        .find(r#"(deny network-bind (local ip "localhost:62471"))"#)
+        .find(r#"(deny network-bind (local ip "*:62471"))"#)
         .expect("deny network-bind for OAuth port missing");
     assert!(
         deny_pos > allow_pos,
