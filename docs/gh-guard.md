@@ -375,11 +375,11 @@ subcommand.
 
 | Condition | Default | With `allow_api_write = true` | Reason |
 |-----------|---------|-------------------------------|--------|
-| No method flag (implicit GET) | ScopeCheck | ScopeCheck | Read operation, must target current repo |
-| `-X GET` | ScopeCheck | ScopeCheck | Explicit read, must target current repo |
-| `-X POST/PUT/PATCH` | Block | ScopeCheck | Write operation, opt-in required |
+| No method flag (implicit GET) | ScopeCheck / cross-repo allowlist | ScopeCheck / cross-repo allowlist | Read operation: in-scope repos pinned, allowlisted REST GETs permitted cross-repo |
+| `-X GET` (even with `-f`/`-F` query params, no `--input`) | ScopeCheck / cross-repo allowlist | ScopeCheck / cross-repo allowlist | Explicit read: `-f`/`-F` become query params; allowlisted REST GETs permitted cross-repo |
+| `-X POST/PUT/PATCH` | Block | ScopeCheck | Write operation, opt-in required (in-scope only) |
 | `-X DELETE` | Block | Block | Destructive, always blocked |
-| `-f`, `-F`, or `--input` present | Block | ScopeCheck | Input implies write, opt-in required |
+| `-f`, `-F` without `-X GET`, or `--input` | Block | ScopeCheck | Implies POST or sends a request body; opt-in required (in-scope only) |
 | `graphql` endpoint | See [below](#gh-api-graphql) | See [below](#gh-api-graphql) | Read-only queries of allowlisted pull request and review-thread fields on a repository in scope, and three review-thread mutations with verified targets. Everything else is blocked |
 | Write to `repos/{o}/{r}/pulls/{n}/merge` or `repos/{o}/{r}/merges` | Block | Block | A merge must go through `gh pr merge` and its `allow_pr_merge` check |
 
@@ -416,17 +416,22 @@ cplt --allow-api-write -- -p "post review comment replies"
 
 ### API scope enforcement
 
-GET requests are repo-scoped. Only endpoints matching
-`/repos/{current-owner}/{current-repo}/...` are allowed, which blocks:
+REST `GET` requests (including `-X GET` with `-f`/`-F` query parameters, without `--input`) are allowed cross-repo on:
+
+- `/repos/{owner}/{repo}/...`
+- `/search/*`
+- `/orgs/{org}/repos`
+- `/users/*`
+- `/rate_limit`
+
+Relative paths without a leading resource prefix (such as `pulls/67/comments`) still resolve against the startup scope and require a matching invocation cwd. Non-allowlisted endpoints remain blocked:
 
 - `/orgs/.../audit-log`, org audit logs, which contain employee PII
 - `/orgs/.../members`, org membership enumeration
 - `/orgs/.../teams`, team structure
-- `/user/repos`, private repos across all orgs
-- `/users/.../repos`, other users' repo lists
+- `/user` and `/user/repos`, authenticated user details and private repos across all orgs
 
-Agents that need current-repo data (issues, PRs, actions, commits) work normally.
-If an agent needs org-level access, the human should run those commands outside the sandbox.
+All `gh api` writes (`POST`/`PUT`/`PATCH`, `-f`/`-F` without `-X GET`, or `--input`) remain restricted to repositories in the startup scope (and require `allow_api_write = true`). If an agent needs org-level access beyond `/orgs/{org}/repos`, the human should run those commands outside the sandbox.
 
 ### `gh api graphql`
 

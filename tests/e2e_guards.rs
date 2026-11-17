@@ -902,9 +902,48 @@ fn gh_gate_scope_check_disabled() {
 }
 
 #[test]
-fn gh_gate_blocks_cross_repo_api_endpoint() {
-    // API GET to a different repo's endpoint — scope check blocks it
+fn gh_gate_allows_cross_repo_api_get_endpoint() {
     let (_, stderr, ok) = gh_gate(&["api", "/repos/evil-org/other-repo/pulls"]);
+    assert!(
+        ok,
+        "cross-repo API GET under repos/{{owner}}/{{repo}} should be allowed: {stderr}"
+    );
+    let (_, stderr, ok) = gh_gate(&["api", "-X", "GET", "repos/x/y/commits", "-f", "q=1"]);
+    assert!(
+        ok,
+        "cross-repo API -X GET with -f query params should be allowed: {stderr}"
+    );
+    let (_, stderr, ok) = gh_gate(&["api", "orgs/other-org/repos"]);
+    assert!(ok, "orgs/{{org}}/repos GET should be allowed: {stderr}");
+    let (_, stderr, ok) = gh_gate(&["api", "orgs/other-org/members"]);
+    assert_refused(&stderr, ok, "outside the startup repo");
+}
+
+#[test]
+fn gh_gate_blocks_cross_repo_api_writes_and_input() {
+    let (_, stderr, ok) = gh_gate(&["api", "repos/x/y/commits", "-f", "q=1"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
+    let (_, stderr, ok) = gh_gate(&["api", "-X", "GET", "repos/x/y/commits", "--input=-"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
+    let (_, stderr, ok) = gh_gate_with_opts(
+        &[
+            "api",
+            "-X",
+            "GET",
+            "repos/x/y/commits",
+            "--input",
+            "body.json",
+        ],
+        &["--allow-api-write"],
+    );
     assert_refused(&stderr, ok, "outside the startup repo");
 }
 
@@ -1514,7 +1553,10 @@ fn gh_gate_blocks_percent_encoded_graphql() {
 
 #[test]
 fn gh_gate_scope_checks_percent_decoded_repo() {
-    let (_, stderr, ok) = gh_gate(&["api", "repos/%6Eavikt/other/pulls"]);
+    let (_, stderr, ok) = gh_gate_with_opts(
+        &["api", "-X", "POST", "repos/%6Eavikt/other/pulls"],
+        &["--allow-api-write"],
+    );
     assert_refused(&stderr, ok, "'repos/%6Eavikt/other/pulls' which is outside");
     let (_, _, ok) = gh_gate(&["api", "repos/%6Eavikt/cplt/pulls"]);
     assert!(
@@ -1527,7 +1569,10 @@ fn gh_gate_scope_checks_percent_decoded_repo() {
 
 #[test]
 fn gh_gate_refuses_git_suffix_as_other_repo() {
-    let (_, stderr, ok) = gh_gate(&["api", "repos/navikt/cplt.git/pulls"]);
+    let (_, stderr, ok) = gh_gate_with_opts(
+        &["api", "-X", "POST", "repos/navikt/cplt.git/pulls"],
+        &["--allow-api-write"],
+    );
     assert_refused(&stderr, ok, "outside the startup repo");
     let (_, stderr, ok) = gh_gate(&["pr", "close", "42", "-R", "navikt/cplt.git"]);
     assert_refused(&stderr, ok, "outside the startup repo");
