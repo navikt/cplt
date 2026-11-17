@@ -1418,7 +1418,12 @@ fn is_cross_repo_api_read(cmd: &ParsedCommand) -> bool {
     // gh expands `{owner}`, `{repo}`, `{branch}` and legacy `:owner`-style
     // placeholders from the cwd; a branch name can contain slashes, so a
     // placeholder can smuggle a denied sub-path past the allowlist.
-    if path.contains(['{', '}']) || path.split('/').any(|seg| seg.starts_with(':')) {
+    // gh's regex is `(\:(owner|repo|branch)\b|\{[a-z]+\})`, unanchored.
+    if path.contains(['{', '}'])
+        || [":owner", ":repo", ":branch"]
+            .iter()
+            .any(|p| path.contains(p))
+    {
         return false;
     }
     if decode_api_path(path).is_none() {
@@ -10653,6 +10658,9 @@ mod tests {
             &["api", "repos/{owner}/{repo}/secret-scanning/alerts"],
             &["api", "repos/x/y/branches/{branch}"],
             &["api", "users/{branch}"],
+            &["api", "repos/x/targ:branch"],
+            &["api", "repos/x/y/commits/a:branch"],
+            &["api", "repos/x/y:repo/hooks"],
             &["api", "user"],
             &["api", "user/repos"],
             &["api", "orgs/other-org/members"],
