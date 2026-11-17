@@ -1848,6 +1848,8 @@ Copilot CLI and OpenCode can run MCP OAuth against fleet-gateway themselves, the
 
 The stricter option, denying every TCP bind, would also deny the callback listener the decision is meant to allow, so cplt keeps today's rule. Port `62471` is reserved for the host broker ([#1017](https://github.com/navikt/cplt/issues/1017)). Ports below 1024 need `CAP_NET_BIND_SERVICE` on Linux. macOS lets an unprivileged process bind them on the wildcard address, and SBPL has no port range, so cplt does not deny them there. A listener on all interfaces stays the gap described above: outbound traffic is still limited to the proxy and port 443, and only the redirect URI the gateway allowlists for a given `client_id` can receive a code.
 
+**Owner decision, 2026-11-17: the address gap is accepted.** A loopback-only bind cannot be enforced on macOS (Seatbelt) or on Linux (Landlock and seccomp). The owner accepted this, and it is documented here rather than enforced. Port `62471` stays reserved for the broker.
+
 OpenCode's callback defaults to `http://127.0.0.1:19876/mcp/oauth/callback` and can be moved with the `oauth` `redirectUri` or `callbackPort` setting (OpenCode 2.3.0, from its bundled schema). Copilot CLI's callback port is not verified.
 
 **Browser.** The decision allows a host-side opener that opens only `https` URLs whose host is `login.microsoftonline.com` or the configured fleet-gateway host. cplt does not ship it yet. Until it does, `lsopen` stays denied (unless `allow_browser` is set), so the client cannot launch a browser and prints the authorize URL for the user to open. OpenCode opens URLs through the `open` npm package, which runs `open` on macOS and `xdg-open` on Linux and does not read `BROWSER`, so an opener has to answer to those names.
