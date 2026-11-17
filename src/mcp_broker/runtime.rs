@@ -2424,10 +2424,14 @@ mod tests {
         let err = bind_exclusive_loopback(port).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
 
+        // Rebinding the port here would race other tests binding port 0, which
+        // can be handed this ephemeral port once released. Prove the release
+        // directly: dropping the guard must drop the state that owns the listener.
+        let state = Arc::downgrade(&guard.state);
         drop(guard);
         assert!(
-            bind_exclusive_loopback(port).is_ok(),
-            "port should be free after guard drops"
+            state.upgrade().is_none(),
+            "guard drop must close the listener on port {port}"
         );
     }
 
