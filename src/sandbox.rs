@@ -5200,11 +5200,11 @@ mod tests {
         assert!(warn_oauth_bind_gaps(&config, Some(4)).is_empty());
         let old = warn_oauth_bind_gaps(&config, Some(3));
         assert_eq!(old.len(), 1);
-        assert!(old[0].contains("ABI < 4"), "{old:?}");
+        assert!(old[0].contains("ABI < 4"));
         config.oauth_port_claimed = false;
         let pending = warn_oauth_bind_gaps(&config, Some(6));
         assert_eq!(pending.len(), 1);
-        assert!(pending[0].contains("bind(0) is denied"), "{pending:?}");
+        assert!(pending[0].contains("bind(0) is denied"));
     }
 
     /// #719: v2's port joins the allowlist; /proc requires bubblewrap.
