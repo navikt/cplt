@@ -3811,6 +3811,7 @@ print('BIND_OK')
     // `specs_use_oauth` is false until OAuth specs exist (#910), so the test sets the
     // debug-build hook CPLT_TEST_OAUTH_PORT_GUARD=1 to make the broker hold the port.
     #[test]
+    #[cfg(debug_assertions)] // the CPLT_TEST_OAUTH_PORT_GUARD hook exists only in debug builds
     fn landlock_denies_oauth_callback_port_bind_with_broker() {
         require_bwrap!(4);
         if !have_python3() {
