@@ -1837,6 +1837,23 @@ Port scoping is the kernel-level control; domain and host scoping happens one la
 
 Outbound TCP is allowed in the sandbox profile, restricted to port 443 plus `--allow-port`, and filesystem isolation stays the primary security control. See [Layer 2](#layer-2-connect-proxy-logging-and-domain-filtering) for what the proxy enforces, and [Proxy-forced mode](#proxy-forced-mode-53) for why the proxy is advisory by default and how to make it mandatory.
 
+### Native MCP OAuth inside the sandbox (#910)
+
+Copilot CLI and OpenCode can run MCP OAuth against fleet-gateway themselves, the same way inside and outside cplt. The host broker path stays optional. Owner decisions of 2026-11-17 on [#910](https://github.com/navikt/cplt/issues/910), and what cplt enforces for each:
+
+**Loopback callback listener.** The decision allows the agent to bind TCP on `127.0.0.1`, ports 1024-65535 except `62471`, and never on `0.0.0.0` or another address. The port part holds. The address part cannot be enforced by either kernel:
+
+- macOS: the profile already allows `(allow network-bind (local ip "*:*"))`. SBPL accepts only `*` or `localhost` as the host, and `localhost` also matches `0.0.0.0` and `::`, see [SBPL network filtering limitations](#sbpl-network-filtering-limitations). Checked on macOS 27 with `sandbox-exec`: under `(allow network-bind (local ip "localhost:*"))` a bind on `0.0.0.0:40123` and `[::]:40123` succeeds.
+- Linux: Landlock network rules match ports only, and seccomp cannot read the `sockaddr` behind a `bind()` pointer. Without a network namespace the agent shares the host's. With `proxy.netns` or bubblewrap the namespace has only loopback, so a bind on `0.0.0.0` is reachable from loopback in that namespace only.
+
+The stricter option, denying every TCP bind, would also deny the callback listener the decision is meant to allow, so cplt keeps today's rule. Port `62471` is reserved for the host broker ([#1017](https://github.com/navikt/cplt/issues/1017)). Ports below 1024 need `CAP_NET_BIND_SERVICE` on Linux. macOS lets an unprivileged process bind them on the wildcard address, and SBPL has no port range, so cplt does not deny them there. A listener on all interfaces stays the gap described above: outbound traffic is still limited to the proxy and port 443, and only the redirect URI the gateway allowlists for a given `client_id` can receive a code.
+
+OpenCode's callback defaults to `http://127.0.0.1:19876/mcp/oauth/callback` and can be moved with the `oauth` `redirectUri` or `callbackPort` setting (OpenCode 2.3.0, from its bundled schema). Copilot CLI's callback port is not verified.
+
+**Browser.** The decision allows a host-side opener that opens only `https` URLs whose host is `login.microsoftonline.com` or the configured fleet-gateway host. cplt does not ship it yet. Until it does, `lsopen` stays denied (unless `allow_browser` is set), so the client cannot launch a browser and prints the authorize URL for the user to open. OpenCode opens URLs through the `open` npm package, which runs `open` on macOS and `xdg-open` on Linux and does not read `BROWSER`, so an opener has to answer to those names.
+
+**Refresh token readable by the agent: accepted risk.** The client stores the token in its own config directory (`~/.copilot/mcp-oauth-config/`, `~/.local/share/opencode/mcp-auth.json`). The agent can write and read those directories, so a prompt-injected agent can read the refresh token and use it until it expires or is revoked. The owner accepted this on 2026-11-17 because the token is valid for fleet-gateway only, has a 12-hour absolute lifetime and can be revoked. Routes that need stronger isolation use the host broker, which keeps tokens outside the sandbox.
+
 ### Self-update security (`cplt update`)
 
 The update mechanism downloads releases from GitHub, verifies SHA256 checksums, and atomically replaces the binary.
