@@ -1655,10 +1655,12 @@ The sandbox gets no D-Bus. With the broker active, Bubblewrap mounts an empty tm
 
 #### MCP OAuth callback port
 
-The fixed OAuth callback port 62471 ([#1017](https://github.com/navikt/cplt/issues/1017)) is reserved only in sessions where the broker holds it, that is, a brokered server uses OAuth. Copilot CLI and OpenCode run their own OAuth natively, and the port stays bindable in those sessions. In a broker-OAuth session the broker binds `127.0.0.1:62471`, or retries until another holder releases it. Seatbelt denies binding the port. Landlock handles `BindTcp` with an allowlist: ephemeral `bind(0)` (granted only once the broker holds the port, because a port-0 grant lets the kernel pick 62471), the `localhost_ports`, and OpenCode v2's service port. Known limits:
+The fixed OAuth callback port 62471 ([#1017](https://github.com/navikt/cplt/issues/1017)) is reserved only in sessions where the broker holds it, that is, a brokered server uses OAuth. Copilot CLI and OpenCode run their own OAuth natively, and the port stays bindable in those sessions. In a broker-OAuth session the broker binds `127.0.0.1:62471`, or retries until another holder releases it. A bind that fails for another reason (`EACCES`, `EMFILE`) leaves the port unclaimed; the restriction stays on. Seatbelt denies explicit binds of the port. Landlock handles `BindTcp` with an allowlist: ephemeral `bind(0)` (granted only once the broker holds the port, because a port-0 grant lets the kernel pick 62471), the `localhost_ports`, and OpenCode v2's service port. Known limits:
 
 - **Landlock ABI v1–v3 (kernel < 6.7) cannot filter bind.** The guard is not enforced there. If another process holds the port at start and releases it, the agent can claim it before the broker's next retry. cplt warns at launch. Bubblewrap's network namespace (`proxy.netns`) closes it.
-- **While the broker waits for the port, ephemeral binds are denied** for the whole session, and cplt warns at launch.
+- **Seatbelt cannot stop the kernel picking 62471 for `bind(0)`.** It only denies binds that name the port. If the broker does not hold the port at launch, macOS refuses the broker's OAuth remotes for that session with a warning; the session continues without them.
+- **On Linux, while the broker waits for the port, ephemeral binds are denied** for the whole session, and cplt warns at launch.
+- **Landlock does not see `listen()` autobind.** A socket that calls `listen()` without `bind()` gets a port from `ip_local_port_range`. The default range (32768–60999) excludes 62471; a host whose range includes it is not covered.
 
 The broker OAuth path is not served yet, so these limits do not affect any current session.
 

@@ -131,8 +131,6 @@ fn is_recoverable_bind_error(e: &std::io::Error) -> bool {
 }
 
 struct OAuthPortState {
-    /// Set on a permanent bind failure: the guard no longer protects the port.
-    failed: std::sync::atomic::AtomicBool,
     listener: Mutex<Option<TcpListener>>,
     stop: Mutex<bool>,
     wake: Condvar,
@@ -149,18 +147,25 @@ struct OAuthPortGuard {
 
 impl OAuthPortGuard {
     fn start(port: u16) -> Self {
-        Self::start_with_interval(port, OAUTH_PORT_RETRY_INTERVAL)
+        Self::start_with(port, OAUTH_PORT_RETRY_INTERVAL, bind_exclusive_loopback)
     }
 
+    #[cfg(test)]
     fn start_with_interval(port: u16, retry_interval: Duration) -> Self {
-        let initial = bind_exclusive_loopback(port);
+        Self::start_with(port, retry_interval, bind_exclusive_loopback)
+    }
+
+    fn start_with(
+        port: u16,
+        retry_interval: Duration,
+        bind: fn(u16) -> std::io::Result<TcpListener>,
+    ) -> Self {
+        let initial = bind(port);
         let needs_retry = matches!(&initial, Err(e) if is_recoverable_bind_error(e));
-        let permanent = initial.is_err() && !needs_retry;
         if let Err(e) = &initial {
             eprintln!("cplt: OAuth callback port {port} not claimed at start: {e}");
         }
         let state = Arc::new(OAuthPortState {
-            failed: std::sync::atomic::AtomicBool::new(permanent),
             listener: Mutex::new(initial.ok()),
             stop: Mutex::new(false),
             wake: Condvar::new(),
@@ -182,7 +187,7 @@ impl OAuthPortGuard {
                         break;
                     }
                     drop(stopped);
-                    match bind_exclusive_loopback(port) {
+                    match bind(port) {
                         Ok(l) => {
                             *s.listener
                                 .lock()
@@ -191,8 +196,9 @@ impl OAuthPortGuard {
                         }
                         Err(e) if is_recoverable_bind_error(&e) => {}
                         Err(e) => {
+                            // Stays unclaimed: the sandbox treats it as held
+                            // by someone else and keeps the bind restriction.
                             eprintln!("cplt: OAuth callback port {port} claim failed: {e}");
-                            s.failed.store(true, std::sync::atomic::Ordering::Release);
                             return;
                         }
                     }
@@ -204,11 +210,6 @@ impl OAuthPortGuard {
             })
         });
         Self { state, thread }
-    }
-
-    /// False once the guard gave up on a permanent bind failure.
-    fn is_active(&self) -> bool {
-        !self.state.failed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn is_claimed(&self) -> bool {
@@ -254,6 +255,31 @@ fn specs_use_oauth(_specs: &[Spec]) -> bool {
     cfg!(debug_assertions) && std::env::var("CPLT_TEST_OAUTH_PORT_GUARD").as_deref() == Ok("1")
 }
 
+/// Seatbelt denies explicit binds of the OAuth port, but the kernel can still
+/// hand it to a `bind(0)` once its holder releases it. Without the broker
+/// holding the port at launch, macOS cannot keep it from the agent, so the
+/// OAuth remotes are dropped for this session (#1017).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn refuse_oauth_remotes_unless_claimed(specs: Vec<Spec>, claimed: bool) -> Vec<Spec> {
+    if claimed {
+        return specs;
+    }
+    specs
+        .into_iter()
+        .filter(|s| {
+            let oauth = s.remote.is_some();
+            if oauth {
+                crate::ui::warn(&format!(
+                    "MCP OAuth: port {} is held by another process, so {} is off for this session.",
+                    super::OAUTH_CALLBACK_PORT,
+                    s.id
+                ));
+            }
+            !oauth
+        })
+        .collect()
+}
+
 impl Shared {
     fn open_url_enabled(&self) -> bool {
         !self.open_hosts.is_empty() && !self.open_off.load(Ordering::Acquire)
@@ -268,6 +294,11 @@ impl Broker {
         // only once one does, so existing sessions keep binding freely.
         let oauth_guard =
             specs_use_oauth(&specs).then(|| OAuthPortGuard::start(super::OAUTH_CALLBACK_PORT));
+        #[cfg(target_os = "macos")]
+        let specs = refuse_oauth_remotes_unless_claimed(
+            specs,
+            oauth_guard.as_ref().is_none_or(OAuthPortGuard::is_claimed),
+        );
         use std::os::unix::fs::PermissionsExt;
         #[cfg(target_os = "macos")]
         let dir = crate::scratch::SessionSocketDir::create()?;
@@ -435,10 +466,10 @@ impl Broker {
     /// Whether this broker guards the fixed OAuth loopback callback port (#1017).
     ///
     /// Only sessions with an OAuth-using brokered server reserve the port.
+    /// True even when the bind failed for good: the sandbox must then treat the
+    /// port as unclaimed, not drop the restriction.
     pub fn holds_oauth_port(&self) -> bool {
-        self.oauth_guard
-            .as_ref()
-            .is_some_and(OAuthPortGuard::is_active)
+        self.oauth_guard.is_some()
     }
 
     /// Whether the guard already holds the OAuth port (not still retrying).
@@ -2392,16 +2423,36 @@ mod tests {
     }
 
     #[test]
-    fn oauth_port_guard_gives_up_on_permanent_failure() {
-        // Privileged port: PermissionDenied for non-root, which is not recoverable.
-        if bind_exclusive_loopback(1).is_ok() {
-            return;
-        }
-        let guard = OAuthPortGuard::start_with_interval(1, Duration::from_millis(10));
+    fn oauth_port_guard_stays_unclaimed_on_permanent_failure() {
+        let guard = OAuthPortGuard::start_with(1, Duration::from_millis(10), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(guard.thread.is_none(), "no retry on a permanent error");
         assert!(!guard.is_claimed());
-        assert!(
-            !guard.is_active(),
-            "permanent failure must deactivate the guard"
+        // holds_oauth_port is `oauth_guard.is_some()`, so the sandbox keeps the
+        // restriction and treats the port as unclaimed (fail closed).
+        let mut b = cat_broker();
+        b.oauth_guard = Some(guard);
+        assert!(b.holds_oauth_port());
+        assert!(!b.oauth_port_claimed());
+    }
+
+    #[test]
+    fn unclaimed_oauth_port_refuses_oauth_remotes() {
+        let mut local = check(base()).unwrap();
+        local.id = "io.example/local".into();
+        let mut remote = local.clone();
+        remote.id = "io.example/remote".into();
+        remote.remote = Some("https://fgw.example/mcp".into());
+        let ids = |v: Vec<Spec>| v.into_iter().map(|s| s.id).collect::<Vec<_>>();
+        let both = vec![local.clone(), remote.clone()];
+        assert_eq!(
+            ids(refuse_oauth_remotes_unless_claimed(both.clone(), true)),
+            ["io.example/local", "io.example/remote"]
+        );
+        assert_eq!(
+            ids(refuse_oauth_remotes_unless_claimed(both, false)),
+            ["io.example/local"]
         );
     }
 
