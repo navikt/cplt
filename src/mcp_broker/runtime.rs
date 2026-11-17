@@ -79,6 +79,11 @@ pub(crate) struct Shared {
     home: PathBuf,
     log: Log,
     stop: AtomicBool,
+    /// Hosts `open_url` may open; empty means the op is off.
+    open_hosts: Vec<String>,
+    open_limiter: super::open_url::Limiter,
+    /// Set by [`Broker::disable_open_url`].
+    open_off: AtomicBool,
     /// Open connections (socket clients and egress tunnels together).
     open: Arc<AtomicUsize>,
 }
@@ -117,6 +122,12 @@ pub struct Broker {
     _dir: SocketDir,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Shared {
+    fn open_url_enabled(&self) -> bool {
+        !self.open_hosts.is_empty() && !self.open_off.load(Ordering::Acquire)
+    }
 }
 
 impl Broker {
@@ -173,8 +184,12 @@ impl Broker {
             };
             servers.insert(server.spec.id.clone(), server);
         }
+        let open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
         let shared = Arc::new(Shared {
             servers,
+            open_hosts,
+            open_limiter: super::open_url::Limiter::default(),
+            open_off: AtomicBool::new(false),
             home: home.to_path_buf(),
             log,
             stop: AtomicBool::new(false),
@@ -260,6 +275,24 @@ impl Broker {
     }
 
     /// The socket path the sandbox profile grants connect to.
+    /// Whether `open_url` is served: some served spec runs OAuth (#1020) and
+    /// the launcher has not turned it off. The shims go in only when it is.
+    #[must_use]
+    pub fn open_url_enabled(&self) -> bool {
+        self.shared.open_url_enabled()
+    }
+
+    /// Hosts the `open_url` shims may open (macOS) or print (Linux).
+    #[must_use]
+    pub fn open_url_hosts(&self) -> &[String] {
+        &self.shared.open_hosts
+    }
+
+    /// Turn `open_url` off for this session.
+    pub fn disable_open_url(&self) {
+        self.shared.open_off.store(true, Ordering::Release);
+    }
+
     pub fn socket(&self) -> &Path {
         &self.socket
     }
@@ -1053,6 +1086,20 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     let Some(id) = read_line(&mut reader, 512) else {
         return;
     };
+    // macOS only: no host opener on Linux (owner decision 2026-11-17).
+    if super::open_url::HOST_OPENER && id == super::open_url::OP_LINE && shared.open_url_enabled() {
+        if let Ok(mut w) = client.lock() {
+            super::open_url::serve(
+                &mut reader,
+                &mut *w,
+                &shared.open_hosts,
+                &shared.open_limiter,
+                &shared.home,
+                &shared.log,
+            );
+        }
+        return;
+    }
     let Some(server) = shared.servers.get(&id) else {
         refuse("no brokered MCP server with that id");
         return;
@@ -1866,6 +1913,27 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// #910: no oauth-remote spec, no `open_url`: the op line is answered
+    /// as an unknown id and the launcher installs no shims.
+    #[test]
+    fn open_url_is_off_without_an_oauth_spec() {
+        let b = cat_broker();
+        assert!(!b.open_url_enabled());
+        let mut s = UnixStream::connect(b.socket()).unwrap();
+        write!(
+            s,
+            "{}\nhttps://fgw.example/\n",
+            super::super::open_url::OP_LINE
+        )
+        .unwrap();
+        let mut answer = String::new();
+        BufReader::new(s).read_line(&mut answer).unwrap();
+        assert!(
+            !answer.starts_with("denied") && !answer.starts_with("ok"),
+            "{answer}"
+        );
     }
 
     /// #930: the macOS probe's command is the child's: sandbox-exec with

@@ -55,6 +55,7 @@ mod client;
 mod credential;
 mod egress;
 mod graphql;
+mod open_url;
 mod policy;
 mod retry;
 mod runtime;
@@ -63,6 +64,10 @@ mod spec;
 mod status;
 
 pub use client::{apply_opencode_overlay, copilot_launch_args};
+pub use open_url::{
+    HOST_OPENER as OPEN_URL_HOST_OPENER, SHIM_NAMES as OPEN_URL_SHIMS, opener_config_writable,
+    run as run_open_url, shim_script as open_url_shim,
+};
 pub use runtime::{Broker, Log, bwrap_disables_userns};
 pub use shim::run_stdio;
 pub use spec::{Detected, Spec, detect, drop_writable, load, spec_dir};

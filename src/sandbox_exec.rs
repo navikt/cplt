@@ -1131,15 +1131,52 @@ fn github_credential_helper_config(
     env
 }
 
+/// `open`/`xdg-open` shims that hand an https URL to the MCP broker's
+/// `open_url` op (#910). Only when the broker runs: without it nothing on the
+/// host would answer.
+fn install_open_url_shims(cmd: &mut Command, sandbox: &crate::sandbox::PreparedSandbox) {
+    use std::os::unix::fs::PermissionsExt;
+    let (Some(socket), Some(scratch)) = (
+        sandbox.mcp_socket.as_deref(),
+        sandbox.scratch_dir.as_deref(),
+    ) else {
+        return;
+    };
+    let Ok(cplt) = std::env::current_exe() else {
+        return;
+    };
+    let dir = scratch.join("open-url-bin");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for name in crate::mcp_broker::OPEN_URL_SHIMS {
+        let real = which_binary(name);
+        let script = crate::mcp_broker::open_url_shim(
+            &cplt.to_string_lossy(),
+            &socket.to_string_lossy(),
+            &sandbox.open_url_hosts,
+            real.as_deref().map(|p| p.to_string_lossy()).as_deref(),
+        );
+        let path = dir.join(name);
+        if std::fs::write(&path, script).is_err()
+            || std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).is_err()
+        {
+            return;
+        }
+    }
+    prepend_path(cmd, &[&dir]);
+}
+
 fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
     let mut paths: Vec<PathBuf> = prefixes.iter().map(|path| path.to_path_buf()).collect();
     // The PATH already set on `cmd` wins over ours, so the shim dir that
-    // `configure_command` took out does not come back here.
-    let set = cmd
-        .get_envs()
-        .find(|(k, _)| *k == "PATH")
-        .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string));
-    if let Some(current_path) = set.or_else(|| std::env::var_os("PATH")) {
+    // `configure_command` took out does not come back here. A PATH removed
+    // from `cmd` (`[deny].env`) stays removed: the parent's is not restored.
+    let current = match cmd.get_envs().find(|(k, _)| *k == "PATH") {
+        Some((_, v)) => v.map(std::ffi::OsStr::to_os_string),
+        None => std::env::var_os("PATH"),
+    };
+    if let Some(current_path) = current {
         paths.extend(std::env::split_paths(&current_path));
     }
     if let Ok(path) = std::env::join_paths(paths) {
@@ -1642,6 +1679,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -1792,6 +1830,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -2035,6 +2074,7 @@ fn exec_bwrap(
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -2475,6 +2515,25 @@ mod child_pid_tests {
 mod pnpm_path_tests {
     use super::*;
 
+    /// `[deny].env` PATH: the shim and shadow dirs go on, the parent's PATH
+    /// does not come back.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned, only its env is read
+    fn prepend_path_keeps_a_denied_path_out() {
+        let shim = Path::new("/shim");
+        let mut cmd = Command::new("true");
+        cmd.env_remove("PATH");
+        prepend_path(&mut cmd, &[shim]);
+        let path = cmd.get_envs().find(|(k, _)| *k == "PATH").unwrap().1;
+        assert_eq!(path, Some(std::ffi::OsStr::new("/shim")));
+
+        let mut cmd = Command::new("true");
+        cmd.env("PATH", "/a:/b");
+        prepend_path(&mut cmd, &[shim]);
+        let path = cmd.get_envs().find(|(k, _)| *k == "PATH").unwrap().1;
+        assert_eq!(path, Some(std::ffi::OsStr::new("/shim:/a:/b")));
+    }
+
     #[test]
     fn pnpm_home_dirs_follow_the_shadow_only_when_absent_and_present() {
         let home = tempfile::tempdir().unwrap();
@@ -2881,7 +2940,7 @@ echo gho_stored_fixture"#,
             || {
                 let sub = crate::agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN");
                 let deny = vec!["GITHUB_TOKEN".to_string()];
-                let mut cmd = Command::new("/usr/bin/true");
+                let mut cmd = Command::new("true");
                 cmd.env_clear().env("GITHUB_TOKEN", "gho_denied_fixture");
                 cmd.env("COPILOT_GITHUB_TOKEN", "gho_copilot_fixture");
                 assert!(child_env_has_gh_token(&cmd, &[]));
@@ -3038,7 +3097,7 @@ mod keychain_substitute_tests {
     #[test]
     fn env_var_substitute_is_forwarded_and_file_substitute_is_not() {
         temp_env::with_var("CPLT_TEST_SUBSTITUTE", Some("tok"), || {
-            let mut cmd = Command::new("/usr/bin/true");
+            let mut cmd = Command::new("true");
             apply_deny_env_and_credential(
                 &mut cmd,
                 &[],
@@ -3052,7 +3111,7 @@ mod keychain_substitute_tests {
             );
 
             // A file substitute needs nothing forwarded — the agent reads it.
-            let mut cmd = Command::new("/usr/bin/true");
+            let mut cmd = Command::new("true");
             apply_deny_env_and_credential(
                 &mut cmd,
                 &[],
@@ -3061,7 +3120,7 @@ mod keychain_substitute_tests {
             assert_eq!(cmd.get_envs().count(), 0);
 
             // No substitute: nothing forwarded, deny sweep still applies.
-            let mut cmd = Command::new("/usr/bin/true");
+            let mut cmd = Command::new("true");
             apply_deny_env_and_credential(&mut cmd, &["FOO".to_string()], None);
             let set: Vec<_> = cmd.get_envs().collect();
             assert_eq!(set, vec![("FOO".as_ref(), None)]);
@@ -3070,7 +3129,7 @@ mod keychain_substitute_tests {
 
     #[test]
     fn session_env_skips_denied_names() {
-        let mut cmd = Command::new("/usr/bin/true");
+        let mut cmd = Command::new("true");
         let extra = vec![
             ("OPENAI_API_KEY".to_string(), "x".to_string()),
             ("KEEP".to_string(), "y".to_string()),
@@ -3084,13 +3143,13 @@ mod keychain_substitute_tests {
     /// command; without it the value stays.
     #[test]
     fn deny_env_strips_a_passed_var_and_absence_keeps_it() {
-        let mut cmd = Command::new("/usr/bin/true");
+        let mut cmd = Command::new("true");
         cmd.env("OPENAI_API_KEY", "x");
         apply_deny_env_and_credential(&mut cmd, &["OPENAI_API_KEY".to_string()], None);
         let set: Vec<_> = cmd.get_envs().collect();
         assert_eq!(set, vec![("OPENAI_API_KEY".as_ref(), None)]);
 
-        let mut cmd = Command::new("/usr/bin/true");
+        let mut cmd = Command::new("true");
         cmd.env("OPENAI_API_KEY", "x");
         apply_deny_env_and_credential(&mut cmd, &[], None);
         let set: Vec<_> = cmd.get_envs().collect();

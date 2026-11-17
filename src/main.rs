@@ -950,6 +950,11 @@ QUICK START:
     #[command(name = "mcp-stdio", hide = true)]
     McpStdio { id: String },
 
+    /// Inside a session: ask the MCP broker to open an https URL on the host.
+    /// The `open`/`xdg-open` shims run this; it is not run by hand.
+    #[command(name = "mcp-open-url", hide = true)]
+    McpOpenUrl { url: String },
+
     /// Verify & explain sandbox enforcement.
     ///
     /// Runs probes inside the REAL resolved sandbox and proxy, the same policy
@@ -5008,6 +5013,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let mut mcp_status = None;
     match cli.command.take() {
         Some(Command::McpStdio { id }) => return Ok(cplt::mcp_broker::run_stdio(&id)),
+        Some(Command::McpOpenUrl { url }) => return Ok(cplt::mcp_broker::run_open_url(&url)),
         Some(Command::Mcp {
             action: McpAction::Status { json },
         }) => mcp_status = Some(json),
@@ -5181,7 +5187,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Worktree { .. } => {
                 unreachable!("Command::Worktree handled before this match")
             }
-            Command::Mcp { .. } | Command::McpStdio { .. } => {
+            Command::Mcp { .. } | Command::McpStdio { .. } | Command::McpOpenUrl { .. } => {
                 unreachable!("Command::Mcp handled before this match")
             }
         });
@@ -7457,9 +7463,20 @@ fn assemble_sandbox(
             level: resolved.proxy_log_level,
             file: resolved.proxy_log_file.clone(),
         };
-        cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
+        let broker = cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
             .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
-            .ok()
+            .ok()?;
+        if cplt::mcp_broker::OPEN_URL_HOST_OPENER
+            && broker.open_url_enabled()
+            && let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir)
+        {
+            broker.disable_open_url();
+            ui::warn(&format!(
+                "MCP login links will not open in the browser: the sandbox can write {}.",
+                p.display()
+            ));
+        }
+        Some(broker)
     });
     let mcp_refusal = opts
         .mcp_probe
@@ -7493,6 +7510,10 @@ fn assemble_sandbox(
         prepared.check_netns().map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     prepared.set_worktree_root(opts.repos.worktree_root);
+    // The shims only where `open_url` is served (#910).
+    if let Some(b) = mcp_broker.as_ref().filter(|b| b.open_url_enabled()) {
+        prepared.set_mcp_socket(b.socket(), b.open_url_hosts());
+    }
     prepared.set_worktree_socket(
         worktree_broker
             .as_ref()
