@@ -166,21 +166,44 @@ fn handler_paths(
             .filter(|p| p.is_absolute())
             .unwrap_or_else(|| home.join(d))
     };
-    let mut v = vec![
-        xdg("XDG_CONFIG_HOME", ".config").join("mimeapps.list"),
+    let desktops: Vec<String> = get("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_string_lossy().to_lowercase())
+        .iter()
+        .flat_map(|d| d.split(':').filter(|x| !x.is_empty()).map(String::from))
+        .collect();
+    let mut v = mimeapps_lists(&xdg("XDG_CONFIG_HOME", ".config"), &desktops);
+    v.extend([
         xdg("XDG_DATA_HOME", ".local/share").join("applications"),
         xdg("XDG_CACHE_HOME", ".cache"),
-    ];
-    v.extend(
-        OPENER_CONFIG_DIRS
-            .iter()
-            .map(|d| Path::new(d).join("mimeapps.list")),
-    );
+    ]);
+    for d in OPENER_CONFIG_DIRS {
+        v.extend(mimeapps_lists(Path::new(d), &desktops));
+    }
     v.extend(
         OPENER_DATA_DIRS
             .iter()
             .map(|d| Path::new(d).join("applications")),
     );
+    v
+}
+
+/// `mimeapps.list` and `<desktop>-mimeapps.list` in `dir`: one per current
+/// desktop (whether or not it exists yet) plus any such file already there.
+fn mimeapps_lists(dir: &Path, desktops: &[String]) -> Vec<PathBuf> {
+    let mut v = vec![dir.join("mimeapps.list")];
+    v.extend(
+        desktops
+            .iter()
+            .map(|d| dir.join(format!("{d}-mimeapps.list"))),
+    );
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        v.extend(
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with("mimeapps.list"))
+                .map(|e| e.path()),
+        );
+    }
     v
 }
 
@@ -508,6 +531,23 @@ mod tests {
             find_writable(h, &[Path::new("/cfg")], &xdg, false),
             Some("/cfg/mimeapps.list".into())
         );
+        // Desktop-specific lists, also when they do not exist yet.
+        let gnome = |k: &str| (k == "XDG_CURRENT_DESKTOP").then(|| "X-Cinnamon:GNOME".into());
+        for root in [
+            "/h/.config/gnome-mimeapps.list",
+            "/etc/xdg/x-cinnamon-mimeapps.list",
+        ] {
+            assert_eq!(
+                find_writable(h, &[Path::new(root)], &gnome, false),
+                Some(root.into()),
+                "{root}"
+            );
+            assert_eq!(
+                find_writable(h, &[Path::new(root)], &none, false),
+                None,
+                "{root}"
+            );
+        }
         // macOS: LaunchServices prefs.
         let mac = |roots: &[&str]| {
             let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
@@ -519,6 +559,31 @@ mod tests {
             mac(&["/h/Library/Preferences/com.apple.LaunchServices"]),
             Some("/h/Library/Preferences".into())
         );
+    }
+
+    #[test]
+    fn opener_config_writable_finds_existing_desktop_list() {
+        use std::os::unix::fs::symlink;
+        let t = std::env::temp_dir().join(format!("cplt-mime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (home, repo) = (t.join("home"), t.join("repo"));
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("kde-mimeapps.list"), "").unwrap();
+        let none = |_: &str| None;
+        let roots = [repo.as_path()];
+        assert_eq!(find_writable(&home, &roots, &none, false), None);
+        // Linked in, desktop not named in the env: found by scanning the dir.
+        symlink(
+            repo.join("kde-mimeapps.list"),
+            home.join(".config/kde-mimeapps.list"),
+        )
+        .unwrap();
+        assert_eq!(
+            find_writable(&home, &roots, &none, false),
+            Some(home.join(".config/kde-mimeapps.list"))
+        );
+        std::fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]
