@@ -59,6 +59,7 @@ mod shim;
 mod spec;
 mod status;
 
+pub use crate::sandbox::OAUTH_CALLBACK_PORT;
 pub use client::{apply_opencode_overlay, copilot_launch_args};
 pub use runtime::{Broker, Log, bwrap_disables_userns};
 pub use shim::run_stdio;

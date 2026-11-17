@@ -127,7 +127,7 @@ pub struct FsRule {
     pub nofollow: bool,
 }
 
-/// TCP connect rule (requires Landlock ABI v4+, kernel 6.7+).
+/// TCP connect or bind port rule (requires Landlock ABI v4+, kernel 6.7+).
 #[derive(Debug, Clone, Copy)]
 pub struct NetRule {
     pub port: u16,
@@ -142,12 +142,28 @@ pub struct NetRule {
 pub struct LandlockPolicy {
     pub fs_rules: Vec<FsRule>,
     pub net_rules: Vec<NetRule>,
+    /// TCP bind allowlist rules (`AccessNet::BindTcp`, Landlock ABI v4+, kernel 6.7+).
+    ///
+    /// Populated only when `restrict_net_bind` is true. Landlock is allowlist-only
+    /// with no single-port deny or range rule, so denying bind on
+    /// [`policy::OAUTH_CALLBACK_PORT`] (62471) requires handling `AccessNet::BindTcp`
+    /// and permitting only ephemeral `bind(0)` (`port 0`) plus configured
+    /// `localhost_ports` (never `OAUTH_CALLBACK_PORT`). On kernels < 6.7
+    /// (ABI < v4) that lack net rules, `CompatLevel::BestEffort` drops `BindTcp`;
+    /// host-side broker port reservation (and Bubblewrap `netns` when active) is
+    /// the fallback.
+    pub bind_rules: Vec<NetRule>,
     /// Whether to handle (and thus restrict) TCP connect at the kernel level.
     /// When false, all outbound TCP connect is unrestricted by Landlock.
     /// This is set to false when `allow_localhost_any` is true because Landlock
     /// network rules are port-based only — they cannot distinguish localhost
     /// from remote hosts. The proxy still provides domain-level filtering.
     pub restrict_net_connect: bool,
+    /// Whether to handle (and thus restrict) TCP bind at the kernel level (#1017).
+    /// Set only when the MCP broker holds the OAuth callback port for this
+    /// session; when false, `AccessNet::BindTcp` is left unhandled so agents
+    /// can bind any port as before.
+    pub restrict_net_bind: bool,
     /// Proxy-forced mode (#53): kernel egress is locked to the proxy port and
     /// the default `*:443` allow is dropped. Recorded here so `precompute()` can
     /// FAIL CLOSED when the kernel cannot enforce TCP-connect restriction
@@ -209,8 +225,11 @@ pub struct PrecomputedSandbox {
     /// renames a new one over it.
     pub deferred_plain_file: Option<(std::ffi::CString, FsAccess)>,
     pub net_rules: Vec<NetRule>,
+    pub bind_rules: Vec<NetRule>,
     /// Whether to restrict TCP connect at the kernel level.
     pub restrict_net_connect: bool,
+    /// Whether to restrict TCP bind at the kernel level (#1017).
+    pub restrict_net_bind: bool,
     pub seccomp_filter: Vec<BpfInstruction>,
 }
 
@@ -1389,6 +1408,26 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
     }
 
+    // Reserve the fixed MCP OAuth loopback callback port (#1017) only when the
+    // MCP broker holds it for this session. Landlock is allowlist-only with no
+    // deny/range rule, so `AccessNet::BindTcp` is handled only then (granting
+    // ephemeral `bind(0)` plus `localhost_ports`, excluding
+    // `OAUTH_CALLBACK_PORT`); in all other sessions `BindTcp` is left
+    // unhandled so dev servers can bind any port.
+    let restrict_net_bind = config.restrict_oauth_bind;
+    let mut bind_rules = Vec::new();
+    if restrict_net_bind {
+        bind_rules.push(NetRule { port: 0 });
+        for &port in config.localhost_ports {
+            if port != 0
+                && port != policy::OAUTH_CALLBACK_PORT
+                && !bind_rules.iter().any(|r| r.port == port)
+            {
+                bind_rules.push(NetRule { port });
+            }
+        }
+    }
+
     // Denied dotfiles and denied files are handled by simply NOT adding
     // them to the ruleset — Landlock is deny-by-default.
     //
@@ -1547,7 +1586,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     LandlockPolicy {
         fs_rules,
         net_rules,
+        bind_rules,
         restrict_net_connect,
+        restrict_net_bind,
         proxy_forced: config.proxy_forced,
         home_dir: home.to_path_buf(),
         precreate_dirs,
@@ -1729,6 +1770,27 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
         }
         out.push('\n');
     }
+    if policy.restrict_net_bind {
+        out.push_str("## Network (TCP bind, requires kernel 6.7+ / ABI v4)\n");
+        for rule in &policy.bind_rules {
+            if rule.port == 0 {
+                out.push_str("  port 0 (ephemeral)\n");
+            } else {
+                let _ = writeln!(out, "  port {}", rule.port);
+            }
+        }
+        let _ = writeln!(
+            out,
+            "  # port {} (OAuth callback) is denied; on kernels < 6.7 (ABI < v4) without net rules,\n\
+             # the host broker's 127.0.0.1:{} listener (and bwrap netns if active) is the fallback.",
+            policy::OAUTH_CALLBACK_PORT,
+            policy::OAUTH_CALLBACK_PORT
+        );
+        out.push('\n');
+    } else {
+        out.push_str("## Network (TCP bind)\n");
+        out.push_str("  UNRESTRICTED (no broker OAuth callback port guard active)\n\n");
+    }
 
     out.push_str("# Note: Landlock is allowlist-only. Paths not listed above are denied.\n");
     out.push_str(
@@ -1884,9 +1946,14 @@ pub fn check_availability() -> Result<ABI, String> {
 /// `restrict_net_connect` controls whether TCP connect is handled at all: when
 /// false (e.g. `--allow-localhost-any`) we do not handle `AccessNet::ConnectTcp`,
 /// leaving connect unrestricted by Landlock (the proxy provides filtering).
+///
+/// `restrict_net_bind` controls whether TCP bind is handled at all (#1017): it
+/// is true only when the MCP broker holds the OAuth callback port for this
+/// session, so dev servers stay unrestricted in all other sessions.
 #[cfg(target_os = "linux")]
 fn build_best_effort_ruleset(
     restrict_net_connect: bool,
+    restrict_net_bind: bool,
 ) -> std::io::Result<landlock::RulesetCreated> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr, Scope,
@@ -1921,9 +1988,19 @@ fn build_best_effort_ruleset(
         .map_err(std::io::Error::other)?;
 
     // Handle TCP connect (ABI v4+) only when network restriction is enabled.
-    // Under BestEffort this is silently dropped on kernels < 6.7; the proxy is
-    // then the sole network control. We intentionally do NOT handle BindTcp —
-    // outbound connect is the only network access cplt scopes.
+    // Handle TCP bind (ABI v4+) only when the MCP broker holds the OAuth
+    // callback port (62471) for this session, so it stays unbindable even
+    // under `--allow-localhost-any` without restricting dev servers otherwise.
+    // Under BestEffort both are silently dropped on kernels < 6.7 (ABI < v4)
+    // that lack Landlock net rules; fallback there is the host broker's
+    // exclusive 127.0.0.1:62471 listener (plus bwrap netns when active).
+    let ruleset = if restrict_net_bind {
+        ruleset
+            .handle_access(AccessNet::BindTcp)
+            .map_err(std::io::Error::other)?
+    } else {
+        ruleset
+    };
     let ruleset = if restrict_net_connect {
         ruleset
             .handle_access(AccessNet::ConnectTcp)
@@ -2054,14 +2131,18 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     let (pre_opened_fds, deferred_paths, deferred_plain_file) = open_fs_rules(&policy)?;
 
     let net_rules = policy.net_rules.clone();
+    let bind_rules = policy.bind_rules.clone();
     let restrict_net_connect = policy.restrict_net_connect;
+    let restrict_net_bind = policy.restrict_net_bind;
 
     Ok(PrecomputedSandbox {
         pre_opened_fds,
         deferred_paths,
         deferred_plain_file,
         net_rules,
+        bind_rules,
         restrict_net_connect,
+        restrict_net_bind,
         seccomp_filter,
     })
 }
@@ -2197,6 +2278,8 @@ impl PrecomputedSandbox {
         self.deferred_paths = deferred;
         self.deferred_plain_file = plain;
         self.net_rules.clone_from(&policy.net_rules);
+        self.bind_rules.clone_from(&policy.bind_rules);
+        self.restrict_net_bind = policy.restrict_net_bind;
         Ok(())
     }
 }
@@ -2511,7 +2594,8 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     // dropped by the crate on older kernels. The hard-required v1 baseline plus
     // the NotEnforced check below keep this fail-closed. See
     // [`build_best_effort_ruleset`].
-    let mut created = build_best_effort_ruleset(sandbox.restrict_net_connect)?;
+    let mut created =
+        build_best_effort_ruleset(sandbox.restrict_net_connect, sandbox.restrict_net_bind)?;
 
     // Add filesystem rules for deferred paths (e.g. /proc/self).
     // These are magic symlinks that resolve per-process — opened here in the
@@ -2549,12 +2633,19 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     }
 
     // Add network rules only when network restriction is active. On kernels
-    // < 6.7 the ConnectTcp handling was best-effort-dropped above, so these
-    // NetPort rules are silently dropped too (no per-ABI branch needed here).
+    // < 6.7 the ConnectTcp/BindTcp handling was best-effort-dropped above, so
+    // these NetPort rules are silently dropped too (no per-ABI branch needed).
     if sandbox.restrict_net_connect {
         for rule in &sandbox.net_rules {
             created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    if sandbox.restrict_net_bind {
+        for rule in &sandbox.bind_rules {
+            created = created
+                .add_rule(NetPort::new(rule.port, AccessNet::BindTcp))
                 .map_err(std::io::Error::other)?;
         }
     }
@@ -2605,7 +2696,9 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 pub(crate) fn apply_landlock_and_seccomp_now(
     fs_rules: &[(FsRule, Option<FileId>)],
     net_rules: &[NetRule],
+    bind_rules: &[NetRule],
     restrict_net_connect: bool,
+    restrict_net_bind: bool,
     proxy_forced: bool,
     plain_file: Option<usize>,
 ) -> std::io::Result<()> {
@@ -2615,7 +2708,7 @@ pub(crate) fn apply_landlock_and_seccomp_now(
 
     // Same best-effort construction as the fork-based path — the hard-required
     // v1 baseline fails closed if Landlock is unavailable inside the namespace.
-    let mut created = build_best_effort_ruleset(restrict_net_connect)?;
+    let mut created = build_best_effort_ruleset(restrict_net_connect, restrict_net_bind)?;
 
     // Open each rule's path in *this* namespace. `/proc/self` resolves to this
     // process's pid, which is preserved across the upcoming `execve()`, so no
@@ -2671,6 +2764,13 @@ pub(crate) fn apply_landlock_and_seccomp_now(
         for rule in net_rules {
             created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    if restrict_net_bind {
+        for rule in bind_rules {
+            created = created
+                .add_rule(NetPort::new(rule.port, AccessNet::BindTcp))
                 .map_err(std::io::Error::other)?;
         }
     }
@@ -3136,6 +3236,7 @@ mod tests {
             managed_worktree_root: None,
             worktree_socket: None,
             mcp_socket: None,
+            restrict_oauth_bind: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -4917,6 +5018,36 @@ mod tests {
 
         assert!(policy.restrict_net_connect);
         assert!(policy.net_rules.iter().any(|r| r.port == 443));
+        assert!(!policy.restrict_net_bind);
+        assert!(policy.bind_rules.is_empty());
+    }
+
+    #[test]
+    fn restrict_oauth_bind_gates_landlock_bind_rules() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let ports = [3000, policy::OAUTH_CALLBACK_PORT];
+
+        let mut without_broker = test_config(&project, &home);
+        without_broker.localhost_ports = &ports;
+        let policy_without = generate_policy(&without_broker);
+        assert!(!policy_without.restrict_net_bind);
+        assert!(policy_without.bind_rules.is_empty());
+
+        let mut with_broker = test_config(&project, &home);
+        with_broker.localhost_ports = &ports;
+        with_broker.allow_localhost_any = true;
+        with_broker.restrict_oauth_bind = true;
+        let policy_with = generate_policy(&with_broker);
+        assert!(policy_with.restrict_net_bind);
+        assert!(policy_with.bind_rules.iter().any(|r| r.port == 0));
+        assert!(policy_with.bind_rules.iter().any(|r| r.port == 3000));
+        assert!(
+            !policy_with
+                .bind_rules
+                .iter()
+                .any(|r| r.port == policy::OAUTH_CALLBACK_PORT)
+        );
     }
 
     #[test]
@@ -6120,7 +6251,9 @@ mod tests {
                 },
             ],
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: false,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: PathBuf::from("/tmp/test-home"),
             precreate_dirs: vec![],
@@ -6176,7 +6309,9 @@ mod tests {
                 access: read_only(),
             }],
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: false,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: dir.to_path_buf(),
             precreate_dirs: vec![],
@@ -6264,7 +6399,9 @@ mod tests {
                 access: read_only(),
             }],
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: false,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: dir.path().to_path_buf(),
             precreate_dirs: vec![],
@@ -6309,7 +6446,9 @@ mod tests {
         let policy = LandlockPolicy {
             fs_rules: vec![rule.clone(), rule],
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: false,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: dir.path().to_path_buf(),
             precreate_dirs: vec![],
@@ -6370,9 +6509,11 @@ mod tests {
             return; // Landlock unavailable here — nothing to assert.
         }
         // Both the network-restricted and the localhost-any (no ConnectTcp)
-        // shapes must construct without a hard error.
-        build_best_effort_ruleset(true).expect("net-restricted ruleset should build");
-        build_best_effort_ruleset(false).expect("fs-only ruleset should build");
+        // shapes must construct without a hard error, with and without BindTcp.
+        build_best_effort_ruleset(true, false).expect("net-restricted ruleset should build");
+        build_best_effort_ruleset(true, true).expect("connect+bind ruleset should build");
+        build_best_effort_ruleset(false, false).expect("fs-only ruleset should build");
+        build_best_effort_ruleset(false, true).expect("bind-restricted ruleset should build");
     }
 
     /// `available_abi_version()` and `check_availability()` must agree: the

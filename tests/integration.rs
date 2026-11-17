@@ -474,6 +474,7 @@ mod macos_tests {
             managed_worktree_root: None,
             worktree_socket: None,
             mcp_socket: None,
+            restrict_oauth_bind: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -6113,6 +6114,48 @@ print(f'OK:{port}')
         assert!(
             success && output.contains("OK:"),
             "IPv6 localhost bind should be allowed.\noutput: {output}"
+        );
+
+        let _ = fs::remove_file(&profile);
+    }
+
+    #[test]
+    fn real_profile_denies_oauth_callback_port_bind() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        let port = cplt::sandbox::OAUTH_CALLBACK_PORT;
+        let script = format!(
+            r"
+import socket
+for addr in [('127.0.0.1', {port}), ('0.0.0.0', {port}), ('::1', {port}), ('::', {port})]:
+    fam = socket.AF_INET6 if ':' in addr[0] else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    try:
+        s.bind(addr)
+        print(f'ALLOWED:{{addr}}')
+    except PermissionError:
+        print(f'DENIED:{{addr}}')
+    finally:
+        s.close()
+"
+        );
+        let (output, success) = run_sandboxed(&profile, &format!("{py} -c \"{script}\""));
+        assert!(success, "probe script failed.\noutput: {output}");
+        assert!(
+            !output.contains("ALLOWED:"),
+            "OAuth callback port {port} must be denied on all loopback/wildcard addresses.\noutput: {output}"
+        );
+        assert_eq!(
+            output.matches("DENIED:").count(),
+            4,
+            "expected all 4 bind attempts denied.\noutput: {output}"
         );
 
         let _ = fs::remove_file(&profile);

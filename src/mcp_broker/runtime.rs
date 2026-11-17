@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -108,6 +109,109 @@ impl Drop for Permit {
     }
 }
 
+const OAUTH_PORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Bind `127.0.0.1:<port>` exclusively without `SO_REUSEPORT` (#1017).
+///
+/// `std::net::TcpListener::bind` sets `SO_REUSEADDR` (for `TIME_WAIT`) and never
+/// sets `SO_REUSEPORT`, so no second process can co-bind `127.0.0.1:<port>` to
+/// intercept OAuth callbacks.
+fn bind_exclusive_loopback(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+}
+
+struct OAuthPortState {
+    listener: Mutex<Option<TcpListener>>,
+    stop: Mutex<bool>,
+    wake: Condvar,
+}
+
+/// Reserves the fixed OAuth loopback callback port for the host broker (#1017).
+///
+/// Claims `127.0.0.1:<port>` at session start when free; if another holder owns
+/// it, retries in the background and claims it as soon as it is released.
+struct OAuthPortGuard {
+    state: Arc<OAuthPortState>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OAuthPortGuard {
+    fn start(port: u16) -> Self {
+        Self::start_with_interval(port, OAUTH_PORT_RETRY_INTERVAL)
+    }
+
+    fn start_with_interval(port: u16, retry_interval: Duration) -> Self {
+        let initial = bind_exclusive_loopback(port);
+        let needs_retry = matches!(
+            &initial,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+        );
+        let state = Arc::new(OAuthPortState {
+            listener: Mutex::new(initial.ok()),
+            stop: Mutex::new(false),
+            wake: Condvar::new(),
+        });
+        let thread = needs_retry.then(|| {
+            let s = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let mut stopped = s
+                    .stop
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*stopped {
+                    let (guard, _) = s
+                        .wake
+                        .wait_timeout(stopped, retry_interval)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    stopped = guard;
+                    if *stopped {
+                        break;
+                    }
+                    drop(stopped);
+                    match bind_exclusive_loopback(port) {
+                        Ok(l) => {
+                            *s.listener
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l);
+                            return;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                        Err(_) => return,
+                    }
+                    stopped = s
+                        .stop
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            })
+        });
+        Self { state, thread }
+    }
+
+    #[cfg(test)]
+    fn is_claimed(&self) -> bool {
+        self.state
+            .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+}
+
+impl Drop for OAuthPortGuard {
+    fn drop(&mut self) {
+        *self
+            .state
+            .stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.state.wake.notify_all();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// The running broker. Dropping it stops every child and removes the socket.
 pub struct Broker {
     socket: PathBuf,
@@ -117,12 +221,23 @@ pub struct Broker {
     _dir: SocketDir,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
+    oauth_guard: Option<OAuthPortGuard>,
+}
+
+/// Whether any brokered spec authenticates with OAuth. None does yet; the
+/// OAuth mechanism (cplt#910) flips this.
+fn specs_use_oauth(_specs: &[Spec]) -> bool {
+    false
 }
 
 impl Broker {
     /// Bind the socket and serve `specs`. The child's egress goes through the
     /// proxy on `proxy_port`, whose allowlist already holds the specs' hosts.
     pub fn start(specs: Vec<Spec>, home: &Path, log: Log) -> Result<Self, String> {
+        // No brokered mechanism uses OAuth yet (#1017): reserve the callback port
+        // only once one does, so existing sessions keep binding freely.
+        let oauth_guard =
+            specs_use_oauth(&specs).then(|| OAuthPortGuard::start(super::OAUTH_CALLBACK_PORT));
         use std::os::unix::fs::PermissionsExt;
         #[cfg(target_os = "macos")]
         let dir = crate::scratch::SessionSocketDir::create()?;
@@ -256,12 +371,20 @@ impl Broker {
             _dir: dir,
             shared,
             thread: Some(thread),
+            oauth_guard,
         })
     }
 
     /// The socket path the sandbox profile grants connect to.
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Whether this broker guards the fixed OAuth loopback callback port (#1017).
+    ///
+    /// Only sessions with an OAuth-using brokered server reserve the port.
+    pub fn holds_oauth_port(&self) -> bool {
+        self.oauth_guard.is_some()
     }
 
     pub fn specs(&self) -> impl Iterator<Item = &Spec> {
@@ -2147,5 +2270,74 @@ mod tests {
             ra.read_line(&mut l).unwrap();
             assert_eq!(l.contains("127.0.0.1:0\""), port0, "{l}");
         }
+    }
+
+    #[test]
+    fn oauth_port_guard_binds_without_so_reuseport() {
+        use std::os::fd::AsRawFd;
+        let l = bind_exclusive_loopback(0).expect("bind ephemeral loopback");
+        let port = l.local_addr().unwrap().port();
+        let mut reuseport: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid socket fd and properly sized output buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                l.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                (&raw mut reuseport).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(reuseport, 0, "SO_REUSEPORT must never be set on the broker");
+        let err = bind_exclusive_loopback(port).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn oauth_port_guard_retries_until_prior_holder_releases() {
+        let holder = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+
+        let guard = OAuthPortGuard::start_with_interval(port, Duration::from_millis(10));
+        assert!(
+            !guard.is_claimed(),
+            "port is still held by initial holder at session start"
+        );
+
+        drop(holder);
+
+        let start = Instant::now();
+        while !guard.is_claimed() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "broker did not claim port {port} after prior holder released it"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let err = bind_exclusive_loopback(port).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+
+        drop(guard);
+        assert!(
+            bind_exclusive_loopback(port).is_ok(),
+            "port should be free after guard drops"
+        );
+    }
+
+    #[test]
+    fn oauth_port_guard_drop_stops_retry_promptly() {
+        let holder = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let guard = OAuthPortGuard::start_with_interval(port, Duration::from_secs(30));
+        assert!(!guard.is_claimed());
+        let start = Instant::now();
+        drop(guard);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "drop must wake the retry thread immediately"
+        );
     }
 }

@@ -1575,7 +1575,9 @@ mod tests {
                 })
                 .collect(),
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: false,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: PathBuf::from("/home/u"),
             precreate_dirs: vec![],
