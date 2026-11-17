@@ -7,31 +7,71 @@
 //! URL to the broker. The broker checks it here and runs the platform opener
 //! with the URL as one argv entry, never through a shell.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::SOCKET_ENV;
 use super::spec::Spec;
 
 /// First line a client sends for this op. Spec ids cannot contain `:`.
 pub(crate) const OP_LINE: &str = "cplt:open_url";
-/// Always allowed: the Entra ID login host.
-const LOGIN_HOST: &str = "login.microsoftonline.com";
 /// An authorize URL with PKCE and state fits well inside this.
 const MAX_LEN: usize = 4096;
 /// The credential of a remote spec that runs OAuth (#1020).
 const OAUTH_CREDENTIAL: &str = "oauth";
 
-/// Hosts a URL may name: the login host plus each oauth spec's `egressHosts`.
+/// Opens per [`WINDOW`], and the window itself.
+const MAX_OPENS: usize = 3;
+const WINDOW: Duration = Duration::from_secs(60);
+
+/// Hosts a URL may name: each oauth spec's `egressHosts`, the fleet gateway.
 /// No new config key: the spec already names where its OAuth flow goes.
+/// The Entra login host is deliberately absent (owner decision 2026-11-17):
+/// an authorize URL for a first-party client_id with a loopback redirect
+/// would complete silently under browser SSO and hand the code to whoever
+/// listens on that port. The gateway redirects the browser to Entra itself.
+/// Empty means the op is off.
 pub(crate) fn allowed_hosts<'a>(specs: impl Iterator<Item = &'a Spec>) -> Vec<String> {
-    let mut hosts = vec![LOGIN_HOST.to_string()];
-    for s in specs.filter(|s| s.credential.name == OAUTH_CREDENTIAL) {
-        hosts.extend(s.egress_hosts.iter().map(|h| h.to_ascii_lowercase()));
+    specs
+        .filter(|s| s.credential.name == OAUTH_CREDENTIAL)
+        .flat_map(|s| s.egress_hosts.iter().map(|h| h.to_ascii_lowercase()))
+        .collect()
+}
+
+/// At most [`MAX_OPENS`] opens per [`WINDOW`] and one opener at a time, so a
+/// sandboxed client cannot flood tabs or pile up host processes.
+#[derive(Default)]
+pub(crate) struct Limiter {
+    recent: Mutex<VecDeque<Instant>>,
+    busy: Arc<AtomicBool>,
+}
+
+impl Limiter {
+    /// Take a slot, or say why not. The returned flag is cleared when the
+    /// opener exits.
+    fn take(&self, now: Instant) -> Result<Arc<AtomicBool>, &'static str> {
+        let mut recent = self.recent.lock().map_err(|_| "limiter poisoned")?;
+        while recent
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= WINDOW)
+        {
+            recent.pop_front();
+        }
+        if recent.len() >= MAX_OPENS {
+            return Err("rate limit: too many URLs opened this minute");
+        }
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return Err("another URL is still being opened");
+        }
+        recent.push_back(now);
+        Ok(Arc::clone(&self.busy))
     }
-    hosts
 }
 
 /// Strict check of `url`. Hand-parsed: no URL crate is a dependency, and a
@@ -72,6 +112,35 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
     }
 }
 
+/// On Linux `xdg-open` picks the handler from `mimeapps.list` and `.desktop`
+/// files under the user's XDG dirs. If the sandbox can write one of those, it
+/// can make the host run any command for an allowed URL. Returns the first
+/// such path among `writable` roots; the launcher then turns the op off.
+#[must_use]
+pub fn opener_config_writable(
+    home: &Path,
+    writable: &[&Path],
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let xdg = |k: &str, d: &str| {
+        get(k)
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| home.join(d))
+    };
+    let mime = xdg("XDG_CONFIG_HOME", ".config").join("mimeapps.list");
+    let apps = xdg("XDG_DATA_HOME", ".local/share").join("applications");
+    writable.iter().find_map(|w| {
+        if mime.starts_with(w) {
+            Some(mime.clone())
+        } else if apps.starts_with(w) || w.starts_with(&apps) {
+            Some(apps.clone())
+        } else {
+            None
+        }
+    })
+}
+
 /// The platform opener, resolved outside the agent's reach.
 fn opener() -> Option<std::path::PathBuf> {
     if cfg!(target_os = "macos") {
@@ -86,26 +155,30 @@ pub(crate) fn serve(
     reader: &mut impl BufRead,
     reply: &mut impl Write,
     hosts: &[String],
+    limiter: &Limiter,
+    home: &Path,
     log: &super::Log,
 ) {
     let Some(url) = super::runtime::read_line(reader, MAX_LEN as u64 + 2) else {
         return;
     };
-    let answer = match check(&url, hosts) {
+    let answer = match check(&url, hosts).and_then(|()| limiter.take(Instant::now())) {
         Err(why) => {
             log.line("open_url", &format!("DENIED {why}"));
             format!("denied: {why}")
         }
-        Ok(()) => match opener().map(|o| spawn_opener(&o, &url)) {
+        Ok(busy) => match opener().map(|o| spawn_opener(&o, &url, home, busy)) {
             Some(Ok(())) => {
                 log.line("open_url", "ALLOWED");
                 "ok".to_string()
             }
             Some(Err(e)) => {
+                limiter.busy.store(false, Ordering::Release);
                 log.line("open_url", &format!("FAIL {e}"));
                 "failed: cannot run the opener".to_string()
             }
             None => {
+                limiter.busy.store(false, Ordering::Release);
                 log.line("open_url", "FAIL no opener");
                 "failed: no opener on the host".to_string()
             }
@@ -114,17 +187,63 @@ pub(crate) fn serve(
     let _ = writeln!(reply, "{answer}");
 }
 
-fn spawn_opener(opener: &Path, url: &str) -> std::io::Result<()> {
+/// The opener's environment, like the broker's other host children
+/// (`runtime::host_env`): cleared, then HOME, the trusted PATH so `xdg-open`
+/// cannot pick up an agent-planted `gio` or browser, TMPDIR, and only what a
+/// desktop opener needs to reach the session and the user's browser choice.
+fn opener_env(
+    home: &Path,
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut env = vec![
+        ("HOME", home.as_os_str().to_owned()),
+        ("PATH", crate::git::TRUSTED_BIN_DIRS.join(":").into()),
+        ("TMPDIR", std::env::temp_dir().into_os_string()),
+    ];
+    let mut keep = vec!["LANG", "LC_ALL"];
+    if cfg!(target_os = "linux") {
+        keep.extend([
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
+            "XDG_CONFIG_HOME",
+            "XDG_CONFIG_DIRS",
+            "XDG_DATA_HOME",
+            "XDG_DATA_DIRS",
+        ]);
+    }
+    env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
+    env
+}
+
+fn spawn_opener(
+    opener: &Path,
+    url: &str,
+    home: &Path,
+    busy: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     // `opener` is an absolute path from `opener()`, never a PATH lookup.
     #[allow(clippy::disallowed_methods)]
-    let mut child = Command::new(opener)
+    let mut cmd = Command::new(opener);
+    cmd.env_clear();
+    for (k, v) in opener_env(home, &|k| std::env::var_os(k)) {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    // Reap it without holding the connection.
-    std::thread::spawn(move || child.wait());
+    // Reap it without holding the connection; the slot frees on exit.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        busy.store(false, Ordering::Release);
+    });
     Ok(())
 }
 
@@ -191,15 +310,14 @@ mod tests {
     use super::*;
 
     fn hosts() -> Vec<String> {
-        vec![LOGIN_HOST.into(), "fgw.example".into()]
+        vec!["fgw.example".into()]
     }
 
     #[test]
     fn accepts_allowed_hosts() {
         for u in [
-            "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize?client_id=x&state=y",
-            "https://LOGIN.microsoftonline.com/",
-            "https://login.microsoftonline.com:443/x",
+            "https://FGW.example/authorize?state=y",
+            "https://fgw.example:443/x",
             "https://fgw.example",
             "https://fgw.example?x=1",
             "https://fgw.example#f",
@@ -219,7 +337,11 @@ mod tests {
             ("https://evil.example/", "host not allowed"),
             ("https://fgw.example.evil/", "host not allowed"),
             ("https://sub.fgw.example/", "host not allowed"),
-            ("https://login.microsoftonline.com./", "host not allowed"),
+            ("https://fgw.example./", "host not allowed"),
+            (
+                "https://login.microsoftonline.com/t/oauth2/v2.0/authorize?client_id=x",
+                "host not allowed",
+            ),
             ("https://xn--fgw-example/", "host not allowed"),
             ("https://user@fgw.example/", "userinfo in URL"),
             ("https://evil.example@fgw.example/", "userinfo in URL"),
@@ -240,10 +362,80 @@ mod tests {
     }
 
     #[test]
-    fn only_the_login_host_without_an_oauth_spec() {
-        let only = allowed_hosts(std::iter::empty());
-        assert_eq!(only, vec![LOGIN_HOST.to_string()]);
-        assert!(check("https://fgw.example/", &only).is_err());
+    fn no_hosts_without_an_oauth_spec() {
+        let none = allowed_hosts(std::iter::empty());
+        assert!(none.is_empty());
+        assert!(check("https://login.microsoftonline.com/", &none).is_err());
+    }
+
+    #[test]
+    fn limiter_caps_rate_and_outstanding_openers() {
+        let l = Limiter::default();
+        let t = Instant::now();
+        let busy = l.take(t).unwrap();
+        assert_eq!(l.take(t).err(), Some("another URL is still being opened"));
+        busy.store(false, Ordering::Release);
+        l.take(t).unwrap().store(false, Ordering::Release);
+        l.take(t).unwrap().store(false, Ordering::Release);
+        assert_eq!(
+            l.take(t).err(),
+            Some("rate limit: too many URLs opened this minute")
+        );
+        l.take(t + WINDOW).unwrap();
+    }
+
+    #[test]
+    fn opener_config_writable_finds_covering_roots() {
+        let h = Path::new("/h");
+        let none = |_: &str| None;
+        let w = |roots: &[&str]| {
+            let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
+            opener_config_writable(h, &roots, &none)
+        };
+        assert_eq!(w(&["/h/proj", "/h/.config/opencode"]), None);
+        assert_eq!(w(&["/h"]), Some("/h/.config/mimeapps.list".into()));
+        assert_eq!(w(&["/h/.config"]), Some("/h/.config/mimeapps.list".into()));
+        assert_eq!(
+            w(&["/h/.local/share/applications/x"]),
+            Some("/h/.local/share/applications".into())
+        );
+        let xdg = |k: &str| (k == "XDG_CONFIG_HOME").then(|| "/cfg".into());
+        assert_eq!(
+            opener_config_writable(h, &[Path::new("/cfg")], &xdg),
+            Some("/cfg/mimeapps.list".into())
+        );
+    }
+
+    #[test]
+    fn opener_env_is_scrubbed() {
+        let get = |k: &str| {
+            Some(std::ffi::OsString::from(match k {
+                "PATH" => "/agent/bin",
+                _ => "v",
+            }))
+        };
+        let env = opener_env(Path::new("/h"), &get);
+        let keys: Vec<_> = env.iter().map(|(k, _)| *k).collect();
+        let path = &env.iter().find(|(k, _)| *k == "PATH").unwrap().1;
+        assert_eq!(
+            path,
+            &std::ffi::OsString::from(crate::git::TRUSTED_BIN_DIRS.join(":"))
+        );
+        for k in [
+            "CPLT_MCP_SOCKET",
+            "GITHUB_TOKEN",
+            "LD_PRELOAD",
+            "BROWSER",
+            "GIO_EXTRA_MODULES",
+        ] {
+            assert!(!keys.contains(&k), "{k} leaked: {keys:?}");
+        }
+        assert!(keys.contains(&"HOME") && keys.contains(&"LANG"));
+        if cfg!(target_os = "linux") {
+            assert!(keys.contains(&"DISPLAY") && keys.contains(&"DBUS_SESSION_BUS_ADDRESS"));
+        } else {
+            assert!(!keys.contains(&"DISPLAY"));
+        }
     }
 
     #[test]
@@ -266,6 +458,8 @@ mod tests {
             &mut "https://evil.example/\n".as_bytes(),
             &mut out,
             &hosts(),
+            &Limiter::default(),
+            Path::new("/h"),
             &log,
         );
         assert_eq!(
