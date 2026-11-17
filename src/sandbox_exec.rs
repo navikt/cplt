@@ -1131,6 +1131,41 @@ fn github_credential_helper_config(
     env
 }
 
+/// `open`/`xdg-open` shims that hand an https URL to the MCP broker's
+/// `open_url` op (#910). Only when the broker runs: without it nothing on the
+/// host would answer.
+fn install_open_url_shims(cmd: &mut Command, sandbox: &crate::sandbox::PreparedSandbox) {
+    use std::os::unix::fs::PermissionsExt;
+    let (Some(socket), Some(scratch)) = (
+        sandbox.mcp_socket.as_deref(),
+        sandbox.scratch_dir.as_deref(),
+    ) else {
+        return;
+    };
+    let Ok(cplt) = std::env::current_exe() else {
+        return;
+    };
+    let dir = scratch.join("open-url-bin");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for name in crate::mcp_broker::OPEN_URL_SHIMS {
+        let real = which_binary(name);
+        let script = crate::mcp_broker::open_url_shim(
+            &cplt.to_string_lossy(),
+            &socket.to_string_lossy(),
+            real.as_deref().map(|p| p.to_string_lossy()).as_deref(),
+        );
+        let path = dir.join(name);
+        if std::fs::write(&path, script).is_err()
+            || std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).is_err()
+        {
+            return;
+        }
+    }
+    prepend_path(cmd, &[&dir]);
+}
+
 fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
     let mut paths: Vec<PathBuf> = prefixes.iter().map(|path| path.to_path_buf()).collect();
     // The PATH already set on `cmd` wins over ours, so the shim dir that
@@ -1642,6 +1677,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -1792,6 +1828,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -2035,6 +2072,7 @@ fn exec_bwrap(
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
