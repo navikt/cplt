@@ -903,20 +903,48 @@ fn gh_gate_scope_check_disabled() {
 
 #[test]
 fn gh_gate_allows_cross_repo_api_get_endpoint() {
-    let (_, stderr, ok) = gh_gate(&["api", "/repos/evil-org/other-repo/pulls"]);
-    assert!(
-        ok,
-        "cross-repo API GET under repos/{{owner}}/{{repo}} should be allowed: {stderr}"
-    );
-    let (_, stderr, ok) = gh_gate(&["api", "-X", "GET", "repos/x/y/commits", "-f", "q=1"]);
-    assert!(
-        ok,
-        "cross-repo API -X GET with -f query params should be allowed: {stderr}"
-    );
-    let (_, stderr, ok) = gh_gate(&["api", "orgs/other-org/repos"]);
-    assert!(ok, "orgs/{{org}}/repos GET should be allowed: {stderr}");
-    let (_, stderr, ok) = gh_gate(&["api", "orgs/other-org/members"]);
-    assert_refused(&stderr, ok, "outside the startup repo");
+    for args in [
+        &["api", "/repos/evil-org/other-repo/pulls"][..],
+        &["api", "-X", "GET", "repos/x/y/commits", "-f", "q=1"],
+        &["api", "repos/x/y/environments"],
+        &["api", "orgs/other-org/repos"],
+        &["api", "users/octocat"],
+        &["api", "users/octocat/repos"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert!(
+            ok,
+            "allowlisted cross-repo API GET {args:?} should be allowed: {stderr}"
+        );
+    }
+
+    for args in [
+        &["api", "orgs/other-org/members"][..],
+        &["api", "repos/x/y/secret-scanning/alerts"],
+        &["api", "repos/x/y/hooks"],
+        &["api", "repos/x/y/security-advisories"],
+        &["api", "repos/x/y/actions/variables"],
+        &["api", "repos/x/y/actions/secrets"],
+        &["api", "repos/x/y/environments/x/secrets"],
+        &["api", "users/me/events"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert_refused(&stderr, ok, "outside the startup repo");
+    }
+
+    // In-scope sensitive endpoints remain allowed as before.
+    for args in [
+        &["api", "repos/navikt/cplt/secret-scanning/alerts"][..],
+        &["api", "repos/navikt/cplt/hooks"],
+        &["api", "repos/navikt/cplt/actions/secrets"],
+        &["api", "repos/navikt/cplt/environments/x/secrets"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert!(
+            ok,
+            "in-scope API GET {args:?} should remain allowed: {stderr}"
+        );
+    }
 }
 
 #[test]

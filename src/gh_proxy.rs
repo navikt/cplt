@@ -1419,15 +1419,65 @@ fn is_cross_repo_api_read(cmd: &ParsedCommand) -> bool {
         return false;
     }
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-    let valid_ident =
-        |s: &str| decode_api_path(s).is_some_and(|d| !d.is_empty() && !d.contains('/'));
 
     match segments.as_slice() {
-        ["repos", owner, repo, ..] => valid_ident(owner) && valid_ident(repo),
-        ["search", kind, ..] => valid_ident(kind),
-        ["orgs", org, "repos"] => valid_ident(org),
-        ["users", user, ..] => valid_ident(user),
+        ["repos", owner, repo, rest @ ..] => {
+            valid_api_ident(owner) && valid_api_ident(repo) && is_allowed_cross_repo_subpath(rest)
+        }
+        ["search", kind, ..] => valid_api_ident(kind),
+        ["orgs", org, "repos"] => valid_api_ident(org),
+        ["users", user] | ["users", user, "repos"] => valid_api_ident(user),
         ["rate_limit"] => true,
+        _ => false,
+    }
+}
+
+fn valid_api_ident(segment: &str) -> bool {
+    decode_api_path(segment).is_some_and(|d| !d.is_empty() && !d.contains('/'))
+}
+
+/// Allowlist of `repos/{owner}/{repo}/...` sub-paths permitted for cross-repo
+/// REST GET reads (code and project data only; secrets, hooks, advisories,
+/// collaborators, traffic, and environment secrets/variables stay scoped to the
+/// startup repository).
+fn is_allowed_cross_repo_subpath(rest: &[&str]) -> bool {
+    let valid_tail = |tail: &[&str]| !tail.is_empty() && tail.iter().all(|s| valid_api_ident(s));
+
+    match rest {
+        [] => true,
+        ["commits"]
+        | ["readme"]
+        | ["branches"]
+        | ["tags"]
+        | ["pulls"]
+        | ["issues"]
+        | ["labels"]
+        | ["milestones"]
+        | ["languages"]
+        | ["topics"]
+        | ["contributors"]
+        | ["deployments"]
+        | ["environments"] => true,
+        ["commits", sha] => valid_api_ident(sha),
+        ["commits", sha, "check-runs" | "status" | "statuses"] => valid_api_ident(sha),
+        ["compare", tail @ ..] => valid_tail(tail),
+        ["contents", tail @ ..] | ["releases", tail @ ..] => {
+            tail.iter().all(|s| valid_api_ident(s))
+        }
+        ["git", "blobs" | "trees" | "commits" | "tags", tail @ ..] => valid_tail(tail),
+        ["git", "refs", tail @ ..] => tail.iter().all(|s| valid_api_ident(s)),
+        ["branches", branch] => valid_api_ident(branch),
+        ["pulls", n] => valid_api_ident(n),
+        ["pulls", n, "files" | "commits" | "reviews" | "comments"] => valid_api_ident(n),
+        ["issues", n] => valid_api_ident(n),
+        ["issues", n, "comments" | "events" | "timeline"] => valid_api_ident(n),
+        ["actions", "runs"] | ["actions", "workflows"] => true,
+        ["actions", "runs", id] => valid_api_ident(id),
+        ["actions", "runs", id, "jobs" | "logs"] => valid_api_ident(id),
+        ["actions", "workflows", id, "runs"] => valid_api_ident(id),
+        ["check-runs", tail @ ..] | ["check-suites", tail @ ..] | ["stats", tail @ ..] => {
+            valid_tail(tail)
+        }
         _ => false,
     }
 }
@@ -2518,8 +2568,9 @@ fn gate_with_scope_resolver(
                          Ways forward: read-only commands take an explicit repository — \
                          `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
                          <number>`, `gh issue view -R <owner>/<repo> <number>` — and REST GET \
-                         reads via `gh api` (under `repos/<owner>/<repo>/...`, `search/*`, \
-                         `orgs/<org>/repos`, `users/*`, or `rate_limit`; pass `-X GET` with \
+                         reads via `gh api` (allowlisted code/project paths under \
+                         `repos/<owner>/<repo>/...`, `search/*`, `orgs/<org>/repos`, \
+                         `users/<user>`, `users/<user>/repos`, or `rate_limit`; pass `-X GET` with \
                          `-f`/`-F` query parameters, without `--input`) are allowed against any \
                          repository. Writes and state changes remain limited to the scope set. \
                          If the agent works in that repository too and it is checked out on this \
@@ -10446,13 +10497,61 @@ mod tests {
             ..GatePolicy::default()
         };
 
-        // Cross-repo GET on repos/{owner}/{repo}/... and safe read endpoints are allowed
-        // without extra config, and do not pin GH_REPO to the startup repo.
+        // Cross-repo GET on allowlisted code/project paths under repos/{owner}/{repo}/...
+        // and safe global read endpoints are allowed without extra config, and do not pin
+        // GH_REPO to the startup repo.
         for args in [
-            &["api", "repos/x/y/commits"][..],
+            &["api", "repos/x/y"][..],
+            &["api", "repos/x/y/commits"],
             &["api", "/repos/x/y/commits"],
             &["api", "https://api.github.com/repos/x/y/commits?per_page=5"],
-            &["api", "repos/x/y"],
+            &["api", "repos/x/y/commits/abc123"],
+            &["api", "repos/x/y/commits/abc123/check-runs"],
+            &["api", "repos/x/y/commits/abc123/status"],
+            &["api", "repos/x/y/commits/abc123/statuses"],
+            &["api", "repos/x/y/compare/main...feat/bar"],
+            &["api", "repos/x/y/contents"],
+            &["api", "repos/x/y/contents/src/main.rs"],
+            &["api", "repos/x/y/readme"],
+            &["api", "repos/x/y/git/blobs/abc123"],
+            &["api", "repos/x/y/git/trees/abc123"],
+            &["api", "repos/x/y/git/commits/abc123"],
+            &["api", "repos/x/y/git/refs"],
+            &["api", "repos/x/y/git/refs/heads/main"],
+            &["api", "repos/x/y/git/tags/abc123"],
+            &["api", "repos/x/y/branches"],
+            &["api", "repos/x/y/branches/main"],
+            &["api", "repos/x/y/tags"],
+            &["api", "repos/x/y/releases"],
+            &["api", "repos/x/y/releases/latest"],
+            &["api", "repos/x/y/releases/tags/v1.0.0"],
+            &["api", "repos/x/y/pulls"],
+            &["api", "repos/x/y/pulls/1"],
+            &["api", "repos/x/y/pulls/1/files"],
+            &["api", "repos/x/y/pulls/1/commits"],
+            &["api", "repos/x/y/pulls/1/reviews"],
+            &["api", "repos/x/y/pulls/1/comments"],
+            &["api", "repos/x/y/issues"],
+            &["api", "repos/x/y/issues/1"],
+            &["api", "repos/x/y/issues/1/comments"],
+            &["api", "repos/x/y/issues/1/events"],
+            &["api", "repos/x/y/issues/1/timeline"],
+            &["api", "repos/x/y/labels"],
+            &["api", "repos/x/y/milestones"],
+            &["api", "repos/x/y/languages"],
+            &["api", "repos/x/y/topics"],
+            &["api", "repos/x/y/contributors"],
+            &["api", "repos/x/y/actions/runs"],
+            &["api", "repos/x/y/actions/runs/42"],
+            &["api", "repos/x/y/actions/runs/42/jobs"],
+            &["api", "repos/x/y/actions/runs/42/logs"],
+            &["api", "repos/x/y/actions/workflows"],
+            &["api", "repos/x/y/actions/workflows/ci.yml/runs"],
+            &["api", "repos/x/y/check-runs/42"],
+            &["api", "repos/x/y/check-suites/42"],
+            &["api", "repos/x/y/deployments"],
+            &["api", "repos/x/y/environments"],
+            &["api", "repos/x/y/stats/contributors"],
             &["api", "-X", "GET", "repos/x/y/commits", "-f", "q=1"],
             &[
                 "api",
@@ -10461,7 +10560,6 @@ mod tests {
                 "-F",
                 "per_page=10",
             ],
-            &["api", "repos/x/y/pulls/1/merge"],
             &["api", "search/repositories", "-X", "GET", "-f", "q=cplt"],
             &["api", "orgs/other-org/repos"],
             &["api", "users/octocat"],
@@ -10476,10 +10574,17 @@ mod tests {
             );
         }
 
-        // In-scope GET continues to pin GH_REPO, and -X GET -f works in-scope too.
+        // In-scope GET continues to pin GH_REPO (including sensitive repo paths and -X GET -f).
         for args in [
             &["api", "repos/navikt/cplt/commits"][..],
             &["api", "-X", "GET", "repos/navikt/cplt/commits", "-f", "q=1"],
+            &["api", "repos/navikt/cplt/pulls/1/merge"],
+            &["api", "repos/navikt/cplt/secret-scanning/alerts"],
+            &["api", "repos/navikt/cplt/hooks"],
+            &["api", "repos/navikt/cplt/security-advisories"],
+            &["api", "repos/navikt/cplt/actions/variables"],
+            &["api", "repos/navikt/cplt/actions/secrets"],
+            &["api", "repos/navikt/cplt/environments/x/secrets"],
         ] {
             let approval = gate_with_repo_scope(args, &default_policy, &scope, None)
                 .unwrap_or_else(|e| panic!("expected in-scope {args:?} to be allowed, got: {e}"));
@@ -10491,7 +10596,8 @@ mod tests {
         }
 
         // Cross-repo writes, implied POST (-f without -X), --input, graphql, merge writes,
-        // and non-allowlisted endpoints must all be refused (under both default and allow_api_write).
+        // sensitive cross-repo paths, and non-allowlisted endpoints must all be refused
+        // (under both default and allow_api_write).
         for args in [
             &["api", "-X", "POST", "repos/x/y/commits"][..],
             &["api", "repos/x/y/commits", "-f", "q=1"],
@@ -10517,6 +10623,25 @@ mod tests {
             &["api", "-X", "PUT", "repos/x/y/pulls/1/merge"],
             &["api", "-X", "PUT", "repos/navikt/cplt/pulls/1/merge"],
             &["api", "repos/x/y/merges", "-f", "base=main"],
+            &["api", "repos/x/y/pulls/1/merge"],
+            &["api", "repos/x/y/secret-scanning/alerts"],
+            &["api", "repos/x/y/hooks"],
+            &["api", "repos/x/y/security-advisories"],
+            &["api", "repos/x/y/actions/variables"],
+            &["api", "repos/x/y/actions/secrets"],
+            &["api", "repos/x/y/dependabot/alerts"],
+            &["api", "repos/x/y/codespaces"],
+            &["api", "repos/x/y/keys"],
+            &["api", "repos/x/y/collaborators"],
+            &["api", "repos/x/y/invitations"],
+            &["api", "repos/x/y/environments/x/secrets"],
+            &["api", "repos/x/y/environments/x/variables"],
+            &["api", "repos/x/y/environments/x"],
+            &["api", "repos/x/y/traffic/views"],
+            &["api", "repos/x/y/vulnerability-alerts"],
+            &["api", "repos/x/y/branches/main/protection"],
+            &["api", "users/me/events"],
+            &["api", "users/octocat/orgs"],
             &["api", "user"],
             &["api", "user/repos"],
             &["api", "orgs/other-org/members"],
