@@ -83,13 +83,24 @@ pub fn gh_hosts() -> &'static [String] {
 /// host arrives on stdin, is marked by [`FOREIGN_CREDENTIAL_ENV`] instead.
 /// With `gh_guard.hosts` unset every exec gets the token, as before.
 #[must_use]
-pub fn github_token_allowed(args: &[&str], pin: Option<&str>) -> bool {
-    github_token_allowed_for(args, pin, gh_hosts())
+pub fn github_token_allowed(args: &[&str], pin: Option<&str>, host_pin: Option<&str>) -> bool {
+    github_token_allowed_for(args, pin, host_pin, gh_hosts())
 }
 
-fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) -> bool {
+fn github_token_allowed_for(
+    args: &[&str],
+    pin: Option<&str>,
+    host_pin: Option<&str>,
+    hosts: &[String],
+) -> bool {
     let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
+    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
+    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
+    // `*.ghe.com` destination can therefore receive the github.com token by
+    // mistake. A URL in a body or notes on any other host is just text.
+    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
     if pin.and_then(foreign_pin_host).is_some_and(foreign)
+        || host_pin.is_some_and(|h| foreign(h) || not_github(h))
         || requested_hostname(args).is_some_and(foreign)
     {
         return false;
@@ -97,11 +108,6 @@ fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) 
     // gh honours an explicit selector over `GH_REPO`: a host-qualified `-R`
     // or a URL argument decides where the request goes, so a destination off
     // github.com gets no github.com token, whatever was pinned.
-    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
-    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
-    // `*.ghe.com` destination can therefore receive the github.com token by
-    // mistake. A URL in a body or notes on any other host is just text.
-    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
     // Go's url.Parse lowercases the scheme, so `HTTPS://` is a URL too.
     fn http_rest(arg: &str) -> Option<&str> {
         let (scheme, rest) = arg.split_once("://")?;
@@ -1618,6 +1624,23 @@ fn is_merge_endpoint(endpoint: &str) -> bool {
     )
 }
 
+/// Destination host for a `gh api` command that passed [`github_api_endpoint_path`].
+///
+/// An absolute URL (only `https://api.github.com/` passes that check) decides
+/// the host whatever `--hostname` says. A bare path goes to `--hostname`, else
+/// `github.com` (`GH_HOST` is scrubbed on every exec).
+fn api_destination_host(cmd: &ParsedCommand) -> &str {
+    if cmd
+        .api_endpoint
+        .as_deref()
+        .is_some_and(|e| e.contains("://"))
+    {
+        DEFAULT_GH_HOST
+    } else {
+        cmd.hostname.as_deref().unwrap_or(DEFAULT_GH_HOST)
+    }
+}
+
 /// Check if a command targets the expected repository.
 ///
 /// `startup_repo` should be in "owner/name" format. Explicit repository targets
@@ -1649,18 +1672,7 @@ pub fn is_repo_in_scope(
             };
             let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
             let decoded = decode_api_path(path)?;
-            // An absolute URL (only `https://api.github.com/` passes above)
-            // decides the host whatever `--hostname` says. A bare path goes to
-            // `--hostname`, else github.com (`GH_HOST` is scrubbed on every exec).
-            let host = if cmd
-                .api_endpoint
-                .as_deref()
-                .is_some_and(|e| e.contains("://"))
-            {
-                DEFAULT_GH_HOST
-            } else {
-                cmd.hostname.as_deref().unwrap_or(DEFAULT_GH_HOST)
-            };
+            let host = api_destination_host(cmd);
             if let Some(endpoint_repo) = extract_repo_from_api_path(endpoint) {
                 return scope_member(scope, &member_name(host, &endpoint_repo));
             }
@@ -2221,6 +2233,13 @@ pub struct GateApproval {
     /// The caller must set `GH_REPO` to this value before executing `gh`, pinning
     /// the operation to the same repository the guard approved.
     pub repo_scope: Option<String>,
+    /// Destination host pinned for an unpinned cross-repo `gh api` read.
+    ///
+    /// When set, the caller must set `GH_HOST` to this value and pass it to
+    /// [`github_token_allowed`] so a bare cross-repo GET cannot fall back to
+    /// a logged-in `*.ghe.com` tenant and a foreign `--hostname` never gets
+    /// the `github.com` token.
+    pub host_pin: Option<String>,
     /// The command is a `gh pr merge` let through by `allow_pr_merge`: the
     /// caller must still run [`check_merge_protection`] against `repo_scope`
     /// and refuse on any error. The gate itself makes no network calls.
@@ -2365,6 +2384,16 @@ fn gate_with_scope_resolver(
     resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
     real_git: Option<&Path>,
 ) -> Result<GateApproval, Refusal> {
+    gate_with_scope_resolver_for(args, policy, gh_hosts(), resolve_scope, real_git)
+}
+
+fn gate_with_scope_resolver_for(
+    args: &[&str],
+    policy: &GatePolicy,
+    hosts: &[String],
+    resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
+    real_git: Option<&Path>,
+) -> Result<GateApproval, Refusal> {
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
         // These are read-only informational invocations — always allow.
@@ -2466,7 +2495,6 @@ fn gate_with_scope_resolver(
             });
         }
 
-        let hosts = gh_hosts();
         if let Some(hostname) = requested_hostname(args)
             && !host_allowed(hostname, hosts)
         {
@@ -2500,7 +2528,7 @@ fn gate_with_scope_resolver(
             let cross_repo_read = is_cross_repo_api_read(&cmd);
             let scope = match resolve_scope() {
                 Ok(scope) => scope,
-                Err(_) if cross_repo_read => return Ok(GateApproval::default()),
+                Err(_) if cross_repo_read => return Ok(cross_repo_read_approval(&cmd)),
                 Err(reason) => {
                     return Err(Refusal {
                         headline: format!(
@@ -2542,7 +2570,7 @@ fn gate_with_scope_resolver(
                     ..approval_from_scope(Some(member))
                 })
             } else if cross_repo_read {
-                Ok(GateApproval::default())
+                Ok(cross_repo_read_approval(&cmd))
             } else if let Some(invocation_repo) = invocation_repo.as_deref()
                 && scope_member(&scope, invocation_repo).is_none()
             {
@@ -2691,6 +2719,7 @@ fn graphql_approval(
     let graphql_targets = crate::gh_graphql::check(args, &scope).map_err(refuse)?;
     Ok(GateApproval {
         repo_scope: None,
+        host_pin: None,
         check_merge_protection: false,
         graphql_targets,
     })
@@ -2712,8 +2741,16 @@ fn approval_from_scope(repo_scope: Option<String>) -> GateApproval {
             let (host, repo) = split_member(&member);
             format!("{host}/{repo}")
         }),
+        host_pin: None,
         check_merge_protection: false,
         graphql_targets: Vec::new(),
+    }
+}
+
+fn cross_repo_read_approval(cmd: &ParsedCommand) -> GateApproval {
+    GateApproval {
+        host_pin: Some(api_destination_host(cmd).to_ascii_lowercase()),
+        ..GateApproval::default()
     }
 }
 
@@ -6504,10 +6541,22 @@ mod tests {
     #[test]
     fn github_token_stays_off_other_hosts() {
         let hosts = ghe_hosts();
-        let ok = |args: &[&str], pin| github_token_allowed_for(args, pin, &hosts);
+        let ok = |args: &[&str], pin| github_token_allowed_for(args, pin, None, &hosts);
         assert!(ok(&["pr", "list"], Some("github.com/o/r")));
         assert!(!ok(&["pr", "list"], Some("example.ghe.com/o/r")));
         assert!(!ok(&["api", "--hostname", "example.ghe.com", "user"], None));
+        assert!(!github_token_allowed_for(
+            &["api", "repos/x/y/commits"],
+            None,
+            Some("example.ghe.com"),
+            &hosts
+        ));
+        assert!(github_token_allowed_for(
+            &["api", "repos/x/y/commits"],
+            None,
+            Some("github.com"),
+            &hosts
+        ));
         // gh honours an explicit -R or URL over the pin.
         assert!(!ok(
             &["pr", "view", "1", "-R", "example.ghe.com/other/repo"],
@@ -6560,15 +6609,18 @@ mod tests {
                 "https://jira.example/X-1"
             ],
             None,
+            None,
             &github
         ));
         assert!(!github_token_allowed_for(
             &["pr", "view", "1", "-R", "x.ghe.com/o/r"],
             None,
+            None,
             &github
         ));
         assert!(!github_token_allowed_for(
             &["pr", "view", "https://x.ghe.com/o/r/pull/1"],
+            None,
             None,
             &github
         ));
@@ -6578,6 +6630,7 @@ mod tests {
         let github = vec!["github.com".to_string()];
         assert!(github_token_allowed_for(
             &["api", "--hostname", "example.ghe.com", "user"],
+            None,
             None,
             &github
         ));
@@ -10583,7 +10636,49 @@ mod tests {
                 approval.repo_scope, None,
                 "cross-repo read {args:?} must not pin GH_REPO"
             );
+            assert_eq!(
+                approval.host_pin.as_deref(),
+                Some("github.com"),
+                "cross-repo read {args:?} must pin GH_HOST to github.com"
+            );
         }
+
+        // Cross-repo read resolves destination host explicitly: github.com by
+        // default (even when scope resolution fails), or the allowed --hostname.
+        let hosts = ghe_hosts();
+        let bare = gate_with_scope_resolver_for(
+            &["api", "repos/x/y/commits"],
+            &default_policy,
+            &hosts,
+            || Err("no git".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(bare.repo_scope, None);
+        assert_eq!(bare.host_pin.as_deref(), Some("github.com"));
+        assert!(github_token_allowed_for(
+            &["api", "repos/x/y/commits"],
+            bare.repo_scope.as_deref(),
+            bare.host_pin.as_deref(),
+            &hosts
+        ));
+
+        let ghe = gate_with_scope_resolver_for(
+            &["api", "--hostname", "Example.GHE.com", "repos/x/y/commits"],
+            &default_policy,
+            &hosts,
+            || Ok(scope.to_vec()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ghe.repo_scope, None);
+        assert_eq!(ghe.host_pin.as_deref(), Some("example.ghe.com"));
+        assert!(!github_token_allowed_for(
+            &["api", "--hostname", "Example.GHE.com", "repos/x/y/commits"],
+            ghe.repo_scope.as_deref(),
+            ghe.host_pin.as_deref(),
+            &hosts
+        ));
 
         // In-scope GET continues to pin GH_REPO (including sensitive repo paths and -X GET -f).
         for args in [

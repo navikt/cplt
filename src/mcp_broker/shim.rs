@@ -62,21 +62,65 @@ pub(crate) fn pipe(tcp: TcpStream, unix: UnixStream) {
 }
 
 fn pipe_idle(tcp: TcpStream, unix: UnixStream, idle: std::time::Duration) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     let (Ok(mut t), Ok(mut u)) = (tcp.try_clone(), unix.try_clone()) else {
         return;
     };
+    // Set the slice timeout before spawning `back`: on macOS, SO_RCVTIMEO set
+    // after `read()` has already entered the kernel does not wake it.
+    let slice = idle.min(std::time::Duration::from_millis(100));
+    let _ = u.set_read_timeout(Some(slice));
+    let tcp_done = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&tcp_done);
     let back = std::thread::spawn(move || {
-        pump(&mut u, &mut t);
+        pump_until_idle(&mut u, &mut t, idle, &done);
         let _ = t.shutdown(Shutdown::Write);
     });
     let (mut t, mut u) = (tcp, unix);
     pump(&mut t, &mut u);
     let _ = u.shutdown(Shutdown::Write);
-    // The TCP side is done (the proxy closed, or its deadline fired): the
-    // unix peer still gets to finish a half-closed stream, but an idle read
-    // now ends the back pump instead of blocking forever.
-    let _ = u.set_read_timeout(Some(idle));
+    tcp_done.store(true, Ordering::Release);
     let _ = back.join();
+}
+
+fn pump_until_idle(
+    from: &mut impl std::io::Read,
+    to: &mut impl Write,
+    idle: std::time::Duration,
+    peer_done: &std::sync::atomic::AtomicBool,
+) {
+    let mut buf = [0u8; 16 * 1024];
+    let mut idle_since: Option<std::time::Instant> = None;
+    loop {
+        match from.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if !peer_done.load(std::sync::atomic::Ordering::Acquire) {
+                    idle_since = None;
+                    continue;
+                }
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= idle {
+                    return;
+                }
+            }
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                idle_since = None;
+                if to.write_all(&buf[..n]).and_then(|()| to.flush()).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Set by the broker on bwrap for the Linux child (#849): JSON

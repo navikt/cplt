@@ -976,6 +976,69 @@ fn gh_gate_blocks_cross_repo_api_writes_and_input() {
 }
 
 #[test]
+fn gh_gate_pins_host_and_scopes_token_for_cross_repo_api_reads() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s|%s|%s\\n' \"${GH_REPO-}\" \"${GH_HOST-}\" \"${GH_TOKEN-}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let token_dir = temp.path().join("tokens");
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join(".gh-exec-token"), "gho_github_token\n").unwrap();
+
+    let run = |args: &[&str]| {
+        cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--gh-host")
+            .arg("github.com")
+            .arg("--gh-host")
+            .arg("example.ghe.com")
+            .arg("--")
+            .args(args)
+            .env("GH_HOST", "example.ghe.com")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .output()
+            .expect("cplt gh-gate should run")
+    };
+
+    // Bare cross-repo GET must pin GH_HOST=github.com (never fall back to a
+    // logged-in *.ghe.com host) and attach the github.com token.
+    let bare = run(&["api", "repos/x/y/commits"]);
+    assert!(
+        bare.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stdout).trim(),
+        "|github.com|gho_github_token"
+    );
+
+    // Allowed --hostname pins GH_HOST to that host and withholds GH_TOKEN.
+    let ghe = run(&["api", "--hostname", "example.ghe.com", "repos/x/y/commits"]);
+    assert!(
+        ghe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ghe.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ghe.stdout).trim(),
+        "|example.ghe.com|"
+    );
+}
+
+#[test]
 fn gh_gate_allows_same_repo_api_endpoint() {
     let (_, _, ok) = gh_gate(&["api", "/repos/navikt/cplt/pulls"]);
     assert!(ok, "same-repo API GET via URL path should be allowed");
