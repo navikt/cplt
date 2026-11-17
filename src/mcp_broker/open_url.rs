@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,7 +30,9 @@ const OAUTH_CREDENTIAL: &str = "oauth";
 const MAX_OPENS: usize = 3;
 const WINDOW: Duration = Duration::from_secs(60);
 
-/// Hosts a URL may name: each oauth spec's `egressHosts`, the fleet gateway.
+/// Hosts a URL may name: each oauth spec's remote URL host, the fleet gateway,
+/// i.e. an `egressHosts` entry that an https URL in the spec's `command` names.
+/// Other egress hosts stay out, so listing a login host there opens nothing.
 /// No new config key: the spec already names where its OAuth flow goes.
 /// The Entra login host is deliberately absent (owner decision 2026-11-17):
 /// an authorize URL for a first-party client_id with a loopback redirect
@@ -40,7 +42,15 @@ const WINDOW: Duration = Duration::from_secs(60);
 pub(crate) fn allowed_hosts<'a>(specs: impl Iterator<Item = &'a Spec>) -> Vec<String> {
     specs
         .filter(|s| s.credential.name == OAUTH_CREDENTIAL)
-        .flat_map(|s| s.egress_hosts.iter().map(|h| h.to_ascii_lowercase()))
+        .flat_map(|s| {
+            s.egress_hosts
+                .iter()
+                .map(|h| h.to_ascii_lowercase())
+                .filter(|h| {
+                    let one = [h.clone()];
+                    s.command.iter().any(|a| check(a, &one).is_ok())
+                })
+        })
         .collect()
 }
 
@@ -112,33 +122,119 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
     }
 }
 
-/// On Linux `xdg-open` picks the handler from `mimeapps.list` and `.desktop`
-/// files under the user's XDG dirs. If the sandbox can write one of those, it
-/// can make the host run any command for an allowed URL. Returns the first
-/// such path among `writable` roots; the launcher then turns the op off.
+/// The system XDG dirs the opener sees, fixed rather than inherited.
+const OPENER_CONFIG_DIRS: &[&str] = &["/etc/xdg"];
+const OPENER_DATA_DIRS: &[&str] = &["/usr/local/share", "/usr/share"];
+
+/// The opener picks the handler from files the sandbox must not write: on
+/// Linux `mimeapps.list`, `.desktop` files and the KDE ksycoca cache under
+/// the XDG dirs it is given; on macOS the LaunchServices prefs. Returns the
+/// first such path a `writable` root reaches (symlinks resolved on both
+/// sides); the launcher then turns the op off.
 #[must_use]
 pub fn opener_config_writable(
     home: &Path,
     writable: &[&Path],
     get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
+) -> Option<PathBuf> {
+    find_writable(home, writable, get, cfg!(target_os = "macos"))
+}
+
+fn find_writable(
+    home: &Path,
+    writable: &[&Path],
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    macos: bool,
+) -> Option<PathBuf> {
+    handler_paths(home, get, macos)
+        .into_iter()
+        .find(|p| reaches(p, writable))
+}
+
+/// Every file or tree the opener reads a handler from.
+fn handler_paths(
+    home: &Path,
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    macos: bool,
+) -> Vec<PathBuf> {
+    if macos {
+        return vec![home.join("Library/Preferences")];
+    }
     let xdg = |k: &str, d: &str| {
         get(k)
-            .map(std::path::PathBuf::from)
+            .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .unwrap_or_else(|| home.join(d))
     };
-    let mime = xdg("XDG_CONFIG_HOME", ".config").join("mimeapps.list");
-    let apps = xdg("XDG_DATA_HOME", ".local/share").join("applications");
-    writable.iter().find_map(|w| {
-        if mime.starts_with(w) {
-            Some(mime.clone())
-        } else if apps.starts_with(w) || w.starts_with(&apps) {
-            Some(apps.clone())
-        } else {
-            None
+    let mut v = vec![
+        xdg("XDG_CONFIG_HOME", ".config").join("mimeapps.list"),
+        xdg("XDG_DATA_HOME", ".local/share").join("applications"),
+        xdg("XDG_CACHE_HOME", ".cache"),
+    ];
+    v.extend(
+        OPENER_CONFIG_DIRS
+            .iter()
+            .map(|d| Path::new(d).join("mimeapps.list")),
+    );
+    v.extend(
+        OPENER_DATA_DIRS
+            .iter()
+            .map(|d| Path::new(d).join("applications")),
+    );
+    v
+}
+
+/// The path with symlinks resolved as far as it exists.
+fn real(p: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            return rest.iter().rev().fold(c, |a, n| a.join(n));
         }
-    })
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Whether a writable root covers `p`, sits inside it, or covers the target
+/// of any symlink under it (a stow-style `.desktop` link into a repo).
+fn reaches(p: &Path, writable: &[&Path]) -> bool {
+    let roots: Vec<PathBuf> = writable
+        .iter()
+        .flat_map(|w| [w.to_path_buf(), real(w)])
+        .collect();
+    let mut targets = vec![p.to_path_buf(), real(p)];
+    if let (Ok(to), Some(dir)) = (std::fs::read_link(p), p.parent()) {
+        targets.push(real(&dir.join(to)));
+    }
+    collect_links(p, 4, &mut targets);
+    targets
+        .iter()
+        .any(|t| roots.iter().any(|w| t.starts_with(w) || w.starts_with(t)))
+}
+
+fn collect_links(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if e.file_type().is_ok_and(|t| t.is_symlink()) {
+            // read_link too: a dangling link into a repo is filled in later.
+            if let Ok(to) = std::fs::read_link(&path) {
+                out.push(real(&dir.join(to)));
+            }
+            out.push(real(&path));
+        } else if depth > 0 && e.file_type().is_ok_and(|t| t.is_dir()) {
+            collect_links(&path, depth - 1, out);
+        }
+    }
 }
 
 /// The platform opener, resolved outside the agent's reach.
@@ -211,10 +307,12 @@ fn opener_env(
             "XDG_CURRENT_DESKTOP",
             "XDG_SESSION_TYPE",
             "XDG_CONFIG_HOME",
-            "XDG_CONFIG_DIRS",
             "XDG_DATA_HOME",
-            "XDG_DATA_DIRS",
+            "XDG_CACHE_HOME",
         ]);
+        // Fixed, so the handler search stays inside what the check covers.
+        env.push(("XDG_CONFIG_DIRS", OPENER_CONFIG_DIRS.join(":").into()));
+        env.push(("XDG_DATA_DIRS", OPENER_DATA_DIRS.join(":").into()));
     }
     env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
     env
@@ -390,7 +488,7 @@ mod tests {
         let none = |_: &str| None;
         let w = |roots: &[&str]| {
             let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
-            opener_config_writable(h, &roots, &none)
+            find_writable(h, &roots, &none, false)
         };
         assert_eq!(w(&["/h/proj", "/h/.config/opencode"]), None);
         assert_eq!(w(&["/h"]), Some("/h/.config/mimeapps.list".into()));
@@ -399,11 +497,93 @@ mod tests {
             w(&["/h/.local/share/applications/x"]),
             Some("/h/.local/share/applications".into())
         );
+        assert_eq!(w(&["/h/.cache/ksycoca"]), Some("/h/.cache".into()));
+        assert_eq!(w(&["/etc/xdg"]), Some("/etc/xdg/mimeapps.list".into()));
+        assert_eq!(
+            w(&["/usr/share/applications"]),
+            Some("/usr/share/applications".into())
+        );
         let xdg = |k: &str| (k == "XDG_CONFIG_HOME").then(|| "/cfg".into());
         assert_eq!(
-            opener_config_writable(h, &[Path::new("/cfg")], &xdg),
+            find_writable(h, &[Path::new("/cfg")], &xdg, false),
             Some("/cfg/mimeapps.list".into())
         );
+        // macOS: LaunchServices prefs.
+        let mac = |roots: &[&str]| {
+            let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
+            find_writable(h, &roots, &none, true)
+        };
+        assert_eq!(mac(&["/h/proj"]), None);
+        assert_eq!(mac(&["/h"]), Some("/h/Library/Preferences".into()));
+        assert_eq!(
+            mac(&["/h/Library/Preferences/com.apple.LaunchServices"]),
+            Some("/h/Library/Preferences".into())
+        );
+    }
+
+    #[test]
+    fn opener_config_writable_resolves_symlinks() {
+        use std::os::unix::fs::symlink;
+        let t = std::env::temp_dir().join(format!("cplt-ou-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (home, repo) = (t.join("home"), t.join("repo"));
+        std::fs::create_dir_all(repo.join("dot/applications")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/applications")).unwrap();
+        let none = |_: &str| None;
+        let roots = [repo.as_path()];
+        assert_eq!(find_writable(&home, &roots, &none, false), None);
+        // A stow-style ~/.config into the writable repo.
+        symlink(repo.join("dot"), home.join(".config")).unwrap();
+        assert_eq!(
+            find_writable(&home, &roots, &none, false),
+            Some(home.join(".config/mimeapps.list"))
+        );
+        std::fs::remove_file(home.join(".config")).unwrap();
+        // One .desktop file linked into the repo.
+        symlink(
+            repo.join("dot/applications/x.desktop"),
+            home.join(".local/share/applications/x.desktop"),
+        )
+        .unwrap();
+        assert_eq!(
+            find_writable(&home, &roots, &none, false),
+            Some(home.join(".local/share/applications"))
+        );
+        // A writable root given through a symlink.
+        std::fs::remove_file(home.join(".local/share/applications/x.desktop")).unwrap();
+        symlink(&home, t.join("alias")).unwrap();
+        let alias = t.join("alias");
+        assert_eq!(
+            find_writable(&home, &[alias.as_path()], &none, false),
+            Some(home.join(".config/mimeapps.list"))
+        );
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn allowed_hosts_are_only_remote_url_hosts() {
+        static OAUTH: crate::mcp_broker::credential::Credential =
+            crate::mcp_broker::credential::Credential {
+                name: OAUTH_CREDENTIAL,
+                command: None,
+                probe: None,
+                keychain: false,
+                write_dirs: &[],
+                linux_write_dirs: &[],
+                linux_read_paths: &[],
+            };
+        let spec = Spec {
+            id: "x".into(),
+            file: PathBuf::new(),
+            credential: &OAUTH,
+            command: vec!["mcp-remote".into(), "https://FGW.example/mcp".into()],
+            program: PathBuf::new(),
+            egress_hosts: vec!["fgw.example".into(), "login.microsoftonline.com".into()],
+            allow: std::collections::BTreeSet::default(),
+            graphql: std::collections::BTreeSet::default(),
+            login: None,
+        };
+        assert_eq!(allowed_hosts([&spec].into_iter()), vec!["fgw.example"]);
     }
 
     #[test]
@@ -431,6 +611,14 @@ mod tests {
             assert!(!keys.contains(&k), "{k} leaked: {keys:?}");
         }
         assert!(keys.contains(&"HOME") && keys.contains(&"LANG"));
+        let val = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        if cfg!(target_os = "linux") {
+            assert_eq!(val("XDG_CONFIG_DIRS"), Some("/etc/xdg".into()));
+            assert_eq!(
+                val("XDG_DATA_DIRS"),
+                Some("/usr/local/share:/usr/share".into())
+            );
+        }
         if cfg!(target_os = "linux") {
             assert!(keys.contains(&"DISPLAY") && keys.contains(&"DBUS_SESSION_BUS_ADDRESS"));
         } else {

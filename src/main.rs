@@ -7466,7 +7466,7 @@ fn assemble_sandbox(
         let broker = cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
             .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
             .ok()?;
-        if cfg!(target_os = "linux") && broker.open_url_enabled() {
+        if broker.open_url_enabled() {
             let writable: Vec<&std::path::Path> = [sandbox_config.project_dir]
                 .into_iter()
                 .chain(
