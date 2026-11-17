@@ -6158,6 +6158,19 @@ for addr in [('127.0.0.1', {port}), ('0.0.0.0', {port}), ('::1', {port}), ('::',
             "expected all 4 bind attempts denied.\noutput: {output}"
         );
 
+        // Only that port is denied: a neighbouring port still binds.
+        let other = port + 1;
+        let (output, success) = run_sandboxed(
+            &profile,
+            &format!(
+                "{py} -c \"import socket; s = socket.socket(); s.bind(('127.0.0.1', {other})); print('OTHER_OK')\""
+            ),
+        );
+        assert!(
+            success && output.contains("OTHER_OK"),
+            "port {other} must still bind.\noutput: {output}"
+        );
+
         let _ = fs::remove_file(&profile);
     }
 

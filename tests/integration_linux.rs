@@ -3808,11 +3808,9 @@ print('BIND_OK')
         );
     }
 
-    // ignore: `specs_use_oauth` is false, so no session sets `restrict_oauth_bind` yet and the
-    // bind is never restricted. The policy side is covered by the unit test
-    // `restrict_oauth_bind_gates_landlock_bind_rules`. Remove once OAuth specs exist (#910).
+    // `specs_use_oauth` is false until OAuth specs exist (#910), so the test sets the
+    // debug-build hook CPLT_TEST_OAUTH_PORT_GUARD=1 to make the broker hold the port.
     #[test]
-    #[ignore = "needs a broker session that holds the OAuth port; specs_use_oauth is false (#910)"]
     fn landlock_denies_oauth_callback_port_bind_with_broker() {
         require_bwrap!(4);
         if !have_python3() {
@@ -3869,6 +3867,7 @@ finally:
                 &script,
             ])
             .env("HOME", &home_path)
+            .env("CPLT_TEST_OAUTH_PORT_GUARD", "1")
             .env_remove("XDG_CONFIG_HOME")
             .output()
             .expect("Failed to execute cplt");

@@ -120,7 +120,14 @@ fn bind_exclusive_loopback(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind((Ipv4Addr::LOCALHOST, port))
 }
 
+fn is_recoverable_bind_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{AddrInUse, Interrupted, TimedOut, WouldBlock};
+    matches!(e.kind(), AddrInUse | Interrupted | WouldBlock | TimedOut)
+}
+
 struct OAuthPortState {
+    /// Set on a permanent bind failure: the guard no longer protects the port.
+    failed: std::sync::atomic::AtomicBool,
     listener: Mutex<Option<TcpListener>>,
     stop: Mutex<bool>,
     wake: Condvar,
@@ -142,11 +149,13 @@ impl OAuthPortGuard {
 
     fn start_with_interval(port: u16, retry_interval: Duration) -> Self {
         let initial = bind_exclusive_loopback(port);
-        let needs_retry = matches!(
-            &initial,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
-        );
+        let needs_retry = matches!(&initial, Err(e) if is_recoverable_bind_error(e));
+        let permanent = initial.is_err() && !needs_retry;
+        if let Err(e) = &initial {
+            eprintln!("cplt: OAuth callback port {port} not claimed at start: {e}");
+        }
         let state = Arc::new(OAuthPortState {
+            failed: std::sync::atomic::AtomicBool::new(permanent),
             listener: Mutex::new(initial.ok()),
             stop: Mutex::new(false),
             wake: Condvar::new(),
@@ -175,8 +184,12 @@ impl OAuthPortGuard {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l);
                             return;
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
-                        Err(_) => return,
+                        Err(e) if is_recoverable_bind_error(&e) => {}
+                        Err(e) => {
+                            eprintln!("cplt: OAuth callback port {port} claim failed: {e}");
+                            s.failed.store(true, std::sync::atomic::Ordering::Release);
+                            return;
+                        }
                     }
                     stopped = s
                         .stop
@@ -186,6 +199,11 @@ impl OAuthPortGuard {
             })
         });
         Self { state, thread }
+    }
+
+    /// False once the guard gave up on a permanent bind failure.
+    fn is_active(&self) -> bool {
+        !self.state.failed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -227,7 +245,9 @@ pub struct Broker {
 /// Whether any brokered spec authenticates with OAuth. None does yet; the
 /// OAuth mechanism (cplt#910) flips this.
 fn specs_use_oauth(_specs: &[Spec]) -> bool {
-    false
+    // Debug-build test hook so integration tests can exercise the restricted
+    // sandbox before OAuth specs exist; ignored in release builds.
+    cfg!(debug_assertions) && std::env::var("CPLT_TEST_OAUTH_PORT_GUARD").as_deref() == Ok("1")
 }
 
 impl Broker {
@@ -384,7 +404,9 @@ impl Broker {
     ///
     /// Only sessions with an OAuth-using brokered server reserve the port.
     pub fn holds_oauth_port(&self) -> bool {
-        self.oauth_guard.is_some()
+        self.oauth_guard
+            .as_ref()
+            .is_some_and(OAuthPortGuard::is_active)
     }
 
     pub fn specs(&self) -> impl Iterator<Item = &Spec> {
@@ -2293,6 +2315,20 @@ mod tests {
         assert_eq!(reuseport, 0, "SO_REUSEPORT must never be set on the broker");
         let err = bind_exclusive_loopback(port).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn oauth_port_guard_gives_up_on_permanent_failure() {
+        // Privileged port: PermissionDenied for non-root, which is not recoverable.
+        if bind_exclusive_loopback(1).is_ok() {
+            return;
+        }
+        let guard = OAuthPortGuard::start_with_interval(1, Duration::from_millis(10));
+        assert!(!guard.is_claimed());
+        assert!(
+            !guard.is_active(),
+            "permanent failure must deactivate the guard"
+        );
     }
 
     #[test]

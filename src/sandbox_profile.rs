@@ -3980,7 +3980,7 @@ fn emit_network_rules(
     // agent must never bind it and intercept an OAuth code flow.
     sbpl!(
         sb,
-        "(deny network-bind (local ip \"localhost:{OAUTH_CALLBACK_PORT}\"))"
+        "(deny network-bind (local ip \"*:{OAUTH_CALLBACK_PORT}\"))"
     );
     if proxy_forced {
         // A background URLSession hands the transfer to nsurlsessiond, which
