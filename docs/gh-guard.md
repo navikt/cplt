@@ -375,11 +375,11 @@ subcommand.
 
 | Condition | Default | With `allow_api_write = true` | Reason |
 |-----------|---------|-------------------------------|--------|
-| No method flag (implicit GET) | ScopeCheck | ScopeCheck | Read operation, must target current repo |
-| `-X GET` | ScopeCheck | ScopeCheck | Explicit read, must target current repo |
-| `-X POST/PUT/PATCH` | Block | ScopeCheck | Write operation, opt-in required |
+| No method flag (implicit GET) | ScopeCheck / cross-repo allowlist | ScopeCheck / cross-repo allowlist | Read operation: in-scope repos pinned, allowlisted REST GETs permitted cross-repo |
+| `-X GET` (even with `-f`/`-F` query params, no `--input`) | ScopeCheck / cross-repo allowlist | ScopeCheck / cross-repo allowlist | Explicit read: `-f`/`-F` become query params; allowlisted REST GETs permitted cross-repo |
+| `-X POST/PUT/PATCH` | Block | ScopeCheck | Write operation, opt-in required (in-scope only) |
 | `-X DELETE` | Block | Block | Destructive, always blocked |
-| `-f`, `-F`, or `--input` present | Block | ScopeCheck | Input implies write, opt-in required |
+| `-f`, `-F` without `-X GET`, or `--input` | Block | ScopeCheck | Implies POST or sends a request body; opt-in required (in-scope only) |
 | `graphql` endpoint | See [below](#gh-api-graphql) | See [below](#gh-api-graphql) | Read-only queries of allowlisted pull request and review-thread fields on a repository in scope, and three review-thread mutations with verified targets. Everything else is blocked |
 | Write to `repos/{o}/{r}/pulls/{n}/merge` or `repos/{o}/{r}/merges` | Block | Block | A merge must go through `gh pr merge` and its `allow_pr_merge` check |
 
@@ -416,17 +416,33 @@ cplt --allow-api-write -- -p "post review comment replies"
 
 ### API scope enforcement
 
-GET requests are repo-scoped. Only endpoints matching
-`/repos/{current-owner}/{current-repo}/...` are allowed, which blocks:
+REST `GET` requests (including `-X GET` with `-f`/`-F` query parameters, without `--input`) are allowed cross-repo on:
+
+- `/repos/{owner}/{repo}` (repo root) and these code/project sub-paths only:
+  - `commits`, `commits/{sha}` and its `check-runs`, `status`, `statuses`
+  - `compare/*`, `contents/*`, `readme`
+  - `git/{blobs,trees,commits,refs,tags}/*`
+  - `branches`, `branches/{b}`, `tags`, `releases`, `releases/*`
+  - `pulls`, `pulls/{n}` and its `files`, `commits`, `reviews`, `comments`
+  - `issues`, `issues/{n}` and its `comments`, `events`, `timeline`
+  - `labels`, `milestones`, `languages`, `topics`, `contributors`
+  - `actions/runs`, `actions/runs/{id}` and its `jobs`, `logs`
+  - `actions/workflows`, `actions/workflows/{id}/runs`
+  - `check-runs/*`, `check-suites/*`, `deployments`, `environments` (names only), `stats/*`
+- `/search/*`
+- `/orgs/{org}/repos`
+- `/users/{user}` and `/users/{user}/repos`
+- `/rate_limit`
+
+Relative paths without a leading resource prefix (such as `pulls/67/comments`) still resolve against the startup scope and require a matching invocation cwd. Everything else under `/repos/{owner}/{repo}/...` remains restricted to repositories in the startup scope — including sensitive endpoints such as `secret-scanning`, `hooks`, `security-advisories`, `actions/secrets`, `actions/variables`, `dependabot/*`, `codespaces/*`, `keys`, `collaborators`, `invitations`, `environments/*/secrets`, `environments/*/variables`, `traffic`, and `vulnerability-alerts`. Non-allowlisted org and user endpoints remain blocked:
 
 - `/orgs/.../audit-log`, org audit logs, which contain employee PII
 - `/orgs/.../members`, org membership enumeration
 - `/orgs/.../teams`, team structure
-- `/user/repos`, private repos across all orgs
-- `/users/.../repos`, other users' repo lists
+- `/users/{user}/events` and other user sub-paths beyond `/users/{user}` and `/users/{user}/repos`
+- `/user` and `/user/repos`, authenticated user details and private repos across all orgs
 
-Agents that need current-repo data (issues, PRs, actions, commits) work normally.
-If an agent needs org-level access, the human should run those commands outside the sandbox.
+All `gh api` writes (`POST`/`PUT`/`PATCH`, `-f`/`-F` without `-X GET`, or `--input`) remain restricted to repositories in the startup scope (and require `allow_api_write = true`). If an agent needs org-level access beyond `/orgs/{org}/repos`, the human should run those commands outside the sandbox.
 
 ### `gh api graphql`
 
@@ -552,13 +568,15 @@ only happens when the command runs.
 ### Why `gh api` is stricter than other commands
 
 Higher-level commands like `gh repo view`, `gh repo list`, and `gh issue list` are
-allowed cross-repo. They output curated, read-only data rather than raw API
-responses with PII, agents commonly need them (checking dependencies,
-understanding upstream issues), and they do not expose sensitive org internals
-such as audit logs, SSO identities, or member emails.
+allowed cross-repo because they output curated, read-only data rather than raw API
+responses with PII or admin state, and agents commonly need them to check
+dependencies or upstream issues.
 
-Raw `gh api` can reach any REST endpoint, including exactly that sensitive
-org and user data, so it gets the tighter rule.
+Raw `gh api` can reach any REST endpoint — including repository secrets,
+webhooks, security advisories, org audit logs, and user events — so cross-repo
+reads are restricted to an explicit allowlist of code and project endpoints
+(`is_allowed_cross_repo_subpath` in `src/gh_proxy.rs`), while all other
+repository paths and all writes stay scoped to the startup repository.
 
 ## Error messages
 
@@ -633,7 +651,7 @@ What the gh/git guard stops, and what it does not.
 | Agent modifies secrets/variables | `gh secret set/delete`, `gh variable set/delete` blocked |
 | Agent installs malicious gh extensions | `gh extension install/remove` blocked |
 | Agent operates on other repositories | `-R other/repo` checked via ScopeCheck |
-| Agent uses `gh api` POST to mutate state | Presence of `-f`, `-F`, `--input`, or non-GET method is blocked by default; opt-in with `allow_api_write = true` (scope-checked to current repo) |
+| Agent uses `gh api` POST to mutate state | Non-GET methods, `--input`, and `-f`/`-F` without `-X GET` are blocked by default; opt-in with `allow_api_write = true` (scope-checked to repos in scope, cross-repo writes still blocked) |
 | Agent uses `gh api graphql` to read outside the repository | Queries must start at a repository in scope and select only allowlisted pull request and review-thread fields; fragments are refused. See [`gh api graphql`](#gh-api-graphql) |
 | Agent uses `gh api graphql` for mutations | Only `resolveReviewThread`, `unresolveReviewThread` and `addPullRequestReviewThreadReply` are allowed, after a lookup shows every target is in a repository in scope. The document is parsed, and anything unparseable is refused. See [`gh api graphql`](#gh-api-graphql) |
 
@@ -641,7 +659,7 @@ What the gh/git guard stops, and what it does not.
 
 | Gap | Explanation | Mitigation |
 |-----|-------------|------------|
-| **Data exfiltration via `gh api` GET** | The agent can `gh api /repos/owner/repo/contents/secret.yml` to read and then exfiltrate via network | Use network proxy domain filtering (`--blocked-domains`) |
+| **Data exfiltration via cross-repo `gh api` GET** | On allowlisted endpoints (such as `/repos/{owner}/{repo}/contents/...`), the agent can read files and project data from any accessible repo and exfiltrate via network | Use network proxy domain filtering (`--blocked-domains`) |
 | **Direct `curl` with `GH_TOKEN`** | Agent can `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/...` bypassing the gh wrapper entirely | `GH_TOKEN` is only injected for Copilot; other agents get it only on the real `gh` process, or by reading the exec token at `$TMPDIR/.gh-exec-token`; network proxy logs all outbound connections |
 | **Wrapper bypass via real binary path** | Agent can `cat $(which gh)` to discover the real `gh` path in the wrapper script and call it directly | The wrapper uses `exec` so the real path is in the script; Seatbelt blocks writes to the scratch bin dir, but the path stays readable |
 | **Agent edits `.github/workflows/`** | Agent can write CI configs that run on push, so destructive actions happen in CI, not locally | Code review (git diff). Under `standard` a feature-branch push is allowed and can trigger `on: push` workflows; only `strict`, which blocks every push, keeps them from running |

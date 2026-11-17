@@ -3725,22 +3725,37 @@ mod tests {
         );
     }
 
+    /// Write a fake executable via a staging file + `/bin/cp` so parallel test
+    /// forks never inherit a writable descriptor to `bin` and trigger `ETXTBSY`.
+    #[cfg(unix)]
+    fn write_fake_opencode(dir: &Path, bin: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let staging = dir.join("opencode.staging");
+        std::fs::write(&staging, script).unwrap();
+        #[allow(clippy::disallowed_methods)] // absolute: other tests swap PATH
+        let copied = std::process::Command::new("/bin/cp")
+            .arg(&staging)
+            .arg(bin)
+            .status()
+            .unwrap();
+        assert!(copied.success(), "cp of the fake binary failed: {copied}");
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn opencode_v2_probe_is_cached() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("opencode");
         let count = dir.path().join("count");
-        std::fs::write(
+        write_fake_opencode(
+            dir.path(),
             &bin,
-            format!(
+            &format!(
                 "#!/bin/sh\necho x >> {}\necho opencode v2.0.24\n",
                 count.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let home = dir.path().join("home");
         assert_eq!(is_opencode_v2(&bin, &home), Some(true));
         assert_eq!(is_opencode_v2(&bin, &home), Some(true));
@@ -3763,7 +3778,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn opencode_v2_unknown_probe_is_retried_and_not_cached() {
-        use std::os::unix::fs::PermissionsExt;
         // The hang case gets an injected probe that reports a timeout (#735).
         // The real timeout path is covered in discover.rs.
         use crate::discover::{VersionProbe, probe_version_within};
@@ -3780,21 +3794,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let bin = dir.path().join("opencode");
             let script = format!("#!/bin/sh\n{body}\n");
-            // Written in-process, the script would be open for writing while
-            // other test threads fork; a fork in that window inherits the
-            // descriptor and the exec fails ETXTBSY. `cp` gives `bin` an inode
-            // whose only writable descriptor lives in the child (as in
-            // discover.rs `fake_binary`).
-            let staging = dir.path().join("opencode.staging");
-            std::fs::write(&staging, script).unwrap();
-            #[allow(clippy::disallowed_methods)] // absolute: other tests swap PATH
-            let copied = std::process::Command::new("/bin/cp")
-                .arg(&staging)
-                .arg(&bin)
-                .status()
-                .unwrap();
-            assert!(copied.success(), "cp of the fake binary failed: {copied}");
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_fake_opencode(dir.path(), &bin, &script);
             let home = dir.path().join("home");
             let mut timeouts = Vec::new();
             let verdict = opencode_v2_within(&bin, &home, |p, t| {
@@ -3814,8 +3814,7 @@ mod tests {
         // A 1.x answer is unchanged.
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("opencode");
-        std::fs::write(&bin, "#!/bin/sh\necho 1.18.35\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_fake_opencode(dir.path(), &bin, "#!/bin/sh\necho 1.18.35\n");
         assert_eq!(is_opencode_v2(&bin, &dir.path().join("home")), Some(false));
     }
 

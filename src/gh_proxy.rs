@@ -45,8 +45,10 @@ pub struct ParsedCommand {
     pub repo_flag: Option<String>,
     /// For `gh api`: the HTTP method (from `-X`/`--method`).
     pub method: Option<String>,
-    /// For `gh api`: whether input flags are present (`-f`, `-F`, `--input`).
+    /// For `gh api`: whether input/field flags are present (`-f`, `-F`, `--field`, `--raw-field`, `--input`).
     pub has_input_flags: bool,
+    /// For `gh api`: whether `--input` (file/stdin request body) is present.
+    pub has_input_file: bool,
     /// For `gh api`: the endpoint path (e.g., "/repos/owner/repo/pulls").
     pub api_endpoint: Option<String>,
     /// The `--hostname` value, if present. Qualifies a `gh api` `/repos/` path
@@ -81,13 +83,24 @@ pub fn gh_hosts() -> &'static [String] {
 /// host arrives on stdin, is marked by [`FOREIGN_CREDENTIAL_ENV`] instead.
 /// With `gh_guard.hosts` unset every exec gets the token, as before.
 #[must_use]
-pub fn github_token_allowed(args: &[&str], pin: Option<&str>) -> bool {
-    github_token_allowed_for(args, pin, gh_hosts())
+pub fn github_token_allowed(args: &[&str], pin: Option<&str>, host_pin: Option<&str>) -> bool {
+    github_token_allowed_for(args, pin, host_pin, gh_hosts())
 }
 
-fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) -> bool {
+fn github_token_allowed_for(
+    args: &[&str],
+    pin: Option<&str>,
+    host_pin: Option<&str>,
+    hosts: &[String],
+) -> bool {
     let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
+    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
+    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
+    // `*.ghe.com` destination can therefore receive the github.com token by
+    // mistake. A URL in a body or notes on any other host is just text.
+    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
     if pin.and_then(foreign_pin_host).is_some_and(foreign)
+        || host_pin.is_some_and(|h| foreign(h) || not_github(h))
         || requested_hostname(args).is_some_and(foreign)
     {
         return false;
@@ -95,11 +108,6 @@ fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) 
     // gh honours an explicit selector over `GH_REPO`: a host-qualified `-R`
     // or a URL argument decides where the request goes, so a destination off
     // github.com gets no github.com token, whatever was pinned.
-    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
-    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
-    // `*.ghe.com` destination can therefore receive the github.com token by
-    // mistake. A URL in a body or notes on any other host is just text.
-    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
     // Go's url.Parse lowercases the scheme, so `HTTPS://` is a URL too.
     fn http_rest(arg: &str) -> Option<&str> {
         let (scheme, rest) = arg.split_once("://")?;
@@ -1166,6 +1174,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
     if command == "api" {
         let mut method = None;
         let mut has_input_flags = false;
+        let mut has_input_file = false;
         let mut repo_flag = None;
         let mut api_endpoint = None;
 
@@ -1194,13 +1203,13 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 method = Some(val.to_uppercase());
             } else if let Some(val) = arg.strip_prefix("--repo=") {
                 repo_flag = Some(val.to_string());
-            } else if arg.starts_with("--field=")
-                || arg.starts_with("--raw-field=")
-                || arg.starts_with("--input=")
-            {
-                // --field=key=value, --raw-field=key=value, --input=-
-                // These imply a mutating request (POST)
+            } else if arg.starts_with("--field=") || arg.starts_with("--raw-field=") {
+                // --field=key=value, --raw-field=key=value
+                // These imply POST unless `-X GET` is explicitly given.
                 has_input_flags = true;
+            } else if arg.starts_with("--input=") {
+                has_input_flags = true;
+                has_input_file = true;
             } else if !arg.starts_with("--")
                 && arg.starts_with('-')
                 && arg.len() >= 2
@@ -1237,8 +1246,13 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                             i += 1;
                         }
                     }
-                    "--input" | "--field" | "--raw-field" => {
+                    "--field" | "--raw-field" => {
                         has_input_flags = true;
+                        i += 1;
+                    }
+                    "--input" => {
+                        has_input_flags = true;
+                        has_input_file = true;
                         i += 1;
                     }
                     "--repo" => {
@@ -1265,6 +1279,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             repo_flag: repo_flag.or(global_repo_flag),
             method,
             has_input_flags,
+            has_input_file,
             api_endpoint,
             hostname: requested_hostname(args).map(str::to_string),
         });
@@ -1330,6 +1345,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         repo_flag: repo_flag.or(global_repo_flag),
         method: None,
         has_input_flags: false,
+        has_input_file: false,
         api_endpoint: None,
         hostname: requested_hostname(args).map(str::to_string),
     })
@@ -1376,13 +1392,121 @@ pub fn evaluate_with_policy(cmd: &ParsedCommand, allow_api_write: bool) -> Polic
     }
 }
 
+/// Whether a `gh api` command performs a write (or supplies `--input`).
+///
+/// Mirrors `gh api`'s HTTP method resolution:
+/// - `--input` always supplies a request body (even with `-X GET`), so it is treated as a write
+/// - explicit `-X`/`--method` decides the method (`-X GET` sends `-f`/`-F` as query params)
+/// - without `-X`/`--method`, any `-f`/`-F`/`--field`/`--raw-field` implies `POST`
+fn is_api_write(cmd: &ParsedCommand) -> bool {
+    if cmd.has_input_file {
+        return true;
+    }
+    match cmd.method.as_deref() {
+        Some("GET") => false,
+        Some(_) => true,
+        None => cmd.has_input_flags,
+    }
+}
+
+/// Whether `cmd` is a cross-repo `gh api` REST read on an allowlisted endpoint.
+fn is_cross_repo_api_read(cmd: &ParsedCommand) -> bool {
+    if cmd.command != "api" || cmd.repo_flag.is_some() || is_api_write(cmd) {
+        return false;
+    }
+    let Some(endpoint) = cmd.api_endpoint.as_deref() else {
+        return false;
+    };
+    let Ok(endpoint) = github_api_endpoint_path(endpoint) else {
+        return false;
+    };
+    let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
+    // gh expands `{owner}`, `{repo}`, `{branch}` and legacy `:owner`-style
+    // placeholders from the cwd; a branch name can contain slashes, so a
+    // placeholder can smuggle a denied sub-path past the allowlist.
+    // gh's regex is `(\:(owner|repo|branch)\b|\{[a-z]+\})`, unanchored.
+    if path.contains(['{', '}'])
+        || [":owner", ":repo", ":branch"]
+            .iter()
+            .any(|p| path.contains(p))
+    {
+        return false;
+    }
+    if decode_api_path(path).is_none() {
+        return false;
+    }
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+
+    match segments.as_slice() {
+        ["repos", owner, repo, rest @ ..] => {
+            valid_api_ident(owner) && valid_api_ident(repo) && is_allowed_cross_repo_subpath(rest)
+        }
+        ["search", kind, ..] => valid_api_ident(kind),
+        ["orgs", org, "repos"] => valid_api_ident(org),
+        ["users", user] | ["users", user, "repos"] => valid_api_ident(user),
+        ["rate_limit"] => true,
+        _ => false,
+    }
+}
+
+fn valid_api_ident(segment: &str) -> bool {
+    decode_api_path(segment).is_some_and(|d| !d.is_empty() && !d.contains('/'))
+}
+
+/// Allowlist of `repos/{owner}/{repo}/...` sub-paths permitted for cross-repo
+/// REST GET reads (code and project data only; secrets, hooks, advisories,
+/// collaborators, traffic, and environment secrets/variables stay scoped to the
+/// startup repository).
+fn is_allowed_cross_repo_subpath(rest: &[&str]) -> bool {
+    let valid_tail = |tail: &[&str]| !tail.is_empty() && tail.iter().all(|s| valid_api_ident(s));
+
+    match rest {
+        [] => true,
+        ["commits"]
+        | ["readme"]
+        | ["branches"]
+        | ["tags"]
+        | ["pulls"]
+        | ["issues"]
+        | ["labels"]
+        | ["milestones"]
+        | ["languages"]
+        | ["topics"]
+        | ["contributors"]
+        | ["deployments"]
+        | ["environments"] => true,
+        ["commits", sha] => valid_api_ident(sha),
+        ["commits", sha, "check-runs" | "status" | "statuses"] => valid_api_ident(sha),
+        ["compare", tail @ ..] => valid_tail(tail),
+        ["contents", tail @ ..] | ["releases", tail @ ..] => {
+            tail.iter().all(|s| valid_api_ident(s))
+        }
+        ["git", "blobs" | "trees" | "commits" | "tags", tail @ ..] => valid_tail(tail),
+        ["git", "refs", tail @ ..] => tail.iter().all(|s| valid_api_ident(s)),
+        ["branches", branch] => valid_api_ident(branch),
+        ["pulls", n] => valid_api_ident(n),
+        ["pulls", n, "files" | "commits" | "reviews" | "comments"] => valid_api_ident(n),
+        ["issues", n] => valid_api_ident(n),
+        ["issues", n, "comments" | "events" | "timeline"] => valid_api_ident(n),
+        ["actions", "runs"] | ["actions", "workflows"] => true,
+        ["actions", "runs", id] => valid_api_ident(id),
+        ["actions", "runs", id, "jobs" | "logs"] => valid_api_ident(id),
+        ["actions", "workflows", id, "runs"] => valid_api_ident(id),
+        ["check-runs", tail @ ..] | ["check-suites", tail @ ..] | ["stats", tail @ ..] => {
+            valid_tail(tail)
+        }
+        _ => false,
+    }
+}
+
 /// Special policy evaluation for `gh api`.
 ///
-/// GET requests are scope-checked. Any other method (or presence of input
-/// flags that imply a write) is blocked by default. When `allow_api_write`
-/// is true, writes are scope-checked instead of blocked. GraphQL is blocked
-/// here in every spelling; for the exact `graphql` endpoint the gate ignores
-/// this verdict and decides with `graphql_approval` instead (#414).
+/// GET requests are scope-checked (with allowlisted REST reads also permitted
+/// cross-repo at the gate). Any other effective method (or `--input`, or `-f`/`-F`
+/// without `-X GET`) is blocked by default. When `allow_api_write` is true,
+/// writes are scope-checked instead of blocked. GraphQL is blocked here in
+/// every spelling; for the exact `graphql` endpoint the gate ignores this
+/// verdict and decides with `graphql_approval` instead (#414).
 fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
     // Block the GraphQL endpoint. Spellings `gh` does not treat as GraphQL
     // (`/graphql`, full URL, query string) stay blocked. Exact `graphql` is parsed
@@ -1438,7 +1562,7 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
     // A REST merge skips `gh pr merge`, and with it the `allow_pr_merge`
     // conditions and gh's refusal to merge a blocked pull request without
     // `--admin`. Refused even with allow_api_write.
-    let is_write = cmd.has_input_flags || cmd.method.as_deref().is_some_and(|m| m != "GET");
+    let is_write = is_api_write(cmd);
     if is_write && cmd.api_endpoint.as_deref().is_some_and(is_merge_endpoint) {
         return PolicyResult {
             decision: Decision::Block,
@@ -1447,40 +1571,36 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
         };
     }
 
-    // If input flags are present, it's implicitly a write
-    if cmd.has_input_flags {
-        return if allow_api_write {
-            PolicyResult {
-                decision: Decision::ScopeCheck,
-                reason: "gh api write (input flags) — scope-checked (allow_api_write=true)",
-            }
-        } else {
-            PolicyResult {
-                decision: Decision::Block,
-                reason: "gh api with input flags implies write operation",
-            }
-        };
-    }
-
-    match cmd.method.as_deref() {
-        None | Some("GET") => PolicyResult {
-            decision: Decision::ScopeCheck,
-            reason: "gh api GET — scope-checked",
-        },
-        // DELETE handled above (before the input-flags shortcut).
-        Some(_) => {
-            if allow_api_write {
+    if is_write {
+        if cmd.has_input_flags {
+            return if allow_api_write {
                 PolicyResult {
                     decision: Decision::ScopeCheck,
-                    reason: "gh api write method — scope-checked (allow_api_write=true)",
+                    reason: "gh api write (input flags) — scope-checked (allow_api_write=true)",
                 }
             } else {
                 PolicyResult {
                     decision: Decision::Block,
-                    reason: "gh api with non-GET method",
+                    reason: "gh api with input flags implies write operation",
                 }
-            }
+            };
         }
+        return if allow_api_write {
+            PolicyResult {
+                decision: Decision::ScopeCheck,
+                reason: "gh api write method — scope-checked (allow_api_write=true)",
+            }
+        } else {
+            PolicyResult {
+                decision: Decision::Block,
+                reason: "gh api with non-GET method",
+            }
+        };
+    }
+
+    PolicyResult {
+        decision: Decision::ScopeCheck,
+        reason: "gh api GET — scope-checked",
     }
 }
 
@@ -1502,6 +1622,23 @@ fn is_merge_endpoint(endpoint: &str) -> bool {
         segments.as_slice(),
         ["repos", _, _, "pulls", _, "merge"] | ["repos", _, _, "merges"]
     )
+}
+
+/// Destination host for a `gh api` command that passed [`github_api_endpoint_path`].
+///
+/// An absolute URL (only `https://api.github.com/` passes that check) decides
+/// the host whatever `--hostname` says. A bare path goes to `--hostname`, else
+/// `github.com` (`GH_HOST` is scrubbed on every exec).
+fn api_destination_host(cmd: &ParsedCommand) -> &str {
+    if cmd
+        .api_endpoint
+        .as_deref()
+        .is_some_and(|e| e.contains("://"))
+    {
+        DEFAULT_GH_HOST
+    } else {
+        cmd.hostname.as_deref().unwrap_or(DEFAULT_GH_HOST)
+    }
 }
 
 /// Check if a command targets the expected repository.
@@ -1535,28 +1672,15 @@ pub fn is_repo_in_scope(
             };
             let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
             let decoded = decode_api_path(path)?;
-            // An absolute URL (only `https://api.github.com/` passes above)
-            // decides the host whatever `--hostname` says. A bare path goes to
-            // `--hostname`, else github.com (`GH_HOST` is scrubbed on every exec).
-            let host = if cmd
-                .api_endpoint
-                .as_deref()
-                .is_some_and(|e| e.contains("://"))
-            {
-                DEFAULT_GH_HOST
-            } else {
-                cmd.hostname.as_deref().unwrap_or(DEFAULT_GH_HOST)
-            };
+            let host = api_destination_host(cmd);
             if let Some(endpoint_repo) = extract_repo_from_api_path(endpoint) {
                 return scope_member(scope, &member_name(host, &endpoint_repo));
             }
-            // Write operations (input flags or non-GET method) require an explicit
+            // Write operations (effective non-GET method or `--input`) require an explicit
             // /repos/{owner}/{repo}/... path — no relative-path fallback.
             // This prevents top-level API endpoints (gists, app/installations, teams, etc.)
             // from being treated as in-scope just because they don't match a deny-list.
-            let is_write =
-                cmd.has_input_flags || matches!(cmd.method.as_deref(), Some(m) if m != "GET");
-            if is_write {
+            if is_api_write(cmd) {
                 return None;
             }
             // For reads: check if this looks like a relative path (no leading absolute prefix)
@@ -1641,6 +1765,10 @@ fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
 
     if cmd.command != "api" {
         return true;
+    }
+
+    if is_cross_repo_api_read(cmd) {
+        return false;
     }
 
     // An explicit /repos/{owner}/{repo}/ API path already carries its target;
@@ -2105,6 +2233,13 @@ pub struct GateApproval {
     /// The caller must set `GH_REPO` to this value before executing `gh`, pinning
     /// the operation to the same repository the guard approved.
     pub repo_scope: Option<String>,
+    /// Destination host pinned for an unpinned cross-repo `gh api` read.
+    ///
+    /// When set, the caller must set `GH_HOST` to this value and pass it to
+    /// [`github_token_allowed`] so a bare cross-repo GET cannot fall back to
+    /// a logged-in `*.ghe.com` tenant and a foreign `--hostname` never gets
+    /// the `github.com` token.
+    pub host_pin: Option<String>,
     /// The command is a `gh pr merge` let through by `allow_pr_merge`: the
     /// caller must still run [`check_merge_protection`] against `repo_scope`
     /// and refuse on any error. The gate itself makes no network calls.
@@ -2249,6 +2384,16 @@ fn gate_with_scope_resolver(
     resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
     real_git: Option<&Path>,
 ) -> Result<GateApproval, Refusal> {
+    gate_with_scope_resolver_for(args, policy, gh_hosts(), resolve_scope, real_git)
+}
+
+fn gate_with_scope_resolver_for(
+    args: &[&str],
+    policy: &GatePolicy,
+    hosts: &[String],
+    resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
+    real_git: Option<&Path>,
+) -> Result<GateApproval, Refusal> {
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
         // These are read-only informational invocations — always allow.
@@ -2350,7 +2495,6 @@ fn gate_with_scope_resolver(
             });
         }
 
-        let hosts = gh_hosts();
         if let Some(hostname) = requested_hostname(args)
             && !host_allowed(hostname, hosts)
         {
@@ -2381,15 +2525,22 @@ fn gate_with_scope_resolver(
                 return Ok(GateApproval::default());
             }
 
-            let scope = resolve_scope().map_err(|reason| Refusal {
-                headline: format!(
-                    "'gh {} {}' cannot verify target repository scope.",
-                    cmd.command,
-                    cmd.subcommand.as_deref().unwrap_or("")
-                ),
-                guidance: format!("Reason: {reason}."),
-                agent_note: &[RESTRICTED, NOTE],
-            })?;
+            let cross_repo_read = is_cross_repo_api_read(&cmd);
+            let scope = match resolve_scope() {
+                Ok(scope) => scope,
+                Err(_) if cross_repo_read => return Ok(cross_repo_read_approval(&cmd)),
+                Err(reason) => {
+                    return Err(Refusal {
+                        headline: format!(
+                            "'gh {} {}' cannot verify target repository scope.",
+                            cmd.command,
+                            cmd.subcommand.as_deref().unwrap_or("")
+                        ),
+                        guidance: format!("Reason: {reason}."),
+                        agent_note: &[RESTRICTED, NOTE],
+                    });
+                }
+            };
 
             let invocation_repo = if requires_invocation_repo_check(&cmd) {
                 Some(resolve_invocation_repo(real_git).map_err(|reason| Refusal {
@@ -2418,6 +2569,8 @@ fn gate_with_scope_resolver(
                     check_merge_protection: gated_merge,
                     ..approval_from_scope(Some(member))
                 })
+            } else if cross_repo_read {
+                Ok(cross_repo_read_approval(&cmd))
             } else if let Some(invocation_repo) = invocation_repo.as_deref()
                 && scope_member(&scope, invocation_repo).is_none()
             {
@@ -2432,7 +2585,8 @@ fn gate_with_scope_resolver(
                 // session that hit this concluded it was blocked when a
                 // supported command would have worked (#403). The higher-level
                 // read commands really are allowed cross-repo with an explicit
-                // `-R`, and another repository the user works in can be
+                // `-R`, REST GET reads via `gh api` are allowed on allowlisted
+                // endpoints, and another repository the user works in can be
                 // named into the scope set.
                 Err(Refusal {
                     headline: format!(
@@ -2452,12 +2606,16 @@ fn gate_with_scope_resolver(
                         "Reason: {}\n\
                          Ways forward: read-only commands take an explicit repository — \
                          `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
-                         <number>`, `gh issue view -R <owner>/<repo> <number>` — and are allowed \
-                         against any repository. Raw `gh api` is not. If the agent \
-                         works in that repository too and it is checked out on this machine, \
-                         name it with `cplt config set --local sandbox.repo_dirs <DIR>` and it \
-                         joins the scope set — beside this repository or inside it, either \
-                         works. Otherwise relaunch cplt against that repository.",
+                         <number>`, `gh issue view -R <owner>/<repo> <number>` — and REST GET \
+                         reads via `gh api` (allowlisted code/project paths under \
+                         `repos/<owner>/<repo>/...`, `search/*`, `orgs/<org>/repos`, \
+                         `users/<user>`, `users/<user>/repos`, or `rate_limit`; pass `-X GET` with \
+                         `-f`/`-F` query parameters, without `--input`) are allowed against any \
+                         repository. Writes and state changes remain limited to the scope set. \
+                         If the agent works in that repository too and it is checked out on this \
+                         machine, name it with `cplt config set --local sandbox.repo_dirs <DIR>` \
+                         and it joins the scope set — beside this repository or inside it, \
+                         either works. Otherwise relaunch cplt against that repository.",
                         result.reason,
                     ),
                     agent_note: &[RESTRICTED, NOTE],
@@ -2491,7 +2649,9 @@ fn gate_with_scope_resolver(
                     "Reason: {}. Raw API writes are off by default because they bypass the \
                      per-command policy the guard rests on; the higher-level commands \
                      (`gh pr comment`, `gh issue comment`, `gh pr review`) are allowed and \
-                     scope-checked. If the raw call is genuinely needed, \
+                     scope-checked. REST GET reads via `gh api` work against any repository \
+                     (pass `-X GET` when using `-f`/`-F` query parameters, without `--input`). \
+                     If a raw write is genuinely needed, \
                      `cplt config set gh_guard.allow_api_write true` opens writes to \
                      repositories in scope and nothing else — it is far narrower than \
                      turning the guard off. `gh api DELETE` stays refused either way.",
@@ -2559,6 +2719,7 @@ fn graphql_approval(
     let graphql_targets = crate::gh_graphql::check(args, &scope).map_err(refuse)?;
     Ok(GateApproval {
         repo_scope: None,
+        host_pin: None,
         check_merge_protection: false,
         graphql_targets,
     })
@@ -2580,8 +2741,16 @@ fn approval_from_scope(repo_scope: Option<String>) -> GateApproval {
             let (host, repo) = split_member(&member);
             format!("{host}/{repo}")
         }),
+        host_pin: None,
         check_merge_protection: false,
         graphql_targets: Vec::new(),
+    }
+}
+
+fn cross_repo_read_approval(cmd: &ParsedCommand) -> GateApproval {
+    GateApproval {
+        host_pin: Some(api_destination_host(cmd).to_ascii_lowercase()),
+        ..GateApproval::default()
     }
 }
 
@@ -5631,6 +5800,7 @@ mod tests {
                 repo_flag: None,
                 method: None,
                 has_input_flags: false,
+                has_input_file: false,
                 api_endpoint: None,
                 hostname: None,
             };
@@ -5661,6 +5831,7 @@ mod tests {
                 repo_flag: None,
                 method: None,
                 has_input_flags: false,
+                has_input_file: false,
                 api_endpoint: None,
                 hostname: None,
             };
@@ -5689,6 +5860,7 @@ mod tests {
                 repo_flag: None,
                 method: None,
                 has_input_flags: false,
+                has_input_file: false,
                 api_endpoint: None,
                 hostname: None,
             };
@@ -5709,6 +5881,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5726,6 +5899,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5748,6 +5922,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5760,6 +5935,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5774,6 +5950,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5785,6 +5962,7 @@ mod tests {
             repo_flag: None,
             method: Some("GET".to_string()),
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5799,6 +5977,7 @@ mod tests {
             repo_flag: None,
             method: Some("POST".to_string()),
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5813,6 +5992,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: true,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5829,6 +6009,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5845,6 +6026,7 @@ mod tests {
             repo_flag: Some("navikt/cplt".to_string()),
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5859,6 +6041,7 @@ mod tests {
             repo_flag: Some("other/repo".to_string()),
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5873,6 +6056,7 @@ mod tests {
             repo_flag: Some("Navikt/CPLT".to_string()),
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5888,6 +6072,7 @@ mod tests {
             repo_flag: Some("navikt/cplt.git".to_string()),
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -5913,6 +6098,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("/repos/other/repo/pulls".to_string()),
             hostname: None,
         };
@@ -5927,6 +6113,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
             hostname: None,
         };
@@ -5942,6 +6129,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("/user".to_string()),
             hostname: None,
         };
@@ -5956,6 +6144,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("/orgs/navikt/members".to_string()),
             hostname: None,
         };
@@ -5971,6 +6160,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("pulls/67/comments".to_string()),
             hostname: None,
         };
@@ -5985,6 +6175,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("pulls?state=open".to_string()),
             hostname: None,
         };
@@ -6000,6 +6191,7 @@ mod tests {
             repo_flag: Some("other/repo".to_string()),
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
             hostname: None,
         };
@@ -6349,10 +6541,22 @@ mod tests {
     #[test]
     fn github_token_stays_off_other_hosts() {
         let hosts = ghe_hosts();
-        let ok = |args: &[&str], pin| github_token_allowed_for(args, pin, &hosts);
+        let ok = |args: &[&str], pin| github_token_allowed_for(args, pin, None, &hosts);
         assert!(ok(&["pr", "list"], Some("github.com/o/r")));
         assert!(!ok(&["pr", "list"], Some("example.ghe.com/o/r")));
         assert!(!ok(&["api", "--hostname", "example.ghe.com", "user"], None));
+        assert!(!github_token_allowed_for(
+            &["api", "repos/x/y/commits"],
+            None,
+            Some("example.ghe.com"),
+            &hosts
+        ));
+        assert!(github_token_allowed_for(
+            &["api", "repos/x/y/commits"],
+            None,
+            Some("github.com"),
+            &hosts
+        ));
         // gh honours an explicit -R or URL over the pin.
         assert!(!ok(
             &["pr", "view", "1", "-R", "example.ghe.com/other/repo"],
@@ -6405,15 +6609,18 @@ mod tests {
                 "https://jira.example/X-1"
             ],
             None,
+            None,
             &github
         ));
         assert!(!github_token_allowed_for(
             &["pr", "view", "1", "-R", "x.ghe.com/o/r"],
             None,
+            None,
             &github
         ));
         assert!(!github_token_allowed_for(
             &["pr", "view", "https://x.ghe.com/o/r/pull/1"],
+            None,
             None,
             &github
         ));
@@ -6423,6 +6630,7 @@ mod tests {
         let github = vec!["github.com".to_string()];
         assert!(github_token_allowed_for(
             &["api", "--hostname", "example.ghe.com", "user"],
+            None,
             None,
             &github
         ));
@@ -6600,6 +6808,7 @@ mod tests {
             repo_flag: None,
             method: Some("POST".to_string()),
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("repos/navikt/cplt/pulls/comments/123/replies".to_string()),
             hostname: None,
         };
@@ -6625,6 +6834,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: true,
+            has_input_file: false,
             api_endpoint: Some("repos/navikt/cplt/pulls/comments/123/replies".to_string()),
             hostname: None,
         };
@@ -6708,6 +6918,7 @@ mod tests {
             repo_flag: None,
             method: Some("POST".to_string()),
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("graphql".to_string()),
             hostname: None,
         };
@@ -6726,6 +6937,7 @@ mod tests {
             repo_flag: None,
             method: Some("DELETE".to_string()),
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some("repos/navikt/cplt/issues/1/labels/bug".to_string()),
             hostname: None,
         };
@@ -6753,6 +6965,7 @@ mod tests {
                 repo_flag: None,
                 method: Some("POST".to_string()),
                 has_input_flags: true,
+                has_input_file: false,
                 api_endpoint: Some(endpoint.to_string()),
                 hostname: None,
             };
@@ -6773,6 +6986,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -6784,6 +6998,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: None,
             hostname: None,
         };
@@ -9696,6 +9911,7 @@ mod tests {
                 repo_flag: None,
                 method: Some("POST".to_string()),
                 has_input_flags: false,
+                has_input_file: false,
                 api_endpoint: Some(ep.to_string()),
                 hostname: None,
             };
@@ -9723,6 +9939,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            has_input_file: false,
             api_endpoint: Some(ep.to_string()),
             hostname: None,
         };
@@ -10332,6 +10549,287 @@ mod tests {
             )
             .is_ok(),
             "a GET is scope-checked, not refused"
+        );
+    }
+
+    #[test]
+    fn api_cross_repo_get_reads_and_refusals() {
+        let scope = ["navikt/cplt".to_string()];
+        let default_policy = GatePolicy::default();
+        let write_policy = GatePolicy {
+            allow_api_write: true,
+            ..GatePolicy::default()
+        };
+
+        // Cross-repo GET on allowlisted code/project paths under repos/{owner}/{repo}/...
+        // and safe global read endpoints are allowed without extra config, and do not pin
+        // GH_REPO to the startup repo.
+        for args in [
+            &["api", "repos/x/y"][..],
+            &["api", "repos/x/y/commits"],
+            &["api", "/repos/x/y/commits"],
+            &["api", "https://api.github.com/repos/x/y/commits?per_page=5"],
+            &["api", "repos/x/y/commits/abc123"],
+            &["api", "repos/x/y/commits/abc123/check-runs"],
+            &["api", "repos/x/y/commits/abc123/status"],
+            &["api", "repos/x/y/commits/abc123/statuses"],
+            &["api", "repos/x/y/compare/main...feat/bar"],
+            &["api", "repos/x/y/contents"],
+            &["api", "repos/x/y/contents/src/main.rs"],
+            &["api", "repos/x/y/readme"],
+            &["api", "repos/x/y/git/blobs/abc123"],
+            &["api", "repos/x/y/git/trees/abc123"],
+            &["api", "repos/x/y/git/commits/abc123"],
+            &["api", "repos/x/y/git/refs"],
+            &["api", "repos/x/y/git/refs/heads/main"],
+            &["api", "repos/x/y/git/tags/abc123"],
+            &["api", "repos/x/y/branches"],
+            &["api", "repos/x/y/branches/main"],
+            &["api", "repos/x/y/tags"],
+            &["api", "repos/x/y/releases"],
+            &["api", "repos/x/y/releases/latest"],
+            &["api", "repos/x/y/releases/tags/v1.0.0"],
+            &["api", "repos/x/y/pulls"],
+            &["api", "repos/x/y/pulls/1"],
+            &["api", "repos/x/y/pulls/1/files"],
+            &["api", "repos/x/y/pulls/1/commits"],
+            &["api", "repos/x/y/pulls/1/reviews"],
+            &["api", "repos/x/y/pulls/1/comments"],
+            &["api", "repos/x/y/issues"],
+            &["api", "repos/x/y/issues/1"],
+            &["api", "repos/x/y/issues/1/comments"],
+            &["api", "repos/x/y/issues/1/events"],
+            &["api", "repos/x/y/issues/1/timeline"],
+            &["api", "repos/x/y/labels"],
+            &["api", "repos/x/y/milestones"],
+            &["api", "repos/x/y/languages"],
+            &["api", "repos/x/y/topics"],
+            &["api", "repos/x/y/contributors"],
+            &["api", "repos/x/y/actions/runs"],
+            &["api", "repos/x/y/actions/runs/42"],
+            &["api", "repos/x/y/actions/runs/42/jobs"],
+            &["api", "repos/x/y/actions/runs/42/logs"],
+            &["api", "repos/x/y/actions/workflows"],
+            &["api", "repos/x/y/actions/workflows/ci.yml/runs"],
+            &["api", "repos/x/y/check-runs/42"],
+            &["api", "repos/x/y/check-suites/42"],
+            &["api", "repos/x/y/deployments"],
+            &["api", "repos/x/y/environments"],
+            &["api", "repos/x/y/stats/contributors"],
+            &["api", "-X", "GET", "repos/x/y/commits", "-f", "q=1"],
+            &[
+                "api",
+                "--method=get",
+                "repos/x/y/commits",
+                "-F",
+                "per_page=10",
+            ],
+            &["api", "search/repositories", "-X", "GET", "-f", "q=cplt"],
+            &["api", "orgs/other-org/repos"],
+            &["api", "users/octocat"],
+            &["api", "users/octocat/repos"],
+            &["api", "rate_limit"],
+        ] {
+            let approval = gate_with_repo_scope(args, &default_policy, &scope, None)
+                .unwrap_or_else(|e| panic!("expected {args:?} to be allowed, got: {e}"));
+            assert_eq!(
+                approval.repo_scope, None,
+                "cross-repo read {args:?} must not pin GH_REPO"
+            );
+            assert_eq!(
+                approval.host_pin.as_deref(),
+                Some("github.com"),
+                "cross-repo read {args:?} must pin GH_HOST to github.com"
+            );
+        }
+
+        // Cross-repo read resolves destination host explicitly: github.com by
+        // default (even when scope resolution fails), or the allowed --hostname.
+        let hosts = ghe_hosts();
+        let bare = gate_with_scope_resolver_for(
+            &["api", "repos/x/y/commits"],
+            &default_policy,
+            &hosts,
+            || Err("no git".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(bare.repo_scope, None);
+        assert_eq!(bare.host_pin.as_deref(), Some("github.com"));
+        assert!(github_token_allowed_for(
+            &["api", "repos/x/y/commits"],
+            bare.repo_scope.as_deref(),
+            bare.host_pin.as_deref(),
+            &hosts
+        ));
+
+        let ghe = gate_with_scope_resolver_for(
+            &["api", "--hostname", "Example.GHE.com", "repos/x/y/commits"],
+            &default_policy,
+            &hosts,
+            || Ok(scope.to_vec()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ghe.repo_scope, None);
+        assert_eq!(ghe.host_pin.as_deref(), Some("example.ghe.com"));
+        assert!(!github_token_allowed_for(
+            &["api", "--hostname", "Example.GHE.com", "repos/x/y/commits"],
+            ghe.repo_scope.as_deref(),
+            ghe.host_pin.as_deref(),
+            &hosts
+        ));
+
+        // In-scope GET continues to pin GH_REPO (including sensitive repo paths and -X GET -f).
+        for args in [
+            &["api", "repos/navikt/cplt/commits"][..],
+            &["api", "-X", "GET", "repos/navikt/cplt/commits", "-f", "q=1"],
+            &["api", "repos/navikt/cplt/pulls/1/merge"],
+            &["api", "repos/navikt/cplt/secret-scanning/alerts"],
+            &["api", "repos/navikt/cplt/hooks"],
+            &["api", "repos/navikt/cplt/security-advisories"],
+            &["api", "repos/navikt/cplt/actions/variables"],
+            &["api", "repos/navikt/cplt/actions/secrets"],
+            &["api", "repos/navikt/cplt/environments/x/secrets"],
+        ] {
+            let approval = gate_with_repo_scope(args, &default_policy, &scope, None)
+                .unwrap_or_else(|e| panic!("expected in-scope {args:?} to be allowed, got: {e}"));
+            assert_eq!(
+                approval.repo_scope.as_deref(),
+                Some("github.com/navikt/cplt"),
+                "in-scope {args:?} must pin GH_REPO"
+            );
+        }
+
+        // Cross-repo writes, implied POST (-f without -X), --input, graphql, merge writes,
+        // sensitive cross-repo paths, and non-allowlisted endpoints must all be refused
+        // (under both default and allow_api_write).
+        for args in [
+            &["api", "-X", "POST", "repos/x/y/commits"][..],
+            &["api", "repos/x/y/commits", "-f", "q=1"],
+            &["api", "repos/x/y/commits", "-F", "q=1"],
+            &["api", "repos/x/y/commits", "--field=q=1"],
+            &["api", "repos/x/y/commits", "--raw-field", "q=1"],
+            &["api", "repos/x/y/commits", "--input", "body.json"],
+            &[
+                "api",
+                "-X",
+                "GET",
+                "repos/x/y/commits",
+                "--input",
+                "body.json",
+            ],
+            &["api", "-X", "GET", "repos/x/y/commits", "--input=-"],
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query={ repository(owner: \"x\", name: \"y\") { pullRequests(first: 1) { nodes { number } } } }",
+            ],
+            &["api", "-X", "PUT", "repos/x/y/pulls/1/merge"],
+            &["api", "-X", "PUT", "repos/navikt/cplt/pulls/1/merge"],
+            &["api", "repos/x/y/merges", "-f", "base=main"],
+            &["api", "repos/x/y/pulls/1/merge"],
+            &["api", "repos/x/y/secret-scanning/alerts"],
+            &["api", "repos/x/y/hooks"],
+            &["api", "repos/x/y/security-advisories"],
+            &["api", "repos/x/y/actions/variables"],
+            &["api", "repos/x/y/actions/secrets"],
+            &["api", "repos/x/y/dependabot/alerts"],
+            &["api", "repos/x/y/codespaces"],
+            &["api", "repos/x/y/keys"],
+            &["api", "repos/x/y/collaborators"],
+            &["api", "repos/x/y/invitations"],
+            &["api", "repos/x/y/environments/x/secrets"],
+            &["api", "repos/x/y/environments/x/variables"],
+            &["api", "repos/x/y/environments/x"],
+            &["api", "repos/x/y/traffic/views"],
+            &["api", "repos/x/y/vulnerability-alerts"],
+            &["api", "repos/x/y/branches/main/protection"],
+            &["api", "users/me/events"],
+            &["api", "users/octocat/orgs"],
+            &["api", "repos/x/{branch}"],
+            &["api", "repos/x/:branch"],
+            &["api", "repos/{owner}/{repo}/secret-scanning/alerts"],
+            &["api", "repos/x/y/branches/{branch}"],
+            &["api", "users/{branch}"],
+            &["api", "repos/x/targ:branch"],
+            &["api", "repos/x/y/commits/a:branch"],
+            &["api", "repos/x/y:repo/hooks"],
+            &["api", "user"],
+            &["api", "user/repos"],
+            &["api", "orgs/other-org/members"],
+            &["api", "orgs/other-org/audit-log"],
+            &["api", "orgs/other-org/teams"],
+            &["api", "gists"],
+            &["api", "repos//y/commits"],
+            &["api", "repos/x%2Fy/z/commits"],
+        ] {
+            assert!(
+                gate_with_repo_scope(args, &default_policy, &scope, None).is_err(),
+                "expected {args:?} to be refused under default policy"
+            );
+            assert!(
+                gate_with_repo_scope(args, &write_policy, &scope, None).is_err(),
+                "expected {args:?} to be refused even with allow_api_write=true"
+            );
+        }
+
+        // In-scope writes without allow_api_write remain refused, and work with allow_api_write.
+        assert!(
+            gate_with_repo_scope(
+                &["api", "repos/navikt/cplt/issues", "-f", "title=hi"],
+                &default_policy,
+                &scope,
+                None,
+            )
+            .is_err()
+        );
+        let in_scope_write = gate_with_repo_scope(
+            &["api", "repos/navikt/cplt/issues", "-f", "title=hi"],
+            &write_policy,
+            &scope,
+            None,
+        )
+        .expect("in-scope write with allow_api_write=true should succeed");
+        assert_eq!(
+            in_scope_write.repo_scope.as_deref(),
+            Some("github.com/navikt/cplt")
+        );
+
+        // Refusal guidance mentions cross-repo GET reads via gh api and the cross-repo write rule.
+        for (args, policy) in [
+            (
+                &["api", "-X", "POST", "repos/x/y/commits"][..],
+                &write_policy,
+            ),
+            (&["pr", "create", "-R", "x/y"][..], &default_policy),
+        ] {
+            let scope_refusal = gate_with_repo_scope(args, policy, &scope, None).unwrap_err();
+            assert!(
+                scope_refusal.guidance.contains("GET")
+                    && scope_refusal.guidance.contains("gh api")
+                    && scope_refusal
+                        .guidance
+                        .contains("Writes and state changes remain limited to the scope set"),
+                "unexpected scope refusal guidance for {args:?}: {}",
+                scope_refusal.guidance
+            );
+        }
+
+        let write_refusal = gate_with_repo_scope(
+            &["api", "repos/x/y/commits", "-f", "q=1"],
+            &default_policy,
+            &scope,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            write_refusal.guidance.contains("GET")
+                && write_refusal.guidance.contains("gh api")
+                && write_refusal.guidance.contains("repositories in scope"),
+            "unexpected write refusal guidance: {}",
+            write_refusal.guidance
         );
     }
 

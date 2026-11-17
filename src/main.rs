@@ -5928,6 +5928,9 @@ enum GateEffect {
     /// Run the real binary with `GH_REPO` pinned to this repository, so the
     /// operation cannot retarget away from the repo the guard approved.
     ExecScoped(String),
+    /// Run the real binary with `GH_HOST` pinned to this host and no `GH_REPO`
+    /// pin: an approved cross-repo `gh api` read.
+    ExecHost(String),
     /// Like `ExecScoped`, but run `args` instead of the invocation: a merge the
     /// protection check rewrote to the pull request number and head it checked.
     ExecRewritten { repo: String, args: Vec<String> },
@@ -6008,11 +6011,12 @@ fn decide_gh_gate(
         Ok((approval, _)) if !approval.graphql_targets.is_empty() => {
             GateEffect::VerifyGraphql(approval.graphql_targets)
         }
-        Ok((approval, pinned)) => match (approval.repo_scope, pinned) {
-            (Some(repo), Some(args)) => GateEffect::ExecRewritten { repo, args },
-            (Some(repo), None) => GateEffect::ExecScoped(repo),
+        Ok((approval, pinned)) => match (approval.repo_scope, approval.host_pin, pinned) {
+            (Some(repo), _, Some(args)) => GateEffect::ExecRewritten { repo, args },
+            (Some(repo), _, None) => GateEffect::ExecScoped(repo),
+            (None, Some(host), _) => GateEffect::ExecHost(host),
             // The check refuses without a pinned repo, so a rewrite always has one.
-            (None, _) => GateEffect::ExecPlain { notice: None },
+            (None, None, _) => GateEffect::ExecPlain { notice: None },
         },
         Err(refusal) => refusal_effect(policy.mode, refusal),
     }
@@ -6107,25 +6111,27 @@ fn perform_gate_effect(
             eprintln!("{refusal}\n{}", escape_hatch(name));
             ExitCode::FAILURE
         }
-        GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo)),
+        GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo), None),
+        GateEffect::ExecHost(host) => exec_real(real_binary, name, args, None, Some(&host)),
         GateEffect::ExecRewritten { repo, args } => {
-            exec_real(real_binary, name, &args, Some(&repo))
+            exec_real(real_binary, name, &args, Some(&repo), None)
         }
         GateEffect::ExecPlain { notice } => {
             if let Some(notice) = notice {
                 eprintln!("{notice}");
             }
-            exec_real(real_binary, name, args, None)
+            exec_real(real_binary, name, args, None, None)
         }
         GateEffect::ExecWithout { notice, args } => {
             eprintln!("{notice}");
-            exec_real(real_binary, name, &args, None)
+            exec_real(real_binary, name, &args, None, None)
         }
     }
 }
 
 /// Replace this process with the real binary. `repo_scope` pins `GH_REPO`, which
-/// only `gh` reads — the git guard always passes `None`.
+/// only `gh` reads — the git guard always passes `None`. `host_pin` pins
+/// `GH_HOST` for unpinned cross-repo `gh api` reads.
 ///
 /// `GH_HOST` and `GH_REPO` are scrubbed on EVERY approved exec, pin or no pin.
 /// They are inherited targeting: `GH_HOST` redirects a read at whatever GHES the
@@ -6140,6 +6146,7 @@ fn exec_real(
     name: &str,
     args: &[String],
     repo_scope: Option<&str>,
+    host_pin: Option<&str>,
 ) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
@@ -6156,13 +6163,15 @@ fn exec_real(
         if gh_proxy::hosts_configured() {
             command.env("GH_HOST", gh_proxy::pin_host(repo));
         }
+    } else if let Some(host) = host_pin {
+        command.env("GH_HOST", host);
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let foreign_credential = std::env::var_os(gh_proxy::FOREIGN_CREDENTIAL_ENV).is_some();
     command.env_remove(gh_proxy::FOREIGN_CREDENTIAL_ENV);
     if name == "gh"
         && !foreign_credential
-        && gh_proxy::github_token_allowed(&arg_refs, repo_scope)
+        && gh_proxy::github_token_allowed(&arg_refs, repo_scope, host_pin)
         && let Some(token) = exec_gh_token()
     {
         command.env("GH_TOKEN", token);
@@ -16083,6 +16092,21 @@ mod tests {
             effect,
             GateEffect::ExecScoped("github.com/navikt/cplt".to_string()),
             "an approved scope-checked command must carry the GH_REPO pin"
+        );
+    }
+
+    #[test]
+    fn cross_repo_api_read_execs_with_host_pinned() {
+        let effect = decide_gh_gate_offline(
+            &gh_args(&["api", "repos/x/y/commits"]),
+            &gh_policy(config::EnforcementMode::Block),
+            &["navikt/cplt".to_string()],
+            None,
+        );
+        assert_eq!(
+            effect,
+            GateEffect::ExecHost("github.com".to_string()),
+            "a bare cross-repo GET must pin GH_HOST explicitly"
         );
     }
 

@@ -902,10 +902,140 @@ fn gh_gate_scope_check_disabled() {
 }
 
 #[test]
-fn gh_gate_blocks_cross_repo_api_endpoint() {
-    // API GET to a different repo's endpoint — scope check blocks it
-    let (_, stderr, ok) = gh_gate(&["api", "/repos/evil-org/other-repo/pulls"]);
+fn gh_gate_allows_cross_repo_api_get_endpoint() {
+    for args in [
+        &["api", "/repos/evil-org/other-repo/pulls"][..],
+        &["api", "-X", "GET", "repos/x/y/commits", "-f", "q=1"],
+        &["api", "repos/x/y/environments"],
+        &["api", "orgs/other-org/repos"],
+        &["api", "users/octocat"],
+        &["api", "users/octocat/repos"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert!(
+            ok,
+            "allowlisted cross-repo API GET {args:?} should be allowed: {stderr}"
+        );
+    }
+
+    for args in [
+        &["api", "orgs/other-org/members"][..],
+        &["api", "repos/x/y/secret-scanning/alerts"],
+        &["api", "repos/x/y/hooks"],
+        &["api", "repos/x/y/security-advisories"],
+        &["api", "repos/x/y/actions/variables"],
+        &["api", "repos/x/y/actions/secrets"],
+        &["api", "repos/x/y/environments/x/secrets"],
+        &["api", "users/me/events"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert_refused(&stderr, ok, "outside the startup repo");
+    }
+
+    // In-scope sensitive endpoints remain allowed as before.
+    for args in [
+        &["api", "repos/navikt/cplt/secret-scanning/alerts"][..],
+        &["api", "repos/navikt/cplt/hooks"],
+        &["api", "repos/navikt/cplt/actions/secrets"],
+        &["api", "repos/navikt/cplt/environments/x/secrets"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert!(
+            ok,
+            "in-scope API GET {args:?} should remain allowed: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn gh_gate_blocks_cross_repo_api_writes_and_input() {
+    let (_, stderr, ok) = gh_gate(&["api", "repos/x/y/commits", "-f", "q=1"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
+    let (_, stderr, ok) = gh_gate(&["api", "-X", "GET", "repos/x/y/commits", "--input=-"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
+    let (_, stderr, ok) = gh_gate_with_opts(
+        &[
+            "api",
+            "-X",
+            "GET",
+            "repos/x/y/commits",
+            "--input",
+            "body.json",
+        ],
+        &["--allow-api-write"],
+    );
     assert_refused(&stderr, ok, "outside the startup repo");
+}
+
+#[test]
+fn gh_gate_pins_host_and_scopes_token_for_cross_repo_api_reads() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s|%s|%s\\n' \"${GH_REPO-}\" \"${GH_HOST-}\" \"${GH_TOKEN-}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let token_dir = temp.path().join("tokens");
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join(".gh-exec-token"), "gho_github_token\n").unwrap();
+
+    let run = |args: &[&str]| {
+        cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--gh-host")
+            .arg("github.com")
+            .arg("--gh-host")
+            .arg("example.ghe.com")
+            .arg("--")
+            .args(args)
+            .env("GH_HOST", "example.ghe.com")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .output()
+            .expect("cplt gh-gate should run")
+    };
+
+    // Bare cross-repo GET must pin GH_HOST=github.com (never fall back to a
+    // logged-in *.ghe.com host) and attach the github.com token.
+    let bare = run(&["api", "repos/x/y/commits"]);
+    assert!(
+        bare.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stdout).trim(),
+        "|github.com|gho_github_token"
+    );
+
+    // Allowed --hostname pins GH_HOST to that host and withholds GH_TOKEN.
+    let ghe = run(&["api", "--hostname", "example.ghe.com", "repos/x/y/commits"]);
+    assert!(
+        ghe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ghe.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ghe.stdout).trim(),
+        "|example.ghe.com|"
+    );
 }
 
 #[test]
@@ -1514,7 +1644,10 @@ fn gh_gate_blocks_percent_encoded_graphql() {
 
 #[test]
 fn gh_gate_scope_checks_percent_decoded_repo() {
-    let (_, stderr, ok) = gh_gate(&["api", "repos/%6Eavikt/other/pulls"]);
+    let (_, stderr, ok) = gh_gate_with_opts(
+        &["api", "-X", "POST", "repos/%6Eavikt/other/pulls"],
+        &["--allow-api-write"],
+    );
     assert_refused(&stderr, ok, "'repos/%6Eavikt/other/pulls' which is outside");
     let (_, _, ok) = gh_gate(&["api", "repos/%6Eavikt/cplt/pulls"]);
     assert!(
@@ -1527,7 +1660,10 @@ fn gh_gate_scope_checks_percent_decoded_repo() {
 
 #[test]
 fn gh_gate_refuses_git_suffix_as_other_repo() {
-    let (_, stderr, ok) = gh_gate(&["api", "repos/navikt/cplt.git/pulls"]);
+    let (_, stderr, ok) = gh_gate_with_opts(
+        &["api", "-X", "POST", "repos/navikt/cplt.git/pulls"],
+        &["--allow-api-write"],
+    );
     assert_refused(&stderr, ok, "outside the startup repo");
     let (_, stderr, ok) = gh_gate(&["pr", "close", "42", "-R", "navikt/cplt.git"]);
     assert_refused(&stderr, ok, "outside the startup repo");
