@@ -27,16 +27,22 @@ pub(crate) fn refresh_retry(
     }
     let wait = match retry_after.map(str::trim).filter(|s| !s.is_empty()) {
         None => DEFAULT_WAIT,
-        Some(s) => match s.parse::<u64>() {
-            Ok(secs) => {
-                let d = Duration::from_secs(secs);
+        // Digits only: u64::from_str would also take "+5".
+        Some(s) => match s
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<u64>())
+        {
+            Some(Ok(secs)) => {
+                // Floor at the default so "0" cannot spin.
+                let d = Duration::from_secs(secs).max(DEFAULT_WAIT);
                 if d > MAX_WAIT {
                     return Err(err());
                 }
                 d
             }
             // HTTP-date or garbage falls back to the short default wait.
-            Err(_) => DEFAULT_WAIT,
+            _ => DEFAULT_WAIT,
         },
     };
     Ok(wait)
@@ -48,6 +54,9 @@ mod tests {
 
     #[test]
     fn retry_after_parsing_and_bounds() {
+        for v in ["0", "+5", "-1"] {
+            assert_eq!(refresh_retry(0, 503, Some(v), "x"), Ok(DEFAULT_WAIT), "{v}");
+        }
         assert_eq!(
             refresh_retry(0, 503, Some("5"), "com.example/srv"),
             Ok(Duration::from_secs(5))

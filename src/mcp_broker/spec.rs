@@ -198,10 +198,11 @@ pub(crate) fn validate_gated(
         ));
     }
     let ext: Ext = serde_json::from_value(ext.clone()).map_err(|e| format!("extension: {e}"))?;
-    let remotes = root
-        .get("remotes")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
+    let remotes = match root.get("remotes") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(a)) => a.as_slice(),
+        Some(_) => return Err("remotes must be an array".into()),
+    };
     let has_remotes = !remotes.is_empty();
     // 4: remote upstreams require both the feature gate and credential = "oauth".
     if has_remotes && !(oauth_gate && ext.credential == "oauth") {
@@ -345,6 +346,21 @@ pub(crate) fn validate_gated(
     })
 }
 
+/// Printable ASCII, no query, fragment or dot segments: a prefix compare on
+/// such a URL is then a path compare, and nothing can hide a token in it.
+fn plain_https_url(url: &str, what: &str) -> Result<(), String> {
+    let ok = url.bytes().all(|b| b.is_ascii_graphic())
+        && !url.contains(['?', '#', '%', '\\'])
+        && !url.split('/').any(|seg| seg == "." || seg == "..");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} must be a plain https URL (printable ASCII, no query, fragment, escapes or dot segments)"
+        ))
+    }
+}
+
 fn validate_oauth_remote(remotes: &[Value], ext: &Ext) -> Result<String, String> {
     if remotes.len() != 1 {
         return Err("oauth spec must have exactly one remote".into());
@@ -355,6 +371,13 @@ fn validate_oauth_remote(remotes: &[Value], ext: &Ext) -> Result<String, String>
     if remote.contains_key("headers") {
         return Err("remote headers are not allowed on an oauth spec".into());
     }
+    // Only type and url: any other key would escape the secret checks.
+    if let Some(k) = remote.keys().find(|k| *k != "type" && *k != "url") {
+        return Err(format!(
+            "unknown key {:?} on the oauth remote",
+            k.escape_debug().to_string()
+        ));
+    }
     if remote.get("type").and_then(Value::as_str) != Some("streamable-http") {
         return Err("oauth remote type must be streamable-http".into());
     }
@@ -362,9 +385,7 @@ fn validate_oauth_remote(remotes: &[Value], ext: &Ext) -> Result<String, String>
         .get("url")
         .and_then(Value::as_str)
         .ok_or("oauth remote must have a url string")?;
-    if url.chars().any(char::is_control) {
-        return Err("control characters in remote url".into());
-    }
+    plain_https_url(url, "remote url")?;
     let rest = url
         .strip_prefix("https://")
         .ok_or("oauth remote url must start with https://")?;
@@ -383,6 +404,7 @@ fn validate_oauth_remote(remotes: &[Value], ext: &Ext) -> Result<String, String>
         .oauth
         .as_ref()
         .ok_or("oauth spec requires an oauth block")?;
+    plain_https_url(&oauth.resource, "oauth.resource")?;
     let res_rest = oauth
         .resource
         .strip_prefix("https://")
@@ -954,6 +976,28 @@ mod tests {
         let mut r = oauth_root();
         r["remotes"][0]["headers"] = json!([]);
         assert!(check_oauth(&r, true).is_err());
+
+        let mut r = oauth_root();
+        r["remotes"][0]["token"] = json!("x");
+        assert!(check_oauth(&r, true).unwrap_err().contains("unknown key"));
+
+        for bad_url in [
+            "https://fgw.example/mcp/nais?token=abc",
+            "https://fgw.example/mcp/nais#x",
+            "https://fgw.example/mcp/nais/../other",
+            "https://fgw.example/mcp/%2e%2e/other",
+            "https://fgw.example/mcp/n\u{e6}is",
+            "https://u@fgw.example/mcp/nais",
+            "https://fgw.example:8443/mcp/nais",
+        ] {
+            let mut r = oauth_root();
+            r["remotes"][0]["url"] = json!(bad_url);
+            assert!(check_oauth(&r, true).is_err(), "{bad_url}");
+        }
+
+        let mut r = oauth_root();
+        r["remotes"] = json!({});
+        assert!(check_oauth(&r, true).unwrap_err().contains("array"));
 
         // Shared policy checks still apply.
         let mut r = oauth_root();
