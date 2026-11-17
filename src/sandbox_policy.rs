@@ -12,6 +12,14 @@ use std::path::{Component, Path, PathBuf};
 /// Characters that would break SBPL profile string interpolation.
 const SBPL_UNSAFE_CHARS: &[char] = &['"', ')', '(', ';', '\\', '\n', '\r', '\0'];
 
+/// Fixed loopback port reserved for the MCP host broker's OAuth callback
+/// (`http://127.0.0.1:62471/callback`, `docs/design/mcp-host-broker.md` §14.3).
+///
+/// The sandboxed agent must never bind this port (#1017): otherwise an agent
+/// could claim it after another holder releases it mid-session and intercept
+/// authorization codes for Nav's CIMD client.
+pub const OAUTH_CALLBACK_PORT: u16 = 62471;
+
 /// Sensitive directories under $HOME that are always denied.
 pub const DENIED_DOTFILES: &[&str] = &[
     ".ssh",

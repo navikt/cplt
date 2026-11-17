@@ -7500,6 +7500,9 @@ fn assemble_sandbox(
         .as_ref()
         .map(cplt::worktree_broker::Broker::socket);
     sandbox_config.mcp_socket = mcp_broker.as_ref().map(cplt::mcp_broker::Broker::socket);
+    sandbox_config.restrict_oauth_bind = mcp_broker
+        .as_ref()
+        .is_some_and(cplt::mcp_broker::Broker::holds_oauth_port);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =
@@ -7614,6 +7617,7 @@ fn build_sandbox_config<'a>(
         managed_worktree_root: repos.worktree_root,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -14717,7 +14721,9 @@ mod tests {
         let policy = |rules| cplt::sandbox::LandlockPolicy {
             fs_rules: rules,
             net_rules: Vec::new(),
+            bind_rules: Vec::new(),
             restrict_net_connect: true,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: root.clone(),
             precreate_dirs: vec![],
@@ -14823,7 +14829,9 @@ mod tests {
                 },
             }],
             net_rules: Vec::new(),
+            bind_rules: Vec::new(),
             restrict_net_connect: true,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: home.clone(),
             precreate_dirs: vec![],
@@ -14868,6 +14876,7 @@ mod tests {
             managed_worktree_root: None,
             worktree_socket: None,
             mcp_socket: None,
+            restrict_oauth_bind: false,
             home_dir: &home,
             extra_read: &base_extra_read,
             extra_write: &[],

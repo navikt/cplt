@@ -63,6 +63,7 @@ mod shim;
 mod spec;
 mod status;
 
+pub use crate::sandbox::OAUTH_CALLBACK_PORT;
 pub use client::{apply_opencode_overlay, copilot_launch_args};
 pub use open_url::{
     HOST_OPENER as OPEN_URL_HOST_OPENER, SHIM_NAMES as OPEN_URL_SHIMS, opener_config_writable,

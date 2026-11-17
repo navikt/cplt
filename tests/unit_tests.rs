@@ -815,6 +815,7 @@ fn landlock_policy_device_files_have_ioctl() {
         managed_worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -2733,6 +2734,7 @@ fn the_landlock_model_grants_a_named_root_the_project_access() {
         managed_worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         ..base_profile_options()
     });
     let rule = policy
@@ -2779,6 +2781,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
         managed_worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         ..base_profile_options()
     });
     let rule = policy
@@ -2809,6 +2812,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         managed_worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4386,6 +4390,80 @@ fn profile_allows_localhost_tcp_bind() {
         p.contains(r#"(allow network-inbound (local ip "*:*"))"#),
         "Profile must allow inbound on all local addresses (for Java IPv4-mapped)"
     );
+    assert!(
+        p.contains(r#"(deny network-bind (local ip "localhost:62471"))"#),
+        "Profile must deny binding the fixed MCP OAuth callback port"
+    );
+}
+
+#[test]
+fn profile_denies_oauth_callback_port_bind_after_allow_and_with_localhost_any() {
+    let ports = [cplt::sandbox::OAUTH_CALLBACK_PORT];
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/tmp/proj"),
+            allow_localhost_any: true,
+            localhost_ports: &ports,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let allow_pos = p
+        .find(r#"(allow network-bind (local ip "*:*"))"#)
+        .expect("allow network-bind missing");
+    let deny_pos = p
+        .find(r#"(deny network-bind (local ip "localhost:62471"))"#)
+        .expect("deny network-bind for OAuth port missing");
+    assert!(
+        deny_pos > allow_pos,
+        "SBPL uses last-match-wins: deny must follow allow"
+    );
+}
+
+#[test]
+fn landlock_policy_leaves_bind_unrestricted_without_broker_oauth() {
+    let ports = [3000, cplt::sandbox::OAUTH_CALLBACK_PORT];
+    let policy = generate_policy(&SandboxConfig {
+        project_dir: std::path::Path::new("/tmp/proj"),
+        localhost_ports: &ports,
+        restrict_oauth_bind: false,
+        ..base_profile_options()
+    });
+    assert!(
+        !policy.restrict_net_bind,
+        "without broker OAuth, Landlock must not handle BindTcp"
+    );
+    assert!(
+        policy.bind_rules.is_empty(),
+        "without broker OAuth, bind_rules must stay empty"
+    );
+    let desc = cplt::sandbox::describe_policy(&policy);
+    assert!(
+        desc.contains("## Network (TCP bind)\n  UNRESTRICTED"),
+        "{desc}"
+    );
+}
+
+#[test]
+fn landlock_policy_restricts_bind_and_excludes_oauth_callback_port() {
+    let ports = [3000, cplt::sandbox::OAUTH_CALLBACK_PORT];
+    let policy = generate_policy(&SandboxConfig {
+        project_dir: std::path::Path::new("/tmp/proj"),
+        allow_localhost_any: true,
+        localhost_ports: &ports,
+        restrict_oauth_bind: true,
+        ..base_profile_options()
+    });
+    assert!(policy.restrict_net_bind);
+    assert_eq!(
+        policy.bind_rules.iter().map(|r| r.port).collect::<Vec<_>>(),
+        vec![0, 3000],
+        "broker OAuth must restrict bind to port 0 + localhost_ports, never OAUTH_CALLBACK_PORT"
+    );
+    let desc = cplt::sandbox::describe_policy(&policy);
+    assert!(desc.contains("Network (TCP bind"), "{desc}");
+    assert!(desc.contains("62471"), "{desc}");
+    assert!(desc.contains("ABI < v4"), "{desc}");
 }
 
 // ============================================================
@@ -4426,6 +4504,7 @@ fn allow_localhost_any_affects_both_backends() {
         managed_worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4505,6 +4584,7 @@ fn config_options_parity_across_backends() {
         managed_worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &ports,
@@ -10716,6 +10796,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         managed_worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        restrict_oauth_bind: false,
         existing_home_tool_dirs: Some(&dirs),
         existing_app_dirs: None,
         extra_ports: &[],

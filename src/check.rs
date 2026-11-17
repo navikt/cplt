@@ -1558,7 +1558,9 @@ mod tests {
         LandlockPolicy {
             fs_rules: rules,
             net_rules: Vec::new(),
+            bind_rules: Vec::new(),
             restrict_net_connect: true,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: PathBuf::from("/home/u"),
             precreate_dirs: vec![],

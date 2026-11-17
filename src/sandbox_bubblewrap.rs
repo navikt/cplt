@@ -245,7 +245,16 @@ fn run_relay(listener: std::net::TcpListener, sock: &Path, agent: libc::pid_t, s
         },
         nofollow: false,
     };
-    if landlock_mod::apply_landlock_and_seccomp_now(&[(rule, None)], &[], true, true, None).is_err()
+    if landlock_mod::apply_landlock_and_seccomp_now(
+        &[(rule, None)],
+        &[],
+        &[],
+        true,
+        false,
+        true,
+        None,
+    )
+    .is_err()
     {
         // Closing `sync` unwritten stops the agent before it starts.
         drop(listener);
@@ -295,8 +304,12 @@ pub(crate) struct BubblewrapWrapper {
     pub fs_rules: Vec<FsRule>,
     /// Landlock TCP-connect rules, re-applied in-namespace by the helper.
     pub net_rules: Vec<NetRule>,
+    /// Landlock TCP-bind rules, re-applied in-namespace by the helper.
+    pub bind_rules: Vec<NetRule>,
     /// Whether to restrict TCP connect at the kernel level.
     pub restrict_net_connect: bool,
+    /// Whether to restrict TCP bind at the kernel level (#1017).
+    pub restrict_net_bind: bool,
     /// `true` when bwrap was explicitly requested (`--use-bubblewrap` /
     /// `use_bubblewrap = true`). A spawn-time failure is then a hard error;
     /// on auto-detect it degrades gracefully to Landlock-only.
@@ -1489,7 +1502,9 @@ pub(crate) fn build_wrapper(
         bwrap_args,
         fs_rules: policy.fs_rules.clone(),
         net_rules: policy.net_rules.clone(),
+        bind_rules: policy.bind_rules.clone(),
         restrict_net_connect: policy.restrict_net_connect,
+        restrict_net_bind: policy.restrict_net_bind,
         // proxy.netns: a spawn failure must not fall back to the shared network.
         strict: strict || netns,
         deny_mask_count: deny_masks.mask_count(),
@@ -1605,7 +1620,11 @@ impl InnerRule {
 struct InnerPolicy {
     fs_rules: Vec<InnerRule>,
     net_ports: Vec<u16>,
+    #[serde(default)]
+    bind_ports: Vec<u16>,
     restrict_net_connect: bool,
+    #[serde(default)]
+    restrict_net_bind: bool,
     proxy_forced: bool,
     /// Index into `fs_rules`, carried as is so the path never goes through a
     /// string round trip to be matched.
@@ -1634,7 +1653,9 @@ pub(crate) fn serialize_policy(
             .collect::<Result<_, _>>()
             .map_err(std::io::Error::other)?,
         net_ports: wrapper.net_rules.iter().map(|r| r.port).collect(),
+        bind_ports: wrapper.bind_rules.iter().map(|r| r.port).collect(),
         restrict_net_connect: wrapper.restrict_net_connect,
+        restrict_net_bind: wrapper.restrict_net_bind,
         proxy_forced: wrapper.proxy_forced,
         plain_file: wrapper.plain_file,
         agent_argv,
@@ -1703,6 +1724,11 @@ fn run_inner() {
         .iter()
         .map(|&port| NetRule { port })
         .collect();
+    let bind_rules: Vec<NetRule> = policy
+        .bind_ports
+        .iter()
+        .map(|&port| NetRule { port })
+        .collect();
 
     // proxy.netns: fork the relay first; only the agent comes back here.
     if !start_netns_relay() {
@@ -1714,7 +1740,9 @@ fn run_inner() {
     if let Err(e) = landlock_mod::apply_landlock_and_seccomp_now(
         &fs_rules,
         &net_rules,
+        &bind_rules,
         policy.restrict_net_connect,
+        policy.restrict_net_bind,
         policy.proxy_forced,
         policy.plain_file,
     ) {
@@ -1863,7 +1891,9 @@ mod tests {
         LandlockPolicy {
             fs_rules,
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: true,
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: PathBuf::from("/nonexistent-home"),
             precreate_dirs: vec![],
@@ -1926,7 +1956,9 @@ mod tests {
             bwrap_args: vec![],
             fs_rules: policy.fs_rules.clone(),
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: true,
+            restrict_net_bind: false,
             strict: false,
             deny_mask_count: 0,
             socket_mask_count: 0,
@@ -1966,7 +1998,9 @@ mod tests {
             bwrap_args: vec![],
             fs_rules,
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: true,
+            restrict_net_bind: false,
             strict: false,
             deny_mask_count: 0,
             socket_mask_count: 0,
