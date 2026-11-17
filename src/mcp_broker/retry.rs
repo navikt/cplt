@@ -41,6 +41,8 @@ pub(crate) fn refresh_retry(
                 }
                 d
             }
+            // Digits too large for u64 are far over the cap.
+            Some(Err(_)) => return Err(err()),
             // HTTP-date or garbage falls back to the short default wait.
             _ => DEFAULT_WAIT,
         },
@@ -66,6 +68,8 @@ mod tests {
             Ok(Duration::from_secs(60))
         );
         assert!(refresh_retry(0, 503, Some("61"), "com.example/srv").is_err());
+        // Overflowing u64 is over the cap, not the 1 s default.
+        assert!(refresh_retry(0, 503, Some("99999999999999999999999"), "x").is_err());
         assert_eq!(
             refresh_retry(0, 503, None, "com.example/srv"),
             Ok(Duration::from_secs(1))

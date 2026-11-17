@@ -234,7 +234,8 @@ pub(crate) fn validate_gated(
         }
     }
     for s in &strings {
-        if looks_like_secret(s) {
+        // Per `/` segment: a token in a URL path (`/mcp/ghp_…`) is not a prefix.
+        if s.split('/').any(looks_like_secret) {
             return Err("the spec holds what looks like a secret value".into());
         }
         if s.contains('{') || s.contains("$(") || s.contains("${") {
@@ -347,7 +348,8 @@ pub(crate) fn validate_gated(
 }
 
 /// Printable ASCII, no query, fragment or dot segments: a prefix compare on
-/// such a URL is then a path compare, and nothing can hide a token in it.
+/// such a URL is then a path compare. A token can still sit in a path
+/// segment; the per-segment `looks_like_secret` check in `validate` covers that.
 fn plain_https_url(url: &str, what: &str) -> Result<(), String> {
     let ok = url.bytes().all(|b| b.is_ascii_graphic())
         && !url.contains(['?', '#', '%', '\\'])
@@ -1008,6 +1010,21 @@ mod tests {
         let mut r = oauth_root();
         r["remotes"][0]["url"] = json!("https://fgw.example/${TOKEN}");
         assert!(check_oauth(&r, true).is_err());
+
+        // A token in a path segment is refused, in url and in resource.
+        for tok in ["ghp_abcdefghijklmnop", "eyJhbGciOiJIUzI1NiJ9"] {
+            let u = format!("https://fgw.example/mcp/{tok}");
+            let mut r = oauth_root();
+            r["remotes"][0]["url"] = json!(u);
+            r["_meta"][META_KEY]["oauth"]["resource"] = json!(u);
+            assert!(check_oauth(&r, true).unwrap_err().contains("secret"), "{u}");
+            let mut r = oauth_root();
+            r["_meta"][META_KEY]["oauth"]["resource"] = json!(format!("https://fgw.example/{tok}"));
+            assert!(
+                check_oauth(&r, true).unwrap_err().contains("secret"),
+                "{tok}"
+            );
+        }
     }
 
     #[test]
