@@ -23,14 +23,14 @@ use super::SandboxConfig;
 use super::policy::{
     CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
-    HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs,
-    ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
-    cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex, first_party_read_target,
-    grant_is_refused, home_config_link_targets, missing_home_config_link_targets,
-    nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
-    pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
+    HomeToolDir, OAUTH_CALLBACK_PORT, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
+    Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
+    SSH_PRIVATE_KEY_NAMES, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, YARN_CONFIG_DIR,
+    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
+    current_uid, cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex,
+    first_party_read_target, grant_is_refused, home_config_link_targets,
+    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    pnpm_config_dirs, pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
     validate_playwright_socket_dir, validate_sbpl_path,
 };
 
@@ -237,6 +237,7 @@ fn profile_locked(
         config.localhost_ports,
         config.proxy_forced,
         config.deny_dns,
+        config.restrict_oauth_bind,
     );
     // Keep PATH-resolved bin and shim locations read-only after user allows.
     // The pnpm rule re-allows its two writable stores, so all security denies
@@ -3858,6 +3859,7 @@ fn emit_network_rules(
     localhost_ports: &[u16],
     proxy_forced: bool,
     deny_dns: bool,
+    restrict_oauth_bind: bool,
 ) {
     // Network — outbound restricted to HTTPS/HTTP, localhost blocked by default.
     // Copilot CLI connects directly to api.githubcopilot.com:443 etc.
@@ -3975,6 +3977,16 @@ fn emit_network_rules(
     //   4. Most build tools (Gradle, Kotlin) bind to 127.0.0.1 explicitly
     sbpl!(sb, "(allow network-bind (local ip \"*:*\"))");
     sbpl!(sb, "(allow network-inbound (local ip \"*:*\"))");
+    // Reserve the MCP OAuth loopback callback port (#1017) when the broker
+    // holds it: even if another process held it at session start and releases
+    // it later, the sandboxed agent must never bind it and intercept an OAuth
+    // code flow. Other sessions leave it bindable, as Landlock does.
+    if restrict_oauth_bind {
+        sbpl!(
+            sb,
+            "(deny network-bind (local ip \"*:{OAUTH_CALLBACK_PORT}\"))"
+        );
+    }
     if proxy_forced {
         // A background URLSession hands the transfer to nsurlsessiond, which
         // resolves and connects outside the sandbox and the proxy. Follows
@@ -5003,6 +5015,8 @@ mod tests {
             managed_worktree_root: None,
             worktree_socket: None,
             mcp_socket: None,
+            restrict_oauth_bind: false,
+            oauth_port_claimed: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

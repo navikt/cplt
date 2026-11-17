@@ -2327,6 +2327,52 @@ print('CONNECTED')
         );
     }
 
+    #[test]
+    fn landlock_allows_dev_server_bind_without_broker_oauth() {
+        require_landlock!(4);
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let home = crate::common::home_temp_dir("no-broker");
+        let home_path = fs::canonicalize(home.path()).unwrap();
+        let script = r#"python3 -c "
+import socket
+s0 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s0.bind(('127.0.0.1', 0))
+port = s0.getsockname()[1]
+s0.close()
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', port))
+s.close()
+print('BIND_OK')
+""#;
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                script,
+            ])
+            .env("HOME", &home_path)
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .expect("Failed to execute cplt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("BIND_OK"),
+            "without broker OAuth, Landlock must leave BindTcp unhandled so dev servers can bind any port.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
     // ── E2E binary tests ──────────────────────────────────────────
 
     #[test]
@@ -3759,6 +3805,82 @@ print('CONNECTED')
         assert!(
             code != 0 || stdout.contains("CONNECT_FAILED"),
             "outbound TCP to port {port} must stay Landlock-blocked under bwrap — code: {code}, stdout: {stdout}"
+        );
+    }
+
+    // `specs_use_oauth` is false until OAuth specs exist (#910), so the test sets the
+    // debug-build hook CPLT_TEST_OAUTH_PORT_GUARD=1 to make the broker hold the port.
+    #[test]
+    #[cfg(debug_assertions)] // the CPLT_TEST_OAUTH_PORT_GUARD hook exists only in debug builds
+    fn landlock_denies_oauth_callback_port_bind_with_broker() {
+        require_bwrap!(4);
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let home = crate::common::home_temp_dir("oauth-bind-broker");
+        let home_path = fs::canonicalize(home.path()).unwrap();
+        let spec_dir = home_path.join(".config/cplt/mcp");
+        fs::create_dir_all(&spec_dir).unwrap();
+        let spec = serde_json::json!({
+            "name": "io.example/fake-mcp",
+            "version": "1.0.0",
+            "_meta": {"io.github.navikt/broker": {
+                "v": 1,
+                "credential": "none",
+                "command": ["python3", "-c", "pass"],
+                "egressHosts": ["example.org"],
+                "tools": {"allow": ["echo"]}
+            }}
+        });
+        fs::write(spec_dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
+
+        let port = cplt::sandbox::OAUTH_CALLBACK_PORT;
+        let script = format!(
+            r#"python3 -c "
+import socket
+s0 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s0.bind(('127.0.0.1', 0))
+s0.close()
+print('EPHEMERAL_OK')
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(('127.0.0.1', {port}))
+    print('ALLOWED')
+except PermissionError:
+    print('DENIED')
+finally:
+    s.close()
+""#
+        );
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("HOME", &home_path)
+            .env("CPLT_TEST_OAUTH_PORT_GUARD", "1")
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .expect("Failed to execute cplt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("EPHEMERAL_OK"),
+            "ephemeral bind(0) must stay allowed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("DENIED") && !stdout.contains("ALLOWED"),
+            "OAuth callback port {port} must be denied under Landlock ABI v4+ when the broker holds it.\nstdout: {stdout}\nstderr: {stderr}"
         );
     }
 

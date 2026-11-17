@@ -129,23 +129,23 @@ pub use policy::{
     AppDir, AppDirKind, BUILD_CREDENTIAL_FILES, CPLT_STATE_DIR, CacheEnv, DENIED_DOTFILES,
     DENIED_FILES, DENIED_HOME_SUBPATHS, DockerAccess, ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST,
     EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory,
-    HardeningEnvVar, HomeToolDir, LinuxCoverage, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES,
-    PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT,
-    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
-    Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
-    TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
-    XDG_PINNED_MARKER, active_tool_dirs, app_dirs, build_credential_grants,
-    copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths,
-    cplt_state_dir, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
-    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
-    exec_write_conflicts, first_party_read_target, home_config_link_targets, home_tool_dirs,
-    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_temp_dir_over,
-    no_exec_tool_dir_over, path_bin_dirs, pin_legacy_state_dir_if_inside,
-    playwright_runtime_intent, process_env, relocatable_tool_prefix, report_state_pinned,
-    shim_ro_protect_paths, socket_mask_paths, state_pinned_message, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
-    xdg_runtime_dir_env, xdg_state_dir,
+    HardeningEnvVar, HomeToolDir, LinuxCoverage, OAUTH_CALLBACK_PORT,
+    PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
+    PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
+    PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
+    TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, XDG_PINNED_MARKER,
+    active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
+    copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_dir, cplt_state_file,
+    credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
+    cypress_runtime_intent, dir_overlaps_credentials, exec_write_conflicts,
+    first_party_read_target, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
+    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
+    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
+    pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
+    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
+    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -228,6 +228,17 @@ pub struct SandboxConfig<'a> {
     /// The MCP broker socket for `cplt mcp-stdio` (#824), granted outbound as
     /// one exact path, like `worktree_socket`. macOS only.
     pub mcp_socket: Option<&'a Path>,
+    /// Whether the MCP broker holds/guards the fixed OAuth loopback callback
+    /// port (`OAUTH_CALLBACK_PORT`) for this session (#1017). Only then does
+    /// Landlock handle `AccessNet::BindTcp` and Seatbelt deny binding the
+    /// port, so dev servers and OpenCode v2's service can bind any port in
+    /// all other sessions.
+    pub restrict_oauth_bind: bool,
+    /// Whether the broker's guard already holds the OAuth port at launch.
+    /// Landlock grants ephemeral `bind(0)` only then: a port-0 grant lets the
+    /// kernel hand out any port, 62471 included, while the guard still waits
+    /// for another holder to release it. Ignored unless `restrict_oauth_bind`.
+    pub oauth_port_claimed: bool,
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
@@ -579,7 +590,16 @@ impl PreparedSandbox {
             });
             landlock_mod::hide_files(&mut w.fs_rules, &mut w.plain_file, &session.hidden)?;
             w.net_rules.push(port);
+            // With the OAuth guard on, BindTcp is handled and v2's service
+            // binds this explicit port, so it needs a bind grant too (#1017).
+            let bind = self.policy.restrict_net_bind && session.port != OAUTH_CALLBACK_PORT;
+            if bind {
+                w.bind_rules.push(port);
+            }
             let p = &mut self.policy;
+            if bind {
+                p.bind_rules.push(port);
+            }
             p.fs_rules.extend(extra.iter().cloned());
             landlock_mod::hide_files(&mut p.fs_rules, &mut p.plain_file, &session.hidden)?;
             p.net_rules.push(port);
@@ -679,6 +699,31 @@ pub fn prepare_with_pnpm_shadow(
     crate::env_read_lock(|| prepare_locked(config, pnpm_shadow_dir, inspect_only))
 }
 
+/// Prints, once per launch, where the OAuth callback port guard (#1017) cannot
+/// hold under Landlock: no `BindTcp` before ABI v4, and no ephemeral binds
+/// while the broker still waits for the port. Returns the warnings for tests.
+#[cfg(target_os = "linux")]
+fn warn_oauth_bind_gaps(config: &SandboxConfig, abi: Option<u32>) -> Vec<String> {
+    let mut out = Vec::new();
+    if abi.is_none_or(|abi| abi < 4) {
+        out.push(format!(
+            "MCP OAuth: this kernel cannot filter TCP bind (Landlock ABI < 4, kernel < 6.7), \
+             so the agent can bind the OAuth callback port {OAUTH_CALLBACK_PORT} if the broker \
+             loses it. See SECURITY.md."
+        ));
+    }
+    if !config.oauth_port_claimed {
+        out.push(format!(
+            "MCP OAuth: port {OAUTH_CALLBACK_PORT} is held by another process; ephemeral \
+             bind(0) is denied for this session."
+        ));
+    }
+    for w in &out {
+        ui::warn(w);
+    }
+    out
+}
+
 fn prepare_locked(
     config: &SandboxConfig,
     pnpm_shadow_dir: Option<&Path>,
@@ -687,6 +732,10 @@ fn prepare_locked(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
+    #[cfg(target_os = "linux")]
+    if config.restrict_oauth_bind && !inspect_only {
+        warn_oauth_bind_gaps(config, landlock_mod::available_abi_version());
+    }
     // Inspect-only callers (`--print-profile`, `cplt mcp status`) never
     // launch, so nothing can forge the state; they report instead.
     if !inspect_only {
@@ -5009,6 +5058,8 @@ mod tests {
             managed_worktree_root: None,
             worktree_socket: None,
             mcp_socket: None,
+            restrict_oauth_bind: false,
+            oauth_port_claimed: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -5085,6 +5136,77 @@ mod tests {
         assert!(text.rfind(";; Broker staging is private").unwrap() > text.rfind(&grant).unwrap());
     }
 
+    /// #1017: with the OAuth guard on, v2's explicit service port is bindable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_session_port_is_bindable_under_oauth_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.use_bubblewrap = Some(false);
+        config.restrict_oauth_bind = true;
+        config.oauth_port_claimed = true;
+        let mut sandbox = prepare(&config).unwrap();
+        assert!(sandbox.policy.restrict_net_bind);
+        sandbox.bwrap_wrapper = Some(bubblewrap::BubblewrapWrapper {
+            bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+            bwrap_args: vec![],
+            fs_rules: vec![],
+            net_rules: vec![],
+            bind_rules: sandbox.policy.bind_rules.clone(),
+            restrict_net_connect: true,
+            restrict_net_bind: true,
+            strict: false,
+            deny_mask_count: 0,
+            socket_mask_count: 0,
+            proc_limited_on_fallback: false,
+            proxy_forced: false,
+            plain_file: None,
+        });
+        sandbox
+            .add_opencode_v2(crate::opencode_v2::Session {
+                env: Vec::new(),
+                port: 50123,
+                model: Err(()),
+                tui: Vec::new(),
+                hidden: Vec::new(),
+                reads: Vec::new(),
+                writes: Vec::new(),
+            })
+            .unwrap();
+        let w = sandbox.bwrap_wrapper.as_ref().unwrap();
+        for ports in [
+            w.bind_rules.iter().map(|r| r.port).collect::<Vec<u16>>(),
+            sandbox
+                .precomputed
+                .bind_rules
+                .iter()
+                .map(|r| r.port)
+                .collect(),
+        ] {
+            assert!(ports.contains(&50123), "{ports:?}");
+            assert!(!ports.contains(&OAUTH_CALLBACK_PORT), "{ports:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oauth_bind_gaps_warn_on_old_abi_and_unclaimed_port() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.restrict_oauth_bind = true;
+        config.oauth_port_claimed = true;
+        assert!(warn_oauth_bind_gaps(&config, Some(4)).is_empty());
+        let old = warn_oauth_bind_gaps(&config, Some(3));
+        assert_eq!(old.len(), 1);
+        assert!(old[0].contains("ABI < 4"));
+        config.oauth_port_claimed = false;
+        let pending = warn_oauth_bind_gaps(&config, Some(6));
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].contains("bind(0) is denied"));
+    }
+
     /// #719: v2's port joins the allowlist; /proc requires bubblewrap.
     #[cfg(target_os = "linux")]
     #[test]
@@ -5115,7 +5237,9 @@ mod tests {
             bwrap_args: vec![],
             fs_rules: vec![],
             net_rules: vec![],
+            bind_rules: vec![],
             restrict_net_connect: true,
+            restrict_net_bind: false,
             strict: false,
             deny_mask_count: 0,
             socket_mask_count: 0,
@@ -5209,7 +5333,9 @@ mod tests {
                 bwrap_args: vec![],
                 fs_rules: vec![rule(&file), rule(&file), cache],
                 net_rules: vec![],
+                bind_rules: vec![],
                 restrict_net_connect: true,
+                restrict_net_bind: false,
                 strict: false,
                 deny_mask_count: 0,
                 socket_mask_count: 0,

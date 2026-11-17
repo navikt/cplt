@@ -486,6 +486,8 @@ mod tests {
                 .collect(),
             net_rules: Vec::new(),
             restrict_net_connect: true,
+            bind_rules: Vec::new(),
+            restrict_net_bind: false,
             proxy_forced: false,
             home_dir: PathBuf::from("/h"),
             precreate_dirs: vec![],
