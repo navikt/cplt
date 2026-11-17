@@ -282,6 +282,12 @@ impl Broker {
         self.shared.open_url_enabled()
     }
 
+    /// Hosts the `open_url` shims may open (macOS) or print (Linux).
+    #[must_use]
+    pub fn open_url_hosts(&self) -> &[String] {
+        &self.shared.open_hosts
+    }
+
     /// Turn `open_url` off for this session.
     pub fn disable_open_url(&self) {
         self.shared.open_off.store(true, Ordering::Release);
@@ -1080,7 +1086,8 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     let Some(id) = read_line(&mut reader, 512) else {
         return;
     };
-    if id == super::open_url::OP_LINE && shared.open_url_enabled() {
+    // macOS only: no host opener on Linux (owner decision 2026-11-17).
+    if super::open_url::HOST_OPENER && id == super::open_url::OP_LINE && shared.open_url_enabled() {
         if let Ok(mut w) = client.lock() {
             super::open_url::serve(
                 &mut reader,

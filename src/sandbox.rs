@@ -408,6 +408,8 @@ pub struct PreparedSandbox {
     /// The MCP broker socket, for the `open_url` shims (#910). Set with
     /// [`Self::set_mcp_socket`].
     pub(crate) mcp_socket: Option<PathBuf>,
+    /// Hosts the `open_url` shims accept.
+    pub(crate) open_url_hosts: Vec<String>,
     /// Set on the child last, after the sandbox environment (OpenCode v2, #710).
     extra_env: Vec<(String, String)>,
     /// An OpenCode v2 session (#710): no gh handover via OPENCODE_AUTH_CONTENT.
@@ -463,8 +465,9 @@ impl PreparedSandbox {
     }
 
     /// The MCP broker socket the `open`/`xdg-open` shims forward to.
-    pub fn set_mcp_socket(&mut self, socket: Option<&Path>) {
-        self.mcp_socket = socket.map(Path::to_path_buf);
+    pub fn set_mcp_socket(&mut self, socket: &Path, hosts: &[String]) {
+        self.mcp_socket = Some(socket.to_path_buf());
+        self.open_url_hosts = hosts.to_vec();
     }
 
     /// Reapply after late agent-specific grants, before capturing the broker's
@@ -2630,6 +2633,7 @@ fn prepare_impl(
         worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        open_url_hosts: Vec::new(),
         extra_env: Vec::new(),
         opencode_v2: false,
     })
@@ -4409,6 +4413,7 @@ fn prepare_impl(
         worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        open_url_hosts: Vec::new(),
         extra_env: Vec::new(),
         opencode_v2: false,
         policy,
