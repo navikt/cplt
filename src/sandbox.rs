@@ -405,6 +405,9 @@ pub struct PreparedSandbox {
     /// Exported to the child as `CPLT_WORKTREE_SOCKET`, set by the launcher
     /// with [`Self::set_worktree_socket`].
     worktree_socket: Option<PathBuf>,
+    /// The MCP broker socket, for the `open_url` shims (#910). Set with
+    /// [`Self::set_mcp_socket`].
+    pub(crate) mcp_socket: Option<PathBuf>,
     /// Set on the child last, after the sandbox environment (OpenCode v2, #710).
     extra_env: Vec<(String, String)>,
     /// An OpenCode v2 session (#710): no gh handover via OPENCODE_AUTH_CONTENT.
@@ -457,6 +460,11 @@ impl PreparedSandbox {
     /// managed root together.
     pub fn set_worktree_socket(&mut self, socket: Option<&Path>) {
         self.worktree_socket = socket.map(Path::to_path_buf);
+    }
+
+    /// The MCP broker socket the `open`/`xdg-open` shims forward to.
+    pub fn set_mcp_socket(&mut self, socket: Option<&Path>) {
+        self.mcp_socket = socket.map(Path::to_path_buf);
     }
 
     /// Reapply after late agent-specific grants, before capturing the broker's
@@ -2621,6 +2629,7 @@ fn prepare_impl(
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         extra_env: Vec::new(),
         opencode_v2: false,
     })
@@ -4399,6 +4408,7 @@ fn prepare_impl(
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         extra_env: Vec::new(),
         opencode_v2: false,
         policy,

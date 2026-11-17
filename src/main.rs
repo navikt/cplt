@@ -950,6 +950,11 @@ QUICK START:
     #[command(name = "mcp-stdio", hide = true)]
     McpStdio { id: String },
 
+    /// Inside a session: ask the MCP broker to open an https URL on the host.
+    /// The `open`/`xdg-open` shims run this; it is not run by hand.
+    #[command(name = "mcp-open-url", hide = true)]
+    McpOpenUrl { url: String },
+
     /// Verify & explain sandbox enforcement.
     ///
     /// Runs probes inside the REAL resolved sandbox and proxy, the same policy
@@ -5008,6 +5013,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let mut mcp_status = None;
     match cli.command.take() {
         Some(Command::McpStdio { id }) => return Ok(cplt::mcp_broker::run_stdio(&id)),
+        Some(Command::McpOpenUrl { url }) => return Ok(cplt::mcp_broker::run_open_url(&url)),
         Some(Command::Mcp {
             action: McpAction::Status { json },
         }) => mcp_status = Some(json),
@@ -5181,7 +5187,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Worktree { .. } => {
                 unreachable!("Command::Worktree handled before this match")
             }
-            Command::Mcp { .. } | Command::McpStdio { .. } => {
+            Command::Mcp { .. } | Command::McpStdio { .. } | Command::McpOpenUrl { .. } => {
                 unreachable!("Command::Mcp handled before this match")
             }
         });
@@ -7493,6 +7499,7 @@ fn assemble_sandbox(
         prepared.check_netns().map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     prepared.set_worktree_root(opts.repos.worktree_root);
+    prepared.set_mcp_socket(mcp_broker.as_ref().map(cplt::mcp_broker::Broker::socket));
     prepared.set_worktree_socket(
         worktree_broker
             .as_ref()

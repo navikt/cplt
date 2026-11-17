@@ -79,6 +79,8 @@ pub(crate) struct Shared {
     home: PathBuf,
     log: Log,
     stop: AtomicBool,
+    /// Hosts `open_url` may open.
+    open_hosts: Vec<String>,
     /// Open connections (socket clients and egress tunnels together).
     open: Arc<AtomicUsize>,
 }
@@ -173,8 +175,10 @@ impl Broker {
             };
             servers.insert(server.spec.id.clone(), server);
         }
+        let open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
         let shared = Arc::new(Shared {
             servers,
+            open_hosts,
             home: home.to_path_buf(),
             log,
             stop: AtomicBool::new(false),
@@ -1053,6 +1057,12 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     let Some(id) = read_line(&mut reader, 512) else {
         return;
     };
+    if id == super::open_url::OP_LINE {
+        if let Ok(mut w) = client.lock() {
+            super::open_url::serve(&mut reader, &mut *w, &shared.open_hosts, &shared.log);
+        }
+        return;
+    }
     let Some(server) = shared.servers.get(&id) else {
         refuse("no brokered MCP server with that id");
         return;
