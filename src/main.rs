@@ -7503,6 +7503,9 @@ fn assemble_sandbox(
     sandbox_config.restrict_oauth_bind = mcp_broker
         .as_ref()
         .is_some_and(cplt::mcp_broker::Broker::holds_oauth_port);
+    sandbox_config.oauth_port_claimed = mcp_broker
+        .as_ref()
+        .is_some_and(cplt::mcp_broker::Broker::oauth_port_claimed);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =
@@ -7618,6 +7621,7 @@ fn build_sandbox_config<'a>(
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -14877,6 +14881,7 @@ mod tests {
             worktree_socket: None,
             mcp_socket: None,
             restrict_oauth_bind: false,
+            oauth_port_claimed: false,
             home_dir: &home,
             extra_read: &base_extra_read,
             extra_write: &[],

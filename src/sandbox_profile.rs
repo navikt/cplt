@@ -237,6 +237,7 @@ fn profile_locked(
         config.localhost_ports,
         config.proxy_forced,
         config.deny_dns,
+        config.restrict_oauth_bind,
     );
     // Keep PATH-resolved bin and shim locations read-only after user allows.
     // The pnpm rule re-allows its two writable stores, so all security denies
@@ -3858,6 +3859,7 @@ fn emit_network_rules(
     localhost_ports: &[u16],
     proxy_forced: bool,
     deny_dns: bool,
+    restrict_oauth_bind: bool,
 ) {
     // Network — outbound restricted to HTTPS/HTTP, localhost blocked by default.
     // Copilot CLI connects directly to api.githubcopilot.com:443 etc.
@@ -3975,13 +3977,16 @@ fn emit_network_rules(
     //   4. Most build tools (Gradle, Kotlin) bind to 127.0.0.1 explicitly
     sbpl!(sb, "(allow network-bind (local ip \"*:*\"))");
     sbpl!(sb, "(allow network-inbound (local ip \"*:*\"))");
-    // Reserve the MCP OAuth loopback callback port (#1017): even if another
-    // process held it at session start and releases it later, the sandboxed
-    // agent must never bind it and intercept an OAuth code flow.
-    sbpl!(
-        sb,
-        "(deny network-bind (local ip \"*:{OAUTH_CALLBACK_PORT}\"))"
-    );
+    // Reserve the MCP OAuth loopback callback port (#1017) when the broker
+    // holds it: even if another process held it at session start and releases
+    // it later, the sandboxed agent must never bind it and intercept an OAuth
+    // code flow. Other sessions leave it bindable, as Landlock does.
+    if restrict_oauth_bind {
+        sbpl!(
+            sb,
+            "(deny network-bind (local ip \"*:{OAUTH_CALLBACK_PORT}\"))"
+        );
+    }
     if proxy_forced {
         // A background URLSession hands the transfer to nsurlsessiond, which
         // resolves and connects outside the sandbox and the proxy. Follows
@@ -5011,6 +5016,7 @@ mod tests {
             worktree_socket: None,
             mcp_socket: None,
             restrict_oauth_bind: false,
+            oauth_port_claimed: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

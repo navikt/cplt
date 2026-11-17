@@ -1417,7 +1417,13 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let restrict_net_bind = config.restrict_oauth_bind;
     let mut bind_rules = Vec::new();
     if restrict_net_bind {
-        bind_rules.push(NetRule { port: 0 });
+        // A port-0 grant lets the kernel pick any ephemeral port, 62471
+        // included, and Landlock has no deny rule to carve it out. Once the
+        // guard holds the port no bind can get it; until then (another holder
+        // still owns it and the guard is retrying) ephemeral binds stay denied.
+        if config.oauth_port_claimed {
+            bind_rules.push(NetRule { port: 0 });
+        }
         for &port in config.localhost_ports {
             if port != 0
                 && port != policy::OAUTH_CALLBACK_PORT
@@ -3237,6 +3243,7 @@ mod tests {
             worktree_socket: None,
             mcp_socket: None,
             restrict_oauth_bind: false,
+            oauth_port_claimed: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -5038,6 +5045,7 @@ mod tests {
         with_broker.localhost_ports = &ports;
         with_broker.allow_localhost_any = true;
         with_broker.restrict_oauth_bind = true;
+        with_broker.oauth_port_claimed = true;
         let policy_with = generate_policy(&with_broker);
         assert!(policy_with.restrict_net_bind);
         assert!(policy_with.bind_rules.iter().any(|r| r.port == 0));
@@ -5047,6 +5055,20 @@ mod tests {
                 .bind_rules
                 .iter()
                 .any(|r| r.port == policy::OAUTH_CALLBACK_PORT)
+        );
+
+        // Guard still waiting for another holder: no port-0 grant, or the
+        // kernel could hand 62471 to an ephemeral bind.
+        with_broker.oauth_port_claimed = false;
+        let pending = generate_policy(&with_broker);
+        assert!(pending.restrict_net_bind);
+        assert_eq!(
+            pending
+                .bind_rules
+                .iter()
+                .map(|r| r.port)
+                .collect::<Vec<_>>(),
+            vec![3000]
         );
     }
 

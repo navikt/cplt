@@ -1653,6 +1653,15 @@ The socket lives in a 0700 `cplt-mcp-<random>` directory under `/tmp`. The polic
 
 The sandbox gets no D-Bus. With the broker active, Bubblewrap mounts an empty tmpfs over every runtime dir (`/run/user/<uid>` and `$XDG_RUNTIME_DIR`) and over `/run/dbus`, and masks each `unix:path=` or `unix:dir=` that `DBUS_SESSION_BUS_ADDRESS` names. Only paths that exist at launch can be masked. An abstract bus address (`unix:abstract=`, `unix:tmpdir=`) is refused below Landlock ABI v6, which is what scopes abstract sockets. A non-unix bus address is always refused. Hiding the runtime dirs also hides what else lives there, including the gpg-agent socket and rootless Docker or Podman. So when `--allow-gpg-signing` or `--allow-rootless-docker` (or `allow_gpg_signing` / `allow_rootless_docker` in config) is on, cplt keeps the flag and turns the broker off for that run. It says so in one line: pass `--no-mcp-broker <id>` to keep the flag without the broker, or drop the flag to use the broker. `cplt mcp status --json` reports the reason as `off_reason`. With the broker active, Bubblewrap is strict for the run, so a spawn-time failure stops the launch instead of falling back to Landlock with the bus reachable.
 
+#### MCP OAuth callback port
+
+The fixed OAuth callback port 62471 ([#1017](https://github.com/navikt/cplt/issues/1017)) is reserved only in sessions where the broker holds it, that is, a brokered server uses OAuth. Copilot CLI and OpenCode run their own OAuth natively, and the port stays bindable in those sessions. In a broker-OAuth session the broker binds `127.0.0.1:62471`, or retries until another holder releases it. Seatbelt denies binding the port. Landlock handles `BindTcp` with an allowlist: ephemeral `bind(0)` (granted only once the broker holds the port, because a port-0 grant lets the kernel pick 62471), the `localhost_ports`, and OpenCode v2's service port. Known limits:
+
+- **Landlock ABI v1–v3 (kernel < 6.7) cannot filter bind.** The guard is not enforced there. If another process holds the port at start and releases it, the agent can claim it before the broker's next retry. cplt warns at launch. Bubblewrap's network namespace (`proxy.netns`) closes it.
+- **While the broker waits for the port, ephemeral binds are denied** for the whole session, and cplt warns at launch.
+
+The broker OAuth path is not served yet, so these limits do not affect any current session.
+
 ### Layer 3: Input validation
 
 #### SBPL injection prevention

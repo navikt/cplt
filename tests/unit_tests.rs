@@ -816,6 +816,7 @@ fn landlock_policy_device_files_have_ioctl() {
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -2735,6 +2736,7 @@ fn the_landlock_model_grants_a_named_root_the_project_access() {
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         ..base_profile_options()
     });
     let rule = policy
@@ -2782,6 +2784,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         ..base_profile_options()
     });
     let rule = policy
@@ -2813,6 +2816,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4391,8 +4395,8 @@ fn profile_allows_localhost_tcp_bind() {
         "Profile must allow inbound on all local addresses (for Java IPv4-mapped)"
     );
     assert!(
-        p.contains(r#"(deny network-bind (local ip "*:62471"))"#),
-        "Profile must deny binding the fixed MCP OAuth callback port"
+        !p.contains(r#"(deny network-bind (local ip "*:62471"))"#),
+        "without broker OAuth the callback port stays bindable (OpenCode v2 may pick it)"
     );
 }
 
@@ -4404,6 +4408,7 @@ fn profile_denies_oauth_callback_port_bind_after_allow_and_with_localhost_any() 
             project_dir: std::path::Path::new("/tmp/proj"),
             allow_localhost_any: true,
             localhost_ports: &ports,
+            restrict_oauth_bind: true,
             ..base_profile_options()
         },
         &[],
@@ -4427,6 +4432,7 @@ fn landlock_policy_leaves_bind_unrestricted_without_broker_oauth() {
         project_dir: std::path::Path::new("/tmp/proj"),
         localhost_ports: &ports,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         ..base_profile_options()
     });
     assert!(
@@ -4452,6 +4458,7 @@ fn landlock_policy_restricts_bind_and_excludes_oauth_callback_port() {
         allow_localhost_any: true,
         localhost_ports: &ports,
         restrict_oauth_bind: true,
+        oauth_port_claimed: true,
         ..base_profile_options()
     });
     assert!(policy.restrict_net_bind);
@@ -4505,6 +4512,7 @@ fn allow_localhost_any_affects_both_backends() {
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4585,6 +4593,7 @@ fn config_options_parity_across_backends() {
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &ports,
@@ -10797,6 +10806,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         worktree_socket: None,
         mcp_socket: None,
         restrict_oauth_bind: false,
+        oauth_port_claimed: false,
         existing_home_tool_dirs: Some(&dirs),
         existing_app_dirs: None,
         extra_ports: &[],

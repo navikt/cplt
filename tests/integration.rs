@@ -475,6 +475,7 @@ mod macos_tests {
             worktree_socket: None,
             mcp_socket: None,
             restrict_oauth_bind: false,
+            oauth_port_claimed: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -6127,7 +6128,8 @@ print(f'OK:{port}')
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
-        let opts = default_opts(&project, &home);
+        let mut opts = default_opts(&project, &home);
+        opts.restrict_oauth_bind = true;
         let profile = write_real_profile(&opts);
 
         let port = cplt::sandbox::OAUTH_CALLBACK_PORT;

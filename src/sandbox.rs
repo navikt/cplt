@@ -229,10 +229,16 @@ pub struct SandboxConfig<'a> {
     /// one exact path, like `worktree_socket`. macOS only.
     pub mcp_socket: Option<&'a Path>,
     /// Whether the MCP broker holds/guards the fixed OAuth loopback callback
-    /// port (`OAUTH_CALLBACK_PORT`) for this session (#1017). Linux only:
-    /// Landlock handles `AccessNet::BindTcp` only when this is true so dev
-    /// servers can bind any port in all other sessions.
+    /// port (`OAUTH_CALLBACK_PORT`) for this session (#1017). Only then does
+    /// Landlock handle `AccessNet::BindTcp` and Seatbelt deny binding the
+    /// port, so dev servers and OpenCode v2's service can bind any port in
+    /// all other sessions.
     pub restrict_oauth_bind: bool,
+    /// Whether the broker's guard already holds the OAuth port at launch.
+    /// Landlock grants ephemeral `bind(0)` only then: a port-0 grant lets the
+    /// kernel hand out any port, 62471 included, while the guard still waits
+    /// for another holder to release it. Ignored unless `restrict_oauth_bind`.
+    pub oauth_port_claimed: bool,
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
@@ -584,7 +590,16 @@ impl PreparedSandbox {
             });
             landlock_mod::hide_files(&mut w.fs_rules, &mut w.plain_file, &session.hidden)?;
             w.net_rules.push(port);
+            // With the OAuth guard on, BindTcp is handled and v2's service
+            // binds this explicit port, so it needs a bind grant too (#1017).
+            let bind = self.policy.restrict_net_bind && session.port != OAUTH_CALLBACK_PORT;
+            if bind {
+                w.bind_rules.push(port);
+            }
             let p = &mut self.policy;
+            if bind {
+                p.bind_rules.push(port);
+            }
             p.fs_rules.extend(extra.iter().cloned());
             landlock_mod::hide_files(&mut p.fs_rules, &mut p.plain_file, &session.hidden)?;
             p.net_rules.push(port);
@@ -684,6 +699,31 @@ pub fn prepare_with_pnpm_shadow(
     crate::env_read_lock(|| prepare_locked(config, pnpm_shadow_dir, inspect_only))
 }
 
+/// Prints, once per launch, where the OAuth callback port guard (#1017) cannot
+/// hold under Landlock: no `BindTcp` before ABI v4, and no ephemeral binds
+/// while the broker still waits for the port. Returns the warnings for tests.
+#[cfg(target_os = "linux")]
+fn warn_oauth_bind_gaps(config: &SandboxConfig, abi: Option<u32>) -> Vec<String> {
+    let mut out = Vec::new();
+    if abi.is_none_or(|abi| abi < 4) {
+        out.push(format!(
+            "MCP OAuth: this kernel cannot filter TCP bind (Landlock ABI < 4, kernel < 6.7), \
+             so the agent can bind the OAuth callback port {OAUTH_CALLBACK_PORT} if the broker \
+             loses it. See SECURITY.md."
+        ));
+    }
+    if !config.oauth_port_claimed {
+        out.push(format!(
+            "MCP OAuth: port {OAUTH_CALLBACK_PORT} is held by another process; ephemeral \
+             bind(0) is denied for this session."
+        ));
+    }
+    for w in &out {
+        ui::warn(w);
+    }
+    out
+}
+
 fn prepare_locked(
     config: &SandboxConfig,
     pnpm_shadow_dir: Option<&Path>,
@@ -692,6 +732,10 @@ fn prepare_locked(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
+    #[cfg(target_os = "linux")]
+    if config.restrict_oauth_bind && !inspect_only {
+        warn_oauth_bind_gaps(config, landlock_mod::available_abi_version());
+    }
     // Inspect-only callers (`--print-profile`, `cplt mcp status`) never
     // launch, so nothing can forge the state; they report instead.
     if !inspect_only {
@@ -5015,6 +5059,7 @@ mod tests {
             worktree_socket: None,
             mcp_socket: None,
             restrict_oauth_bind: false,
+            oauth_port_claimed: false,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -5089,6 +5134,77 @@ mod tests {
             .unwrap();
         let text = describe(&sandbox);
         assert!(text.rfind(";; Broker staging is private").unwrap() > text.rfind(&grant).unwrap());
+    }
+
+    /// #1017: with the OAuth guard on, v2's explicit service port is bindable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_session_port_is_bindable_under_oauth_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.use_bubblewrap = Some(false);
+        config.restrict_oauth_bind = true;
+        config.oauth_port_claimed = true;
+        let mut sandbox = prepare(&config).unwrap();
+        assert!(sandbox.policy.restrict_net_bind);
+        sandbox.bwrap_wrapper = Some(bubblewrap::BubblewrapWrapper {
+            bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+            bwrap_args: vec![],
+            fs_rules: vec![],
+            net_rules: vec![],
+            bind_rules: sandbox.policy.bind_rules.clone(),
+            restrict_net_connect: true,
+            restrict_net_bind: true,
+            strict: false,
+            deny_mask_count: 0,
+            socket_mask_count: 0,
+            proc_limited_on_fallback: false,
+            proxy_forced: false,
+            plain_file: None,
+        });
+        sandbox
+            .add_opencode_v2(crate::opencode_v2::Session {
+                env: Vec::new(),
+                port: 50123,
+                model: Err(()),
+                tui: Vec::new(),
+                hidden: Vec::new(),
+                reads: Vec::new(),
+                writes: Vec::new(),
+            })
+            .unwrap();
+        let w = sandbox.bwrap_wrapper.as_ref().unwrap();
+        for ports in [
+            w.bind_rules.iter().map(|r| r.port).collect::<Vec<u16>>(),
+            sandbox
+                .precomputed
+                .bind_rules
+                .iter()
+                .map(|r| r.port)
+                .collect(),
+        ] {
+            assert!(ports.contains(&50123), "{ports:?}");
+            assert!(!ports.contains(&OAUTH_CALLBACK_PORT), "{ports:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oauth_bind_gaps_warn_on_old_abi_and_unclaimed_port() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.restrict_oauth_bind = true;
+        config.oauth_port_claimed = true;
+        assert!(warn_oauth_bind_gaps(&config, Some(4)).is_empty());
+        let old = warn_oauth_bind_gaps(&config, Some(3));
+        assert_eq!(old.len(), 1);
+        assert!(old[0].contains("ABI < 4"), "{old:?}");
+        config.oauth_port_claimed = false;
+        let pending = warn_oauth_bind_gaps(&config, Some(6));
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].contains("bind(0) is denied"), "{pending:?}");
     }
 
     /// #719: v2's port joins the allowlist; /proc requires bubblewrap.

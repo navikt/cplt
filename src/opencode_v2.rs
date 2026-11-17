@@ -583,9 +583,15 @@ fn build_overlay(
 /// process can take it in between; the service then fails "already in use"
 /// after its 15 s retry. Rare; passing a bound socket in would need upstream.
 fn free_port() -> std::io::Result<u16> {
-    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port())
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        // The sandbox may deny binding the MCP OAuth callback port (#1017).
+        if port != crate::sandbox::OAUTH_CALLBACK_PORT {
+            return Ok(port);
+        }
+    }
 }
 
 /// The SBPL rules a v2 session adds: (file grants that go before the

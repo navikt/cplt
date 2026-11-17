@@ -211,7 +211,6 @@ impl OAuthPortGuard {
         !self.state.failed.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    #[cfg(test)]
     fn is_claimed(&self) -> bool {
         self.state
             .listener
@@ -440,6 +439,13 @@ impl Broker {
         self.oauth_guard
             .as_ref()
             .is_some_and(OAuthPortGuard::is_active)
+    }
+
+    /// Whether the guard already holds the OAuth port (not still retrying).
+    pub fn oauth_port_claimed(&self) -> bool {
+        self.oauth_guard
+            .as_ref()
+            .is_some_and(OAuthPortGuard::is_claimed)
     }
 
     pub fn specs(&self) -> impl Iterator<Item = &Spec> {
