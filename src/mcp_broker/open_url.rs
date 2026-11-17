@@ -122,89 +122,20 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
     }
 }
 
-/// The system XDG dirs the opener sees, fixed rather than inherited.
-const OPENER_CONFIG_DIRS: &[&str] = &["/etc/xdg"];
-const OPENER_DATA_DIRS: &[&str] = &["/usr/local/share", "/usr/share"];
+/// macOS only (owner decision 2026-11-17): LaunchServices picks the handler
+/// from `~/Library/Preferences`, which the sandbox must not write. Linux has
+/// no host opener: `xdg-open` resolves its handler through many agent-writable,
+/// desktop-specific files (`~/.cache` ksycoca, `kdeglobals`, XFCE
+/// `helpers.rc`), which would give host code execution. There the shim prints
+/// the URL instead, see [`run`].
+pub const HOST_OPENER: bool = cfg!(target_os = "macos");
 
-/// The opener picks the handler from files the sandbox must not write: on
-/// Linux `mimeapps.list`, `.desktop` files and the KDE ksycoca cache under
-/// the XDG dirs it is given; on macOS the LaunchServices prefs. Returns the
-/// first such path a `writable` root reaches (symlinks resolved on both
-/// sides); the launcher then turns the op off.
+/// The LaunchServices prefs dir when a `writable` root reaches it (symlinks
+/// resolved on both sides); the launcher then turns the op off.
 #[must_use]
-pub fn opener_config_writable(
-    home: &Path,
-    writable: &[&Path],
-    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    find_writable(home, writable, get, cfg!(target_os = "macos"))
-}
-
-fn find_writable(
-    home: &Path,
-    writable: &[&Path],
-    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-    macos: bool,
-) -> Option<PathBuf> {
-    handler_paths(home, get, macos)
-        .into_iter()
-        .find(|p| reaches(p, writable))
-}
-
-/// Every file or tree the opener reads a handler from.
-fn handler_paths(
-    home: &Path,
-    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-    macos: bool,
-) -> Vec<PathBuf> {
-    if macos {
-        return vec![home.join("Library/Preferences")];
-    }
-    let xdg = |k: &str, d: &str| {
-        get(k)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| home.join(d))
-    };
-    let desktops: Vec<String> = get("XDG_CURRENT_DESKTOP")
-        .map(|d| d.to_string_lossy().to_lowercase())
-        .iter()
-        .flat_map(|d| d.split(':').filter(|x| !x.is_empty()).map(String::from))
-        .collect();
-    let mut v = mimeapps_lists(&xdg("XDG_CONFIG_HOME", ".config"), &desktops);
-    v.extend([
-        xdg("XDG_DATA_HOME", ".local/share").join("applications"),
-        xdg("XDG_CACHE_HOME", ".cache"),
-    ]);
-    for d in OPENER_CONFIG_DIRS {
-        v.extend(mimeapps_lists(Path::new(d), &desktops));
-    }
-    v.extend(
-        OPENER_DATA_DIRS
-            .iter()
-            .map(|d| Path::new(d).join("applications")),
-    );
-    v
-}
-
-/// `mimeapps.list` and `<desktop>-mimeapps.list` in `dir`: one per current
-/// desktop (whether or not it exists yet) plus any such file already there.
-fn mimeapps_lists(dir: &Path, desktops: &[String]) -> Vec<PathBuf> {
-    let mut v = vec![dir.join("mimeapps.list")];
-    v.extend(
-        desktops
-            .iter()
-            .map(|d| dir.join(format!("{d}-mimeapps.list"))),
-    );
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        v.extend(
-            entries
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().ends_with("mimeapps.list"))
-                .map(|e| e.path()),
-        );
-    }
-    v
+pub fn opener_config_writable(home: &Path, writable: &[&Path]) -> Option<PathBuf> {
+    let prefs = home.join("Library/Preferences");
+    reaches(&prefs, writable).then_some(prefs)
 }
 
 /// The path with symlinks resolved as far as it exists.
@@ -260,13 +191,9 @@ fn collect_links(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The platform opener, resolved outside the agent's reach.
-fn opener() -> Option<std::path::PathBuf> {
-    if cfg!(target_os = "macos") {
-        Some("/usr/bin/open".into())
-    } else {
-        crate::git::trusted_binary("xdg-open")
-    }
+/// The host opener: `/usr/bin/open` on macOS, none elsewhere.
+fn opener(macos: bool) -> Option<PathBuf> {
+    macos.then(|| "/usr/bin/open".into())
 }
 
 /// Host side: read the URL line, check it, open it. Answers `ok` or the reason.
@@ -286,7 +213,7 @@ pub(crate) fn serve(
             log.line("open_url", &format!("DENIED {why}"));
             format!("denied: {why}")
         }
-        Ok(busy) => match opener().map(|o| spawn_opener(&o, &url, home, busy)) {
+        Ok(busy) => match opener(HOST_OPENER).map(|o| spawn_opener(&o, &url, home, busy)) {
             Some(Ok(())) => {
                 log.line("open_url", "ALLOWED");
                 "ok".to_string()
@@ -307,9 +234,8 @@ pub(crate) fn serve(
 }
 
 /// The opener's environment, like the broker's other host children
-/// (`runtime::host_env`): cleared, then HOME, the trusted PATH so `xdg-open`
-/// cannot pick up an agent-planted `gio` or browser, TMPDIR, and only what a
-/// desktop opener needs to reach the session and the user's browser choice.
+/// (`runtime::host_env`): cleared, then HOME, the trusted PATH, TMPDIR and
+/// the locale.
 fn opener_env(
     home: &Path,
     get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
@@ -319,24 +245,7 @@ fn opener_env(
         ("PATH", crate::git::TRUSTED_BIN_DIRS.join(":").into()),
         ("TMPDIR", std::env::temp_dir().into_os_string()),
     ];
-    let mut keep = vec!["LANG", "LC_ALL"];
-    if cfg!(target_os = "linux") {
-        keep.extend([
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "XAUTHORITY",
-            "DBUS_SESSION_BUS_ADDRESS",
-            "XDG_RUNTIME_DIR",
-            "XDG_CURRENT_DESKTOP",
-            "XDG_SESSION_TYPE",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
-        ]);
-        // Fixed, so the handler search stays inside what the check covers.
-        env.push(("XDG_CONFIG_DIRS", OPENER_CONFIG_DIRS.join(":").into()));
-        env.push(("XDG_DATA_DIRS", OPENER_DATA_DIRS.join(":").into()));
-    }
+    let keep = ["LANG", "LC_ALL"];
     env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
     env
 }
@@ -370,6 +279,23 @@ fn spawn_opener(
 
 /// `cplt mcp-open-url <url>`, inside the sandbox: ask the broker to open it.
 pub fn run(url: &str) -> ExitCode {
+    if !HOST_OPENER {
+        let hosts: Vec<String> = std::env::var(HOSTS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(String::from)
+            .collect();
+        return match print_link(url, &hosts) {
+            Ok(line) => {
+                eprintln!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(line) => {
+                eprintln!("{line}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|s| !s.is_empty()) else {
         eprintln!("cplt mcp-open-url: {SOCKET_ENV} is not set; run inside a cplt session");
         return ExitCode::FAILURE;
@@ -397,10 +323,25 @@ pub fn run(url: &str) -> ExitCode {
     }
 }
 
+/// The allowed hosts, comma-separated, for the Linux shim.
+const HOSTS_ENV: &str = "CPLT_OPEN_URL_HOSTS";
+
+/// Linux: the line to show instead of opening `url`. Only an allowed URL is
+/// printed, so the agent cannot use the shim to show arbitrary links styled
+/// as cplt messages; `check` also refuses control bytes. Never spawns.
+fn print_link(url: &str, hosts: &[String]) -> Result<String, String> {
+    match check(url, hosts) {
+        Ok(()) => Ok(format!(
+            "cplt: open this link in your browser to log in: {url}"
+        )),
+        Err(why) => Err(format!("cplt: not showing the link: {why}")),
+    }
+}
+
 /// The shim script. One `https://` argument goes to the broker; anything
 /// else runs the real opener, if there is one, as before.
 #[must_use]
-pub fn shim_script(cplt: &str, socket: &str, real: Option<&str>) -> String {
+pub fn shim_script(cplt: &str, socket: &str, hosts: &[String], real: Option<&str>) -> String {
     let fallback = match real {
         Some(r) => format!("exec {} \"$@\"", sh_quote(r)),
         None => "echo \"cplt: only https URLs are opened in this session\" >&2; exit 1".into(),
@@ -408,9 +349,10 @@ pub fn shim_script(cplt: &str, socket: &str, real: Option<&str>) -> String {
     format!(
         "#!/bin/sh\n\
          if [ \"$#\" -eq 1 ]; then case \"$1\" in https://*) \
-         exec env {SOCKET_ENV}={} {} mcp-open-url \"$1\" ;; esac; fi\n\
+         exec env {SOCKET_ENV}={} {HOSTS_ENV}={} {} mcp-open-url \"$1\" ;; esac; fi\n\
          {fallback}\n",
         sh_quote(socket),
+        sh_quote(&hosts.join(",")),
         sh_quote(cplt),
     )
 }
@@ -508,82 +450,16 @@ mod tests {
     #[test]
     fn opener_config_writable_finds_covering_roots() {
         let h = Path::new("/h");
-        let none = |_: &str| None;
         let w = |roots: &[&str]| {
             let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
-            find_writable(h, &roots, &none, false)
+            opener_config_writable(h, &roots)
         };
-        assert_eq!(w(&["/h/proj", "/h/.config/opencode"]), None);
-        assert_eq!(w(&["/h"]), Some("/h/.config/mimeapps.list".into()));
-        assert_eq!(w(&["/h/.config"]), Some("/h/.config/mimeapps.list".into()));
+        assert_eq!(w(&["/h/proj"]), None);
+        assert_eq!(w(&["/h"]), Some("/h/Library/Preferences".into()));
         assert_eq!(
-            w(&["/h/.local/share/applications/x"]),
-            Some("/h/.local/share/applications".into())
-        );
-        assert_eq!(w(&["/h/.cache/ksycoca"]), Some("/h/.cache".into()));
-        assert_eq!(w(&["/etc/xdg"]), Some("/etc/xdg/mimeapps.list".into()));
-        assert_eq!(
-            w(&["/usr/share/applications"]),
-            Some("/usr/share/applications".into())
-        );
-        let xdg = |k: &str| (k == "XDG_CONFIG_HOME").then(|| "/cfg".into());
-        assert_eq!(
-            find_writable(h, &[Path::new("/cfg")], &xdg, false),
-            Some("/cfg/mimeapps.list".into())
-        );
-        // Desktop-specific lists, also when they do not exist yet.
-        let gnome = |k: &str| (k == "XDG_CURRENT_DESKTOP").then(|| "X-Cinnamon:GNOME".into());
-        for root in [
-            "/h/.config/gnome-mimeapps.list",
-            "/etc/xdg/x-cinnamon-mimeapps.list",
-        ] {
-            assert_eq!(
-                find_writable(h, &[Path::new(root)], &gnome, false),
-                Some(root.into()),
-                "{root}"
-            );
-            assert_eq!(
-                find_writable(h, &[Path::new(root)], &none, false),
-                None,
-                "{root}"
-            );
-        }
-        // macOS: LaunchServices prefs.
-        let mac = |roots: &[&str]| {
-            let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
-            find_writable(h, &roots, &none, true)
-        };
-        assert_eq!(mac(&["/h/proj"]), None);
-        assert_eq!(mac(&["/h"]), Some("/h/Library/Preferences".into()));
-        assert_eq!(
-            mac(&["/h/Library/Preferences/com.apple.LaunchServices"]),
+            w(&["/h/Library/Preferences/com.apple.LaunchServices"]),
             Some("/h/Library/Preferences".into())
         );
-    }
-
-    #[test]
-    fn opener_config_writable_finds_existing_desktop_list() {
-        use std::os::unix::fs::symlink;
-        let t = std::env::temp_dir().join(format!("cplt-mime-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&t);
-        let (home, repo) = (t.join("home"), t.join("repo"));
-        std::fs::create_dir_all(home.join(".config")).unwrap();
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("kde-mimeapps.list"), "").unwrap();
-        let none = |_: &str| None;
-        let roots = [repo.as_path()];
-        assert_eq!(find_writable(&home, &roots, &none, false), None);
-        // Linked in, desktop not named in the env: found by scanning the dir.
-        symlink(
-            repo.join("kde-mimeapps.list"),
-            home.join(".config/kde-mimeapps.list"),
-        )
-        .unwrap();
-        assert_eq!(
-            find_writable(&home, &roots, &none, false),
-            Some(home.join(".config/kde-mimeapps.list"))
-        );
-        std::fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]
@@ -592,37 +468,47 @@ mod tests {
         let t = std::env::temp_dir().join(format!("cplt-ou-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         let (home, repo) = (t.join("home"), t.join("repo"));
-        std::fs::create_dir_all(repo.join("dot/applications")).unwrap();
-        std::fs::create_dir_all(home.join(".local/share/applications")).unwrap();
-        let none = |_: &str| None;
+        std::fs::create_dir_all(repo.join("prefs")).unwrap();
+        std::fs::create_dir_all(home.join("Library")).unwrap();
         let roots = [repo.as_path()];
-        assert_eq!(find_writable(&home, &roots, &none, false), None);
-        // A stow-style ~/.config into the writable repo.
-        symlink(repo.join("dot"), home.join(".config")).unwrap();
+        assert_eq!(opener_config_writable(&home, &roots), None);
+        // Preferences linked into the writable repo.
+        symlink(repo.join("prefs"), home.join("Library/Preferences")).unwrap();
         assert_eq!(
-            find_writable(&home, &roots, &none, false),
-            Some(home.join(".config/mimeapps.list"))
-        );
-        std::fs::remove_file(home.join(".config")).unwrap();
-        // One .desktop file linked into the repo.
-        symlink(
-            repo.join("dot/applications/x.desktop"),
-            home.join(".local/share/applications/x.desktop"),
-        )
-        .unwrap();
-        assert_eq!(
-            find_writable(&home, &roots, &none, false),
-            Some(home.join(".local/share/applications"))
+            opener_config_writable(&home, &roots),
+            Some(home.join("Library/Preferences"))
         );
         // A writable root given through a symlink.
-        std::fs::remove_file(home.join(".local/share/applications/x.desktop")).unwrap();
+        std::fs::remove_file(home.join("Library/Preferences")).unwrap();
         symlink(&home, t.join("alias")).unwrap();
         let alias = t.join("alias");
         assert_eq!(
-            find_writable(&home, &[alias.as_path()], &none, false),
-            Some(home.join(".config/mimeapps.list"))
+            opener_config_writable(&home, &[alias.as_path()]),
+            Some(home.join("Library/Preferences"))
         );
         std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    /// Owner decision 2026-11-17: no host opener off macOS, ever.
+    #[test]
+    fn linux_never_spawns_and_prints_only_allowed_urls() {
+        assert_eq!(opener(true), Some("/usr/bin/open".into()));
+        assert_eq!(opener(false), None);
+        assert_eq!(HOST_OPENER, cfg!(target_os = "macos"));
+        assert_eq!(
+            print_link("https://fgw.example/a?b=c", &hosts()),
+            Ok("cplt: open this link in your browser to log in: https://fgw.example/a?b=c".into())
+        );
+        for bad in [
+            "https://evil.example/",
+            "https://fgw.example/\x1b[2J",
+            "https://fgw.example/\u{1b}]8;;https://evil.example\u{7}",
+            "https://fgw.example/\nfake",
+        ] {
+            let e = print_link(bad, &hosts()).unwrap_err();
+            assert!(e.starts_with("cplt: not showing the link: "), "{e}");
+            assert!(!e.contains("evil") && !e.contains('\u{1b}'), "{e}");
+        }
     }
 
     #[test]
@@ -676,28 +562,20 @@ mod tests {
             assert!(!keys.contains(&k), "{k} leaked: {keys:?}");
         }
         assert!(keys.contains(&"HOME") && keys.contains(&"LANG"));
-        let val = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
-        if cfg!(target_os = "linux") {
-            assert_eq!(val("XDG_CONFIG_DIRS"), Some("/etc/xdg".into()));
-            assert_eq!(
-                val("XDG_DATA_DIRS"),
-                Some("/usr/local/share:/usr/share".into())
-            );
-        }
-        if cfg!(target_os = "linux") {
-            assert!(keys.contains(&"DISPLAY") && keys.contains(&"DBUS_SESSION_BUS_ADDRESS"));
-        } else {
-            assert!(!keys.contains(&"DISPLAY"));
-        }
+        assert!(!keys.contains(&"DISPLAY") && !keys.contains(&"XDG_CONFIG_HOME"));
     }
 
     #[test]
     fn shim_forwards_one_https_url_and_quotes_paths() {
-        let s = shim_script("/opt/c'p", "/tmp/s", Some("/usr/bin/open"));
+        let s = shim_script("/opt/c'p", "/tmp/s", &hosts(), Some("/usr/bin/open"));
         assert!(s.contains("'/opt/c'\\''p' mcp-open-url \"$1\""), "{s}");
         assert!(s.contains("CPLT_MCP_SOCKET='/tmp/s'"), "{s}");
+        assert!(
+            s.contains(&format!("CPLT_OPEN_URL_HOSTS='{}'", hosts().join(","))),
+            "{s}"
+        );
         assert!(s.contains("exec '/usr/bin/open' \"$@\""), "{s}");
-        assert!(shim_script("c", "s", None).contains("exit 1"));
+        assert!(shim_script("c", "s", &[], None).contains("exit 1"));
     }
 
     #[test]

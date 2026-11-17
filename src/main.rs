@@ -7466,7 +7466,7 @@ fn assemble_sandbox(
         let broker = cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
             .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
             .ok()?;
-        if broker.open_url_enabled() {
+        if cplt::mcp_broker::OPEN_URL_HOST_OPENER && broker.open_url_enabled() {
             let writable: Vec<&std::path::Path> = [sandbox_config.project_dir]
                 .into_iter()
                 .chain(
@@ -7483,9 +7483,7 @@ fn assemble_sandbox(
                 )
                 .chain(sandbox_config.managed_worktree_root)
                 .collect();
-            if let Some(p) = cplt::mcp_broker::opener_config_writable(home_dir, &writable, &|k| {
-                std::env::var_os(k)
-            }) {
+            if let Some(p) = cplt::mcp_broker::opener_config_writable(home_dir, &writable) {
                 broker.disable_open_url();
                 ui::warn(&format!(
                     "MCP login links will not open in the browser: the sandbox can write {}.",
@@ -7528,12 +7526,9 @@ fn assemble_sandbox(
     }
     prepared.set_worktree_root(opts.repos.worktree_root);
     // The shims only where `open_url` is served (#910).
-    prepared.set_mcp_socket(
-        mcp_broker
-            .as_ref()
-            .filter(|b| b.open_url_enabled())
-            .map(cplt::mcp_broker::Broker::socket),
-    );
+    if let Some(b) = mcp_broker.as_ref().filter(|b| b.open_url_enabled()) {
+        prepared.set_mcp_socket(b.socket(), b.open_url_hosts());
+    }
     prepared.set_worktree_socket(
         worktree_broker
             .as_ref()

@@ -1154,6 +1154,7 @@ fn install_open_url_shims(cmd: &mut Command, sandbox: &crate::sandbox::PreparedS
         let script = crate::mcp_broker::open_url_shim(
             &cplt.to_string_lossy(),
             &socket.to_string_lossy(),
+            &sandbox.open_url_hosts,
             real.as_deref().map(|p| p.to_string_lossy()).as_deref(),
         );
         let path = dir.join(name);
