@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use super::SOCKET_ENV;
 use super::spec::Spec;
+use crate::sandbox::{FsRule, LandlockPolicy};
 
 /// First line a client sends for this op. Spec ids cannot contain `:`.
 pub(crate) const OP_LINE: &str = "cplt:open_url";
@@ -132,12 +133,40 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
 /// the URL instead, see [`run`].
 pub const HOST_OPENER: bool = cfg!(target_os = "macos");
 
-/// The LaunchServices prefs dir when a `writable` root reaches it (symlinks
-/// resolved on both sides); the launcher then turns the op off.
+/// The LaunchServices prefs dir when the session `policy` can write it, an
+/// entry on the way to it, or anything a symlink under it leads through; the
+/// launcher then turns the op off.
+///
+/// Each path is walked one component at a time by
+/// [`crate::check::writable_tree_on_path`], so a two-hop chain
+/// (`Preferences -> ~/dotfiles/prefs -> /elsewhere`) is caught at the
+/// writable middle hop. A write grant inside the dir counts too.
 #[must_use]
-pub fn opener_config_writable(home: &Path, writable: &[&Path]) -> Option<PathBuf> {
+pub fn opener_config_writable(policy: &LandlockPolicy, home: &Path) -> Option<PathBuf> {
     let prefs = home.join("Library/Preferences");
-    reaches(&prefs, writable).then_some(prefs)
+    // Grants given through a symlink match the resolved paths as well.
+    let mut policy = policy.clone();
+    let resolved: Vec<_> = policy
+        .fs_rules
+        .iter()
+        .filter(|r| r.access.write)
+        .map(|r| FsRule {
+            path: real(&r.path),
+            ..r.clone()
+        })
+        .collect();
+    policy.fs_rules.extend(resolved);
+    let mut paths = vec![prefs.clone()];
+    collect_links(&prefs, 4, &mut paths);
+    let real_prefs = real(&prefs);
+    let inside = policy
+        .fs_rules
+        .iter()
+        .any(|r| r.access.write && (r.path.starts_with(&prefs) || r.path.starts_with(&real_prefs)));
+    let on_path = paths
+        .iter()
+        .any(|p| crate::check::writable_tree_on_path(&policy, home, p).is_some());
+    (inside || on_path).then_some(prefs)
 }
 
 /// The path with symlinks resolved as far as it exists.
@@ -158,23 +187,7 @@ fn real(p: &Path) -> PathBuf {
     }
 }
 
-/// Whether a writable root covers `p`, sits inside it, or covers the target
-/// of any symlink under it (a stow-style `.desktop` link into a repo).
-fn reaches(p: &Path, writable: &[&Path]) -> bool {
-    let roots: Vec<PathBuf> = writable
-        .iter()
-        .flat_map(|w| [w.to_path_buf(), real(w)])
-        .collect();
-    let mut targets = vec![p.to_path_buf(), real(p)];
-    if let (Ok(to), Some(dir)) = (std::fs::read_link(p), p.parent()) {
-        targets.push(real(&dir.join(to)));
-    }
-    collect_links(p, 4, &mut targets);
-    targets
-        .iter()
-        .any(|t| roots.iter().any(|w| t.starts_with(w) || w.starts_with(t)))
-}
-
+/// Every symlink under `dir`, to `depth` levels; the caller walks each chain.
 fn collect_links(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -182,11 +195,7 @@ fn collect_links(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
     for e in entries.flatten() {
         let path = e.path();
         if e.file_type().is_ok_and(|t| t.is_symlink()) {
-            // read_link too: a dangling link into a repo is filled in later.
-            if let Ok(to) = std::fs::read_link(&path) {
-                out.push(real(&dir.join(to)));
-            }
-            out.push(real(&path));
+            out.push(path);
         } else if depth > 0 && e.file_type().is_ok_and(|t| t.is_dir()) {
             collect_links(&path, depth - 1, out);
         }
@@ -460,12 +469,36 @@ mod tests {
         l.take(t + WINDOW).unwrap();
     }
 
+    fn write_policy(roots: &[&Path]) -> LandlockPolicy {
+        use crate::sandbox::FsAccess;
+        LandlockPolicy {
+            fs_rules: roots
+                .iter()
+                .map(|r| FsRule {
+                    path: r.to_path_buf(),
+                    access: FsAccess {
+                        read: true,
+                        write: true,
+                        ..FsAccess::default()
+                    },
+                    nofollow: false,
+                })
+                .collect(),
+            net_rules: Vec::new(),
+            restrict_net_connect: true,
+            proxy_forced: false,
+            home_dir: PathBuf::from("/h"),
+            precreate_dirs: vec![],
+            plain_file: None,
+        }
+    }
+
     #[test]
     fn opener_config_writable_finds_covering_roots() {
         let h = Path::new("/h");
         let w = |roots: &[&str]| {
             let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
-            opener_config_writable(h, &roots)
+            opener_config_writable(&write_policy(&roots), h)
         };
         assert_eq!(w(&["/h/proj"]), None);
         assert_eq!(w(&["/h"]), Some("/h/Library/Preferences".into()));
@@ -473,33 +506,57 @@ mod tests {
             w(&["/h/Library/Preferences/com.apple.LaunchServices"]),
             Some("/h/Library/Preferences".into())
         );
+        // An implicit grant beside it, like ~/Library/Caches, does not count.
+        assert_eq!(w(&["/h/Library/Caches"]), None);
     }
 
     #[test]
     fn opener_config_writable_resolves_symlinks() {
         use std::os::unix::fs::symlink;
-        let t = std::env::temp_dir().join(format!("cplt-ou-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&t);
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
         let (home, repo) = (t.join("home"), t.join("repo"));
         std::fs::create_dir_all(repo.join("prefs")).unwrap();
         std::fs::create_dir_all(home.join("Library")).unwrap();
-        let roots = [repo.as_path()];
-        assert_eq!(opener_config_writable(&home, &roots), None);
+        let ask = |roots: &[&Path]| opener_config_writable(&write_policy(roots), &home);
+        assert_eq!(ask(&[&repo]), None);
         // Preferences linked into the writable repo.
         symlink(repo.join("prefs"), home.join("Library/Preferences")).unwrap();
-        assert_eq!(
-            opener_config_writable(&home, &roots),
-            Some(home.join("Library/Preferences"))
-        );
+        assert_eq!(ask(&[&repo]), Some(home.join("Library/Preferences")));
         // A writable root given through a symlink.
         std::fs::remove_file(home.join("Library/Preferences")).unwrap();
         symlink(&home, t.join("alias")).unwrap();
-        let alias = t.join("alias");
         assert_eq!(
-            opener_config_writable(&home, &[alias.as_path()]),
+            ask(&[&t.join("alias")]),
             Some(home.join("Library/Preferences"))
         );
-        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    /// Two hops: Preferences -> dotfiles/prefs -> elsewhere. Only the middle
+    /// link sits in a writable tree; the agent can repoint it.
+    #[test]
+    fn opener_config_writable_catches_a_writable_middle_hop() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, dotfiles, elsewhere) = (t.join("home"), t.join("dotfiles"), t.join("elsewhere"));
+        for d in [&home.join("Library"), &dotfiles, &elsewhere] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        symlink(&elsewhere, dotfiles.join("prefs")).unwrap();
+        symlink(dotfiles.join("prefs"), home.join("Library/Preferences")).unwrap();
+        let ask = |roots: &[&Path]| opener_config_writable(&write_policy(roots), &home);
+        assert_eq!(ask(&[&t.join("proj")]), None);
+        assert_eq!(ask(&[&dotfiles]), Some(home.join("Library/Preferences")));
+        // The same through a link inside Preferences.
+        std::fs::remove_file(home.join("Library/Preferences")).unwrap();
+        std::fs::create_dir(home.join("Library/Preferences")).unwrap();
+        symlink(
+            dotfiles.join("prefs"),
+            home.join("Library/Preferences/com.apple.LaunchServices"),
+        )
+        .unwrap();
+        assert_eq!(ask(&[&dotfiles]), Some(home.join("Library/Preferences")));
     }
 
     /// Owner decision 2026-11-17: no host opener off macOS, ever.

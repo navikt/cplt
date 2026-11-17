@@ -7466,30 +7466,15 @@ fn assemble_sandbox(
         let broker = cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
             .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
             .ok()?;
-        if cplt::mcp_broker::OPEN_URL_HOST_OPENER && broker.open_url_enabled() {
-            let writable: Vec<&std::path::Path> = [sandbox_config.project_dir]
-                .into_iter()
-                .chain(
-                    sandbox_config
-                        .named_roots
-                        .iter()
-                        .map(std::path::PathBuf::as_path),
-                )
-                .chain(
-                    sandbox_config
-                        .extra_write
-                        .iter()
-                        .map(std::path::PathBuf::as_path),
-                )
-                .chain(sandbox_config.managed_worktree_root)
-                .collect();
-            if let Some(p) = cplt::mcp_broker::opener_config_writable(home_dir, &writable) {
-                broker.disable_open_url();
-                ui::warn(&format!(
-                    "MCP login links will not open in the browser: the sandbox can write {}.",
-                    p.display()
-                ));
-            }
+        if cplt::mcp_broker::OPEN_URL_HOST_OPENER
+            && broker.open_url_enabled()
+            && let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir)
+        {
+            broker.disable_open_url();
+            ui::warn(&format!(
+                "MCP login links will not open in the browser: the sandbox can write {}.",
+                p.display()
+            ));
         }
         Some(broker)
     });
