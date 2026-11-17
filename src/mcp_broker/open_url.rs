@@ -3,12 +3,14 @@
 //!
 //! The sandbox side is a PATH shim named `open` (macOS) or `xdg-open`
 //! (Linux), because OpenCode opens URLs through the npm `open` package, which
-//! ignores `BROWSER`. The shim runs `cplt mcp-open-url <url>`, which sends the
-//! URL to the broker. The broker checks it here and runs the platform opener
-//! with the URL as one argv entry, never through a shell.
+//! ignores `BROWSER`. On macOS the shim runs `cplt mcp-open-url <url>`, which
+//! sends the URL to the broker; the broker checks it here and runs `open` with
+//! the URL as one argv entry, never through a shell. Linux has no host opener:
+//! `cplt mcp-open-url` checks the URL against `CPLT_OPEN_URL_HOSTS`, prints it
+//! to stderr and `/dev/tty`, and exits 1 because nothing was opened.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -30,8 +32,8 @@ const OAUTH_CREDENTIAL: &str = "oauth";
 const MAX_OPENS: usize = 3;
 const WINDOW: Duration = Duration::from_secs(60);
 
-/// Hosts a URL may name: each oauth spec's remote URL host, the fleet gateway,
-/// i.e. an `egressHosts` entry that an https URL in the spec's `command` names.
+/// Hosts a URL may name: each oauth spec's `remote` URL host (the fleet
+/// gateway), and only when that host is also one of the spec's `egressHosts`.
 /// Other egress hosts stay out, so listing a login host there opens nothing.
 /// No new config key: the spec already names where its OAuth flow goes.
 /// The Entra login host is deliberately absent (owner decision 2026-11-17):
@@ -48,7 +50,7 @@ pub(crate) fn allowed_hosts<'a>(specs: impl Iterator<Item = &'a Spec>) -> Vec<St
                 .map(|h| h.to_ascii_lowercase())
                 .filter(|h| {
                     let one = [h.clone()];
-                    s.command.iter().any(|a| check(a, &one).is_ok())
+                    s.remote.iter().any(|r| check(r, &one).is_ok())
                 })
         })
         .collect()
@@ -288,7 +290,17 @@ pub fn run(url: &str) -> ExitCode {
         return match print_link(url, &hosts) {
             Ok(line) => {
                 eprintln!("{line}");
-                ExitCode::SUCCESS
+                // npm `open` spawns xdg-open with stdio ignored, so stderr is
+                // lost there; the terminal, if the process still has one, is not.
+                if !std::io::stderr().is_terminal()
+                    && let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty")
+                {
+                    let _ = writeln!(tty, "{line}");
+                }
+                // Nothing was opened. A nonzero exit lets OpenCode 1.19 report
+                // the open as failed (mcp.browser.open.failed) instead of
+                // waiting on a browser that never appears.
+                ExitCode::FAILURE
             }
             Err(line) => {
                 eprintln!("{line}");
@@ -326,9 +338,10 @@ pub fn run(url: &str) -> ExitCode {
 /// The allowed hosts, comma-separated, for the Linux shim.
 const HOSTS_ENV: &str = "CPLT_OPEN_URL_HOSTS";
 
-/// Linux: the line to show instead of opening `url`. Only an allowed URL is
-/// printed, so the agent cannot use the shim to show arbitrary links styled
-/// as cplt messages; `check` also refuses control bytes. Never spawns.
+/// Linux: the line to show instead of opening `url`. The shim prints only an
+/// allowed URL, and `check` refuses control bytes. This is not a boundary: the
+/// agent can run `cplt mcp-open-url` with its own `CPLT_OPEN_URL_HOSTS`, and it
+/// can print any text itself. Never spawns.
 fn print_link(url: &str, hosts: &[String]) -> Result<String, String> {
     match check(url, hosts) {
         Ok(()) => Ok(format!(
@@ -527,14 +540,23 @@ mod tests {
             id: "x".into(),
             file: PathBuf::new(),
             credential: &OAUTH,
-            command: vec!["mcp-remote".into(), "https://FGW.example/mcp".into()],
+            command: vec!["https://cmd.example/mcp".into()],
             program: PathBuf::new(),
-            egress_hosts: vec!["fgw.example".into(), "login.microsoftonline.com".into()],
+            remote: Some("https://FGW.example/mcp".into()),
+            egress_hosts: vec![
+                "fgw.example".into(),
+                "cmd.example".into(),
+                "login.microsoftonline.com".into(),
+            ],
             allow: std::collections::BTreeSet::default(),
             graphql: std::collections::BTreeSet::default(),
             login: None,
         };
         assert_eq!(allowed_hosts([&spec].into_iter()), vec!["fgw.example"]);
+        // A remote host missing from egressHosts is not allowed.
+        let mut off = spec.clone();
+        off.egress_hosts = vec!["cmd.example".into()];
+        assert!(allowed_hosts([&off].into_iter()).is_empty());
     }
 
     #[test]

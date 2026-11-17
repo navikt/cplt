@@ -820,8 +820,8 @@ and the port guard (14.3) is what stops an agent-run login.
    random segment is dropped (the gateway would reject it). macOS `ps` exposes
    the `open` URL (`(allow sysctl-read)`, `src/sandbox_profile.rs:1144`), but
    `state` and PKCE keep that to login DoS. Build the request with PKCE S256, `state`, `resource=R` (RFC 8707)
-   and the spec's scopes, and open the browser (`open` on macOS, `xdg-open` on
-   Linux) or print the URL.
+   and the spec's scopes, and open the browser with `open` on macOS. Linux
+   has no host opener: the `xdg-open` shim prints the URL and exits 1.
 5. The listener accepts only the first `GET /callback` request matching
    `state` (and `iss` per RFC 9207 when the metadata
    advertises it), ignores other requests, and closes immediately after match
