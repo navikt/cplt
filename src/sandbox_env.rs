@@ -165,7 +165,7 @@ pub fn build_sandbox_env(
         }
         // Also strip agent-specific vars in inherit mode
         for (key, _) in parent_env {
-            if is_agent_suppressed(key, agent) {
+            if is_agent_suppressed(key, agent) && !extra_pass_env.iter().any(|p| p == key) {
                 env.remove.push(key.clone());
             }
         }
@@ -1258,6 +1258,9 @@ mod tests {
         let inherit = build_sandbox_env(&parent, &[], true, &[], None, None, Agent::Copilot);
         assert!(inherit.remove.iter().any(|k| k == "TMUX"));
         assert!(inherit.remove.iter().any(|k| k == "TMUX_PANE"));
+        let pass = vec!["TMUX".to_string(), "TMUX_PANE".to_string()];
+        let kept = build_sandbox_env(&parent, &pass, true, &[], None, None, Agent::Copilot);
+        assert!(!kept.remove.iter().any(|k| k == "TMUX" || k == "TMUX_PANE"));
         let claude = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Claude);
         assert!(has(&claude, "TMUX") && has(&claude, "TMUX_PANE"));
     }

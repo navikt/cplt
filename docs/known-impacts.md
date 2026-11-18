@@ -856,9 +856,13 @@ podman --remote images
 
 ## Copying text in Copilot CLI inside tmux
 
-Copilot CLI copies to the clipboard through the tmux socket when `TMUX` is set. The sandbox blocks that socket, because a process that can reach it can run `tmux send-keys` outside the sandbox. Copy then failed without an error.
+Copilot CLI copies to the clipboard through the tmux socket when `TMUX` is set. On macOS, and on Linux under bubblewrap, the sandbox blocks that socket, because a process that can reach it can run `tmux send-keys` outside the sandbox. Copy then failed without an error.
 
-cplt now removes `TMUX` and `TMUX_PANE` from the environment of the `copilot` agent only. Copilot CLI then uses `pbcopy` on macOS, which works. Other agents still see both variables. To keep them for Copilot anyway, pass `--pass-env TMUX --pass-env TMUX_PANE`.
+cplt now removes `TMUX` and `TMUX_PANE` from the environment of the `copilot` agent only. Other agents still see both variables. On macOS Copilot CLI then uses `pbcopy`. The sandbox denies the clipboard by default, so pass `--allow-clipboard` or set `sandbox.deny_clipboard = false` for copy to work.
+
+On Linux without bubblewrap a tmux socket under `/tmp` stays reachable. Removing the variables only stops Copilot CLI from finding it, so Copilot CLI uses its non-tmux copy path there instead. Pass `--pass-env TMUX` to restore the old behaviour.
+
+To keep the variables for Copilot anyway, pass `--pass-env TMUX --pass-env TMUX_PANE`. This also works with `--inherit-env`.
 
 ## SSH agent blocking
 
