@@ -2236,13 +2236,24 @@ fn warn_exec_tool_dir_shadowing(
 /// The `sandbox.refuse_invalid_repo_config` refusal (#385 M-01). Names the
 /// copy cplt read, because the fix differs: the loader prefers
 /// `HEAD:.cplt.toml`, and editing the working tree does not change that one.
-fn invalid_repo_config_refusal(problem: &str, committed: bool, named: bool) -> anyhow::Error {
-    let fix = if committed {
-        "The copy cplt read is the one committed at HEAD, not the working tree, so \
-         commit a fix and rerun"
-    } else {
-        "The copy cplt read is the uncommitted working-tree file, so fix the file and \
-         rerun"
+fn invalid_repo_config_refusal(
+    problem: &str,
+    committed: Option<bool>,
+    named: bool,
+) -> anyhow::Error {
+    let fix = match committed {
+        Some(true) => {
+            "The copy cplt read is the one committed at HEAD, not the working tree, so \
+             commit a fix and rerun"
+        }
+        Some(false) => {
+            "The copy cplt read is the uncommitted working-tree file, so fix the file and \
+             rerun"
+        }
+        None => {
+            "Could not read .cplt.toml from git HEAD, so fix the repository or git \
+             configuration and rerun"
+        }
     };
     let drop = if named {
         ", or drop the repository from the named set"
@@ -3427,7 +3438,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         ".cplt.toml has [deny] keys this cplt does not understand: deny.{}",
                         deny_unknown(&loaded.config)
                     ),
-                    matches!(loaded.source, repo_config::RepoConfigSource::GitHead),
+                    Some(matches!(
+                        loaded.source,
+                        repo_config::RepoConfigSource::GitHead
+                    )),
                     false,
                 ));
             }
@@ -3608,9 +3622,11 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         // #385 M-01: a file that does not parse loses its `[deny]` with it.
         // Warned by default; `sandbox.refuse_invalid_repo_config` makes it fatal.
         Err(e) if resolved.refuse_invalid_repo_config => {
+            let committed = (!e.contains("from git HEAD"))
+                .then(|| repo_config::committed_in_head(&project_dir));
             return Err(invalid_repo_config_refusal(
                 &format!("Cannot load .cplt.toml: {e}"),
-                repo_config::committed_in_head(&project_dir),
+                committed,
                 false,
             ));
         }
@@ -3672,7 +3688,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                             root.dir.display(),
                             deny_unknown(&loaded.config)
                         ),
-                        matches!(loaded.source, repo_config::RepoConfigSource::GitHead),
+                        Some(matches!(
+                            loaded.source,
+                            repo_config::RepoConfigSource::GitHead
+                        )),
                         true,
                     ));
                 }
@@ -3697,12 +3716,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             // for, and the operator is told exactly that.
             // `sandbox.refuse_invalid_repo_config` makes both fatal (#385 M-01).
             Err(e) if resolved.refuse_invalid_repo_config => {
+                let committed = (!e.contains("from git HEAD"))
+                    .then(|| repo_config::committed_in_head(&root.dir));
                 return Err(invalid_repo_config_refusal(
                     &format!(
                         "Cannot read .cplt.toml in the named repository {}: {e}",
                         root.dir.display()
                     ),
-                    repo_config::committed_in_head(&root.dir),
+                    committed,
                     true,
                 ));
             }
@@ -5233,7 +5254,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     } = resolve_context(&cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
-    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths).map_err(anyhow::Error::msg)?;
     let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
@@ -7767,7 +7788,7 @@ fn run_exec_command(
     } = resolve_context(cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
-    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths).map_err(anyhow::Error::msg)?;
     let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     let launch_dir = exec_launch_dir(
         std::env::current_dir().and_then(std::fs::canonicalize).ok(),
@@ -8340,7 +8361,7 @@ fn run_check_command(
     // The same set as owned paths, for the sandbox policy `check` probes
     // against: `check` must build the policy the launch would build.
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
-    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths).map_err(anyhow::Error::msg)?;
     let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
@@ -9318,14 +9339,24 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     } = ctx;
     // `doctor` reports the policy a launch would build, so it has to carry the
     // same named roots the launch would (#447).
+    let mut findings: Vec<Finding> = Vec::new();
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
-    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let repo_git_dirs = match sandbox::named_root_git_dirs(&repo_paths) {
+        Ok(dirs) => dirs,
+        Err(message) => {
+            findings.push(Finding {
+                level: Level::Blocking,
+                message,
+                fix: None,
+            });
+            Vec::new()
+        }
+    };
     let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
     let tilde = |p: &Path| doctor::tilde(p, &home_dir);
-    let mut findings: Vec<Finding> = Vec::new();
     let mut ok: Vec<String> = Vec::new();
 
     // ── agent: which one, and why ──

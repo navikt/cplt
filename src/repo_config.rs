@@ -298,8 +298,10 @@ pub const MAX_REPO_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// Returns `None` if no `.cplt.toml` exists.
 pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, String> {
-    // Try git HEAD first (tamper-proof source)
-    if let Some(content) = read_from_git_head(project_dir) {
+    // Try git HEAD first (tamper-proof source). A spawn/timeout failure while
+    // reading HEAD must fail closed rather than falling back to the working
+    // tree, which an attacker could delete or relax alongside a FIFO `.git/config`.
+    if let Some(content) = read_from_git_head(project_dir)? {
         let config = parse_repo_config(&content)?;
         validate_repo_config(&config)?;
         return Ok(Some(LoadedRepoConfig {
@@ -373,23 +375,45 @@ fn git_toplevel(project_dir: &Path) -> Option<PathBuf> {
 /// which copy a load error came from (#385 M-01).
 #[must_use]
 pub fn committed_in_head(project_dir: &Path) -> bool {
-    read_from_git_head(project_dir).is_some()
+    matches!(read_from_git_head(project_dir), Ok(Some(_)))
 }
 
 /// Read `.cplt.toml` from git HEAD (the latest committed version).
 ///
 /// Uses `git cat-file blob HEAD:.cplt.toml` which reads from the object store,
 /// not the working tree. This prevents mid-session tampering by the agent.
-fn read_from_git_head(project_dir: &Path) -> Option<String> {
-    let output = crate::git::output(
+///
+/// Distinguishes an absent blob (`Ok(None)` — not a git repo, unborn HEAD, or
+/// `.cplt.toml` not in HEAD) from a spawn/timeout/UTF-8/refused error (`Err`),
+/// so callers never fall back to the working tree when `git` timed out (for
+/// example on a planted FIFO at `.git/config`).
+fn read_from_git_head(project_dir: &Path) -> Result<Option<String>, String> {
+    let output = match crate::git::try_output(
         project_dir,
         &["cat-file", "blob", &format!("HEAD:{REPO_CONFIG_FILE}")],
-    )?;
+    ) {
+        Ok(o) => o,
+        Err(crate::git::GitOutputError::Refused) => {
+            if crate::sandbox::has_dot_git_or_is_bare(project_dir) {
+                return Err(format!(
+                    "Failed to read {REPO_CONFIG_FILE} from git HEAD: git invocation refused"
+                ));
+            }
+            return Ok(None);
+        }
+        Err(crate::git::GitOutputError::Io(e)) => {
+            return Err(format!(
+                "Failed to read {REPO_CONFIG_FILE} from git HEAD: {e}"
+            ));
+        }
+    };
 
     if output.status.success() {
-        String::from_utf8(output.stdout).ok()
+        String::from_utf8(output.stdout)
+            .map(Some)
+            .map_err(|e| format!("Invalid UTF-8 in HEAD:{REPO_CONFIG_FILE}: {e}"))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -469,7 +493,7 @@ pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
 
     // Existence in HEAD is what closes the gitignore hole: `git status` says
     // nothing at all about an ignored file, so it cannot answer this.
-    if read_from_git_head(project_dir).is_some() {
+    if matches!(read_from_git_head(project_dir), Ok(Some(_))) {
         // Whether the checkout still MATCHES HEAD is git's question to answer.
         // Byte-comparing the raw blob against the file on disk would call every
         // .gitattributes filter (eol=crlf, LFS, git-crypt, ident) permanent
@@ -1782,13 +1806,15 @@ paths = [".env", "certs/server.pem", "~/secrets", "apps/web/.env.local"]
         )
         .unwrap();
 
+        // Timeout reading HEAD must fail closed rather than falling back to
+        // the working tree, even when a working-tree `.cplt.toml` exists.
         let p = path.clone();
-        let loaded = crate::untrusted::tests::bounded(move || load_repo_config(&p))
-            .expect("working-tree fallback")
-            .expect("config present");
-        assert_eq!(loaded.source, RepoConfigSource::WorkingTree);
-        assert!(loaded.propose_dropped);
-        assert!(loaded.config.propose.allow.domains.is_empty());
+        let err = crate::untrusted::tests::bounded(move || load_repo_config(&p))
+            .expect_err("FIFO .git/config must fail closed instead of falling back");
+        assert!(
+            err.contains("HEAD") && err.contains(REPO_CONFIG_FILE),
+            "unexpected error: {err}"
+        );
 
         let p = path.clone();
         assert!(!crate::untrusted::tests::bounded(
@@ -1801,5 +1827,43 @@ paths = [".env", "certs/server.pem", "~/secrets", "apps/web/.env.local"]
             move || repo_config_state(&path),
         );
         assert_eq!(state, RepoConfigState::NotAGitRepo { has_file: true });
+    }
+
+    fn init_committed_deny_repo(working_tree_replacement: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().canonicalize().expect("canonical");
+        git_in(&path, &["init", "--quiet"]);
+        std::fs::write(
+            path.join(REPO_CONFIG_FILE),
+            "[deny]\npaths = [\".env\"]\nenv = [\"SECRET_TOKEN\"]\n",
+        )
+        .unwrap();
+        git_in(&path, &["add", REPO_CONFIG_FILE]);
+        git_in(&path, &["commit", "--quiet", "-m", "add .cplt.toml"]);
+        match working_tree_replacement {
+            Some(content) => std::fs::write(path.join(REPO_CONFIG_FILE), content).unwrap(),
+            None => std::fs::remove_file(path.join(REPO_CONFIG_FILE)).unwrap(),
+        }
+        std::fs::remove_file(path.join(".git/config")).unwrap();
+        crate::untrusted::tests::mkfifo(&path.join(".git/config"));
+        dir
+    }
+
+    #[test]
+    fn committed_config_with_missing_working_tree_fails_closed_on_fifo_git_config() {
+        let dir = init_committed_deny_repo(None);
+        let path = dir.path().canonicalize().expect("canonical");
+        let err = crate::untrusted::tests::bounded(move || load_repo_config(&path))
+            .expect_err("must not return Ok(None) when HEAD read times out");
+        assert!(err.contains(REPO_CONFIG_FILE), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn committed_config_with_relaxed_working_tree_fails_closed_on_fifo_git_config() {
+        let dir = init_committed_deny_repo(Some("[propose.allow]\ndomains = [\"example.com\"]\n"));
+        let path = dir.path().canonicalize().expect("canonical");
+        let err = crate::untrusted::tests::bounded(move || load_repo_config(&path))
+            .expect_err("must not fall back to relaxed working tree when HEAD read times out");
+        assert!(err.contains(REPO_CONFIG_FILE), "unexpected error: {err}");
     }
 }

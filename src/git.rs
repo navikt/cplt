@@ -865,6 +865,50 @@ pub fn output_bounded(
     })
 }
 
+/// Failure mode of [`try_output`] before a child `git` process exits normally.
+#[derive(Debug)]
+pub enum GitOutputError {
+    /// [`command`] refused the invocation (no trusted `git`, a disallowed
+    /// global flag, or a content filter / timed-out config probe).
+    Refused,
+    /// Spawning, waiting for, or draining `git` failed (including
+    /// [`std::io::ErrorKind::TimedOut`] when the child was killed and reaped).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for GitOutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused => f.write_str("git invocation refused"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for GitOutputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Refused => None,
+            Self::Io(e) => Some(e),
+        }
+    }
+}
+
+/// Build and run a hardened `git` command in `project_dir`, bounded by
+/// [`GIT_TIMEOUT`].
+///
+/// Unlike [`output`], distinguishes refusal and spawn/timeout failures from a
+/// child process that ran and exited (even non-zero). Security-critical callers
+/// that must not treat a timeout the same as "absent" (for example reading
+/// `HEAD:.cplt.toml`) should use this.
+pub fn try_output(
+    project_dir: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, GitOutputError> {
+    let cmd = command(project_dir, args).ok_or(GitOutputError::Refused)?;
+    output_bounded(cmd, GIT_TIMEOUT).map_err(GitOutputError::Io)
+}
+
 /// Build and run a hardened `git` command in `project_dir`, bounded by
 /// [`GIT_TIMEOUT`].
 ///
@@ -873,8 +917,7 @@ pub fn output_bounded(
 /// killed and reaped).
 #[must_use]
 pub fn output(project_dir: &Path, args: &[&str]) -> Option<std::process::Output> {
-    let cmd = command(project_dir, args)?;
-    output_bounded(cmd, GIT_TIMEOUT).ok()
+    try_output(project_dir, args).ok()
 }
 
 /// The toplevel of the git repository containing `dir`, not canonicalized.
@@ -1054,8 +1097,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::untrusted::tests::plant_fifo_git_config(dir.path());
         let p = dir.path().to_path_buf();
-        let res = crate::untrusted::tests::bounded(move || output(&p, &["rev-parse", "--git-dir"]));
-        assert!(res.is_none());
+        let res =
+            crate::untrusted::tests::bounded(move || try_output(&p, &["rev-parse", "--git-dir"]));
+        assert!(
+            matches!(
+                res,
+                Err(GitOutputError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut
+            ),
+            "expected TimedOut error, got {res:?}"
+        );
+        // Non-repo returns Ok(non-zero Output), distinct from timeout/refusal.
+        let plain = tempfile::tempdir().unwrap();
+        let out = try_output(plain.path(), &["rev-parse", "--git-dir"]).expect("ran git");
+        assert!(!out.status.success());
     }
 
     #[test]

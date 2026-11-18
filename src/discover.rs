@@ -1384,7 +1384,17 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
 /// hostile `filter.*.clean` in a granted repo would make the hardened invoker
 /// refuse, and that repo's `.git/hooks` would lose its deny.
 pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
-    git_dir_of_with(
+    try_git_dir_of(dir).ok().flatten()
+}
+
+/// Fallible counterpart to [`git_dir_of`] for writable-root protection.
+///
+/// Returns `Ok(None)` when `dir` does not exist or is not inside a git
+/// repository, `Ok(Some(gitdir))` when resolved (by `git` or the git-free
+/// fallback), and `Err` if `git` timed out or failed to run on an existing
+/// directory and git-free fallback found no gitdir.
+pub fn try_git_dir_of(dir: &Path) -> Result<Option<PathBuf>, String> {
+    try_git_dir_of_with(
         crate::git::command(dir, &["rev-parse", "--git-common-dir"]),
         dir,
     )
@@ -1395,35 +1405,48 @@ pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
 /// Exists so the no-trusted-git arm is reachable in a test: `trusted_git()`
 /// caches in a `OnceLock`, so on a host that has git the fallback branch is
 /// otherwise unreachable and a revert of the wiring goes unnoticed.
+#[cfg(test)]
 fn git_dir_of_with(cmd: Option<std::process::Command>, dir: &Path) -> Option<PathBuf> {
+    try_git_dir_of_with(cmd, dir).ok().flatten()
+}
+
+fn try_git_dir_of_with(
+    cmd: Option<std::process::Command>,
+    dir: &Path,
+) -> Result<Option<PathBuf>, String> {
     let Some(cmd) = cmd else {
         // No trusted git on this machine. Before this fallback existed, that
-        // returned `None` and every gitdir-derived deny for a worktree or a
-        // separate-gitdir repo silently vanished — the fail-open the doc
+        // returned `None` and every gitdir-derived deny for a worktree, bare,
+        // or separate-gitdir repo silently vanished — the fail-open the doc
         // comment above warns about, now reachable on an ordinary machine
         // whose git simply lives outside the trusted directories.
         //
-        // `<dir>/.git` is enough to recover the common cases without running
-        // anything: a plain repo has it as a directory, and a worktree or
-        // submodule has it as a file holding `gitdir: <path>`. Reading a file
-        // is not a PATH-hijack surface, which is the whole reason git is
-        // resolved from trusted directories in the first place.
-        //
-        // Still `None` for a bare repo (no `.git` entry at all); that case has
-        // no working tree for an agent to be sandboxed into.
-        return gitdir_without_git(dir);
+        // Reading `<dir>/.git` and bare-repo metadata via `lstat` / `O_NONBLOCK`
+        // recovers all layouts without running anything and is not a
+        // PATH-hijack surface.
+        return Ok(gitdir_without_git_ancestors(dir));
     };
-    let Ok(output) = crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT) else {
-        // A wedged or unspawnable git (e.g. a planted FIFO in `.git/config`)
-        // must not strip persistence denies: fall back to the git-free check.
-        return gitdir_without_git(dir);
+    let output = match crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT) {
+        Ok(output) => output,
+        Err(e) => {
+            if !dir.is_dir() {
+                return Ok(None);
+            }
+            // A wedged or unspawnable git (e.g. a planted FIFO in `config`)
+            // must not strip persistence denies: fall back to git-free
+            // discovery across `dir` and its ancestors, and fail closed if no
+            // gitdir can be confirmed.
+            return gitdir_without_git_ancestors(dir).map(Some).ok_or_else(|| {
+                format!("failed to resolve git directory for {}: {e}", dir.display())
+            });
+        }
     };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if raw.is_empty() {
-        return None;
+        return Ok(None);
     }
     // git prints the common dir relative to `dir` (`.git`, `../.git`, `.` for a
     // bare repo) unless it is absolute (worktree).
@@ -1434,62 +1457,14 @@ fn git_dir_of_with(cmd: Option<std::process::Command>, dir: &Path) -> Option<Pat
     };
     let resolved = std::fs::canonicalize(&path).unwrap_or(path);
     if resolved.is_dir() {
-        Some(resolved)
+        Ok(Some(resolved))
     } else {
-        None
+        Ok(None)
     }
 }
 
-/// Resolve `<dir>`'s git directory by reading `<dir>/.git`, without running git.
-///
-/// Used only when no trusted git binary exists. Handles the two layouts that
-/// matter for the persistence denies:
-/// - directory → an ordinary repo, the gitdir is `<dir>/.git`
-/// - file      → a worktree or submodule, holding `gitdir: <path>`
-///
-/// The pointer is resolved relative to `<dir>` when relative, canonicalized,
-/// and accepted only if it is a directory — matching what the git-backed path
-/// returns. Deliberately no validation beyond that: the result is turned into
-/// write denies by the caller, so a wrong answer can only over-deny, never
-/// grant. (`git_common_dir` returns before granting whenever there is no
-/// trusted git, because its commondir-steering check runs the invoker too.)
-///
-/// The residual that buys: an agent that can write `<root>/.git` can point this
-/// at any existing directory and get that directory's `hooks`/`config`/`modules`
-/// write-denied next session. Real git refuses a pointer to a non-gitdir; this
-/// does not. It is self-denial-of-service only — it can subtract access, never
-/// add it — and the alternative is validating a gitdir's shape without git,
-/// which is more code for a worse failure mode.
-fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
-    let dot_git = dir.join(".git");
-    // `metadata`, not `symlink_metadata`: git follows a `.git` symlink to a
-    // directory, and the git-backed path canonicalizes to the target. Not
-    // following it here would drop straight to the `read_to_string` branch,
-    // fail with EISDIR, and lose the target's denies.
-    let meta = std::fs::metadata(&dot_git).ok()?;
-    if meta.is_dir() {
-        return std::fs::canonicalize(&dot_git).ok().or(Some(dot_git));
-    }
-    // Regular file only. `read_regular_following` opens with O_NONBLOCK and
-    // fstats the open fd so neither a planted FIFO nor a TOCTOU swap between
-    // stat and open can block the launch, and caps the read at 4 KiB.
-    let contents = crate::untrusted::read_regular_following(&dot_git, 4096).ok()??;
-    let pointer = contents
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
-        .trim();
-    if pointer.is_empty() {
-        return None;
-    }
-    let path = if Path::new(pointer).is_absolute() {
-        PathBuf::from(pointer)
-    } else {
-        dir.join(pointer)
-    };
-    let resolved = std::fs::canonicalize(&path).unwrap_or(path);
-    if !resolved.is_dir() {
-        return None;
-    }
+/// Follow `<gitdir>/commondir` if present as a regular non-symlink file.
+fn resolve_commondir(resolved: PathBuf) -> PathBuf {
     // A worktree's pointer names `<main>/.git/worktrees/<name>`, which is NOT
     // the directory that holds `hooks/` and `config` — those live in the shared
     // dir, which `git rev-parse --git-common-dir` returns and which the
@@ -1510,11 +1485,105 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
             };
             let common = std::fs::canonicalize(&common).unwrap_or(common);
             if common.is_dir() {
-                return Some(common);
+                return common;
             }
         }
     }
-    Some(resolved)
+    resolved
+}
+
+/// Recognize a bare git repository (or gitdir itself) without running git.
+///
+/// Uses `symlink_metadata` (`lstat`) so a planted FIFO or symlink at `HEAD`,
+/// `objects`, `refs`, `commondir`, or `config` never blocks or redirects
+/// discovery.
+fn bare_gitdir_without_git(dir: &Path) -> Option<PathBuf> {
+    let head = std::fs::symlink_metadata(dir.join("HEAD")).ok()?;
+    if head.is_dir() {
+        return None;
+    }
+    let has_objects_and_refs = std::fs::symlink_metadata(dir.join("objects"))
+        .is_ok_and(|m| m.is_dir() || m.file_type().is_symlink())
+        && std::fs::symlink_metadata(dir.join("refs"))
+            .is_ok_and(|m| m.is_dir() || m.file_type().is_symlink());
+    let has_commondir = std::fs::symlink_metadata(dir.join("commondir")).is_ok_and(|m| !m.is_dir());
+    if !has_objects_and_refs && !has_commondir {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !resolved.is_dir() {
+        return None;
+    }
+    Some(resolve_commondir(resolved))
+}
+
+/// Resolve `<dir>`'s git directory without running git, walking up ancestors
+/// (stopping if an ancestor owns a `.git` entry, matching git's own search).
+fn gitdir_without_git_ancestors(dir: &Path) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+    for ancestor in dir.ancestors() {
+        if std::fs::symlink_metadata(ancestor.join(".git")).is_ok() {
+            return gitdir_without_git(ancestor);
+        }
+        if let Some(bare) = bare_gitdir_without_git(ancestor) {
+            return Some(bare);
+        }
+    }
+    None
+}
+
+/// Resolve `<dir>`'s git directory by reading `<dir>/.git` or recognizing a
+/// bare repository layout, without running git.
+///
+/// Used when no trusted git binary exists or when `git` times out. Handles all
+/// layouts that matter for persistence denies:
+/// - `<dir>/.git` directory → an ordinary repo, the gitdir is `<dir>/.git`
+/// - `<dir>/.git` file      → a worktree or submodule, holding `gitdir: <path>`
+/// - bare repository        → `<dir>` itself (having `HEAD` plus `objects` &
+///   `refs`, or `commondir`)
+///
+/// The pointer is resolved relative to `<dir>` when relative, canonicalized,
+/// and accepted only if it is a directory — matching what the git-backed path
+/// returns. Deliberately no validation beyond that: the result is turned into
+/// write denies by the caller, so a wrong answer can only over-deny, never
+/// grant. (`git_common_dir` returns before granting whenever there is no
+/// trusted git, because its commondir-steering check runs the invoker too.)
+fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    if std::fs::symlink_metadata(&dot_git).is_ok() {
+        // `metadata`, not `symlink_metadata`: git follows a `.git` symlink to a
+        // directory, and the git-backed path canonicalizes to the target. Not
+        // following it here would drop straight to the `read_to_string` branch,
+        // fail with EISDIR, and lose the target's denies.
+        let meta = std::fs::metadata(&dot_git).ok()?;
+        if meta.is_dir() {
+            return std::fs::canonicalize(&dot_git).ok().or(Some(dot_git));
+        }
+        // Regular file only. `read_regular_following` opens with O_NONBLOCK and
+        // fstats the open fd so neither a planted FIFO nor a TOCTOU swap between
+        // stat and open can block the launch, and caps the read at 4 KiB.
+        let contents = crate::untrusted::read_regular_following(&dot_git, 4096).ok()??;
+        let pointer = contents
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+            .trim();
+        if pointer.is_empty() {
+            return None;
+        }
+        let path = if Path::new(pointer).is_absolute() {
+            PathBuf::from(pointer)
+        } else {
+            dir.join(pointer)
+        };
+        let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+        if !resolved.is_dir() {
+            return None;
+        }
+        return Some(resolve_commondir(resolved));
+    }
+    bare_gitdir_without_git(dir)
 }
 
 /// Why [`git_common_dir`] left a worktree's shared git dir ungranted. Discovery
@@ -2878,5 +2947,79 @@ mod wsl_tool_report_tests {
             move || git_common_dir(&h, &wt, &[]),
         );
         assert!(common.is_none() && problem.is_none());
+    }
+
+    #[test]
+    fn gitdir_without_git_recognizes_bare_repo_safely() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let bare = root.join("bare.git");
+        std::fs::create_dir_all(bare.join("objects")).unwrap();
+        std::fs::create_dir_all(bare.join("refs")).unwrap();
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        mkfifo(&bare.join("config"));
+        let b = bare.clone();
+        assert_eq!(bounded(move || gitdir_without_git(&b)), Some(bare.clone()));
+
+        // Dangling symlink at HEAD and FIFO at HEAD must not block or redirect.
+        let dangling = root.join("dangling.git");
+        std::fs::create_dir_all(dangling.join("objects")).unwrap();
+        std::fs::create_dir_all(dangling.join("refs")).unwrap();
+        std::os::unix::fs::symlink("refs/heads/missing", dangling.join("HEAD")).unwrap();
+        mkfifo(&dangling.join("config"));
+        let d = dangling.clone();
+        assert_eq!(bounded(move || gitdir_without_git(&d)), Some(dangling));
+
+        let fifo_head = root.join("fifo-head.git");
+        std::fs::create_dir_all(fifo_head.join("objects")).unwrap();
+        std::fs::create_dir_all(fifo_head.join("refs")).unwrap();
+        mkfifo(&fifo_head.join("HEAD"));
+        mkfifo(&fifo_head.join("config"));
+        let fh = fifo_head.clone();
+        assert_eq!(bounded(move || gitdir_without_git(&fh)), Some(fifo_head));
+    }
+
+    #[test]
+    fn try_git_dir_of_falls_back_for_bare_repo_and_subdir_with_fifo_config() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let bare = root.join("bare.git");
+        std::fs::create_dir_all(bare.join("objects")).unwrap();
+        std::fs::create_dir_all(bare.join("refs")).unwrap();
+        let sub = bare.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        mkfifo(&bare.join("config"));
+
+        let b = bare.clone();
+        assert_eq!(
+            bounded(move || try_git_dir_of(&b)),
+            Ok(Some(bare.clone())),
+            "bare repo with FIFO config must resolve to itself"
+        );
+        assert_eq!(
+            bounded(move || try_git_dir_of(&sub)),
+            Ok(Some(bare)),
+            "subdir of bare repo with FIFO config must resolve to bare repo"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // absolute /bin/sleep to simulate a timed-out git subprocess
+    fn try_git_dir_of_with_fails_closed_on_timeout_without_gitdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = std::fs::canonicalize(tmp.path()).unwrap().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        let p = plain.clone();
+        let res = crate::untrusted::tests::bounded(move || try_git_dir_of_with(Some(cmd), &p));
+        assert!(
+            res.is_err(),
+            "timeout on an existing writable directory with no recoverable gitdir must fail closed: {res:?}"
+        );
     }
 }
