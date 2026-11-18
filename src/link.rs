@@ -187,8 +187,7 @@ fn identity_of(real_git: &Path, dir: &Path) -> Option<String> {
 /// two clones — and every worktree reports the repository's origin, since the
 /// config lives in the shared directory.
 fn common_dir(dir: &Path) -> Option<PathBuf> {
-    crate::git::command(dir, &["rev-parse", "--git-common-dir"])
-        .and_then(|mut c| c.output().ok())
+    crate::git::output(dir, &["rev-parse", "--git-common-dir"])
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|p| std::fs::canonicalize(dir.join(p.trim())).ok())
@@ -197,8 +196,7 @@ fn common_dir(dir: &Path) -> Option<PathBuf> {
 /// Whether `dir` is a git toplevel — the directory itself, not somewhere inside
 /// a repository.
 fn is_toplevel(dir: &Path) -> bool {
-    crate::git::command(dir, &["rev-parse", "--show-toplevel"])
-        .and_then(|mut c| c.output().ok())
+    crate::git::output(dir, &["rev-parse", "--show-toplevel"])
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|top| std::fs::canonicalize(top.trim()).ok())
@@ -920,5 +918,33 @@ mod tests {
         );
         verify_named(&other, &root.join("spleis"), "someone-else/thing")
             .expect("its own identity verifies");
+    }
+
+    #[test]
+    fn verify_named_and_resolve_refuse_fifo_git_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let project = root.join("spleis");
+        make_repo(&project, "navikt/spleis");
+        let sibling = root.join("sykepenger-model");
+        crate::untrusted::tests::plant_fifo_git_config(&sibling);
+
+        let s = sibling.clone();
+        let p = project.clone();
+        assert!(
+            crate::untrusted::tests::bounded(move || {
+                verify_named(&s, &p, "navikt/sykepenger-model")
+            })
+            .is_err()
+        );
+
+        let home = root.join("home");
+        // `resolve` checks name candidates + origin_scan_dirs (2 * GIT_TIMEOUT).
+        let err = crate::untrusted::tests::bounded_within(
+            std::time::Duration::from_secs(20),
+            move || resolve(&project, &home, "navikt/sykepenger-model"),
+        )
+        .expect_err("must fail closed");
+        assert!(matches!(err, ResolveError::NotFound { .. }), "{err}");
     }
 }

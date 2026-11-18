@@ -8530,14 +8530,13 @@ fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> 
     let Some(git) = cplt::git::trusted_git() else {
         return Vec::new();
     };
-    let Ok(out) = std::process::Command::new(git)
-        .arg("-C")
+    let mut cmd = std::process::Command::new(git);
+    cmd.arg("-C")
         // The path itself, not a lossy string: a non-UTF-8 byte would be
         // replaced and point git at a different directory, or none.
         .arg(project_dir)
-        .args(["ls-files", "-z"])
-        .output()
-    else {
+        .args(["ls-files", "-z"]);
+    let Ok(out) = cplt::git::output_bounded(cmd, cplt::git::GIT_TIMEOUT) else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -13174,8 +13173,7 @@ matched against these proposal values. Only the keys approved now are kept.",
     // whose repository moved is re-bound by the approval that follows.
     let mut remote = entry.repo.remote.clone();
     if remote.is_empty()
-        && let Some(output) = cplt::git::command(project_dir, &["remote", "get-url", "origin"])
-            .and_then(|mut c| c.output().ok())
+        && let Some(output) = cplt::git::output(project_dir, &["remote", "get-url", "origin"])
         && output.status.success()
         && let Ok(url) = String::from_utf8(output.stdout)
     {
@@ -18537,5 +18535,30 @@ mod tests {
             }
             other => panic!("expected ExecWithout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tracked_sensitive_files_refuses_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/refs")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let c = std::ffi::CString::new(
+            dir.path()
+                .join(".git/config")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: valid NUL-terminated path for mkfifo.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let p = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(tracked_sensitive_files(&p, true)));
+        let found = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("tracked_sensitive_files hung on a planted FIFO");
+        assert!(found.is_empty());
     }
 }

@@ -100,10 +100,10 @@ pub fn resolve_head(real_git: &Path, cwd: &Path, argv: &[String]) -> (PathBuf, V
     // Runs inside the sandbox on the gate's already-resolved git binary, the
     // same way the gate's own probes do.
     #[allow(clippy::disallowed_methods)]
-    let head = std::process::Command::new(real_git)
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = std::process::Command::new(real_git);
+    cmd.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(&cwd);
+    let head = crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -240,7 +240,7 @@ pub fn judge(argv: &[String], p: &Probe) -> Result<Upstream, Skip> {
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = crate::git::command(dir, args)?.output().ok()?;
+    let out = crate::git::output(dir, args)?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -260,8 +260,7 @@ fn read_entries(path: &Path) -> Vec<Entry> {
 /// Write the two keys. Returns whether both writes succeeded.
 fn write(u: &Upstream) -> bool {
     let set = |key: String, value: &str| {
-        crate::git::command(&u.dir, &["config", "--local", &key, value])
-            .and_then(|mut c| c.output().ok())
+        crate::git::output(&u.dir, &["config", "--local", &key, value])
             .is_some_and(|o| o.status.success())
     };
     set(format!("branch.{}.remote", u.branch), &u.remote)
@@ -743,5 +742,34 @@ mod tests {
         record(scratch.path(), &nested, &argv("push -u origin feat"));
         apply(scratch.path(), &repo, &[], &policy(), true);
         assert_eq!(git(&nested, &["config", "--local", "--list"]), before);
+    }
+
+    #[test]
+    fn upstream_write_and_resolve_head_refuse_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(&repo);
+
+        let u = Upstream {
+            dir: repo.clone(),
+            remote: "origin".into(),
+            branch: "feat".into(),
+        };
+        assert!(!crate::untrusted::tests::bounded(move || write(&u)));
+
+        let scratch = tempfile::tempdir().unwrap();
+        record(scratch.path(), &repo, &argv("push -u origin feat"));
+        let s = scratch.path().to_path_buf();
+        let r = repo.clone();
+        // `apply` runs `session_repo_facts` (2 calls) + `check` (1 call) = 3 * GIT_TIMEOUT.
+        crate::untrusted::tests::bounded_within(std::time::Duration::from_secs(25), move || {
+            apply(&s, &r, &[], &policy(), true);
+        });
+
+        let real_git = crate::git::trusted_git().unwrap();
+        let (_, resolved) = crate::untrusted::tests::bounded(move || {
+            resolve_head(real_git, &repo, &argv("push -u origin HEAD"))
+        });
+        assert_eq!(resolved, argv("push -u origin HEAD"));
     }
 }

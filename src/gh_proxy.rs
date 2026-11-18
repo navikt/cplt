@@ -1977,7 +1977,7 @@ pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String
         }
     }
 
-    let output = command
+    command
         .args([
             "config",
             "--local",
@@ -1987,8 +1987,8 @@ pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String
         ])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .current_dir(project_dir)
-        .output()
+        .current_dir(project_dir);
+    let output = crate::git::output_bounded(command, crate::git::GIT_TIMEOUT)
         .map_err(|e| format!("failed to run trusted git binary: {e}"))?;
 
     if !output.status.success() {
@@ -4628,16 +4628,22 @@ fn repo_target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// Only a `refs/heads/` answer is a branch, so everything else yields `None`
 /// and the caller fails closed. The token is always a push positional, which
 /// `push_positionals` never lets start with `-`, so it cannot be read as a flag.
+/// Run a read-only query against `real_git`, bounded by [`crate::git::GIT_TIMEOUT`].
 #[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn run_git(real_git: &Path, repo_args: &[&str], args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = std::process::Command::new(real_git);
+    cmd.args(repo_args).args(args);
+    crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT)
+        .ok()
+        .filter(|o| o.status.success())
+}
+
 fn resolve_token_branch(real_git: &Path, repo_args: &[&str], token: &str) -> Option<String> {
-    let output = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["rev-parse", "--symbolic-full-name", token])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = run_git(
+        real_git,
+        repo_args,
+        &["rev-parse", "--symbolic-full-name", token],
+    )?;
     let full = String::from_utf8_lossy(&output.stdout).trim().to_string();
     full.strip_prefix("refs/heads/")
         .filter(|b| !b.is_empty())
@@ -4645,22 +4651,13 @@ fn resolve_token_branch(real_git: &Path, repo_args: &[&str], token: &str) -> Opt
 }
 
 /// Resolve the current git branch of the repository `repo_args` targets.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_current_branch(real_git: &Path, repo_args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if branch.is_empty() {
-            None
-        } else {
-            Some(branch)
-        }
-    } else {
+    let output = run_git(real_git, repo_args, &["symbolic-ref", "--short", "HEAD"])?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
         None
+    } else {
+        Some(branch)
     }
 }
 
@@ -4676,17 +4673,13 @@ fn resolve_current_branch(real_git: &Path, repo_args: &[&str]) -> Option<String>
 /// `None` when the remote does not exist, git fails, or no git binary is
 /// available — every caller treats that as "cannot prove identity" and fails
 /// closed.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Option<String> {
     // `--` guards against a remote name that looks like a flag.
-    let output = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["remote", "get-url", "--push", "--", remote])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = run_git(
+        real_git,
+        repo_args,
+        &["remote", "get-url", "--push", "--", remote],
+    )?;
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if url.is_empty() {
         None
@@ -4705,7 +4698,6 @@ fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Opti
 /// Empty when the remote does not exist, git fails, or no git binary is
 /// available — the caller treats an empty set as "cannot prove identity" and
 /// fails closed.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<String> {
     push_urls(real_git, repo_args, remote)
         .iter()
@@ -4715,19 +4707,15 @@ fn resolve_push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<S
 
 /// [`resolve_push_urls`] as git spells them, not normalized: the URLs a
 /// `git push` to `remote` contacts.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<String> {
     // `--` guards against a remote name that looks like a flag.
-    let Ok(output) = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["remote", "get-url", "--push", "--all", "--", remote])
-        .output()
-    else {
+    let Some(output) = run_git(
+        real_git,
+        repo_args,
+        &["remote", "get-url", "--push", "--all", "--", remote],
+    ) else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
@@ -4740,16 +4728,8 @@ fn push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<String> {
 ///
 /// `key` is a fixed, guard-constructed key (never agent-supplied), so no `--`
 /// guard is needed; `--get` takes exactly one name.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn git_config_value(real_git: &Path, repo_args: &[&str], key: &str) -> Option<String> {
-    let output = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["config", "--get", key])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = run_git(real_git, repo_args, &["config", "--get", key])?;
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if value.is_empty() { None } else { Some(value) }
 }
@@ -4797,19 +4777,11 @@ fn resolve_push_dest_remote(real_git: &Path, repo_args: &[&str]) -> String {
 /// guard's yardstick (GHSA-cm6f-3wjh-x9qx). Do not call it from `gate_git`.
 ///
 /// `None` when the symref is missing, the remote does not exist, or git fails.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_default_branch(real_git: &Path, repo_args: &[&str], remote: &str) -> Option<String> {
     // The ref name is always `refs/…`-prefixed, so a remote called `-x` cannot
     // turn into a flag here.
     let refname = format!("refs/remotes/{remote}/HEAD");
-    let output = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["symbolic-ref", "--short", &refname])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = run_git(real_git, repo_args, &["symbolic-ref", "--short", &refname])?;
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     // `--short` yields `origin/main`; the branch name is what callers compare.
     let branch = value
@@ -4998,16 +4970,12 @@ impl RepoFacts {
 /// directory git resolved it in, which is not the one this process is comparing
 /// against; canonicalized on top so a symlinked path (`/tmp` → `/private/tmp`)
 /// compares equal to the baked one.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn git_common_dir(real_git: &Path, repo_args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = run_git(
+        real_git,
+        repo_args,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() {
         return None;
@@ -5021,18 +4989,10 @@ fn git_common_dir(real_git: &Path, repo_args: &[&str]) -> Option<String> {
 }
 
 /// Every configured remote of the repository `repo_args` targets.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn list_remotes(real_git: &Path, repo_args: &[&str]) -> Vec<String> {
-    let Ok(output) = std::process::Command::new(real_git)
-        .args(repo_args)
-        .args(["remote"])
-        .output()
-    else {
+    let Some(output) = run_git(real_git, repo_args, &["remote"]) else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
@@ -5243,12 +5203,7 @@ pub fn session_repo_facts(
 fn record_remote_head(project_dir: &Path, remote: &str, branch: &str) {
     let head = format!("refs/remotes/{remote}/HEAD");
     let target = format!("refs/remotes/{remote}/{branch}");
-    if let Some(mut cmd) = crate::git::command(project_dir, &["symbolic-ref", &head, &target]) {
-        let _ = cmd
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    let _ = crate::git::output(project_dir, &["symbolic-ref", &head, &target]);
 }
 
 /// `default_branch` of `owner/name` from the GitHub API, via the trusted `gh`.
@@ -11393,5 +11348,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn detect_current_repo_and_facts_refuse_fifo_git_config() {
+        let Some(real_git) = crate::git::trusted_git() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(dir.path());
+
+        let p = dir.path().to_path_buf();
+        assert!(
+            crate::untrusted::tests::bounded(move || detect_current_repo(real_git, &p)).is_err()
+        );
+
+        let p = dir.path().to_path_buf();
+        let rules = vec![crate::config::ResolvedPushRule {
+            remote: Some("origin".into()),
+            branches: vec!["feat".into()],
+            force: false,
+            url: None,
+        }];
+        let pinned = crate::untrusted::tests::bounded(move || {
+            resolve_push_rule_urls(real_git, &[p.as_path()], &rules)
+        });
+        assert!(pinned.iter().all(|r| r.url.is_none()));
+
+        let p = dir.path().to_path_buf();
+        // `capture_repo_facts` runs `remote` + `rev-parse` (2 * GIT_TIMEOUT).
+        let facts = crate::untrusted::tests::bounded_within(
+            std::time::Duration::from_secs(20),
+            move || capture_repo_facts(real_git, &p),
+        );
+        assert!(facts.default_branches.is_empty());
+        assert!(facts.git_common_dir.is_empty());
     }
 }

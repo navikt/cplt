@@ -57,9 +57,9 @@ pub fn refuse_unsupported_os(os: &str) -> Result<(), String> {
 /// or the gitdir is `<common>/worktrees/<name>`.
 pub fn repository_common_dir(project_dir: &Path) -> Result<Option<PathBuf>, String> {
     let run = |arg: &str| -> Result<Option<PathBuf>, String> {
-        let out = crate::git::command(project_dir, &["rev-parse", arg])
-            .ok_or("no trusted git binary to identify the repository")?
-            .output()
+        let cmd = crate::git::command(project_dir, &["rev-parse", arg])
+            .ok_or("no trusted git binary to identify the repository")?;
+        let out = crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT)
             .map_err(|e| format!("cannot run git: {e}"))?;
         if !out.status.success() {
             return Ok(None);
@@ -1716,5 +1716,13 @@ mod tests {
                 .any(|p| p.detail.starts_with("cannot tell which worktree root")),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn repository_common_dir_refuses_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(dir.path());
+        let p = dir.path().to_path_buf();
+        assert!(crate::untrusted::tests::bounded(move || repository_common_dir(&p)).is_err());
     }
 }

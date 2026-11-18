@@ -786,18 +786,107 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
     Some(cmd)
 }
 
+/// Upper bound on any parent-side `git` invocation that reads repository files
+/// or configuration. Matches `audit::GIT_TIMEOUT`.
+pub const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long stdout/stderr reader threads get to deliver remaining bytes once
+/// the child has exited. A descendant that kept a pipe open must not hang us.
+const READ_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run `cmd` to completion, killing and reaping it if it outlives `timeout`.
+///
+/// Stdout and stderr are drained concurrently on helper threads so a chatty
+/// command cannot fill a pipe buffer and deadlock while waiting, and stdin is
+/// `/dev/null` so a prompt can never block on the terminal.
+///
+/// On timeout the child is SIGKILLed and reaped (no zombie) and an
+/// `ErrorKind::TimedOut` error is returned.
+pub fn output_bounded(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "missing child stdout pipe",
+        ));
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "missing child stderr pipe",
+        ));
+    };
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let res = std::io::Read::read_to_end(&mut stdout, &mut buf).map(|_| buf);
+        let _ = out_tx.send(res);
+    });
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let res = std::io::Read::read_to_end(&mut stderr, &mut buf).map(|_| buf);
+        let _ = err_tx.send(res);
+    });
+
+    let Some(status) = crate::audit::wait_timeout(&mut child, timeout) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("git timed out after {timeout:?}"),
+        ));
+    };
+    let stdout = out_rx.recv_timeout(READ_GRACE).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out draining git stdout",
+        )
+    })??;
+    let stderr = err_rx.recv_timeout(READ_GRACE).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out draining git stderr",
+        )
+    })??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Build and run a hardened `git` command in `project_dir`, bounded by
+/// [`GIT_TIMEOUT`].
+///
+/// Returns `None` when [`command`] refuses the invocation, when spawning or
+/// waiting fails, or when `git` outlives [`GIT_TIMEOUT`] (the child is
+/// killed and reaped).
+#[must_use]
+pub fn output(project_dir: &Path, args: &[&str]) -> Option<std::process::Output> {
+    let cmd = command(project_dir, args)?;
+    output_bounded(cmd, GIT_TIMEOUT).ok()
+}
+
 /// The toplevel of the git repository containing `dir`, not canonicalized.
 ///
-/// `Err` carries the first nonempty line of git's stderr, or the spawn error,
-/// so the caller can say *why* detection failed. `Err(None)` means git gave
-/// no reason (no trusted git, or a refused invocation).
+/// `Err` carries the first nonempty line of git's stderr, or the spawn/timeout
+/// error, so the caller can say *why* detection failed. `Err(None)` means git
+/// gave no reason (no trusted git, or a refused invocation).
 ///
 /// Hardened like every other call: `dir` may be inside a hostile repo.
 pub fn project_root(dir: &Path) -> Result<PathBuf, Option<String>> {
-    let output = command(dir, &["rev-parse", "--show-toplevel"])
-        .ok_or(None)?
-        .output()
-        .map_err(|e| Some(e.to_string()))?;
+    let cmd = command(dir, &["rev-parse", "--show-toplevel"]).ok_or(None)?;
+    let output = output_bounded(cmd, GIT_TIMEOUT).map_err(|e| Some(e.to_string()))?;
     if output.status.success() {
         let path = String::from_utf8(output.stdout).map_err(|_| None)?;
         return Ok(PathBuf::from(path.trim()));
@@ -845,34 +934,18 @@ fn content_filter_probe(project_dir: &Path) -> Option<bool> {
     };
     let mut cmd = Command::new(git);
     harden(&mut cmd);
-    let Ok(mut child) = cmd
-        .args(["config", "--list", "--show-scope", "--includes", "-z"])
-        .current_dir(project_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Some(false);
-    };
+    cmd.args(["config", "--list", "--show-scope", "--includes", "-z"])
+        .current_dir(project_dir);
     // Bounded: an agent-written repo can plant a FIFO where git reads its
     // config (#963). A probe that does not finish refuses, like a found filter.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut stdout, &mut buf).map(|_| buf)
-    });
-    let status = crate::audit::wait_timeout(&mut child, CONFIG_PROBE_TIMEOUT)?;
-    if !status.success() {
+    let out = match output_bounded(cmd, CONFIG_PROBE_TIMEOUT) {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return None,
+        Err(_) => return Some(false),
+    };
+    if !out.status.success() {
         return Some(false);
     }
-    let Ok(Ok(stdout)) = reader.join() else {
-        return None;
-    };
-    let out = std::process::Output {
-        status,
-        stdout,
-        stderr: Vec::new(),
-    };
     // `-z` output is a flat NUL-separated stream of alternating fields:
     // scope NUL "key\nvalue" NUL scope NUL "key\nvalue" NUL ...
     // A valueless key has no newline; `split_once` yielding None handles it.
@@ -890,7 +963,7 @@ fn content_filter_probe(project_dir: &Path) -> Option<bool> {
     Some(false)
 }
 
-const CONFIG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CONFIG_PROBE_TIMEOUT: std::time::Duration = GIT_TIMEOUT;
 
 /// `filter.<name>.clean` / `filter.<name>.process` — the two filter stages git
 /// runs while comparing the working tree. `smudge` is checkout-only and cannot
@@ -929,13 +1002,60 @@ mod tests {
     #[test]
     fn config_probe_timeout_is_not_a_content_filter() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git/refs")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
-        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        crate::untrusted::tests::mkfifo(&dir.path().join(".git/config"));
+        crate::untrusted::tests::plant_fifo_git_config(dir.path());
         assert_eq!(content_filter_probe(dir.path()), None);
         assert!(repo_defines_content_filter(dir.path()));
         assert!(command(dir.path(), &["status"]).is_none());
+    }
+
+    /// `output_bounded` kills and reaps a child that outlives the deadline.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // absolute trusted system shell for timeout test
+    fn output_bounded_kills_and_reaps_hung_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$1\"; exec /bin/sleep 30",
+            "_",
+            pidfile.to_str().unwrap(),
+        ]);
+        let started = std::time::Instant::now();
+        let err = output_bounded(cmd, std::time::Duration::from_millis(300))
+            .expect_err("hung child must time out");
+        let waited = started.elapsed();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            waited >= std::time::Duration::from_millis(300)
+                && waited < std::time::Duration::from_secs(10),
+            "deadline must hold: {waited:?}"
+        );
+        if let Ok(raw) = std::fs::read_to_string(&pidfile)
+            && let Ok(pid) = raw.trim().parse::<libc::pid_t>()
+        {
+            // SAFETY: signal 0 only probes whether the pid still exists.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!alive, "timed-out child must be killed and reaped");
+        }
+    }
+
+    #[test]
+    fn project_root_refuses_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(dir.path());
+        let p = dir.path().to_path_buf();
+        let res = crate::untrusted::tests::bounded(move || project_root(&p));
+        assert!(matches!(res, Err(Some(_))), "expected timeout err: {res:?}");
+    }
+
+    #[test]
+    fn git_output_refuses_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(dir.path());
+        let p = dir.path().to_path_buf();
+        let res = crate::untrusted::tests::bounded(move || output(&p, &["rev-parse", "--git-dir"]));
+        assert!(res.is_none());
     }
 
     #[test]

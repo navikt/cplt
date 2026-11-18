@@ -152,9 +152,7 @@ pub fn repo_fingerprint(project_dir: &Path) -> String {
 ///
 /// Normalizes: strips `.git` suffix, lowercases host, converts SSH to HTTPS style.
 pub(crate) fn canonical_remote(project_dir: &Path) -> Option<String> {
-    let output = crate::git::command(project_dir, &["remote", "get-url", "origin"])?
-        .output()
-        .ok()?;
+    let output = crate::git::output(project_dir, &["remote", "get-url", "origin"])?;
 
     if !output.status.success() {
         return None;
@@ -1964,5 +1962,13 @@ approved_at = "2026-05-01T12:00:00Z"
         assert_eq!(&ts[10..11], "T");
         assert_eq!(&ts[13..14], ":");
         assert_eq!(&ts[16..17], ":");
+    }
+
+    #[test]
+    fn canonical_remote_refuses_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(dir.path());
+        let p = dir.path().to_path_buf();
+        assert!(crate::untrusted::tests::bounded(move || canonical_remote(&p)).is_none());
     }
 }

@@ -381,12 +381,10 @@ pub fn committed_in_head(project_dir: &Path) -> bool {
 /// Uses `git cat-file blob HEAD:.cplt.toml` which reads from the object store,
 /// not the working tree. This prevents mid-session tampering by the agent.
 fn read_from_git_head(project_dir: &Path) -> Option<String> {
-    let output = crate::git::command(
+    let output = crate::git::output(
         project_dir,
         &["cat-file", "blob", &format!("HEAD:{REPO_CONFIG_FILE}")],
-    )?
-    .output()
-    .ok()?;
+    )?;
 
     if output.status.success() {
         String::from_utf8(output.stdout).ok()
@@ -510,9 +508,7 @@ pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
 /// `cat-file`, which cannot reach a filter and is never refused. What it does
 /// block is `cplt trust accept`, which approves only `Committed`.
 fn git_succeeds(project_dir: &Path, args: &[&str]) -> bool {
-    crate::git::command(project_dir, args)
-        .and_then(|mut c| c.output().ok())
-        .is_some_and(|o| o.status.success())
+    crate::git::output(project_dir, args).is_some_and(|o| o.status.success())
 }
 
 /// Parse and validate a `.cplt.toml` content string.
@@ -1773,5 +1769,37 @@ paths = [".env", "certs/server.pem", "~/secrets", "apps/web/.env.local"]
                 "expected error for control characters in: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn load_and_state_refuse_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(&path);
+        std::fs::write(
+            path.join(REPO_CONFIG_FILE),
+            "[deny]\npaths = [\".env\"]\n[propose.allow]\ndomains = [\"example.com\"]\n",
+        )
+        .unwrap();
+
+        let p = path.clone();
+        let loaded = crate::untrusted::tests::bounded(move || load_repo_config(&p))
+            .expect("working-tree fallback")
+            .expect("config present");
+        assert_eq!(loaded.source, RepoConfigSource::WorkingTree);
+        assert!(loaded.propose_dropped);
+        assert!(loaded.config.propose.allow.domains.is_empty());
+
+        let p = path.clone();
+        assert!(!crate::untrusted::tests::bounded(
+            move || committed_in_head(&p)
+        ));
+
+        // `repo_config_state` runs cat-file + rev-parse (2 * GIT_TIMEOUT).
+        let state = crate::untrusted::tests::bounded_within(
+            std::time::Duration::from_secs(20),
+            move || repo_config_state(&path),
+        );
+        assert_eq!(state, RepoConfigState::NotAGitRepo { has_file: true });
     }
 }

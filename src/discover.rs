@@ -637,14 +637,8 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
     // macOS-only: Keychain and Security framework database.
     let keychains_dir_exists = probe_keychains_dir(home_dir);
 
-    let is_git_repo = crate::git::command(project_dir, &["rev-parse", "--git-dir"])
-        .and_then(|mut c| {
-            c.stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .ok()
-        })
-        .is_some_and(|s| s.success());
+    let is_git_repo = crate::git::output(project_dir, &["rev-parse", "--git-dir"])
+        .is_some_and(|o| o.status.success());
 
     let security_db_exists = probe_security_db();
 
@@ -1329,9 +1323,7 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
     // particular repository, so it intentionally runs in the process cwd.
     // `crate::git::command` does not blank global config (see its `harden`
     // docs); doing so would break exactly this detection.
-    let output = crate::git::command(Path::new("."), &["config", "--global", "core.hooksPath"])?
-        .output()
-        .ok()?;
+    let output = crate::git::output(Path::new("."), &["config", "--global", "core.hooksPath"])?;
     if !output.status.success() {
         return None;
     }
@@ -1404,7 +1396,7 @@ pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
 /// caches in a `OnceLock`, so on a host that has git the fallback branch is
 /// otherwise unreachable and a revert of the wiring goes unnoticed.
 fn git_dir_of_with(cmd: Option<std::process::Command>, dir: &Path) -> Option<PathBuf> {
-    let Some(mut cmd) = cmd else {
+    let Some(cmd) = cmd else {
         // No trusted git on this machine. Before this fallback existed, that
         // returned `None` and every gitdir-derived deny for a worktree or a
         // separate-gitdir repo silently vanished — the fail-open the doc
@@ -1421,7 +1413,11 @@ fn git_dir_of_with(cmd: Option<std::process::Command>, dir: &Path) -> Option<Pat
         // no working tree for an agent to be sandboxed into.
         return gitdir_without_git(dir);
     };
-    let output = cmd.output().ok()?;
+    let Ok(output) = crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT) else {
+        // A wedged or unspawnable git (e.g. a planted FIFO in `.git/config`)
+        // must not strip persistence denies: fall back to the git-free check.
+        return gitdir_without_git(dir);
+    };
     if !output.status.success() {
         return None;
     }
@@ -1648,9 +1644,7 @@ fn worktree_common_dir(project_dir: &Path) -> Option<PathBuf> {
     //   - worktree: the common dir is `<gitdir>/../..`, because git writes
     //     literally `../..` into `<main>/.git/worktrees/<name>/commondir`
     // A steered commondir satisfies neither, and is never named in a warning.
-    let git_dir = crate::git::command(project_dir, &["rev-parse", "--absolute-git-dir"])?
-        .output()
-        .ok()
+    let git_dir = crate::git::output(project_dir, &["rev-parse", "--absolute-git-dir"])
         .filter(|o| o.status.success())
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))?;
     let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
@@ -2837,5 +2831,52 @@ mod wsl_tool_report_tests {
     #[test]
     fn npm_is_checked() {
         assert!(TOOLS_TO_CHECK.contains(&"npm"));
+    }
+
+    #[test]
+    fn discover_paths_refuses_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(dir.path());
+        let p = dir.path().to_path_buf();
+        let h = home.path().to_path_buf();
+        let d = crate::untrusted::tests::bounded(move || discover_paths(&h, &p));
+        assert!(!d.is_git_repo);
+    }
+
+    #[test]
+    fn git_dir_of_falls_back_on_fifo_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        crate::untrusted::tests::plant_fifo_git_config(&root);
+        let p = root.clone();
+        let found = crate::untrusted::tests::bounded(move || git_dir_of(&p));
+        assert_eq!(
+            found,
+            Some(root.join(".git")),
+            "timed-out git must fall back to .git so persistence denies stay emitted"
+        );
+    }
+
+    #[test]
+    fn git_common_dir_refuses_fifo_git_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = root.join("main");
+        crate::untrusted::tests::plant_fifo_git_config(&main);
+        let wt_admin = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&wt_admin).unwrap();
+        std::fs::write(wt_admin.join("commondir"), "../..\n").unwrap();
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_admin.display())).unwrap();
+
+        let h = root.clone();
+        // `git_common_dir` calls `git_dir_of` (falls back after 5s) + `rev-parse --absolute-git-dir` (5s).
+        let (common, problem) = crate::untrusted::tests::bounded_within(
+            std::time::Duration::from_secs(20),
+            move || git_common_dir(&h, &wt, &[]),
+        );
+        assert!(common.is_none() && problem.is_none());
     }
 }

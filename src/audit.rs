@@ -1115,29 +1115,12 @@ fn human_duration(d: Duration) -> String {
 /// deadlock while we wait), and on timeout the child is killed and reaped (no
 /// zombie) before returning `None`.
 fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
-    let mut child = crate::git::command(project_dir, args)?
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    // Drain stdout on a helper thread so git can never block writing to a full
-    // pipe while the main thread waits for it to exit.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-
-    // On timeout the child is already killed and reaped; the reader then sees
-    // EOF and joins.
-    let status = wait_timeout(&mut child, GIT_TIMEOUT);
-    let buf = reader.join().ok()?;
-    if !status?.success() {
+    let cmd = crate::git::command(project_dir, args)?;
+    let out = crate::git::output_bounded(cmd, GIT_TIMEOUT).ok()?;
+    if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Wait for `child` to exit, at most `timeout`. Returns its status, or `None`
@@ -2180,12 +2163,9 @@ fn template_dirs() -> Vec<PathBuf> {
         return Vec::new();
     };
     let ask = |args: &[&str]| -> Option<PathBuf> {
-        let out = Command::new(git)
-            .args(args)
-            .current_dir("/")
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
+        let mut cmd = Command::new(git);
+        cmd.args(args).current_dir("/");
+        let out = crate::git::output_bounded(cmd, GIT_TIMEOUT).ok()?;
         let s = String::from_utf8(out.stdout).ok()?;
         let s = s.trim();
         (out.status.success() && !s.is_empty()).then(|| PathBuf::from(s))
