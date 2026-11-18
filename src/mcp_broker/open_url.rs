@@ -141,7 +141,8 @@ pub const HOST_OPENER: bool = cfg!(target_os = "macos");
 /// [`crate::check::writable_tree_on_path`], so a two-hop chain
 /// (`Preferences -> ~/dotfiles/prefs -> /elsewhere`) is caught at the
 /// writable middle hop. A write grant inside the dir (or inside a symlinked
-/// directory target under it) counts too.
+/// directory target under it) counts too. Fails closed if scanning `Preferences`
+/// hits the entry or depth cap.
 #[must_use]
 pub fn opener_config_writable(policy: &LandlockPolicy, home: &Path) -> Option<PathBuf> {
     let prefs = home.join("Library/Preferences");
@@ -204,8 +205,9 @@ const MAX_COLLECT_ENTRIES: usize = 10_000;
 /// Every symlink under `root` (and inside symlinked directories it points to),
 /// to `depth` levels; the caller walks each chain. Records every visited
 /// canonical directory in `visited` so cycles are skipped and write grants
-/// inside symlinked directory targets are checked too. Returns `true` if the
-/// entry cap was hit so the caller can fail closed.
+/// inside symlinked directory targets are checked too. Returns `true` if
+/// traversal was truncated by `max_entries` or `depth` (leaving an unvisited
+/// directory or symlinked directory unchecked) so the caller can fail closed.
 fn collect_links(
     root: &Path,
     depth: u8,
@@ -234,15 +236,27 @@ fn collect_links(
             let Ok(ft) = e.file_type() else {
                 continue;
             };
-            if ft.is_symlink() {
+            let recurse = if ft.is_symlink() {
                 out.push(path.clone());
                 // `metadata` uses `stat` (never opens FIFOs/devices); only
                 // recurse when the symlink resolves to a directory.
-                if rem_depth > 0 && std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+                std::fs::metadata(&path).is_ok_and(|m| m.is_dir())
+            } else {
+                ft.is_dir()
+            };
+            if recurse {
+                if rem_depth == 0 {
+                    // An already-visited directory (cycle) was already scanned;
+                    // any unvisited directory leaves its subtree unchecked.
+                    if std::fs::canonicalize(&path)
+                        .ok()
+                        .is_none_or(|c| !visited.contains(&c))
+                    {
+                        return true;
+                    }
+                } else {
                     queue.push_back((path, rem_depth - 1));
                 }
-            } else if rem_depth > 0 && ft.is_dir() {
-                queue.push_back((path, rem_depth - 1));
             }
         }
     }
@@ -799,6 +813,85 @@ mod tests {
         out.clear();
         visited.clear();
         assert!(collect_links(&dir, 4, 4, &mut out, &mut visited));
+    }
+
+    #[test]
+    fn opener_config_writable_fails_closed_at_depth_limit() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, outside, repo) = (root.join("home"), root.join("outside"), root.join("repo"));
+        let prefs = home.join("Library/Preferences");
+        for dir in [&prefs, &outside, &repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let secure_plist = outside.join("secure.plist");
+        std::fs::write(&secure_plist, "").unwrap();
+
+        // Depth 3 (`a/b/c/link -> outside`) still scans `outside` (`rem_depth == 0`)
+        // and catches a write grant only on `outside/secure.plist`.
+        let c = prefs.join("a/b/c");
+        std::fs::create_dir_all(&c).unwrap();
+        let link_in_c = c.join("link");
+        symlink(&outside, &link_in_c).unwrap();
+        assert_eq!(opener_config_writable(&write_policy(&[&repo]), &home), None);
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&secure_plist]), &home),
+            Some(prefs.clone())
+        );
+
+        // An already-visited cycle at `rem_depth == 0` (`a/b/c/d/back -> prefs`)
+        // does not falsely trigger depth truncation.
+        std::fs::remove_file(&link_in_c).unwrap();
+        let d = c.join("d");
+        std::fs::create_dir_all(&d).unwrap();
+        let back = d.join("back");
+        symlink(&prefs, &back).unwrap();
+        assert_eq!(opener_config_writable(&write_policy(&[&repo]), &home), None);
+        std::fs::remove_file(&back).unwrap();
+
+        // Depth 4 (`a/b/c/d/link -> outside`) hits `rem_depth == 0` on `d`, leaving
+        // `outside` unchecked; must fail closed even for grants only on `outside/secure.plist`
+        // or unrelated roots.
+        let link_in_d = d.join("link");
+        symlink(&outside, &link_in_d).unwrap();
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        assert!(collect_links(
+            &prefs,
+            4,
+            MAX_COLLECT_ENTRIES,
+            &mut out,
+            &mut visited
+        ));
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&secure_plist]), &home),
+            Some(prefs.clone())
+        );
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&repo]), &home),
+            Some(prefs.clone())
+        );
+        std::fs::remove_file(&link_in_d).unwrap();
+
+        // Ordinary directory at depth 4 (`a/b/c/d/sub`) also fails closed because
+        // symlinks inside `sub` cannot be inspected.
+        let sub = d.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        symlink(repo.join("evil.plist"), sub.join("evil.plist")).unwrap();
+        out.clear();
+        visited.clear();
+        assert!(collect_links(
+            &prefs,
+            4,
+            MAX_COLLECT_ENTRIES,
+            &mut out,
+            &mut visited
+        ));
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&repo]), &home),
+            Some(prefs)
+        );
     }
 
     /// Owner decision 2026-11-17: no host opener off macOS, ever.
