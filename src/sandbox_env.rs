@@ -29,10 +29,15 @@ const COPILOT_ONLY_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB
 /// Environment variable prefix that is Copilot-specific.
 const COPILOT_ONLY_PREFIXES: &[&str] = &["COPILOT_"];
 
+/// Environment variables hidden from Copilot only (#1029).
+const COPILOT_SUPPRESSED_VARS: &[&str] = &["TMUX", "TMUX_PANE"];
+
 /// Returns true if this env var should be suppressed for the given agent.
 fn is_agent_suppressed(key: &str, agent: Agent) -> bool {
     if agent == Agent::Copilot {
-        return false; // Copilot gets everything in the allowlist
+        // Copilot CLI copies via the tmux socket when TMUX is set; the sandbox
+        // blocks that socket (send-keys escape), so drop TMUX to fall back to pbcopy (#1029).
+        return COPILOT_SUPPRESSED_VARS.contains(&key);
     }
     if COPILOT_ONLY_VARS.contains(&key) {
         return true;
@@ -1239,5 +1244,21 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("0")
         );
+    }
+
+    #[test]
+    fn tmux_vars_are_hidden_from_copilot_only() {
+        let parent = vec![
+            ("TMUX".to_string(), "/tmp/tmux-501/default,1,0".to_string()),
+            ("TMUX_PANE".to_string(), "%0".to_string()),
+        ];
+        let has = |e: &SandboxEnv, k: &str| e.vars.iter().any(|(n, _)| n == k);
+        let copilot = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Copilot);
+        assert!(!has(&copilot, "TMUX") && !has(&copilot, "TMUX_PANE"));
+        let inherit = build_sandbox_env(&parent, &[], true, &[], None, None, Agent::Copilot);
+        assert!(inherit.remove.iter().any(|k| k == "TMUX"));
+        assert!(inherit.remove.iter().any(|k| k == "TMUX_PANE"));
+        let claude = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Claude);
+        assert!(has(&claude, "TMUX") && has(&claude, "TMUX_PANE"));
     }
 }
