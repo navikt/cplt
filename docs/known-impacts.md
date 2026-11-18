@@ -854,6 +854,16 @@ podman --remote images
 
 **`/proc/self` for child processes:** under bubblewrap the agent's whole `/proc` is readable, because bubblewrap mounts a fresh `/proc` for a new pid namespace that lists only sandbox processes. Without bubblewrap only the agent's first process can read its own `/proc/self/cmdline`, `stat` and `status`; anything it starts gets `EACCES`, and tools that read their own command line (Podman: `cannot retrieve cmd line`) fail. cplt does not grant `/proc` there, since it would expose the command line of every host process, and says so at launch. Install bubblewrap, or pass `--allow-read /proc` if that exposure is acceptable.
 
+## Copying text in Copilot CLI inside tmux
+
+Copilot CLI copies to the clipboard through the tmux socket when `TMUX` is set. On macOS, and on Linux under bubblewrap, the sandbox blocks that socket, because a process that can reach it can run `tmux send-keys` outside the sandbox. Copy then failed without an error.
+
+cplt now removes `TMUX` and `TMUX_PANE` from the environment of the `copilot` agent only. Other agents still see both variables. On macOS Copilot CLI then uses `pbcopy`. The sandbox denies the clipboard by default, so pass `--allow-clipboard` or set `sandbox.deny_clipboard = false` for copy to work.
+
+On Linux without bubblewrap a tmux socket under `/tmp` stays reachable. Removing the variables only stops Copilot CLI from finding it, so Copilot CLI uses its non-tmux copy path there instead. Pass `--pass-env TMUX` to restore the old behaviour.
+
+To keep the variables for Copilot anyway, pass `--pass-env TMUX --pass-env TMUX_PANE`. This also works with `--inherit-env`.
+
 ## SSH agent blocking
 
 SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. `~/.ssh` is denied as well, so there is no key file to fall back on. Unless the agent reaches a loaded agent socket (possible on Linux, see the caveat below), this means:
