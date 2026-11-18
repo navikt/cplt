@@ -3676,12 +3676,29 @@ fn gh_gate_credential_helper_decides_token_by_stdin_host() {
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::process::Stdio;
+    use std::time::{Duration, Instant};
 
     let temp = tempfile::tempdir().unwrap();
     let fake_gh = temp.path().join("gh");
     std::fs::write(
         &fake_gh,
-        "#!/bin/sh\nprintf 'TOKEN=%s\\n' \"${GH_TOKEN-}\"\ncase \" $* \" in *\" --help \"*) exit 0 ;; esac\ncat\n",
+        "#!/bin/sh\n\
+         printf 'TOKEN=%s\\n' \"${GH_TOKEN-}\"\n\
+         help=0\n\
+         for a in \"$@\"; do\n\
+           case \"$a\" in\n\
+             --) break ;;\n\
+             --help|-h|--help=1|--help=true|-h=true|-h=1) help=1 ;;\n\
+             --help=0|--help=false|-h=0|-h=false) help=0 ;;\n\
+           esac\n\
+         done\n\
+         if [ \"$help\" -eq 1 ]; then printf 'HELP\\n'; exit 0; fi\n\
+         last=\"\"\n\
+         for a in \"$@\"; do last=\"$a\"; done\n\
+         case \"$last\" in\n\
+           get) cat ;;\n\
+           *) printf 'OP=%s\\n' \"$last\" ;;\n\
+         esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3740,6 +3757,21 @@ fn gh_gate_credential_helper_decides_token_by_stdin_host() {
             true,
         ),
         (
+            "gist.github.com",
+            b"protocol=https\nhost=gist.github.com\n\n",
+            true,
+        ),
+        (
+            "url=https://github.com/org/repo",
+            b"url=https://github.com/org/repo\n\n",
+            true,
+        ),
+        (
+            "url=https://gist.github.com/user/123",
+            b"url=https://gist.github.com/user/123\n\n",
+            true,
+        ),
+        (
             "*.ghe.com",
             b"protocol=https\nhost=example.ghe.com\n\n",
             false,
@@ -3759,6 +3791,16 @@ fn gh_gate_credential_helper_decides_token_by_stdin_host() {
             b"protocol=https\nhost=github.com\nurl=https://example.ghe.com/o/r\n\n",
             false,
         ),
+        (
+            "conflicting host= and gist url=",
+            b"protocol=https\nhost=github.com\nurl=https://gist.github.com/u/1\n\n",
+            false,
+        ),
+        (
+            "malformed url=",
+            b"url=https://github.com@evil.com/o/r\n\n",
+            false,
+        ),
         ("missing host=", b"protocol=https\n\n", false),
     ] {
         let out = run(&["auth", "git-credential", "get"], input);
@@ -3776,6 +3818,16 @@ fn gh_gate_credential_helper_decides_token_by_stdin_host() {
             String::from_utf8_lossy(&out)
         );
     }
+
+    // `--help --help=false get` runs `get`, reads stdin, and injects GH_TOKEN.
+    let overrides_out = run(
+        &["auth", "git-credential", "--help", "--help=false", "get"],
+        b"url=https://github.com/org/repo\n\n",
+    );
+    assert_eq!(
+        overrides_out,
+        b"TOKEN=gho_github_token\nurl=https://github.com/org/repo\n\n"
+    );
 
     // Blank-line termination: must return without waiting for EOF on stdin.
     let mut open_child = cplt_cmd()
@@ -3816,8 +3868,179 @@ fn gh_gate_credential_helper_decides_token_by_stdin_host() {
         "TOKEN=gho_github_token\nprotocol=https\nhost=github.com\n\n"
     );
 
-    // `--help` must not read stdin or attach GH_TOKEN.
-    let mut help_child = cplt_cmd()
+    // Help flags (`--help`, `--help=1`, `-h=true`) and non-`get` operations
+    // (`store`, `erase`, invalid operation, missing operation) must NOT block
+    // on an open stdin pipe and must NOT attach GH_TOKEN.
+    for (args, expected_stdout) in [
+        (&["auth", "git-credential", "--help"][..], "TOKEN=\nHELP\n"),
+        (
+            &["auth", "git-credential", "--help=1"][..],
+            "TOKEN=\nHELP\n",
+        ),
+        (&["auth", "git-credential", "-h=true"][..], "TOKEN=\nHELP\n"),
+        (
+            &["auth", "git-credential", "store"][..],
+            "TOKEN=\nOP=store\n",
+        ),
+        (
+            &["auth", "git-credential", "erase"][..],
+            "TOKEN=\nOP=erase\n",
+        ),
+        (
+            &["auth", "git-credential", "bogus"][..],
+            "TOKEN=\nOP=bogus\n",
+        ),
+        (
+            &["auth", "git-credential"][..],
+            "TOKEN=\nOP=git-credential\n",
+        ),
+    ] {
+        let mut child = cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--real-git")
+            .arg(binary_in_path("git"))
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--")
+            .args(args)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let open_stdin = child.stdin.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{args:?} blocked on open stdin pipe"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "{args:?} failed: {status}");
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        drop(open_stdin);
+        assert_eq!(stdout, expected_stdout, "{args:?}: got {stdout:?}");
+    }
+}
+
+#[test]
+fn gh_gate_credential_helper_forwards_signals_and_reaps_child() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().unwrap();
+    let token_dir = temp.path().join("tokens");
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join(".gh-exec-token"), "gho_github_token\n").unwrap();
+
+    let pid_file = temp.path().join("child.pid");
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        format!(
+            "#!/bin/sh\n\
+             printf '%d\\n' \"$$\" > '{}'\n\
+             printf 'READY=%d\\n' \"$$\"\n\
+             exec sleep 30\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let _ = std::fs::remove_file(&pid_file);
+        let mut child = cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--real-git")
+            .arg(binary_in_path("git"))
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--")
+            .args(["auth", "git-credential", "get"])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .unwrap();
+        stdin.flush().unwrap();
+
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut ready_line = String::new();
+        reader.read_line(&mut ready_line).unwrap();
+        let gh_pid: i32 = ready_line
+            .trim()
+            .strip_prefix("READY=")
+            .expect("expected READY=<pid>")
+            .parse()
+            .unwrap();
+
+        // SAFETY: sending `sig` to the spawned `cplt gh-gate` child PID.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, sig) }, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cplt gh-gate did not exit after signal {sig}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(128 + sig));
+
+        // Pipe reader must see EOF once gate and child are gone.
+        let mut trailing = String::new();
+        reader.read_line(&mut trailing).unwrap();
+        assert!(trailing.is_empty(), "expected EOF, got {trailing:?}");
+
+        // The spawned `gh` child must be terminated and reaped (ESRCH).
+        // SAFETY: signal 0 probes whether `gh_pid` still exists.
+        let probe = unsafe { libc::kill(gh_pid, 0) };
+        assert_eq!(probe, -1, "gh child {gh_pid} survived signal {sig}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "gh child {gh_pid} was not reaped after signal {sig}"
+        );
+    }
+
+    // Signal arriving while writing a large credential block (child never drains stdin).
+    let _ = std::fs::remove_file(&pid_file);
+    let mut big_block = Vec::from(b"protocol=https\nhost=github.com\npath=".as_slice());
+    big_block.resize(63 * 1024, b'a');
+    big_block.extend_from_slice(b"\n\n");
+
+    let mut write_child = cplt_cmd()
         .arg("gh-gate")
         .arg("--real-gh")
         .arg(&fake_gh)
@@ -3826,7 +4049,7 @@ fn gh_gate_credential_helper_decides_token_by_stdin_host() {
         .arg("--repo-scope")
         .arg("navikt/cplt")
         .arg("--")
-        .args(["auth", "git-credential", "--help"])
+        .args(["auth", "git-credential", "get"])
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
@@ -3835,18 +4058,43 @@ fn gh_gate_credential_helper_decides_token_by_stdin_host() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let help_stdin = help_child.stdin.take().unwrap();
-    let help_status = help_child.wait().unwrap();
-    assert!(help_status.success());
-    let mut help_stdout = String::new();
-    help_child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut help_stdout)
+    let mut big_stdin = write_child.stdin.take().unwrap();
+    big_stdin.write_all(&big_block).unwrap();
+    big_stdin.flush().unwrap();
+
+    let mut reader = BufReader::new(write_child.stdout.take().unwrap());
+    let mut ready_line = String::new();
+    reader.read_line(&mut ready_line).unwrap();
+    let gh_pid: i32 = ready_line
+        .trim()
+        .strip_prefix("READY=")
+        .expect("expected READY=<pid>")
+        .parse()
         .unwrap();
-    drop(help_stdin);
-    assert_eq!(help_stdout, "TOKEN=\n");
+
+    // SAFETY: sending SIGTERM to the spawned `cplt gh-gate` child PID while it writes stdin.
+    assert_eq!(
+        unsafe { libc::kill(write_child.id() as i32, libc::SIGTERM) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = write_child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cplt gh-gate hung during stdin write after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM));
+    // SAFETY: signal 0 probes whether `gh_pid` still exists.
+    assert_eq!(unsafe { libc::kill(gh_pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 
 #[test]

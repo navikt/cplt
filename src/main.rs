@@ -6174,7 +6174,7 @@ fn exec_real(
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     if name == "gh"
-        && gh_proxy::is_auth_git_credential_request(&arg_refs)
+        && gh_proxy::is_auth_git_credential_get_request(&arg_refs)
         && !gh_proxy::is_help_request(&arg_refs)
     {
         return exec_credential_helper(command, name);
@@ -6190,10 +6190,133 @@ fn exec_real(
     ExitCode::FAILURE
 }
 
-/// Run `gh auth git-credential`: read the blank-line-terminated stdin block,
-/// attach `GH_TOKEN` only when `host=github.com`, and pipe the input to `gh`.
+/// PID of the active `gh auth git-credential` child while `exec_credential_helper`
+/// is running; 0 when no child is alive.
+static CREDENTIAL_CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// First termination signal received by `exec_credential_helper` (0 if none).
+static CREDENTIAL_FORWARDED_SIGNAL: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+const CREDENTIAL_FORWARDED_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+
+extern "C" fn forward_credential_signal(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    let _ =
+        CREDENTIAL_FORWARDED_SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
+    let pid = CREDENTIAL_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: `pid` is the live child PID stored before unblocking signals
+        // and cleared before `child.wait()` reaps it, so PID reuse cannot occur.
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+struct CredentialSignalGuard {
+    prev_actions: [(libc::c_int, libc::sigaction); 3],
+    installed: bool,
+    blocked: bool,
+    prev_mask: libc::sigset_t,
+}
+
+impl CredentialSignalGuard {
+    fn install_blocked() -> Self {
+        use std::sync::atomic::Ordering;
+        CREDENTIAL_CHILD_PID.store(0, Ordering::SeqCst);
+        CREDENTIAL_FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
+
+        // SAFETY: zeroed sigaction/sigset_t are valid C structs; sigemptyset,
+        // sigaddset, sigprocmask, and sigaction are POSIX calls with valid
+        // pointers and async-signal-safe handler `forward_credential_signal`.
+        unsafe {
+            let mut block_set: libc::sigset_t = std::mem::zeroed();
+            let mut prev_mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut block_set);
+            for sig in CREDENTIAL_FORWARDED_SIGNALS {
+                libc::sigaddset(&raw mut block_set, sig);
+            }
+            let blocked =
+                libc::sigprocmask(libc::SIG_BLOCK, &raw const block_set, &raw mut prev_mask) == 0;
+
+            let mut new_act: libc::sigaction = std::mem::zeroed();
+            new_act.sa_sigaction = forward_credential_signal as *const () as usize;
+            libc::sigemptyset(&raw mut new_act.sa_mask);
+            // Leave SA_RESTART unset so a blocked stdin write returns EINTR if
+            // a termination signal arrives while writing the credential block.
+            new_act.sa_flags = 0;
+
+            let mut prev_actions: [(libc::c_int, libc::sigaction); 3] = [
+                (CREDENTIAL_FORWARDED_SIGNALS[0], std::mem::zeroed()),
+                (CREDENTIAL_FORWARDED_SIGNALS[1], std::mem::zeroed()),
+                (CREDENTIAL_FORWARDED_SIGNALS[2], std::mem::zeroed()),
+            ];
+            for (sig, old_act) in &mut prev_actions {
+                libc::sigaction(*sig, std::ptr::null(), old_act);
+                if old_act.sa_sigaction != libc::SIG_IGN {
+                    libc::sigaction(*sig, &raw const new_act, std::ptr::null_mut());
+                }
+            }
+
+            Self {
+                prev_actions,
+                installed: true,
+                blocked,
+                prev_mask,
+            }
+        }
+    }
+
+    fn attach_child_and_unblock(&mut self, child_pid: i32) {
+        CREDENTIAL_CHILD_PID.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+        if self.blocked {
+            // SAFETY: `self.prev_mask` was initialized by `sigprocmask(SIG_BLOCK, ...)`.
+            unsafe {
+                libc::sigprocmask(
+                    libc::SIG_SETMASK,
+                    &raw const self.prev_mask,
+                    std::ptr::null_mut(),
+                );
+            }
+            self.blocked = false;
+        }
+    }
+}
+
+impl Drop for CredentialSignalGuard {
+    fn drop(&mut self) {
+        CREDENTIAL_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+        if self.installed {
+            for (sig, old_act) in &self.prev_actions {
+                // SAFETY: `old_act` was populated by `sigaction` in `install_blocked`.
+                unsafe {
+                    libc::sigaction(*sig, old_act, std::ptr::null_mut());
+                }
+            }
+            self.installed = false;
+        }
+        if self.blocked {
+            // SAFETY: `self.prev_mask` was initialized by `sigprocmask(SIG_BLOCK, ...)`.
+            unsafe {
+                libc::sigprocmask(
+                    libc::SIG_SETMASK,
+                    &raw const self.prev_mask,
+                    std::ptr::null_mut(),
+                );
+            }
+            self.blocked = false;
+        }
+    }
+}
+
+/// Run `gh auth git-credential get`: read the blank-line-terminated stdin
+/// block, attach `GH_TOKEN` only for `github.com` / `gist.github.com`, pipe the
+/// input to `gh`, forward termination signals (`SIGTERM`, `SIGHUP`, `SIGINT`),
+/// and reap the child before exiting.
 fn exec_credential_helper(mut command: std::process::Command, name: &str) -> ExitCode {
     use std::io::Write;
+    use std::sync::atomic::Ordering;
 
     let stdin_bytes = match gh_proxy::read_credential_stdin(std::io::stdin().lock()) {
         Ok(bytes) => bytes,
@@ -6208,27 +6331,102 @@ fn exec_credential_helper(mut command: std::process::Command, name: &str) -> Exi
         command.env("GH_TOKEN", token);
     }
     command.stdin(std::process::Stdio::piped());
+
+    let mut sig_guard = CredentialSignalGuard::install_blocked();
+    // Restore the caller's original signal mask in the child so the temporary
+    // SIG_BLOCK around spawn() is never inherited by `gh`.
+    let child_mask = sig_guard.prev_mask;
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `sigprocmask` is async-signal-safe and `child_mask` is a
+        // plain Copy `libc::sigset_t` populated before `spawn()`.
+        unsafe {
+            command.pre_exec(move || {
+                libc::sigprocmask(
+                    libc::SIG_SETMASK,
+                    &raw const child_mask,
+                    std::ptr::null_mut(),
+                );
+                Ok(())
+            });
+        }
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
+            drop(sig_guard);
             ui::error(&format!("Failed to exec {name}: {err}"));
             return ExitCode::FAILURE;
         }
     };
-    if let Some(mut child_stdin) = child.stdin.take()
-        && let Err(err) = child_stdin.write_all(&stdin_bytes)
-        && err.kind() != std::io::ErrorKind::BrokenPipe
-    {
+    let child_pid = child.id();
+    sig_guard.attach_child_and_unblock(i32::try_from(child_pid).unwrap_or(0));
+
+    let mut write_failed: Option<std::io::Error> = None;
+    if let Some(mut child_stdin) = child.stdin.take() {
+        let mut written = 0;
+        while written < stdin_bytes.len() {
+            match child_stdin.write(&stdin_bytes[written..]) {
+                Ok(0) => {
+                    write_failed = Some(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "wrote zero bytes to child stdin",
+                    ));
+                    break;
+                }
+                Ok(n) => written += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    if CREDENTIAL_FORWARDED_SIGNAL.load(Ordering::SeqCst) != 0 {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(err) => {
+                    write_failed = Some(err);
+                    break;
+                }
+            }
+        }
+        drop(child_stdin);
+    }
+
+    // Wait for exit without reaping first so CREDENTIAL_CHILD_PID can be cleared
+    // before `child.wait()` frees the PID (#724 pattern).
+    loop {
+        // SAFETY: zeroed siginfo_t is a valid out-parameter for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `child_pid` is our own unreaped child; WNOWAIT leaves it for `child.wait()`.
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child_pid as libc::id_t,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            CREDENTIAL_CHILD_PID.store(0, Ordering::SeqCst);
+            break;
+        }
+    }
+
+    let wait_res = child.wait();
+    let forwarded_sig = CREDENTIAL_FORWARDED_SIGNAL.load(Ordering::SeqCst);
+    drop(sig_guard);
+
+    if let Some(err) = write_failed {
         ui::error(&format!("Failed to write stdin to {name}: {err}"));
-        let _ = child.wait();
         return ExitCode::FAILURE;
     }
-    match child.wait() {
+
+    match wait_res {
         Ok(status) => {
-            if status.success() {
-                ExitCode::SUCCESS
-            } else if let Some(code) = status.code() {
-                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            if let Some(code) = status.code() {
+                if forwarded_sig != 0 && code == 0 {
+                    ExitCode::from(u8::try_from(128 + forwarded_sig).unwrap_or(1))
+                } else {
+                    ExitCode::from(u8::try_from(code).unwrap_or(1))
+                }
             } else {
                 #[cfg(unix)]
                 {
