@@ -6173,10 +6173,13 @@ fn exec_real(
         command.env("GH_HOST", host);
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let foreign_credential = std::env::var_os(gh_proxy::FOREIGN_CREDENTIAL_ENV).is_some();
-    command.env_remove(gh_proxy::FOREIGN_CREDENTIAL_ENV);
     if name == "gh"
-        && !foreign_credential
+        && gh_proxy::is_auth_git_credential_request(&arg_refs)
+        && !gh_proxy::is_help_request(&arg_refs)
+    {
+        return exec_credential_helper(command, name);
+    }
+    if name == "gh"
         && gh_proxy::github_token_allowed(&arg_refs, repo_scope, host_pin)
         && let Some(token) = exec_gh_token()
     {
@@ -6185,6 +6188,63 @@ fn exec_real(
     let err = command.exec();
     ui::error(&format!("Failed to exec {name}: {err}"));
     ExitCode::FAILURE
+}
+
+/// Run `gh auth git-credential`: read the blank-line-terminated stdin block,
+/// attach `GH_TOKEN` only when `host=github.com`, and pipe the input to `gh`.
+fn exec_credential_helper(mut command: std::process::Command, name: &str) -> ExitCode {
+    use std::io::Write;
+
+    let stdin_bytes = match gh_proxy::read_credential_stdin(std::io::stdin().lock()) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            ui::error(&err);
+            return ExitCode::FAILURE;
+        }
+    };
+    if gh_proxy::credential_stdin_allows_github_token(&stdin_bytes)
+        && let Some(token) = exec_gh_token()
+    {
+        command.env("GH_TOKEN", token);
+    }
+    command.stdin(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            ui::error(&format!("Failed to exec {name}: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(mut child_stdin) = child.stdin.take()
+        && let Err(err) = child_stdin.write_all(&stdin_bytes)
+        && err.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        ui::error(&format!("Failed to write stdin to {name}: {err}"));
+        let _ = child.wait();
+        return ExitCode::FAILURE;
+    }
+    match child.wait() {
+        Ok(status) => {
+            if status.success() {
+                ExitCode::SUCCESS
+            } else if let Some(code) = status.code() {
+                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = status.signal() {
+                        return ExitCode::from(u8::try_from(128 + sig).unwrap_or(1));
+                    }
+                }
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            ui::error(&format!("Failed to wait for {name}: {err}"));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The token cplt cached at launch for the real `gh` (`$TMPDIR/.gh-exec-token`),

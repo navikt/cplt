@@ -3670,3 +3670,328 @@ fn gh_gate_pins_nothing_when_the_set_is_ambiguous() {
         "an ambiguous set must pin nothing AND leak neither GH_REPO nor GH_HOST"
     );
 }
+
+#[test]
+fn gh_gate_credential_helper_decides_token_by_stdin_host() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf 'TOKEN=%s\\n' \"${GH_TOKEN-}\"\ncase \" $* \" in *\" --help \"*) exit 0 ;; esac\ncat\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let token_dir = temp.path().join("tokens");
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join(".gh-exec-token"), "gho_github_token\n").unwrap();
+
+    let run = |args: &[&str], stdin_bytes: &[u8]| {
+        let mut child = cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--real-git")
+            .arg(binary_in_path("git"))
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--")
+            .args(args)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cplt gh-gate should spawn");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(stdin_bytes)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    for (label, input, want_token) in [
+        (
+            "github.com",
+            b"protocol=https\nhost=github.com\n\n".as_slice(),
+            true,
+        ),
+        (
+            "uppercase GITHUB.COM",
+            b"protocol=https\nhost=GITHUB.COM\n\n",
+            true,
+        ),
+        (
+            "CRLF github.com",
+            b"protocol=https\r\nhost=github.com\r\n\r\n",
+            true,
+        ),
+        (
+            "*.ghe.com",
+            b"protocol=https\nhost=example.ghe.com\n\n",
+            false,
+        ),
+        (
+            "api.github.com",
+            b"protocol=https\nhost=api.github.com\n\n",
+            false,
+        ),
+        (
+            "conflicting host=",
+            b"protocol=https\nhost=github.com\nhost=example.ghe.com\n\n",
+            false,
+        ),
+        (
+            "url= override",
+            b"protocol=https\nhost=github.com\nurl=https://example.ghe.com/o/r\n\n",
+            false,
+        ),
+        ("missing host=", b"protocol=https\n\n", false),
+    ] {
+        let out = run(&["auth", "git-credential", "get"], input);
+        let expected_prefix = if want_token {
+            b"TOKEN=gho_github_token\n".as_slice()
+        } else {
+            b"TOKEN=\n".as_slice()
+        };
+        let mut expected = expected_prefix.to_vec();
+        expected.extend_from_slice(input);
+        assert_eq!(
+            out,
+            expected,
+            "{label}: got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    // Blank-line termination: must return without waiting for EOF on stdin.
+    let mut open_child = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["auth", "git-credential", "get"])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut open_stdin = open_child.stdin.take().unwrap();
+    open_stdin
+        .write_all(b"protocol=https\nhost=github.com\n\n")
+        .unwrap();
+    open_stdin.flush().unwrap();
+    let status = open_child.wait().unwrap();
+    assert!(status.success());
+    let mut open_stdout = String::new();
+    open_child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut open_stdout)
+        .unwrap();
+    drop(open_stdin);
+    assert_eq!(
+        open_stdout,
+        "TOKEN=gho_github_token\nprotocol=https\nhost=github.com\n\n"
+    );
+
+    // `--help` must not read stdin or attach GH_TOKEN.
+    let mut help_child = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["auth", "git-credential", "--help"])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let help_stdin = help_child.stdin.take().unwrap();
+    let help_status = help_child.wait().unwrap();
+    assert!(help_status.success());
+    let mut help_stdout = String::new();
+    help_child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut help_stdout)
+        .unwrap();
+    drop(help_stdin);
+    assert_eq!(help_stdout, "TOKEN=\n");
+}
+
+#[test]
+fn gh_gate_planted_credential_helper_on_ghe_host_withholds_token() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let token_dir = temp.path().join("tokens");
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join(".gh-exec-token"), "gho_github_token\n").unwrap();
+
+    let log_file = temp.path().join("gh-calls.log");
+    let fake_gh = temp.path().join("real-gh");
+    std::fs::write(
+        &fake_gh,
+        format!(
+            "#!/bin/sh\n\
+             input=$(cat)\n\
+             printf 'TOKEN=%s\\n%s\\n---\\n' \"${{GH_TOKEN-}}\" \"$input\" >> '{}'\n\
+             if [ -n \"${{GH_TOKEN-}}\" ]; then\n\
+               printf 'username=x-access-token\\npassword=%s\\n' \"$GH_TOKEN\"\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+            log_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let write_wrapper = |extra_flags: &str| {
+        let gh_wrapper = bin_dir.join("gh");
+        std::fs::write(
+            &gh_wrapper,
+            format!(
+                "#!/bin/sh\nexec '{}' gh-gate --real-gh '{}' --real-git '{}' --repo-scope navikt/cplt --mode=block --scope-check --block-auth-token --unknown-command=block {extra_flags} -- \"$@\"\n",
+                common::binary_path().display(),
+                fake_gh.display(),
+                binary_in_path("git").display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write_wrapper("");
+
+    let repo = temp_repo("navikt/cplt");
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run_git_credential = |extra_args: &[&str], stdin_data: &str| {
+        let mut cmd = common::git_cmd(repo.path());
+        common::with_scratch_home(&mut cmd);
+        cmd.args(extra_args)
+            .args(["credential", "fill"])
+            .env("CPLT_CONFIG", common::NO_CONFIG)
+            .env("PATH", &path_env)
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("git credential fill should spawn");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(stdin_data.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // 1. Agent-controlled `git -c` helper on a *.ghe.com host (drops any marker).
+    let out_c = run_git_credential(
+        &[
+            "-c",
+            "credential.https://example.ghe.com.helper=!gh auth git-credential",
+        ],
+        "url=https://example.ghe.com/org/repo\n\n",
+    );
+    let stdout_c = String::from_utf8_lossy(&out_c.stdout);
+    assert!(
+        !stdout_c.contains("gho_github_token"),
+        "git -c planted *.ghe.com helper must not leak github.com token: {stdout_c}"
+    );
+
+    // 2. Agent-controlled `.git/config` helper on a *.ghe.com host.
+    let git_config = repo.path().join(".git/config");
+    let mut existing = std::fs::read_to_string(&git_config).unwrap();
+    existing.push_str(
+        "\n[credential \"https://tenant.ghe.com\"]\n\thelper = !gh auth git-credential\n",
+    );
+    std::fs::write(&git_config, existing).unwrap();
+    let out_repo_cfg = run_git_credential(&[], "url=https://tenant.ghe.com/org/repo\n\n");
+    let stdout_repo_cfg = String::from_utf8_lossy(&out_repo_cfg.stdout);
+    assert!(
+        !stdout_repo_cfg.contains("gho_github_token"),
+        ".git/config planted *.ghe.com helper must not leak github.com token: {stdout_repo_cfg}"
+    );
+
+    // 3. Same planted helper when `gh_guard.hosts` includes `example.ghe.com`.
+    write_wrapper("--gh-host github.com --gh-host example.ghe.com");
+    let out_hosts = run_git_credential(
+        &[
+            "-c",
+            "credential.https://example.ghe.com.helper=!gh auth git-credential",
+        ],
+        "url=https://example.ghe.com/org/repo\n\n",
+    );
+    let stdout_hosts = String::from_utf8_lossy(&out_hosts.stdout);
+    assert!(
+        !stdout_hosts.contains("gho_github_token"),
+        "planted *.ghe.com helper with gh_guard.hosts must not leak token: {stdout_hosts}"
+    );
+
+    // 4. Positive control: `github.com` helper still receives the cached token.
+    let out_github = run_git_credential(
+        &[
+            "-c",
+            "credential.https://github.com.helper=!gh auth git-credential",
+        ],
+        "url=https://github.com/navikt/cplt\n\n",
+    );
+    assert!(
+        out_github.status.success(),
+        "github.com credential fill should succeed: {}",
+        String::from_utf8_lossy(&out_github.stderr)
+    );
+    let stdout_github = String::from_utf8_lossy(&out_github.stdout);
+    assert!(
+        stdout_github.contains("password=gho_github_token"),
+        "github.com helper must receive cached token: {stdout_github}"
+    );
+
+    let log = std::fs::read_to_string(&log_file).unwrap();
+    assert!(log.contains("TOKEN=\nprotocol=https\nhost=example.ghe.com"));
+    assert!(log.contains("TOKEN=\nprotocol=https\nhost=tenant.ghe.com"));
+    assert!(log.contains("TOKEN=gho_github_token\nprotocol=https\nhost=github.com"));
+}
