@@ -1216,3 +1216,58 @@ fn a_branch_being_rebased_or_bisected_elsewhere_is_refused() {
     }
     assert!(!fx.root.join("wt1").exists());
 }
+
+#[test]
+fn busy_branch_reader_ignores_fifos_and_symlinks() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let targets = tempfile::tempdir().unwrap();
+    let target_entries = [
+        ("HEAD", "ref: refs/heads/topic\n"),
+        ("rebase-merge/head-name", "refs/heads/topic\n"),
+        ("rebase-apply/head-name", "refs/heads/topic\n"),
+        ("BISECT_START", "topic\n"),
+    ];
+    for (rel, body) in target_entries {
+        let path = targets.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    for (idx, fifo) in [false, true].into_iter().enumerate() {
+        let fx = Fixture::new(&tracked_files());
+        assert!(common::git_ok(fx.project.path(), &["branch", "topic"]));
+        let admin = fx.common.join("worktrees/other");
+        std::fs::create_dir_all(admin.join("rebase-merge")).unwrap();
+        std::fs::create_dir_all(admin.join("rebase-apply")).unwrap();
+        for (rel, _) in target_entries {
+            let path = admin.join(rel);
+            if fifo {
+                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: c_path is a live NUL-terminated filename.
+                assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            } else {
+                symlink(targets.path().join(rel), &path).unwrap();
+            }
+        }
+
+        let wt_name = format!("wt{idx}");
+        let (result, elapsed) = with_home(fx.home.path(), || {
+            let ctx = fx.ctx();
+            let started = Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(add(&ctx, &wt_name, "topic", None));
+            });
+            let res = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("busy-branch check hung on planted FIFO");
+            (res, started.elapsed())
+        });
+        let wt = PathBuf::from(result.unwrap_or_else(|e| {
+            panic!("busy-branch check (fifo={fifo}) unexpectedly failed: {e}")
+        }));
+        assert!(elapsed < Duration::from_secs(5), "add took {elapsed:?}");
+        assert_eq!(head_branch(&wt), "refs/heads/topic");
+    }
+}
