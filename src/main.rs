@@ -12773,8 +12773,8 @@ fn unlinked_proposed_repos_messages(
                     cplt::audit::escape_path(&dir.display().to_string())
                 ),
                 None => format!(
-                    "{identity} is proposed by .cplt.toml but not linked. Clone it, then run: \
-                 cplt trust accept repos"
+                    "{identity} is proposed by .cplt.toml but not linked. Run `cplt trust show` \
+                     to check, or `cplt trust accept repos` to link or clone it"
                 ),
             },
         )
@@ -18849,5 +18849,81 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("tracked_sensitive_files hung on a planted FIFO");
         assert!(found.is_empty());
+    }
+
+    /// #1012: launch only stats `../<name>/.git`, so when `sibling_checkout`
+    /// returns `None` (e.g. a renamed clone) it must not claim the repo is
+    /// missing with "Clone it".
+    #[test]
+    fn unlinked_proposed_repos_messages_hints_trust_show_without_sibling() {
+        let (_g, parent) = canonical_tempdir();
+        let project = parent.join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        git_in(&project, &["init", "--quiet"]);
+        std::fs::write(
+            project.join(".cplt.toml"),
+            "[propose]\nrepos = [\"navikt/lib-one\"]\n",
+        )
+        .unwrap();
+        git_in(&project, &["add", ".cplt.toml"]);
+        git_in(
+            &project,
+            &["-c", "commit.gpgSign=false", "commit", "-qm", "init"],
+        );
+        let loaded = repo_config::load_repo_config(&project).unwrap().unwrap();
+        let hash = trust::proposal_content_hash(&loaded.config.propose);
+        let entry = approval(&project, &["repos"], &hash);
+        let verdict = trust::verdict(Some(&entry), &project, &loaded);
+        let unlinked = vec!["navikt/lib-one".to_string()];
+
+        // Unapproved: silent.
+        let unapproved_verdict = trust::verdict(None, &project, &loaded);
+        assert!(
+            unlinked_proposed_repos_messages(
+                &project,
+                &unlinked,
+                None,
+                unapproved_verdict,
+                &loaded.config.propose,
+            )
+            .is_empty()
+        );
+
+        // Renamed sibling on disk: launch does not spawn git, so it points
+        // to `cplt trust show` / `cplt trust accept repos` without "Clone it".
+        let renamed = parent.join("lib-one-renamed");
+        std::fs::create_dir_all(renamed.join(".git")).unwrap();
+        let msgs = unlinked_proposed_repos_messages(
+            &project,
+            &unlinked,
+            Some(&entry),
+            verdict,
+            &loaded.config.propose,
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0],
+            "navikt/lib-one is proposed by .cplt.toml but not linked. Run `cplt trust show` \
+             to check, or `cplt trust accept repos` to link or clone it"
+        );
+        assert!(!msgs[0].contains("Clone it"), "{}", msgs[0]);
+
+        // Matching sibling name on disk: still reports the path directly.
+        let exact = parent.join("lib-one");
+        std::fs::create_dir_all(exact.join(".git")).unwrap();
+        let msgs = unlinked_proposed_repos_messages(
+            &project,
+            &unlinked,
+            Some(&entry),
+            verdict,
+            &loaded.config.propose,
+        );
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("navikt/lib-one found at "), "{}", msgs[0]);
+        assert!(
+            msgs[0].contains("Link it: cplt trust accept repos"),
+            "{}",
+            msgs[0]
+        );
     }
 }

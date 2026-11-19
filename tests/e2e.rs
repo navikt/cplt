@@ -6702,7 +6702,8 @@ paths = [
         );
         let out = launch();
         assert!(
-            out.contains("navikt/e2e-late is proposed by .cplt.toml but not linked. Clone it, then run: cplt trust accept repos"),
+            out.contains("navikt/e2e-late is proposed by .cplt.toml but not linked. Run `cplt trust show` to check, or `cplt trust accept repos` to link or clone it")
+                && !out.contains("Clone it"),
             "{out}"
         );
         let doctor = run(&["doctor", "--agent", "shell"]);
@@ -6791,6 +6792,78 @@ paths = [
                 && !shown.contains('\x1b'),
             "{shown}"
         );
+        let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
+    }
+
+    /// #1012: when `repos` is approved and a renamed clone exists beside the
+    /// project, `cplt trust show` finds it and launch does not claim it is
+    /// missing ("Clone it").
+    #[test]
+    fn e2e_launch_hint_for_renamed_clone_points_to_trust_show() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "propose-renamed-launch",
+            "[propose]\nrepos = [\"navikt/e2e-ren\"]\n",
+        );
+        let accept = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "repos"])
+            .output()
+            .expect("accept runs");
+        assert!(accept.status.success(), "{accept:?}");
+
+        let clone = repo.parent().expect("parent").join("ren-fork-local");
+        std::fs::create_dir_all(&clone).expect("mkdir");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:navikt/e2e-ren.git",
+            ],
+        ] {
+            assert!(git_cmd(&clone).args(&args).status().expect("git").success());
+        }
+
+        let show = trust_cmd(&repo, &config_file)
+            .args(["trust", "show"])
+            .output()
+            .expect("trust show runs");
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&show.stdout),
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(
+            shown.contains("navikt/e2e-ren: not linked, found at")
+                && shown.contains("ren-fork-local"),
+            "{shown}"
+        );
+
+        let launch = trust_cmd(&repo, &config_file)
+            .args([
+                "--agent",
+                "shell",
+                "--yes",
+                "--no-validate",
+                "--",
+                "-c",
+                "true",
+            ])
+            .output()
+            .expect("launch runs");
+        let out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&launch.stdout),
+            String::from_utf8_lossy(&launch.stderr)
+        );
+        assert!(
+            out.contains("navikt/e2e-ren is proposed by .cplt.toml but not linked. Run `cplt trust show` to check, or `cplt trust accept repos` to link or clone it")
+                && !out.contains("Clone it"),
+            "{out}"
+        );
+
         let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));
         let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
     }
