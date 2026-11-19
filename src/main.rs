@@ -2077,21 +2077,35 @@ fn warn_worktrees_not_audited(
     // The session could not write into it, but it could rewrite `commondir`
     // in place, which only the key-on profile denies.
     let problems = match worktree_root {
-        Some(root) => cplt::worktrees::session_end_problems(project_dir, root, max_dirs),
+        Some(root) => cplt::worktrees::session_end_problems(home_dir, project_dir, root, max_dirs),
         None => cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs),
     };
     if !problems.is_empty() {
-        let dirs = cplt::worktrees::problem_dirs(&problems);
-        let details: Vec<String> = problems.iter().map(ToString::to_string).collect();
-        ui::error(&format!(
-            "WORKTREE LINKS CHANGED. Do not run git in these directories until this is \
-             fixed:\n    {}\n  git there would follow a link the agent wrote and could run \
-             agent-written config on this machine. Found:\n    {}\n  The next cplt launch \
-             with sandbox.allow_git_worktrees on refuses to start until they are fixed; with \
-             it off, the launch repeats this error.",
-            dirs.join("\n    "),
-            details.join("\n    ")
-        ));
+        let (tampering, stale) = cplt::worktrees::partition_problems(&problems);
+        if tampering.is_empty() {
+            ui::warn(&format!(
+                "{}.",
+                cplt::worktrees::format_stale_scratch_warning(&stale)
+            ));
+        } else {
+            let dirs = cplt::worktrees::problem_dirs_for(&tampering);
+            let details: Vec<&str> = tampering.iter().map(|p| p.detail.as_str()).collect();
+            let mut msg = format!(
+                "WORKTREE LINKS CHANGED. Do not run git in these directories until this is \
+                 fixed:\n    {}\n  git there would follow a link the agent wrote and could run \
+                 agent-written config on this machine. Found:\n    {}\n  The next cplt launch \
+                 with sandbox.allow_git_worktrees on refuses to start until they are fixed; with \
+                 it off, the launch repeats this error.",
+                dirs.join("\n    "),
+                details.join("\n    ")
+            );
+            if !stale.is_empty() {
+                msg.push_str("\n  Also found ");
+                msg.push_str(&cplt::worktrees::format_stale_scratch_warning(&stale));
+                msg.push('.');
+            }
+            ui::error(&msg);
+        }
     }
     // Detail tier: the table already names the worktree root as persisting.
     if let (true, Some(root)) = (audit_enabled && ui::verbose(), worktree_root) {
@@ -2137,19 +2151,32 @@ fn managed_worktree_root(
         }
         let problems = cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs);
         if !problems.is_empty() {
-            ui::error(&format!(
-                "sandbox.allow_git_worktrees is off, but the worktree root an earlier session \
-                 left has links that do not match what git writes. Do not run git in these \
-                 directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
-                 without git and remove the worktrees involved (delete the directories, then \
-                 run `git worktree prune` from this repository)",
-                cplt::worktrees::problem_dirs(&problems).join("\n    "),
-                problems
-                    .iter()
-                    .map(|p| p.detail.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n    ")
-            ));
+            let (tampering, stale) = cplt::worktrees::partition_problems(&problems);
+            if tampering.is_empty() {
+                ui::warn(&format!(
+                    "{}.",
+                    cplt::worktrees::format_stale_scratch_warning(&stale)
+                ));
+            } else {
+                let mut msg = format!(
+                    "sandbox.allow_git_worktrees is off, but the worktree root an earlier session \
+                     left has links that do not match what git writes. Do not run git in these \
+                     directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
+                     without git and remove the worktrees involved (delete the directories, then \
+                     run `git worktree prune` from this repository)",
+                    cplt::worktrees::problem_dirs_for(&tampering).join("\n    "),
+                    tampering
+                        .iter()
+                        .map(|p| p.detail.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n    ")
+                );
+                if !stale.is_empty() {
+                    msg.push_str("\n  Also found ");
+                    msg.push_str(&cplt::worktrees::format_stale_scratch_warning(&stale));
+                }
+                ui::error(&msg);
+            }
         }
         return Ok(None);
     }

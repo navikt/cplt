@@ -129,21 +129,9 @@ pub fn prepare_root(
         return Ok(None);
     };
     let root = prepare_root_for(home_dir, &common, create)?;
-    let problems = link_problems(&common, &root, max_dirs);
+    let problems = link_problems_for_home(&common, &root, home_dir, max_dirs);
     if !problems.is_empty() {
-        return Err(format!(
-            "the worktree links of this repository do not match what git writes, so git \
-             run outside cplt could read agent-written config and run it. Do not run git in \
-             these directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
-             without git and remove the worktrees involved (delete the directories, then run \
-             `git worktree prune` from this repository)",
-            problem_dirs(&problems).join("\n    "),
-            problems
-                .iter()
-                .map(|p| p.detail.as_str())
-                .collect::<Vec<_>>()
-                .join("\n    ")
-        ));
+        return Err(format_launch_error(&problems));
     }
     Ok(Some(root))
 }
@@ -249,6 +237,16 @@ fn resolve(base: &Path, raw: &str) -> Result<PathBuf, String> {
     std::fs::canonicalize(&abs).map_err(|e| format!("cannot resolve {}: {e}", abs.display()))
 }
 
+/// Classification of a [`LinkProblem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkProblemKind {
+    /// A worktree link does not match what git writes (possible tampering).
+    Tampering,
+    /// A dangling `.git/worktrees/<id>/gitdir` pointing into cplt's own
+    /// scratch root whose directory no longer exists.
+    StaleScratch,
+}
+
 /// One finding of [`link_problems`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkProblem {
@@ -258,6 +256,26 @@ pub struct LinkProblem {
     pub dir: PathBuf,
     /// What is wrong, naming the file involved.
     pub detail: String,
+    /// Whether this finding indicates tampering or a stale scratch worktree.
+    pub kind: LinkProblemKind,
+}
+
+impl LinkProblem {
+    fn tampering(dir: &Path, detail: String) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            detail,
+            kind: LinkProblemKind::Tampering,
+        }
+    }
+
+    fn stale_scratch(dir: &Path, detail: String) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            detail,
+            kind: LinkProblemKind::StaleScratch,
+        }
+    }
 }
 
 impl std::fmt::Display for LinkProblem {
@@ -266,10 +284,71 @@ impl std::fmt::Display for LinkProblem {
     }
 }
 
+/// Split findings into `(tampering, stale_scratch)` while preserving order.
+#[must_use]
+pub fn partition_problems(problems: &[LinkProblem]) -> (Vec<&LinkProblem>, Vec<&LinkProblem>) {
+    let mut tampering = Vec::new();
+    let mut stale = Vec::new();
+    for p in problems {
+        match p.kind {
+            LinkProblemKind::Tampering => tampering.push(p),
+            LinkProblemKind::StaleScratch => stale.push(p),
+        }
+    }
+    (tampering, stale)
+}
+
+/// Format a stale-worktree warning naming `git worktree prune` without
+/// accusing tampering.
+#[must_use]
+pub fn format_stale_scratch_warning(stale: &[&LinkProblem]) -> String {
+    let details: Vec<&str> = stale.iter().map(|p| p.detail.as_str()).collect();
+    format!(
+        "stale worktree from an earlier session (its directory under cplt scratch no longer \
+         exists):\n    {}\n  Run `git worktree prune` from this repository",
+        details.join("\n    ")
+    )
+}
+
+/// Format the launch refusal for [`prepare_root`].
+#[must_use]
+fn format_launch_error(problems: &[LinkProblem]) -> String {
+    let (tampering, stale) = partition_problems(problems);
+    if tampering.is_empty() {
+        return format_stale_scratch_warning(&stale);
+    }
+    let mut msg = format!(
+        "the worktree links of this repository do not match what git writes, so git \
+         run outside cplt could read agent-written config and run it. Do not run git in \
+         these directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
+         without git and remove the worktrees involved (delete the directories, then run \
+         `git worktree prune` from this repository)",
+        problem_dirs_for(&tampering).join("\n    "),
+        tampering
+            .iter()
+            .map(|p| p.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("\n    ")
+    );
+    if !stale.is_empty() {
+        msg.push_str("\n  Also found ");
+        msg.push_str(&format_stale_scratch_warning(&stale));
+    }
+    msg
+}
+
 /// The distinct [`LinkProblem::dir`]s, in order of first appearance: the
 /// directories not to run git in.
 #[must_use]
 pub fn problem_dirs(problems: &[LinkProblem]) -> Vec<String> {
+    let refs: Vec<&LinkProblem> = problems.iter().collect();
+    problem_dirs_for(&refs)
+}
+
+/// The distinct [`LinkProblem::dir`]s for a slice of references, in order of
+/// first appearance.
+#[must_use]
+pub fn problem_dirs_for(problems: &[&LinkProblem]) -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();
     for p in problems {
         let d = p.dir.display().to_string();
@@ -325,8 +404,30 @@ pub const DEFAULT_WALK_MAX_DIRS: usize = 100_000;
 ///   agent builds in `/private/tmp`, now or later.
 #[must_use]
 pub fn link_problems(common: &Path, root: &Path, max_dirs: usize) -> Vec<LinkProblem> {
+    link_problems_inner(common, root, None, max_dirs)
+}
+
+/// [`link_problems`] with `home_dir` so dangling worktree pointers into
+/// cplt's own scratch root can be recognised as stale from an earlier session
+/// rather than tampering.
+#[must_use]
+pub fn link_problems_for_home(
+    common: &Path,
+    root: &Path,
+    home_dir: &Path,
+    max_dirs: usize,
+) -> Vec<LinkProblem> {
+    link_problems_inner(common, root, Some(home_dir), max_dirs)
+}
+
+fn link_problems_inner(
+    common: &Path,
+    root: &Path,
+    home_dir: Option<&Path>,
+    max_dirs: usize,
+) -> Vec<LinkProblem> {
     let mut out = Vec::new();
-    admin_problems(common, root, &mut out);
+    admin_problems(common, root, home_dir, &mut out);
     walk_problems(common, root, max_dirs, &mut out);
     out
 }
@@ -365,35 +466,116 @@ fn is_plain_path(raw: &str) -> bool {
         && std::fs::canonicalize(raw).is_ok_and(|c| c.as_os_str() == std::ffi::OsStr::new(raw))
 }
 
-fn admin_problems(common: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
-    let admin = &common.join("worktrees");
-    let mut push = |dir: &Path, detail: String| {
-        out.push(LinkProblem {
-            dir: dir.to_path_buf(),
-            detail,
-        });
+/// True when `raw` names a `.git` pointer inside `home_dir`'s cplt scratch
+/// root (`<canonical home>/<SCRATCH_BASE>/<session>/.../.git`) that genuinely
+/// no longer exists, with no symlink anywhere along the existing prefix.
+///
+/// Walks every prefix from `canonical_home` down to `target` with
+/// `symlink_metadata` (`lstat`), so it never follows a symlink and never opens
+/// a FIFO. Any symlink, existing leaf, non-directory intermediate, `.` / `..` /
+/// `//`, trailing slash, or `lstat` error other than `NotFound` fails closed
+/// (`false`).
+fn is_stale_scratch_gitdir(raw: &str, home_dir: &Path) -> bool {
+    use std::path::Component;
+
+    if raw.is_empty() || raw.ends_with('/') || raw.contains("//") {
+        return false;
+    }
+    let target = Path::new(raw);
+    if !target.is_absolute() || target.file_name() != Some(std::ffi::OsStr::new(".git")) {
+        return false;
+    }
+    if target
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return false;
+    }
+    let Ok(canonical_home) = std::fs::canonicalize(home_dir) else {
+        return false;
     };
+    let scratch_base = crate::scratch::ScratchDir::base(&canonical_home);
+    let Ok(rel_to_scratch) = target.strip_prefix(&scratch_base) else {
+        return false;
+    };
+    // Must sit inside a session/worktree subdir of scratch, not `<scratch_base>/.git`.
+    if rel_to_scratch.components().count() < 2 {
+        return false;
+    }
+    let Ok(rel_to_home) = target.strip_prefix(&canonical_home) else {
+        return false;
+    };
+    let mut cur = canonical_home;
+    for part in rel_to_home.components() {
+        cur.push(part);
+        match cur.symlink_metadata() {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return false;
+                }
+                if cur == target {
+                    // The target itself still exists (e.g. a directory or FIFO),
+                    // so it is not a stale deleted worktree.
+                    return false;
+                }
+                if !meta.is_dir() {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn admin_problems(common: &Path, root: &Path, home_dir: Option<&Path>, out: &mut Vec<LinkProblem>) {
+    let admin = &common.join("worktrees");
     match admin.symlink_metadata() {
         Ok(m) if m.is_dir() => {}
-        Ok(_) => return push(root, format!("{} is not a directory", admin.display())),
+        Ok(_) => {
+            out.push(LinkProblem::tampering(
+                root,
+                format!("{} is not a directory", admin.display()),
+            ));
+            return;
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => return push(root, format!("cannot stat {}: {e}", admin.display())),
+        Err(e) => {
+            out.push(LinkProblem::tampering(
+                root,
+                format!("cannot stat {}: {e}", admin.display()),
+            ));
+            return;
+        }
     }
     let it = match std::fs::read_dir(admin) {
         Ok(it) => it,
-        Err(e) => return push(root, format!("cannot read {}: {e}", admin.display())),
+        Err(e) => {
+            out.push(LinkProblem::tampering(
+                root,
+                format!("cannot read {}: {e}", admin.display()),
+            ));
+            return;
+        }
     };
     for entry in it {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                push(root, format!("cannot read {}: {e}", admin.display()));
+                out.push(LinkProblem::tampering(
+                    root,
+                    format!("cannot read {}: {e}", admin.display()),
+                ));
                 continue;
             }
         };
         let dir = entry.path();
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            push(root, format!("{} is not a directory", dir.display()));
+            out.push(LinkProblem::tampering(
+                root,
+                format!("{} is not a directory", dir.display()),
+            ));
             continue;
         }
         // The worktree this admin dir serves, from its `gitdir` back link:
@@ -413,34 +595,44 @@ fn admin_problems(common: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
                     && is_plain_path(&raw)
                     && target.symlink_metadata().is_ok_and(|m| m.is_file());
                 if !ok {
-                    push(
-                        &worktree,
-                        format!(
-                            "{} names {raw}, which is not an existing regular .git file on a \
-                             path without symlinks{}",
-                            back.display(),
-                            if in_root_ok {
-                                ""
-                            } else {
-                                ", directly in a worktree of the root"
-                            }
-                        ),
-                    );
+                    if home_dir.is_some_and(|h| is_stale_scratch_gitdir(&raw, h)) {
+                        out.push(LinkProblem::stale_scratch(
+                            &worktree,
+                            format!(
+                                "{} names {raw}, which is under cplt scratch and no longer exists",
+                                back.display()
+                            ),
+                        ));
+                    } else {
+                        out.push(LinkProblem::tampering(
+                            &worktree,
+                            format!(
+                                "{} names {raw}, which is not an existing regular .git file on a \
+                                 path without symlinks{}",
+                                back.display(),
+                                if in_root_ok {
+                                    ""
+                                } else {
+                                    ", directly in a worktree of the root"
+                                }
+                            ),
+                        ));
+                    }
                 }
             }
-            Err(e) => push(root, e),
+            Err(e) => out.push(LinkProblem::tampering(root, e)),
         }
         let file = dir.join("commondir");
         match read_link_file(&file) {
             Ok(raw) if raw == "../.." => {}
-            Ok(raw) => push(
+            Ok(raw) => out.push(LinkProblem::tampering(
                 &worktree,
                 format!(
                     "{} reads {raw:?}, not \"../..\" as git writes it",
                     file.display()
                 ),
-            ),
-            Err(e) => push(&worktree, e),
+            )),
+            Err(e) => out.push(LinkProblem::tampering(&worktree, e)),
         }
     }
 }
@@ -449,10 +641,7 @@ fn admin_problems(common: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
 /// symlinks, bounded by [`WALK_MAX_DEPTH`] and `max_dirs`.
 fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<LinkProblem>) {
     let mut push = |dir: &Path, detail: String| {
-        out.push(LinkProblem {
-            dir: dir.to_path_buf(),
-            detail,
-        });
+        out.push(LinkProblem::tampering(dir, detail));
     };
     let mut budget = max_dirs;
     // Directories counted under each entry directly in the root: the
@@ -723,12 +912,7 @@ pub fn existing_root_problems(
     project_dir: &Path,
     max_dirs: usize,
 ) -> Vec<LinkProblem> {
-    let finding = |dir: &Path, detail: String| {
-        vec![LinkProblem {
-            dir: dir.to_path_buf(),
-            detail,
-        }]
-    };
+    let finding = |dir: &Path, detail: String| vec![LinkProblem::tampering(dir, detail)];
     // `None` when absent; a finding when it is there but not a directory we
     // can look at (a symlink, a file, EACCES), since that is not "no root".
     let present = |p: &Path| match p.symlink_metadata() {
@@ -763,7 +947,7 @@ pub fn existing_root_problems(
     };
     let root = base.join(fingerprint(&common));
     match present(&root) {
-        Ok(true) => link_problems(&common, &root, max_dirs),
+        Ok(true) => link_problems_for_home(&common, &root, home_dir, max_dirs),
         Ok(false) => Vec::new(),
         Err(f) => f,
     }
@@ -772,19 +956,21 @@ pub fn existing_root_problems(
 /// [`link_problems`] for the end of a session, re-deriving the common dir.
 /// A repository that no longer resolves is itself a finding.
 #[must_use]
-pub fn session_end_problems(project_dir: &Path, root: &Path, max_dirs: usize) -> Vec<LinkProblem> {
+pub fn session_end_problems(
+    home_dir: &Path,
+    project_dir: &Path,
+    root: &Path,
+    max_dirs: usize,
+) -> Vec<LinkProblem> {
     let detail = match repository_common_dir(project_dir) {
-        Ok(Some(common)) => return link_problems(&common, root, max_dirs),
+        Ok(Some(common)) => return link_problems_for_home(&common, root, home_dir, max_dirs),
         Ok(None) => format!(
             "{} no longer resolves as a git repository",
             project_dir.display()
         ),
         Err(e) => e,
     };
-    vec![LinkProblem {
-        dir: project_dir.to_path_buf(),
-        detail,
-    }]
+    vec![LinkProblem::tampering(project_dir, detail)]
 }
 
 #[cfg(test)]
@@ -1724,5 +1910,202 @@ mod tests {
         crate::untrusted::tests::plant_fifo_git_config(dir.path());
         let p = dir.path().to_path_buf();
         assert!(crate::untrusted::tests::bounded(move || repository_common_dir(&p)).is_err());
+    }
+
+    #[test]
+    fn a_dangling_worktree_under_cplt_scratch_is_reported_as_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        if !git_in(&main, &["init", "-q", "-b", "main"]) {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        std::fs::write(main.join("f"), "x").unwrap();
+        assert!(git_in(&main, &["add", "-A"]) && git_in(&main, &["commit", "-qm", "i"]));
+
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let scratch = crate::scratch::ScratchDir::base(&home);
+        let session = scratch.join("5c2be000-0000-4000-8000-000000000001");
+        std::fs::create_dir_all(&session).unwrap();
+        let wt = session.join("opencode/native-plugin-spike");
+        assert!(git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "spike",
+                &wt.to_string_lossy()
+            ]
+        ));
+        // Simulate scratch cleanup deleting the session directory at exit.
+        std::fs::remove_dir_all(&session).unwrap();
+
+        let common = main.join(".git");
+        let root = home.join(BASE).join(fingerprint(&common));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].kind, LinkProblemKind::StaleScratch);
+        assert!(
+            problems[0]
+                .detail
+                .contains("under cplt scratch and no longer exists"),
+            "{:?}",
+            problems[0]
+        );
+
+        let err = prepare_root(&home, &main, true, DEFAULT_WALK_MAX_DIRS).unwrap_err();
+        assert!(
+            err.contains("stale worktree from an earlier session")
+                && err.contains("git worktree prune"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("do not match what git writes")
+                && !err.contains("agent-written config")
+                && !err.contains("Inspect them without git"),
+            "{err}"
+        );
+
+        // Pruning clears the stale admin entry and unblocks launch.
+        assert!(git_in(&main, &["worktree", "prune"]));
+        assert!(
+            prepare_root(&home, &main, true, DEFAULT_WALK_MAX_DIRS)
+                .expect("ok after prune")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn dangling_scratch_worktree_hostile_and_tampered_cases_stay_tampering() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        if !git_in(&main, &["init", "-q", "-b", "main"]) {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        std::fs::write(main.join("f"), "x").unwrap();
+        assert!(git_in(&main, &["add", "-A"]) && git_in(&main, &["commit", "-qm", "i"]));
+
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let scratch = crate::scratch::ScratchDir::base(&home);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let common = main.join(".git");
+        let root = home.join(BASE).join(fingerprint(&common));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let admin = common.join("worktrees/wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        let back = admin.join("gitdir");
+        let commondir = admin.join("commondir");
+        std::fs::write(&commondir, "../..\n").unwrap();
+
+        // 1. Path traversal with `..` out of scratch must stay tampering.
+        let outside_escape = format!("{}/a/../../outside/.git\n", scratch.display());
+        std::fs::write(&back, outside_escape).unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "{problems:?}"
+        );
+
+        // 2. `<scratch>/.git` directly (not under a session subdir) stays tampering.
+        std::fs::write(&back, format!("{}/.git\n", scratch.display())).unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "{problems:?}"
+        );
+
+        // 3. A symlink along the existing scratch prefix must never be followed
+        //    and must stay tampering.
+        let real_outside = base.join("outside");
+        std::fs::create_dir_all(&real_outside).unwrap();
+        let link_session = scratch.join("linked-session");
+        std::os::unix::fs::symlink(&real_outside, &link_session).unwrap();
+        std::fs::write(&back, format!("{}/wt/.git\n", link_session.display())).unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "{problems:?}"
+        );
+        std::fs::remove_file(&link_session).unwrap();
+
+        // 4. A FIFO at the target `.git` path under scratch must not block and
+        //    stays tampering (the target exists and is not a regular `.git` file).
+        let fifo_wt = scratch.join("s1/wt");
+        std::fs::create_dir_all(&fifo_wt).unwrap();
+        let fifo_git = fifo_wt.join(".git");
+        crate::untrusted::tests::mkfifo(&fifo_git);
+        std::fs::write(&back, format!("{}\n", fifo_git.display())).unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "{problems:?}"
+        );
+
+        // 5. A dangling target outside scratch stays tampering.
+        std::fs::write(&back, format!("{}/missing/.git\n", base.display())).unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "{problems:?}"
+        );
+
+        // 6. A FIFO or symlink in place of `.git/worktrees/wt/gitdir` itself must
+        //    not block or follow symlinks and stays tampering.
+        let valid_stale = scratch.join("gone/wt/.git");
+        let real_file = base.join("real_gitdir");
+        std::fs::write(&real_file, format!("{}\n", valid_stale.display())).unwrap();
+        std::fs::remove_file(&back).unwrap();
+        std::os::unix::fs::symlink(&real_file, &back).unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "symlinked gitdir must fail: {problems:?}"
+        );
+        std::fs::remove_file(&back).unwrap();
+        crate::untrusted::tests::mkfifo(&back);
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "FIFO gitdir must not hang and must fail: {problems:?}"
+        );
+        std::fs::remove_file(&back).unwrap();
+
+        // 7. Stale scratch `gitdir` combined with a tampered `commondir` must still
+        //    report tampering at launch (never hide tampering behind stale).
+        std::fs::write(&back, format!("{}\n", valid_stale.display())).unwrap();
+        std::fs::write(&commondir, format!("{}\n", base.display())).unwrap();
+        let err = prepare_root(&home, &main, true, DEFAULT_WALK_MAX_DIRS).unwrap_err();
+        assert!(
+            err.contains("do not match what git writes")
+                && err.contains("stale worktree from an earlier session"),
+            "{err}"
+        );
     }
 }
