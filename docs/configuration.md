@@ -544,8 +544,10 @@ policy, checks the private checkout, and publishes it atomically. It:
 at most 64 characters. Plain `git worktree add` inside the sandbox still works
 as before, but git runs it directly and none of the checks above apply.
 
-The command works only in a session cplt started, on macOS. The worktrees it
-creates outlive the session, like any other in the root.
+The command works only in a session cplt started, on macOS (on Linux, worktrees
+inside the sandbox are unsupported because the parent-side worktree broker is
+macOS-only). The worktrees it creates outlive the session, like any other in the
+root.
 The broker requires a launch HEAD commit whose protected bytes and executable
 modes match the checkout. Symlinked protected paths or ancestors, filesystem
 aliases of protected names, and protected files larger than 1 MiB are refused.

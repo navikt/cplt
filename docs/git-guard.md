@@ -274,7 +274,9 @@ the root is baked into the wrapper at launch, not read from the agent's env) is
 allowed, resolved against the working
 directory and any `-C`, with symlinks followed; an unknown option or a `..`
 the guard can't resolve is refused. Otherwise use `cplt worktree add <name>
-<ref>` when `CPLT_WORKTREE_SOCKET` is set, or prepare worktrees outside cplt.
+<ref>` when `CPLT_WORKTREE_SOCKET` is set, or prepare worktrees outside cplt
+(on Linux, worktrees inside the sandbox are unsupported because the parent-side
+worktree broker and per-worktree protected-path enforcement are macOS-only).
 Other `git worktree` subcommands (`list`, `prune`, `remove`, ...) are allowed.
 Warn mode prints the refusal and runs the command.
 

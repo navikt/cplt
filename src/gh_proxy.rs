@@ -4012,17 +4012,11 @@ pub fn gate_git(
     if is_worktree_add(args)
         && !worktree_add_target_in_managed_root(args, &repo_facts.worktree_root)
     {
-        let hint = if std::env::var_os(crate::worktree_broker::SOCKET_ENV).is_some() {
-            "Use `cplt worktree add <name> <ref>`, or `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\"`."
-        } else if cfg!(target_os = "macos") {
-            "Prepare worktrees outside cplt (the managed `cplt worktree add` is not enabled for this session)."
-        } else {
-            "Prepare worktrees outside cplt (the managed `cplt worktree add` is macOS-only)."
-        };
         return Err(Refusal {
             headline: "'git worktree add' is not allowed in this environment.".to_string(),
-            guidance: format!(
-                "Plain `git worktree add` can't check out protected files in the sandbox, and work in the session scratch dir is deleted at exit. {hint}"
+            guidance: worktree_add_refusal_guidance(
+                std::env::var_os(crate::worktree_broker::SOCKET_ENV).is_some(),
+                std::env::consts::OS,
             ),
             agent_note: &[NOTE],
         });
@@ -4561,6 +4555,27 @@ pub fn gate_git(
     }
 
     Ok(())
+}
+
+fn worktree_add_refusal_guidance(has_socket: bool, os: &str) -> String {
+    let hint = if os != "macos" {
+        let platform = if os == "linux" { "Linux" } else { os };
+        format!(
+            "Worktrees inside the sandbox are unsupported on {platform}: the parent-side \
+             worktree broker (`cplt worktree add`) is currently macOS-only (the Seatbelt + \
+             socket flow and kernel protected-path enforcement inside worktrees are not wired on \
+             {platform} yet). Prepare worktrees outside cplt."
+        )
+    } else if has_socket {
+        "Use `cplt worktree add <name> <ref>`, or `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\"`."
+            .to_string()
+    } else {
+        "Prepare worktrees outside cplt (the managed `cplt worktree add` is not enabled for this session)."
+            .to_string()
+    };
+    format!(
+        "Plain `git worktree add` can't check out protected files in the sandbox, and work in the session scratch dir is deleted at exit. {hint}"
+    )
 }
 
 /// `git [globals] worktree add ...`.
@@ -7449,6 +7464,31 @@ mod tests {
         ] {
             assert!(gate(args).is_ok(), "{args:?} must be allowed");
         }
+    }
+
+    #[test]
+    fn git_worktree_add_guidance_by_platform() {
+        for has_socket in [false, true] {
+            let linux = worktree_add_refusal_guidance(has_socket, "linux");
+            assert!(linux.contains("unsupported on Linux"), "{linux}");
+            assert!(linux.contains("macOS-only"), "{linux}");
+            assert!(linux.contains("Seatbelt + socket"), "{linux}");
+            assert!(linux.contains("cplt worktree add"), "{linux}");
+            assert!(linux.contains("Prepare worktrees outside cplt"), "{linux}");
+        }
+
+        let mac_off = worktree_add_refusal_guidance(false, "macos");
+        assert!(
+            mac_off.contains("not enabled for this session"),
+            "{mac_off}"
+        );
+        assert!(!mac_off.contains("unsupported on"), "{mac_off}");
+
+        let mac_on = worktree_add_refusal_guidance(true, "macos");
+        assert!(
+            mac_on.contains("Use `cplt worktree add <name> <ref>`"),
+            "{mac_on}"
+        );
     }
 
     #[test]

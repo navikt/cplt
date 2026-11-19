@@ -1690,6 +1690,19 @@ fn truncate(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
+fn client_os_error(os: &str) -> Option<String> {
+    if os == "macos" {
+        return None;
+    }
+    let platform = if os == "linux" { "Linux" } else { os };
+    Some(format!(
+        "cplt worktree: worktrees inside the sandbox are unsupported on {platform}: the \
+         parent-side worktree broker is currently macOS-only (the Seatbelt + socket flow \
+         and kernel protected-path enforcement inside worktrees are not wired on {platform} \
+         yet). Prepare worktrees outside cplt."
+    ))
+}
+
 /// The sandboxed side of `cplt worktree add`. Sends one request to the socket
 /// the sandbox grants, prints the new path on success.
 ///
@@ -1697,6 +1710,10 @@ fn truncate(s: &str, max: usize) -> String {
 /// filtering the environment, so a value inherited from the parent cannot point
 /// the client elsewhere.
 pub fn run_client(name: &str, reference: &str, branch: Option<&str>) -> ExitCode {
+    if let Some(msg) = client_os_error(std::env::consts::OS) {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
     let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|s| !s.is_empty()) else {
         eprintln!(
             "cplt worktree: not available here. It needs a cplt session with \
@@ -1856,5 +1873,15 @@ mod tests {
                 .unwrap_err()
                 .contains("1 MiB")
         );
+    }
+
+    #[test]
+    fn client_os_error_explains_linux_unsupported_and_why() {
+        assert_eq!(client_os_error("macos"), None);
+        let linux = client_os_error("linux").expect("linux must be rejected");
+        assert!(linux.contains("unsupported on Linux"), "{linux}");
+        assert!(linux.contains("macOS-only"), "{linux}");
+        assert!(linux.contains("Seatbelt + socket"), "{linux}");
+        assert!(linux.contains("Prepare worktrees outside cplt"), "{linux}");
     }
 }
