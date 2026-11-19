@@ -2016,6 +2016,7 @@ fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::Repo
 struct ResolvedContext {
     resolved: config::Resolved,
     config_path: Option<PathBuf>,
+    has_local_config: bool,
     home_dir: PathBuf,
     project_dir: PathBuf,
     /// Pi resolves project-local prompts from its process cwd. Keep this inside
@@ -3257,6 +3258,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(local) => local,
         Err(e) => bail!("{e}"),
     };
+    let has_local_config = local_cfg.is_some();
 
     // After the local layer, not before it: the set is the union of the flags
     // and `sandbox.repo_dirs`, and every rule reapplies to the union on every
@@ -4029,6 +4031,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     Ok(ResolvedContext {
         resolved,
         config_path,
+        has_local_config,
         home_dir,
         project_dir,
         launch_dir,
@@ -5242,6 +5245,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let ResolvedContext {
         mut resolved,
         config_path,
+        has_local_config: _,
         home_dir,
         project_dir,
         launch_dir,
@@ -8033,6 +8037,7 @@ fn run_exec_command(
     let ResolvedContext {
         mut resolved,
         config_path,
+        has_local_config: _,
         home_dir,
         project_dir,
         repo_roots,
@@ -8601,6 +8606,7 @@ fn run_check_command(
     let ResolvedContext {
         mut resolved,
         config_path,
+        has_local_config: _,
         home_dir,
         project_dir,
         repo_roots,
@@ -9585,6 +9591,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let ResolvedContext {
         mut resolved,
         config_path,
+        has_local_config,
         home_dir,
         project_dir,
         repo_roots,
@@ -9921,14 +9928,17 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let can_force = sandbox::available_abi_version().is_some_and(|abi| abi >= 4);
     #[cfg(not(target_os = "linux"))]
     let can_force = true;
-    // #1005: the "new configs" nudges are for an existing config. A user
-    // with none gets one pointer to `cplt config init` instead of five.
+    // #1005 / #1010: the "new configs" nudges are for an existing user config.
+    // A `--local` config does not count: `cplt trust accept` and `cplt link`
+    // create one with only `sandbox.repo_dirs`, `cplt config init` creates the
+    // global user config without touching `--local` overrides, and all five
+    // nudges suggest global `cplt config set` commands.
     let has_config = config_path.is_some();
     if has_config {
         findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
         findings.extend(doctor::copilot_persistence_nudge(&resolved, active_agent));
     } else {
-        findings.push(doctor::no_user_config_finding());
+        findings.push(doctor::no_user_config_finding(has_local_config));
     }
     let mut cfg_findings = config_findings(
         &resolved,
@@ -13155,6 +13165,40 @@ fn trust_accept_nothing_proposed(
     ExitCode::SUCCESS
 }
 
+/// Notice printed by `cplt trust accept` when prior approvals cannot be
+/// carried forward (#1009, #1010).
+///
+/// Legacy whole-proposal entries (`key_hashes.is_empty()` with a non-empty
+/// `content_hash`) drop *all* keys on any `.cplt.toml` change, even keys whose
+/// own value did not change or get removed; naming them as "changed or were
+/// removed" would misstate what happened.
+fn lapsed_approval_notice(stored: Option<&trust::TrustEntry>, lapsed: &[&str]) -> Option<String> {
+    let entry = stored?;
+    if entry.accepted.content_hash.is_empty() && entry.accepted.key_hashes.is_empty() {
+        return Some(
+            "The previous approval predates value pinning, so it cannot be matched against \
+             these proposal values. Only the keys approved now are kept."
+                .to_string(),
+        );
+    }
+    if lapsed.is_empty() {
+        return None;
+    }
+    if entry.accepted.key_hashes.is_empty() {
+        Some(format!(
+            "The proposal changed since the last approval (which predates per-key value \
+             pinning), so these keys are no longer approved: {}.",
+            lapsed.join(", ")
+        ))
+    } else {
+        Some(format!(
+            "These keys changed or were removed since the last approval, so they are no longer \
+             approved: {}.",
+            lapsed.join(", ")
+        ))
+    }
+}
+
 fn trust_accept(
     project_dir: &std::path::Path,
     loaded: &repo_config::LoadedRepoConfig,
@@ -13235,33 +13279,26 @@ fn trust_accept(
     // whose value changed underneath it (SECURITY.md, "reapproval"). A legacy
     // entry (no per-key hashes) carries all its keys only while the whole
     // proposal is unchanged, as before, and is rewritten per key below.
-    let stored_hash_is_legacy = stored
+    let stored_for_repo = stored
         .as_ref()
-        .is_some_and(|t| t.accepted.content_hash.is_empty() && t.accepted.key_hashes.is_empty());
+        .filter(|t| trust::approved_path_matches(t, project_dir));
     // Kept regardless of hash staleness, unlike the approved keys: a stale hash
     // means "re-review the values", not "those roots stopped existing". Bound
     // to the checkout the same way approvals are, so a foreign entry's roots are
     // never adopted.
-    let prior_linked = stored
-        .as_ref()
-        .filter(|t| trust::approved_path_matches(t, project_dir))
+    let prior_linked = stored_for_repo
         .map(|t| t.accepted.linked.clone())
         .unwrap_or_default();
 
-    let carried = stored
-        .clone()
-        .filter(|t| trust::approved_path_matches(t, project_dir))
-        .map(|mut t| {
-            let keys = trust::approved_for(&t, &loaded.config.propose);
-            trust::pin_keys(&mut t.accepted, keys, &loaded.config.propose);
-            t
-        });
-    // Approved keys that no longer apply: their value changed, or they are no
-    // longer proposed. Named, so a user approving something else learns they
-    // lapsed.
-    let lapsed: Vec<&str> = stored
-        .as_ref()
-        .filter(|t| trust::approved_path_matches(t, project_dir))
+    let carried = stored_for_repo.cloned().map(|mut t| {
+        let keys = trust::approved_for(&t, &loaded.config.propose);
+        trust::pin_keys(&mut t.accepted, keys, &loaded.config.propose);
+        t
+    });
+    // Approved keys that no longer apply: their value changed, they are no
+    // longer proposed, or (for a legacy whole-proposal entry) the proposal
+    // changed. Named, so a user approving something else learns they lapsed.
+    let lapsed: Vec<&str> = stored_for_repo
         .map(|t| {
             t.accepted
                 .keys
@@ -13276,25 +13313,15 @@ fn trust_accept(
         })
         .unwrap_or_default();
 
-    if stored_hash_is_legacy || !lapsed.is_empty() {
-        if stored_hash_is_legacy {
-            println!(
-                "{}[cplt]{} The previous approval predates value pinning, so it cannot be \
-matched against these proposal values. Only the keys approved now are kept.",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET),
-            );
-        } else {
-            println!(
-                "{}[cplt]{} These keys changed or were removed since the last approval, so they are no longer approved: {}.",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET),
-                lapsed.join(", "),
-            );
-        }
+    if let Some(notice) = lapsed_approval_notice(stored_for_repo, &lapsed) {
+        println!(
+            "{}[cplt]{} {notice}",
+            ui::stdout_color(ui::YELLOW),
+            ui::stdout_color(ui::RESET),
+        );
         // Which repository changed (#982): the grant is a whole tree.
         if lapsed.contains(&"repos")
-            && let Some(before) = stored.as_ref().and_then(|t| t.accepted.repos.as_deref())
+            && let Some(before) = stored_for_repo.and_then(|t| t.accepted.repos.as_deref())
         {
             let (added, removed) = trust::repos_diff(before, &loaded.config.propose.repos);
             for r in added {
@@ -18849,5 +18876,33 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("tracked_sensitive_files hung on a planted FIFO");
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn lapsed_approval_notice_distinguishes_legacy_and_per_key_entries() {
+        assert!(lapsed_approval_notice(None, &["allow.read"]).is_none());
+
+        let pre_pinning = trust::TrustEntry::default();
+        let msg = lapsed_approval_notice(Some(&pre_pinning), &[]).unwrap();
+        assert!(msg.contains("predates value pinning"), "{msg}");
+
+        let mut whole_hash = trust::TrustEntry::default();
+        whole_hash.accepted.content_hash = "abc".into();
+        assert!(lapsed_approval_notice(Some(&whole_hash), &[]).is_none());
+        let msg =
+            lapsed_approval_notice(Some(&whole_hash), &["allow_jvm_attach", "repos"]).unwrap();
+        assert!(msg.contains("predates per-key value pinning"), "{msg}");
+        assert!(!msg.contains("changed or were removed"), "{msg}");
+        assert!(msg.contains("allow_jvm_attach, repos"), "{msg}");
+
+        let mut per_key = whole_hash;
+        per_key
+            .accepted
+            .key_hashes
+            .insert("allow.read".into(), "def".into());
+        assert!(lapsed_approval_notice(Some(&per_key), &[]).is_none());
+        let msg = lapsed_approval_notice(Some(&per_key), &["allow.read"]).unwrap();
+        assert!(msg.contains("changed or were removed"), "{msg}");
+        assert!(msg.contains("allow.read"), "{msg}");
     }
 }
