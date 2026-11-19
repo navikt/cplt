@@ -924,6 +924,23 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         },
     });
 
+    // macOS Seatbelt (`emit_temp_rules`) grants read+write on `/private/tmp`
+    // and `/private/var/folders` (the canonical `confstr(_CS_DARWIN_USER_TEMP_DIR)`).
+    // Include `/private/var/folders` here so policy queries on macOS
+    // (`opener_config_writable`, `check`, `drop_writable`) see it as writable (#1026).
+    #[cfg(target_os = "macos")]
+    fs_rules.push(FsRule {
+        nofollow: false,
+        path: PathBuf::from("/private/var/folders"),
+        access: FsAccess {
+            read: true,
+            write: true,
+            execute: config.allow_tmp_exec,
+            ioctl: false,
+            create_dirs: false,
+        },
+    });
+
     // ── Device files: read + write + ioctl (no execute) ──
     // ioctl: true grants LANDLOCK_ACCESS_FS_IOCTL_DEV (ABI v5+, kernel ≥ 6.8).
     // Without it, tcsetattr() on /dev/tty is denied — the terminal stays in
@@ -5451,6 +5468,36 @@ mod tests {
             !rule.access.execute,
             "/tmp should not have execute by default"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_var_folders_is_writable_in_fs_rules() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let mut config = test_config(&project, &home);
+        let policy = generate_policy(&config);
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == Path::new("/private/var/folders"))
+            .expect("/private/var/folders should be in macOS fs_rules");
+        assert!(rule.access.read);
+        assert!(rule.access.write);
+        assert!(
+            !rule.access.execute,
+            "/private/var/folders should not have execute by default"
+        );
+
+        config.allow_tmp_exec = true;
+        let exec_policy = generate_policy(&config);
+        let exec_rule = exec_policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == Path::new("/private/var/folders"))
+            .expect("/private/var/folders should be in macOS fs_rules");
+        assert!(exec_rule.access.execute);
     }
 
     #[test]

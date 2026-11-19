@@ -9,7 +9,7 @@
 //! `cplt mcp-open-url` checks the URL against `CPLT_OPEN_URL_HOSTS`, prints it
 //! to stderr and `/dev/tty`, and exits 1 because nothing was opened.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -140,7 +140,9 @@ pub const HOST_OPENER: bool = cfg!(target_os = "macos");
 /// Each path is walked one component at a time by
 /// [`crate::check::writable_tree_on_path`], so a two-hop chain
 /// (`Preferences -> ~/dotfiles/prefs -> /elsewhere`) is caught at the
-/// writable middle hop. A write grant inside the dir counts too.
+/// writable middle hop. A write grant inside the dir (or inside a symlinked
+/// directory target under it) counts too. Fails closed if scanning `Preferences`
+/// hits the entry or depth cap.
 #[must_use]
 pub fn opener_config_writable(policy: &LandlockPolicy, home: &Path) -> Option<PathBuf> {
     let prefs = home.join("Library/Preferences");
@@ -157,16 +159,25 @@ pub fn opener_config_writable(policy: &LandlockPolicy, home: &Path) -> Option<Pa
         .collect();
     policy.fs_rules.extend(resolved);
     let mut paths = vec![prefs.clone()];
-    collect_links(&prefs, 4, &mut paths);
+    let mut visited_dirs = HashSet::new();
+    let truncated = collect_links(
+        &prefs,
+        4,
+        MAX_COLLECT_ENTRIES,
+        &mut paths,
+        &mut visited_dirs,
+    );
     let real_prefs = real(&prefs);
-    let inside = policy
-        .fs_rules
-        .iter()
-        .any(|r| r.access.write && (r.path.starts_with(&prefs) || r.path.starts_with(&real_prefs)));
+    let inside = policy.fs_rules.iter().any(|r| {
+        r.access.write
+            && (r.path.starts_with(&prefs)
+                || r.path.starts_with(&real_prefs)
+                || visited_dirs.iter().any(|d| r.path.starts_with(d)))
+    });
     let on_path = paths
         .iter()
         .any(|p| crate::check::writable_tree_on_path(&policy, home, p).is_some());
-    (inside || on_path).then_some(prefs)
+    (truncated || inside || on_path).then_some(prefs)
 }
 
 /// The path with symlinks resolved as far as it exists.
@@ -187,19 +198,69 @@ fn real(p: &Path) -> PathBuf {
     }
 }
 
-/// Every symlink under `dir`, to `depth` levels; the caller walks each chain.
-fn collect_links(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let path = e.path();
-        if e.file_type().is_ok_and(|t| t.is_symlink()) {
-            out.push(path);
-        } else if depth > 0 && e.file_type().is_ok_and(|t| t.is_dir()) {
-            collect_links(&path, depth - 1, out);
+/// Cap total directory entries scanned under `~/Library/Preferences` so a
+/// symlink to a huge directory (such as `/`) cannot stall launch.
+const MAX_COLLECT_ENTRIES: usize = 10_000;
+
+/// Every symlink under `root` (and inside symlinked directories it points to),
+/// to `depth` levels; the caller walks each chain. Records every visited
+/// canonical directory in `visited` so cycles are skipped and write grants
+/// inside symlinked directory targets are checked too. Returns `true` if
+/// traversal was truncated by `max_entries` or `depth` (leaving an unvisited
+/// directory or symlinked directory unchecked) so the caller can fail closed.
+fn collect_links(
+    root: &Path,
+    depth: u8,
+    max_entries: usize,
+    out: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+) -> bool {
+    let mut queue = VecDeque::from([(root.to_path_buf(), depth)]);
+    let mut seen_entries = 0usize;
+    while let Some((dir, rem_depth)) = queue.pop_front() {
+        let Ok(canon) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
+        if !visited.insert(canon.clone()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&canon) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            seen_entries += 1;
+            if seen_entries > max_entries {
+                return true;
+            }
+            let path = e.path();
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            let recurse = if ft.is_symlink() {
+                out.push(path.clone());
+                // `metadata` uses `stat` (never opens FIFOs/devices); only
+                // recurse when the symlink resolves to a directory.
+                std::fs::metadata(&path).is_ok_and(|m| m.is_dir())
+            } else {
+                ft.is_dir()
+            };
+            if recurse {
+                if rem_depth == 0 {
+                    // An already-visited directory (cycle) was already scanned;
+                    // any unvisited directory leaves its subtree unchecked.
+                    if std::fs::canonicalize(&path)
+                        .ok()
+                        .is_none_or(|c| !visited.contains(&c))
+                    {
+                        return true;
+                    }
+                } else {
+                    queue.push_back((path, rem_depth - 1));
+                }
+            }
         }
     }
+    false
 }
 
 /// The host opener: `/usr/bin/open` on macOS, none elsewhere.
@@ -559,6 +620,278 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ask(&[&dotfiles]), Some(home.join("Library/Preferences")));
+    }
+
+    #[test]
+    fn opener_config_writable_enumerates_symlinked_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, d, e, repo) = (t.join("home"), t.join("d"), t.join("e"), t.join("repo"));
+        for dir in [&home.join("Library/Preferences"), &d, &e, &repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        symlink(
+            &d,
+            home.join("Library/Preferences/com.apple.LaunchServices"),
+        )
+        .unwrap();
+
+        let ask = |roots: &[&Path]| opener_config_writable(&write_policy(roots), &home);
+        // Read-only target directory with no writable entries or links -> allowed.
+        assert_eq!(ask(&[&repo]), None);
+
+        // Regular file inside D covered by a write rule (no symlink inside D).
+        let direct_plist = d.join("com.apple.LaunchServices.secure.plist");
+        std::fs::write(&direct_plist, "").unwrap();
+        assert_eq!(
+            ask(&[&direct_plist]),
+            Some(home.join("Library/Preferences"))
+        );
+
+        // Symlink inside D pointing to a writable path (and dangling target under writable repo).
+        let dangling = d.join("missing.plist");
+        symlink(repo.join("missing.plist"), &dangling).unwrap();
+        assert_eq!(ask(&[&repo]), Some(home.join("Library/Preferences")));
+        std::fs::remove_file(&dangling).unwrap();
+
+        symlink(
+            repo.join("ls.plist"),
+            d.join("com.apple.LaunchServices.plist"),
+        )
+        .unwrap();
+        assert_eq!(ask(&[&repo]), Some(home.join("Library/Preferences")));
+
+        // Nested symlinked directory: Preferences/ls -> D, D/sub -> E, E/item -> repo/item.
+        std::fs::remove_file(d.join("com.apple.LaunchServices.plist")).unwrap();
+        symlink(&e, d.join("sub")).unwrap();
+        symlink(repo.join("item"), e.join("item")).unwrap();
+        assert_eq!(ask(&[&repo]), Some(home.join("Library/Preferences")));
+    }
+
+    #[test]
+    fn opener_config_writable_handles_cycles_and_hostile_entries() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, d, repo) = (t.join("home"), t.join("d"), t.join("repo"));
+        let prefs = home.join("Library/Preferences");
+        for dir in [&prefs, &d, &repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        symlink(&d, prefs.join("com.apple.LaunchServices")).unwrap();
+        // Cycles: back to Preferences, self-loop, mutual symlink loop.
+        symlink(&prefs, d.join("back")).unwrap();
+        symlink(".", d.join("self_dir")).unwrap();
+        symlink("b", d.join("a")).unwrap();
+        symlink("a", d.join("b")).unwrap();
+        // Hostile entries: FIFO, symlink to FIFO, dangling symlink to read-only path.
+        let fifo = d.join("fifo");
+        crate::untrusted::tests::mkfifo(&fifo);
+        symlink(&fifo, d.join("link_to_fifo")).unwrap();
+        symlink("/nonexistent/safe", d.join("dangling")).unwrap();
+
+        let (home_c, repo_c, prefs_c) = (home.clone(), repo.clone(), prefs.clone());
+        let res = crate::untrusted::tests::bounded(move || {
+            opener_config_writable(&write_policy(&[&repo_c]), &home_c)
+        });
+        assert_eq!(res, None);
+
+        // A writable link alongside cycles and FIFOs is still caught.
+        symlink(repo.join("evil.plist"), d.join("evil.plist")).unwrap();
+        let res = crate::untrusted::tests::bounded(move || {
+            opener_config_writable(&write_policy(&[&repo]), &home)
+        });
+        assert_eq!(res, Some(prefs_c));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opener_config_writable_catches_var_folders_links() {
+        use std::os::unix::fs::symlink;
+        let target_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
+        std::fs::create_dir_all(target_dir).unwrap();
+        let tmp = tempfile::tempdir_in(target_dir).unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, project, d) = (root.join("home"), root.join("project"), root.join("d"));
+        let prefs = home.join("Library/Preferences");
+        for dir in [&prefs, &project, &d] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let cfg = crate::sandbox::SandboxConfig {
+            project_dir: &project,
+            home_dir: &home,
+            extra_read: &[],
+            extra_write: &[],
+            extra_exec: &[],
+            extra_socket: &[],
+            extra_deny: &[],
+            named_roots: &[],
+            named_root_git_dirs: &[],
+            managed_worktree_root: None,
+            worktree_socket: None,
+            mcp_socket: None,
+            restrict_oauth_bind: false,
+            oauth_port_claimed: false,
+            existing_home_tool_dirs: Some(&[]),
+            existing_app_dirs: Some(&[]),
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            proxy_forced: false,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            playwright_socket_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            copilot_cache_env: &crate::sandbox::no_cache_env,
+            java_home: None,
+            dotnet_root: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            root_agents_md: None,
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            deny_dns: false,
+            netns: false,
+            deny_nested_git: false,
+            refuse_cache_exec_links: false,
+            refuse_unenforced: false,
+            proxy_enabled: false,
+            deny_key_files_by_extension: false,
+            protect_pnpm_config: true,
+            deny_copilot_dir_exec: true,
+            allow_copilot_host_persistence: false,
+            mask_missing_deny_paths: false,
+            allow_jvm_attach: false,
+            allow_msbuild: false,
+            allow_docker: false,
+            allow_rootless_docker: false,
+            electron_app_dir: None,
+            agent: crate::agent::Agent::Copilot,
+            agent_dirs: &[],
+            allow_cache_exec: &[],
+            allow_cache_exec_any: false,
+            allow_browser: false,
+            use_bubblewrap: None,
+            allow_git_config_write: false,
+            keychain_substitute: None,
+        };
+        let policy = crate::sandbox::generate_policy(&cfg);
+
+        // Read-only symlinked dir under Preferences -> allowed.
+        let ls_link = prefs.join("com.apple.LaunchServices");
+        symlink(&d, &ls_link).unwrap();
+        assert_eq!(opener_config_writable(&policy, &home), None);
+
+        // Link inside D pointing into /var/folders (writable in SBPL) -> caught.
+        let vf_dir = tempfile::tempdir().unwrap();
+        let vf_target = vf_dir.path().join("ls.plist");
+        std::fs::write(&vf_target, "").unwrap();
+        symlink(&vf_target, d.join("com.apple.LaunchServices.plist")).unwrap();
+        assert_eq!(opener_config_writable(&policy, &home), Some(prefs.clone()));
+
+        // Direct link under Preferences into /private/var/folders -> caught.
+        std::fs::remove_file(d.join("com.apple.LaunchServices.plist")).unwrap();
+        std::fs::remove_file(&ls_link).unwrap();
+        let canon_vf = std::fs::canonicalize(vf_dir.path()).unwrap();
+        symlink(&canon_vf, &ls_link).unwrap();
+        assert_eq!(opener_config_writable(&policy, &home), Some(prefs));
+    }
+
+    #[test]
+    fn collect_links_flags_truncation_over_entry_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("f{i}")), "").unwrap();
+        }
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        assert!(!collect_links(&dir, 4, 5, &mut out, &mut visited));
+        out.clear();
+        visited.clear();
+        assert!(collect_links(&dir, 4, 4, &mut out, &mut visited));
+    }
+
+    #[test]
+    fn opener_config_writable_fails_closed_at_depth_limit() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, outside, repo) = (root.join("home"), root.join("outside"), root.join("repo"));
+        let prefs = home.join("Library/Preferences");
+        for dir in [&prefs, &outside, &repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let secure_plist = outside.join("secure.plist");
+        std::fs::write(&secure_plist, "").unwrap();
+
+        // Depth 3 (`a/b/c/link -> outside`) still scans `outside` (`rem_depth == 0`)
+        // and catches a write grant only on `outside/secure.plist`.
+        let c = prefs.join("a/b/c");
+        std::fs::create_dir_all(&c).unwrap();
+        let link_in_c = c.join("link");
+        symlink(&outside, &link_in_c).unwrap();
+        assert_eq!(opener_config_writable(&write_policy(&[&repo]), &home), None);
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&secure_plist]), &home),
+            Some(prefs.clone())
+        );
+
+        // An already-visited cycle at `rem_depth == 0` (`a/b/c/d/back -> prefs`)
+        // does not falsely trigger depth truncation.
+        std::fs::remove_file(&link_in_c).unwrap();
+        let d = c.join("d");
+        std::fs::create_dir_all(&d).unwrap();
+        let back = d.join("back");
+        symlink(&prefs, &back).unwrap();
+        assert_eq!(opener_config_writable(&write_policy(&[&repo]), &home), None);
+        std::fs::remove_file(&back).unwrap();
+
+        // Depth 4 (`a/b/c/d/link -> outside`) hits `rem_depth == 0` on `d`, leaving
+        // `outside` unchecked; must fail closed even for grants only on `outside/secure.plist`
+        // or unrelated roots.
+        let link_in_d = d.join("link");
+        symlink(&outside, &link_in_d).unwrap();
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        assert!(collect_links(
+            &prefs,
+            4,
+            MAX_COLLECT_ENTRIES,
+            &mut out,
+            &mut visited
+        ));
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&secure_plist]), &home),
+            Some(prefs.clone())
+        );
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&repo]), &home),
+            Some(prefs.clone())
+        );
+        std::fs::remove_file(&link_in_d).unwrap();
+
+        // Ordinary directory at depth 4 (`a/b/c/d/sub`) also fails closed because
+        // symlinks inside `sub` cannot be inspected.
+        let sub = d.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        symlink(repo.join("evil.plist"), sub.join("evil.plist")).unwrap();
+        out.clear();
+        visited.clear();
+        assert!(collect_links(
+            &prefs,
+            4,
+            MAX_COLLECT_ENTRIES,
+            &mut out,
+            &mut visited
+        ));
+        assert_eq!(
+            opener_config_writable(&write_policy(&[&repo]), &home),
+            Some(prefs)
+        );
     }
 
     /// Owner decision 2026-11-17: no host opener off macOS, ever.
