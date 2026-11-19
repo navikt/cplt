@@ -467,22 +467,30 @@ fn is_plain_path(raw: &str) -> bool {
 }
 
 /// True when `raw` names a `.git` pointer inside `home_dir`'s cplt scratch
-/// root (`<canonical home>/<SCRATCH_BASE>/<session>/.../.git`) that genuinely
-/// no longer exists, with no symlink anywhere along the existing prefix.
+/// root (`<canonical home>/<SCRATCH_BASE>/<session>/.../.git`) whose directory
+/// prefix genuinely no longer exists, with no symlink anywhere along the
+/// existing prefix.
 ///
 /// Walks every prefix from `canonical_home` down to `target` with
 /// `symlink_metadata` (`lstat`), so it never follows a symlink and never opens
-/// a FIFO. Any symlink, existing leaf, non-directory intermediate, `.` / `..` /
-/// `//`, trailing slash, or `lstat` error other than `NotFound` fails closed
-/// (`false`).
+/// a FIFO. Any symlink, existing leaf, missing `.git` inside an existing
+/// worktree directory, non-directory intermediate, `.` / `..` / `//`, trailing
+/// slash, or `lstat` error other than `NotFound` fails closed (`false`).
 fn is_stale_scratch_gitdir(raw: &str, home_dir: &Path) -> bool {
     use std::path::Component;
 
-    if raw.is_empty() || raw.ends_with('/') || raw.contains("//") {
+    // Check raw slash-separated segments before `Path::components()`, which
+    // normalizes away interior `.` (e.g. `<scratch>/session/./gone/.git`).
+    if !raw.starts_with('/')
+        || raw
+            .split('/')
+            .skip(1)
+            .any(|seg| seg.is_empty() || matches!(seg, "." | ".."))
+    {
         return false;
     }
     let target = Path::new(raw);
-    if !target.is_absolute() || target.file_name() != Some(std::ffi::OsStr::new(".git")) {
+    if target.file_name() != Some(std::ffi::OsStr::new(".git")) {
         return false;
     }
     if target
@@ -522,7 +530,10 @@ fn is_stale_scratch_gitdir(raw: &str, home_dir: &Path) -> bool {
                     return false;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            // Only classify as stale when a directory prefix is missing; if the
+            // worktree directory itself exists and only `.git` is missing, keep
+            // the tampering classification.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return cur != target,
             Err(_) => return false,
         }
     }
@@ -596,11 +607,13 @@ fn admin_problems(common: &Path, root: &Path, home_dir: Option<&Path>, out: &mut
                     && target.symlink_metadata().is_ok_and(|m| m.is_file());
                 if !ok {
                     if home_dir.is_some_and(|h| is_stale_scratch_gitdir(&raw, h)) {
+                        let escaped_back = crate::audit::escape_path(&back.to_string_lossy());
+                        let escaped_raw = crate::audit::escape_path(&raw);
                         out.push(LinkProblem::stale_scratch(
                             &worktree,
                             format!(
-                                "{} names {raw}, which is under cplt scratch and no longer exists",
-                                back.display()
+                                "{escaped_back} names {escaped_raw}, which is under cplt scratch \
+                                 and no longer exists"
                             ),
                         ));
                     } else {
@@ -2097,7 +2110,36 @@ mod tests {
         );
         std::fs::remove_file(&back).unwrap();
 
-        // 7. Stale scratch `gitdir` combined with a tampered `commondir` must still
+        // 7. Interior `.` in the path is normalized away by `Path::components()`,
+        //    so a spelling like `<scratch>/session/./gone/.git` must still stay
+        //    tampering rather than stale.
+        std::fs::write(
+            &back,
+            format!("{}/session/./gone/.git\n", scratch.display()),
+        )
+        .unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "interior dot component must stay tampering: {problems:?}"
+        );
+
+        // 8. Existing worktree directory whose `.git` file alone is missing
+        //    still holds user/agent work and must stay tampering.
+        let existing_wt = scratch.join("existing-session/wt");
+        std::fs::create_dir_all(&existing_wt).unwrap();
+        std::fs::write(&back, format!("{}\n", existing_wt.join(".git").display())).unwrap();
+        let problems = link_problems_for_home(&common, &root, &home, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == LinkProblemKind::Tampering),
+            "existing worktree dir missing only .git must stay tampering: {problems:?}"
+        );
+
+        // 9. Stale scratch `gitdir` combined with a tampered `commondir` must still
         //    report tampering at launch (never hide tampering behind stale).
         std::fs::write(&back, format!("{}\n", valid_stale.display())).unwrap();
         std::fs::write(&commondir, format!("{}\n", base.display())).unwrap();
@@ -2106,6 +2148,26 @@ mod tests {
             err.contains("do not match what git writes")
                 && err.contains("stale worktree from an earlier session"),
             "{err}"
+        );
+
+        // 10. Control/ANSI bytes in the admin entry name or dangling scratch path
+        //     must be escaped before reaching terminal warnings/errors.
+        std::fs::write(&commondir, "../..\n").unwrap();
+        std::fs::remove_dir_all(&admin).unwrap();
+        let ctl_admin = common.join("worktrees/wt\r\x1b[2K");
+        std::fs::create_dir_all(&ctl_admin).unwrap();
+        let ctl_target = format!("{}/s\x1b[1A/wt\r\n/.git", scratch.display());
+        let ctl_back = ctl_admin.join("gitdir");
+        std::fs::write(&ctl_back, format!("{ctl_target}\n")).unwrap();
+        std::fs::write(ctl_admin.join("commondir"), "../..\n").unwrap();
+        let err = prepare_root(&home, &main, true, DEFAULT_WALK_MAX_DIRS).unwrap_err();
+        assert!(
+            err.contains("stale worktree from an earlier session"),
+            "{err}"
+        );
+        assert!(
+            !err.contains('\x1b') && !err.contains('\r') && err.lines().count() == 3,
+            "raw control/ANSI/newline bytes leaked into output: {err:?}"
         );
     }
 }
