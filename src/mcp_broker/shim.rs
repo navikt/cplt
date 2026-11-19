@@ -71,8 +71,15 @@ fn pipe_idle(tcp: TcpStream, unix: UnixStream, idle: std::time::Duration) {
     };
     // Set the slice timeout before spawning `back`: on macOS, SO_RCVTIMEO set
     // after `read()` has already entered the kernel does not wake it.
-    let slice = idle.min(std::time::Duration::from_millis(100));
-    let _ = u.set_read_timeout(Some(slice));
+    // Clamp to >= 1ms: a zero/sub-microsecond SO_RCVTIMEO is rejected or treated
+    // as infinite by the OS.
+    let slice = idle.clamp(
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(100),
+    );
+    if u.set_read_timeout(Some(slice)).is_err() {
+        return;
+    }
     let tcp_done = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&tcp_done);
     let back = std::thread::spawn(move || {
@@ -206,6 +213,19 @@ fn run_egress_relay(port: u16, argv: &[String]) -> i32 {
 mod tests {
     use super::*;
 
+    fn run_pipe_bounded(tcp: TcpStream, unix: UnixStream, idle: std::time::Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            pipe_idle(tcp, unix, idle);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "pipe_idle did not finish within 5s"
+        );
+        h.join().unwrap();
+    }
+
     /// A unix peer that keeps its write half open after the TCP side has
     /// closed no longer pins the pipe (and its connection permit).
     #[test]
@@ -215,8 +235,51 @@ mod tests {
         drop(l.accept().unwrap().0); // the proxy closes at once
         let (ours, _peer) = UnixStream::pair().unwrap(); // _peer stays open
         let t0 = std::time::Instant::now();
-        pipe_idle(tcp, ours, std::time::Duration::from_millis(200));
+        run_pipe_bounded(tcp, ours, std::time::Duration::from_millis(200));
         assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn pipe_stays_open_while_tcp_is_open_then_ends_after_tcp_closes() {
+        use std::io::Read;
+
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut server, _) = l.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (ours, mut peer) = UnixStream::pair().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            pipe_idle(tcp, ours, std::time::Duration::from_millis(150));
+            let _ = tx.send(());
+        });
+
+        // Stay idle longer than both the 100ms read slice and the 150ms half-closed
+        // idle timeout while TCP is still open: the unix->tcp path must survive.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        peer.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+
+        drop(server);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "pipe_idle did not finish within 5s after TCP closed"
+        );
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn pipe_with_zero_idle_does_not_hang() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        drop(l.accept().unwrap().0);
+        let (ours, _peer) = UnixStream::pair().unwrap();
+        run_pipe_bounded(tcp, ours, std::time::Duration::ZERO);
     }
 
     use super::relay;
