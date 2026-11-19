@@ -1112,17 +1112,10 @@ fn github_credential_helper_config(
             format!("GIT_CONFIG_KEY_{}", n + i),
             format!("credential.https://{host}.helper"),
         ));
-        // A non-github.com entry marks its call, so the gate withholds the
-        // github.com token (gh would send it to a `*.ghe.com` tenant).
-        let helper = if host == crate::gh_proxy::DEFAULT_GH_HOST {
-            "!gh auth git-credential".to_string()
-        } else {
-            format!(
-                "!{}=1 gh auth git-credential",
-                crate::gh_proxy::FOREIGN_CREDENTIAL_ENV
-            )
-        };
-        env.push((format!("GIT_CONFIG_VALUE_{}", n + i), helper));
+        env.push((
+            format!("GIT_CONFIG_VALUE_{}", n + i),
+            "!gh auth git-credential".to_string(),
+        ));
     }
     env.push((
         "GIT_CONFIG_COUNT".to_string(),
@@ -2922,10 +2915,7 @@ echo gho_stored_fixture"#,
             Some("credential.https://example.ghe.com.helper")
         );
         assert_eq!(get("GIT_CONFIG_VALUE_1"), Some("!gh auth git-credential"));
-        assert_eq!(
-            get("GIT_CONFIG_VALUE_2"),
-            Some("!CPLT_GH_FOREIGN_CREDENTIAL=1 gh auth git-credential")
-        );
+        assert_eq!(get("GIT_CONFIG_VALUE_2"), Some("!gh auth git-credential"));
     }
 
     #[test]

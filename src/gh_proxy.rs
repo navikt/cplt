@@ -59,6 +59,9 @@ pub struct ParsedCommand {
 /// The host a scope member is on when its name carries none.
 pub const DEFAULT_GH_HOST: &str = "github.com";
 
+/// Gist host that shares the `github.com` token when `gh auth git-credential` runs.
+const GIST_HOST: &str = "gist.github.com";
+
 static GH_HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// Set the GitHub hosts the guard accepts (`gh_guard.hosts`), lowercased. Once
@@ -80,8 +83,9 @@ pub fn gh_hosts() -> &'static [String] {
 /// `gh` sends `GH_TOKEN` to github.com and to every `*.ghe.com` tenant, so it
 /// must not ride along to a command aimed at another configured host: a
 /// non-github.com pin or a `--hostname` naming one. `auth git-credential`, whose
-/// host arrives on stdin, is marked by [`FOREIGN_CREDENTIAL_ENV`] instead.
-/// With `gh_guard.hosts` unset every exec gets the token, as before.
+/// host arrives on stdin, is decided strictly by
+/// [`credential_stdin_allows_github_token`], so this helper fails closed for it.
+/// With `gh_guard.hosts` unset every other exec gets the token, as before.
 #[must_use]
 pub fn github_token_allowed(args: &[&str], pin: Option<&str>, host_pin: Option<&str>) -> bool {
     github_token_allowed_for(args, pin, host_pin, gh_hosts())
@@ -93,6 +97,9 @@ fn github_token_allowed_for(
     host_pin: Option<&str>,
     hosts: &[String],
 ) -> bool {
+    if is_auth_git_credential_request(args) {
+        return false;
+    }
     let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
     // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
     // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
@@ -167,10 +174,173 @@ pub fn hosts_configured() -> bool {
     gh_hosts() != [DEFAULT_GH_HOST]
 }
 
-/// Env var a credential-helper entry for a non-github.com host sets, so the
-/// gate withholds the github.com token from that call only. Setting it can
-/// only take the token away, so the agent gains nothing by forging it.
-pub const FOREIGN_CREDENTIAL_ENV: &str = "CPLT_GH_FOREIGN_CREDENTIAL";
+/// Maximum bytes read from `gh auth git-credential` stdin before refusing.
+/// A git credential block is a handful of short `key=value` lines (~100 bytes).
+pub const MAX_CREDENTIAL_STDIN_BYTES: usize = 64 * 1024;
+
+/// Read a single blank-line-terminated `git credential` block from `reader`,
+/// stopping at the first blank line (`\n` or `\r\n`) or EOF without blocking for
+/// EOF when the caller keeps the pipe open.
+pub fn read_credential_stdin<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
+    use std::io::BufRead;
+
+    let mut limited = std::io::BufReader::new(reader.take((MAX_CREDENTIAL_STDIN_BYTES + 1) as u64));
+    let mut buf = Vec::new();
+    loop {
+        let before = buf.len();
+        let n = limited
+            .read_until(b'\n', &mut buf)
+            .map_err(|e| format!("failed to read credential input from stdin: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() > MAX_CREDENTIAL_STDIN_BYTES {
+            return Err(format!(
+                "credential input exceeds {MAX_CREDENTIAL_STDIN_BYTES} bytes"
+            ));
+        }
+        let line = &buf[before..];
+        let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+        let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
+        if trimmed.is_empty() {
+            break;
+        }
+    }
+    Ok(buf)
+}
+
+fn canonical_github_credential_host(host: &str) -> Option<&'static str> {
+    if host.eq_ignore_ascii_case(DEFAULT_GH_HOST) {
+        Some(DEFAULT_GH_HOST)
+    } else if host.eq_ignore_ascii_case(GIST_HOST) {
+        Some(GIST_HOST)
+    } else {
+        None
+    }
+}
+
+/// Validate RFC 3986 / Go `net/url` userinfo bytes (rejecting bare `@`, `\`,
+/// whitespace, control characters, and malformed `%` escapes).
+fn valid_url_userinfo(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        let ok = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+            );
+        if !ok {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Extract and validate the host from a `git credential` `url=` attribute.
+///
+/// Mirrors `gh auth git-credential` (`net/url.Parse` on `url=`) while failing
+/// closed on non-HTTPS schemes, malformed URLs, control/backslash characters,
+/// ports, or any host other than `github.com` / `gist.github.com`.
+fn parse_credential_url_host(url: &str) -> Option<&'static str> {
+    if url
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\')
+    {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    let host = match authority.split_once('@') {
+        Some((userinfo, host)) => {
+            if host.is_empty() || host.contains('@') || !valid_url_userinfo(userinfo) {
+                return None;
+            }
+            host
+        }
+        None => authority,
+    };
+    canonical_github_credential_host(host)
+}
+
+/// Whether a `gh auth git-credential` stdin block targets `github.com` or
+/// `gist.github.com` alone.
+///
+/// `gh` forwards `GH_TOKEN` to `*.ghe.com` tenants as well as `github.com`, and
+/// parses `url=` (which sets/overrides `host=`). Require at least one `host=` or
+/// `url=` line, reject malformed URLs, duplicate `host=`/`url=` lines, or any
+/// conflicting or non-GitHub host, and allow only `github.com` or
+/// `gist.github.com` (ASCII case-insensitive).
+#[must_use]
+pub fn credential_stdin_allows_github_token(stdin: &[u8]) -> bool {
+    let mut seen_host: Option<&'static str> = None;
+    let mut saw_host_line = false;
+    let mut saw_url_line = false;
+    for raw_line in stdin.split(|&b| b == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            break;
+        }
+        if let Some(url_bytes) = line.strip_prefix(b"url=") {
+            let Ok(url) = std::str::from_utf8(url_bytes) else {
+                return false;
+            };
+            let Some(host) = parse_credential_url_host(url) else {
+                return false;
+            };
+            if saw_url_line || seen_host.is_some_and(|prev| prev != host) {
+                return false;
+            }
+            saw_url_line = true;
+            seen_host = Some(host);
+        } else if let Some(host_bytes) = line.strip_prefix(b"host=") {
+            let Ok(host) = std::str::from_utf8(host_bytes) else {
+                return false;
+            };
+            let Some(host) = canonical_github_credential_host(host) else {
+                return false;
+            };
+            if saw_host_line || seen_host.is_some_and(|prev| prev != host) {
+                return false;
+            }
+            saw_host_line = true;
+            seen_host = Some(host);
+        }
+    }
+    seen_host.is_some()
+}
 
 /// The host of an approved `GH_REPO` pin, when it is a configured host other
 /// than github.com. The caller then pins `GH_HOST` to it too, so a bare
@@ -1756,6 +1926,116 @@ pub fn repos_match(left: &str, right: &str) -> bool {
 pub fn is_auth_token_request(args: &[&str]) -> bool {
     let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
     positional.next() == Some("auth") && positional.next() == Some("token")
+}
+
+fn parse_pflag_bool(val: &str) -> Option<bool> {
+    match val {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether this argv is `gh auth git-credential`.
+#[must_use]
+pub fn is_auth_git_credential_request(args: &[&str]) -> bool {
+    parse_command(args).is_some_and(|cmd| {
+        cmd.command == "auth" && cmd.subcommand.as_deref() == Some("git-credential")
+    })
+}
+
+/// Whether this argv is specifically `gh auth git-credential get` (with a
+/// single `"get"` positional operation and no unknown or invalid flags).
+///
+/// `store`, `erase`, missing/extra operations, and invalid flags do not read
+/// stdin in `gh`, so the gate passes them straight through without blocking on
+/// stdin and without injecting `GH_TOKEN`.
+#[must_use]
+pub fn is_auth_git_credential_get_request(args: &[&str]) -> bool {
+    const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &["--repo", "-R", "--hostname"];
+    let mut idx = 0;
+    while idx < args.len() && args[idx].starts_with('-') {
+        let arg = args[idx];
+        if !arg.starts_with("--")
+            && arg.len() >= 2
+            && let Some(('R', attached)) = scan_short_cluster(&arg[1..], &['R'])
+        {
+            if attached.is_none() && idx + 1 < args.len() {
+                idx += 1;
+            }
+            idx += 1;
+            continue;
+        }
+        if arg.contains('=') {
+            idx += 1;
+            continue;
+        }
+        if GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
+            idx += 1;
+        }
+        idx += 1;
+    }
+    if args.get(idx).copied() != Some("auth") {
+        return false;
+    }
+    idx += 1;
+    while idx < args.len() && args[idx].starts_with('-') {
+        idx += 1;
+    }
+    if args.get(idx).copied() != Some("git-credential") {
+        return false;
+    }
+    idx += 1;
+
+    let mut after_double_dash = false;
+    let mut op: Option<&str> = None;
+    for &arg in &args[idx..] {
+        if after_double_dash {
+            if op.is_some() {
+                return false;
+            }
+            op = Some(arg);
+        } else if arg == "--" {
+            after_double_dash = true;
+        } else if arg == "-h" || arg == "--help" {
+            // Handled by `is_help_request`.
+        } else if let Some(val) = arg
+            .strip_prefix("--help=")
+            .or_else(|| arg.strip_prefix("-h="))
+        {
+            if parse_pflag_bool(val).is_none() {
+                return false;
+            }
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            return false;
+        } else {
+            if op.is_some() {
+                return false;
+            }
+            op = Some(arg);
+        }
+    }
+    op == Some("get")
+}
+
+/// Whether `args` asks `gh` for help (`-h`, `--help`, `--help=<bool>`, or
+/// `-h=<bool>` before `--`), using pflag's boolean spellings and
+/// last-value-wins semantics.
+#[must_use]
+pub fn is_help_request(args: &[&str]) -> bool {
+    let mut help = false;
+    for &arg in args.iter().take_while(|&&a| a != "--") {
+        if arg == "-h" || arg == "--help" {
+            help = true;
+        } else if let Some(val) = arg
+            .strip_prefix("--help=")
+            .or_else(|| arg.strip_prefix("-h="))
+            && let Some(b) = parse_pflag_bool(val)
+        {
+            help = b;
+        }
+    }
+    help
 }
 
 fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
@@ -6624,9 +6904,9 @@ mod tests {
             None,
             &github
         ));
-        // Its host is on stdin: the helper entry marks it instead.
-        assert!(ok(&["auth", "git-credential", "get"], None));
-        // Default list: unchanged, every exec gets the token.
+        // Its host arrives on stdin: without stdin this check fails closed.
+        assert!(!ok(&["auth", "git-credential", "get"], None));
+        // Default list: unchanged, every other exec gets the token.
         let github = vec!["github.com".to_string()];
         assert!(github_token_allowed_for(
             &["api", "--hostname", "example.ghe.com", "user"],
@@ -6634,6 +6914,191 @@ mod tests {
             None,
             &github
         ));
+    }
+
+    #[test]
+    fn credential_stdin_host_gating() {
+        for allowed in [
+            b"protocol=https\nhost=github.com\n\n".as_slice(),
+            b"protocol=https\nhost=GITHUB.COM\npath=navikt/cplt.git\n\n",
+            b"protocol=https\r\nhost=github.com\r\n\r\n",
+            b"protocol=https\nhost=github.com\n",
+            b"protocol=https\nhost=github.com",
+            b"protocol=https\nhost=gist.github.com\n\n",
+            b"protocol=https\nhost=GIST.GITHUB.COM\n\n",
+            b"url=https://github.com/o/r\n\n",
+            b"url=HTTPS://GITHUB.COM/o/r\n\n",
+            b"url=https://gist.github.com/user/123\n\n",
+            b"url=https://user:pass@github.com/o/r\n\n",
+            b"url=https://github.com?foo=bar\n\n",
+            b"protocol=https\nhost=github.com\nurl=https://github.com/o/r\n\n",
+            b"url=https://gist.github.com/u/1\nhost=gist.github.com\n\n",
+        ] {
+            assert!(
+                credential_stdin_allows_github_token(allowed),
+                "expected allow for {:?}",
+                String::from_utf8_lossy(allowed)
+            );
+        }
+
+        for rejected in [
+            b"protocol=https\nhost=example.ghe.com\n\n".as_slice(),
+            b"protocol=https\nhost=api.github.com\n\n",
+            b"protocol=https\nhost=github.com:443\n\n",
+            b"protocol=https\nhost=github.com.\n\n",
+            b"protocol=https\nhost=github.com \n\n",
+            b"protocol=https\nhost= github.com\n\n",
+            b"protocol=https\nhost=\n\n",
+            b"protocol=https\n\n",
+            b"",
+            b"\nhost=github.com\n\n",
+            b"protocol=https\nhost=github.com\nhost=example.ghe.com\n\n",
+            b"protocol=https\nhost=example.ghe.com\nhost=github.com\n\n",
+            b"protocol=https\nhost=github.com\nhost=github.com\n\n",
+            b"protocol=https\nhost=github.com\nurl=https://example.ghe.com/o/r\n\n",
+            b"protocol=https\nhost=github.com\nurl=https://gist.github.com/u/1\n\n",
+            b"url=https://github.com/o/r\nhost=gist.github.com\n\n",
+            b"url=https://github.com/o/r\nhost=example.ghe.com\n\n",
+            b"url=https://github.com/o/r\nurl=https://gist.github.com/u/1\n\n",
+            b"url=https://github.com/o/r\nurl=https://github.com/o/r2\n\n",
+            b"url=http://github.com/o/r\n\n",
+            b"url=https://github.com:443/o/r\n\n",
+            b"url=https://github.com./o/r\n\n",
+            b"url=https://github.com@evil.com/o/r\n\n",
+            b"url=https://evil.com\\@github.com/o/r\n\n",
+            b"url=https://github.com\\@evil.com/o/r\n\n",
+            b"url=https://evil@user@github.com/o/r\n\n",
+            b"url=https:///o/r\n\n",
+            b"url=https://\n\n",
+            b"url=not-a-url\n\n",
+            b"url=https://github.com /o/r\n\n",
+            b"protocol=https\nhost=\xff\xfe\n\n",
+            b"url=\xff\xfe\n\n",
+        ] {
+            assert!(
+                !credential_stdin_allows_github_token(rejected),
+                "expected withhold for {:?}",
+                String::from_utf8_lossy(rejected)
+            );
+        }
+    }
+
+    #[test]
+    fn read_credential_stdin_stops_at_blank_line_without_eof() {
+        struct BlockAfterBlankLine<'a>(&'a [u8]);
+        impl std::io::Read for BlockAfterBlankLine<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.0.is_empty(), "read past blank line terminator");
+                let byte = self.0[0];
+                self.0 = &self.0[1..];
+                buf[0] = byte;
+                Ok(1)
+            }
+        }
+
+        let input = b"protocol=https\nhost=github.com\n\n";
+        let got = read_credential_stdin(BlockAfterBlankLine(input)).unwrap();
+        assert_eq!(got, input);
+
+        let crlf = b"protocol=https\r\nhost=github.com\r\n\r\n";
+        let got_crlf = read_credential_stdin(BlockAfterBlankLine(crlf)).unwrap();
+        assert_eq!(got_crlf, crlf);
+
+        let eof_no_blank = b"protocol=https\nhost=example.ghe.com\n";
+        assert_eq!(
+            read_credential_stdin(eof_no_blank.as_slice()).unwrap(),
+            eof_no_blank
+        );
+
+        let oversized = vec![b'a'; MAX_CREDENTIAL_STDIN_BYTES + 1];
+        assert!(read_credential_stdin(oversized.as_slice()).is_err());
+    }
+
+    #[test]
+    fn auth_git_credential_and_help_detection() {
+        assert!(is_auth_git_credential_request(&[
+            "auth",
+            "git-credential",
+            "get"
+        ]));
+        assert!(is_auth_git_credential_request(&[
+            "--hostname",
+            "github.com",
+            "auth",
+            "git-credential",
+            "get"
+        ]));
+        assert!(!is_auth_git_credential_request(&["auth", "token"]));
+        assert!(!is_auth_git_credential_request(&["auth", "status"]));
+
+        assert!(is_auth_git_credential_get_request(&[
+            "auth",
+            "git-credential",
+            "get"
+        ]));
+        assert!(is_auth_git_credential_get_request(&[
+            "--hostname",
+            "github.com",
+            "auth",
+            "git-credential",
+            "--help",
+            "--help=false",
+            "get"
+        ]));
+        assert!(is_auth_git_credential_get_request(&[
+            "auth",
+            "git-credential",
+            "--",
+            "get"
+        ]));
+        for non_get in [
+            &["auth", "git-credential", "store"][..],
+            &["auth", "git-credential", "erase"],
+            &["auth", "git-credential", "invalid"],
+            &["auth", "git-credential"],
+            &["auth", "git-credential", "get", "extra"],
+            &["auth", "git-credential", "--unknown", "get"],
+            &["auth", "git-credential", "--help=bogus", "get"],
+            &["auth", "token"],
+        ] {
+            assert!(
+                !is_auth_git_credential_get_request(non_get),
+                "expected false for {non_get:?}"
+            );
+        }
+
+        for help_args in [
+            &["auth", "git-credential", "--help"][..],
+            &["auth", "git-credential", "-h"],
+            &["auth", "git-credential", "--help=true"],
+            &["auth", "git-credential", "--help=1"],
+            &["auth", "git-credential", "--help=t"],
+            &["auth", "git-credential", "--help=TRUE"],
+            &["auth", "git-credential", "-h=true"],
+            &["auth", "git-credential", "-h=1"],
+            &["auth", "git-credential", "--help=false", "--help", "get"],
+            &["auth", "git-credential", "--help=0", "-h=true", "get"],
+            &["auth", "git-credential", "get", "--help=1"],
+        ] {
+            assert!(
+                is_help_request(help_args),
+                "expected help for {help_args:?}"
+            );
+        }
+        for non_help_args in [
+            &["auth", "git-credential", "--help=false", "get"][..],
+            &["auth", "git-credential", "--help=0", "get"],
+            &["auth", "git-credential", "-h=false", "get"],
+            &["auth", "git-credential", "--help", "--help=false", "get"],
+            &["auth", "git-credential", "-h=1", "--help=0", "get"],
+            &["auth", "git-credential", "--", "-h"],
+            &["auth", "git-credential", "get", "--", "--help=1"],
+        ] {
+            assert!(
+                !is_help_request(non_help_args),
+                "expected non-help for {non_help_args:?}"
+            );
+        }
     }
 
     // ── wrapper script test ──
