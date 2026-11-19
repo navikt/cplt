@@ -63,12 +63,8 @@ pub(crate) mod bubblewrap_probe {
         config: &super::SandboxConfig,
         grants: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> Result<(), String> {
-        let plan = super::bwrap_plan(
-            config,
-            &super::launch_git_dirs(config),
-            grants,
-            &std::cell::OnceCell::new(),
-        );
+        let git_dirs = super::launch_git_dirs(config)?;
+        let plan = super::bwrap_plan(config, &git_dirs, grants, &std::cell::OnceCell::new());
         super::bubblewrap::build_wrapper(
             &plan.policy,
             super::bubblewrap::Overlays {
@@ -90,12 +86,8 @@ pub(crate) mod bubblewrap_probe {
         config: &super::SandboxConfig,
         grants: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> Vec<std::path::PathBuf> {
-        let plan = super::bwrap_plan(
-            config,
-            &super::launch_git_dirs(config),
-            grants,
-            &std::cell::OnceCell::new(),
-        );
+        let git_dirs = super::launch_git_dirs(config).unwrap_or_default();
+        let plan = super::bwrap_plan(config, &git_dirs, grants, &std::cell::OnceCell::new());
         config
             .extra_deny
             .iter()
@@ -759,9 +751,10 @@ fn prepare_locked(
             shadow.display()
         ));
     }
+    let git_dirs = launch_git_dirs(config)?;
     prepare_impl(
         config,
-        &launch_git_dirs(config),
+        &git_dirs,
         pnpm_shadow_dir,
         inspect_only,
         &canonical_grants,
@@ -789,8 +782,8 @@ pub fn launch_grants(
 /// The named roots' resolved gitdirs join the write grants' here: they are
 /// granted (see `named_root_git_dirs`) and therefore need the same
 /// persistence denies and the same bubblewrap read-only binds.
-fn launch_git_dirs(config: &SandboxConfig) -> Vec<PathBuf> {
-    let mut git_dirs = extra_git_dirs(config.extra_write);
+fn launch_git_dirs(config: &SandboxConfig) -> Result<Vec<PathBuf>, String> {
+    let mut git_dirs = try_extra_git_dirs(config.extra_write)?;
     for dir in config.named_root_git_dirs {
         if !git_dirs.contains(dir) {
             git_dirs.push(dir.clone());
@@ -798,7 +791,7 @@ fn launch_git_dirs(config: &SandboxConfig) -> Vec<PathBuf> {
     }
     git_dirs.sort();
     git_dirs.dedup();
-    git_dirs
+    Ok(git_dirs)
 }
 
 fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
@@ -2012,33 +2005,40 @@ const SYSTEM_TEMP_DIRS: &[&str] = &["/tmp"];
 /// PARENT process, with the granted repo's config in scope — so it routes
 /// through the hardened invoker (`git::command`, #211) like every other
 /// parent-side git invocation.
-fn extra_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = roots
-        .iter()
-        .filter_map(|root| {
-            let dir = crate::discover::git_dir_of(root)?;
-            // Ordinary repo — already covered by the `<root>/.git` denies.
-            (dir != root.join(".git")).then_some(dir)
-        })
-        .collect();
+fn try_extra_git_dirs(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    for root in roots {
+        let Some(dir) = crate::discover::try_git_dir_of(root)? else {
+            continue;
+        };
+        // Ordinary repo — already covered by the `<root>/.git` denies.
+        if dir != root.join(".git") {
+            dirs.push(dir);
+        }
+    }
     // The same repo can be granted twice, and two grants can share one `.git`
     // (two worktrees of one repo); duplicate denies are harmless but noisy.
     dirs.sort();
     dirs.dedup();
-    dirs
+    Ok(dirs)
+}
+
+#[cfg(test)]
+fn extra_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    try_extra_git_dirs(roots).expect("extra_git_dirs")
 }
 
 /// The real `.git` of every named root that does not keep it at `<root>/.git`.
 ///
-/// The same resolution `extra_git_dirs` performs for write grants, exposed
+/// The same resolution `try_extra_git_dirs` performs for write grants, exposed
 /// because the answer is *granted* for a named root rather than only denied:
 /// a linked worktree's objects and refs live in the main checkout's gitdir, and
 /// without it `git` inside the named root fails with `not a git repository`.
 /// Callers build the policy from it, so it is resolved once, parent-side,
-/// through the hardened invoker.
-#[must_use]
-pub fn named_root_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
-    extra_git_dirs(roots)
+/// through the hardened invoker. Fails closed if `git` times out on a root
+/// and git-free fallback finds no gitdir.
+pub fn named_root_git_dirs(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    try_extra_git_dirs(roots)
 }
 
 /// The credential that stands in for the login Keychain this run, if any
@@ -2837,7 +2837,8 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
         base.get_or_init(|| landlock_mod::generate_policy(config)),
     )
     .unwrap_or_default();
-    let plan = bwrap_plan(config, &launch_git_dirs(config), &grants, &base);
+    let git_dirs = launch_git_dirs(config).unwrap_or_default();
+    let plan = bwrap_plan(config, &git_dirs, &grants, &base);
     let wrapper = if config.use_bubblewrap == Some(false) {
         Err("it is turned off".to_string())
     } else {
@@ -3719,7 +3720,8 @@ fn missing_worktree_config_masks(write_roots: &[&Path], git_dirs: &[&Path]) -> V
 /// inspection must not write to HOME or the project.
 #[cfg(any(target_os = "linux", test))]
 fn missing_dir_masks(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
-    missing_dir_masks_with(config, &launch_git_dirs(config), &[], inspect_only)
+    let git_dirs = launch_git_dirs(config).unwrap_or_default();
+    missing_dir_masks_with(config, &git_dirs, &[], inspect_only)
 }
 
 #[cfg(any(target_os = "linux", test))]

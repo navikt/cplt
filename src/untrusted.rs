@@ -94,12 +94,27 @@ pub(crate) mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
     }
 
-    /// Run `f` on a thread and fail if it takes over 10 s: a FIFO read hangs.
-    pub(crate) fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    /// Run `f` on a thread and fail if it takes over `limit`: a FIFO read hangs.
+    pub(crate) fn bounded_within<T: Send + 'static>(
+        limit: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(f()));
-        rx.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("hung on a planted FIFO")
+        rx.recv_timeout(limit).expect("hung on a planted FIFO")
+    }
+
+    /// Run `f` on a thread and fail if it takes over 10 s: a FIFO read hangs.
+    pub(crate) fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        bounded_within(std::time::Duration::from_secs(10), f)
+    }
+
+    /// Create a minimal `.git` directory whose `config` is a FIFO.
+    pub(crate) fn plant_fifo_git_config(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        mkfifo(&dir.join(".git/config"));
     }
 
     #[test]

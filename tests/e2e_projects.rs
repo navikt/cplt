@@ -2449,6 +2449,51 @@ fi
         assert_result_fail(&stdout, "bare_hook_write");
     }
 
+    /// A granted bare repository whose `config` is a planted FIFO times out
+    /// `git rev-parse --git-common-dir`, so git-free discovery must still
+    /// recognize the bare repo layout and emit persistence denies on `hooks/`.
+    #[test]
+    fn granted_bare_repo_with_fifo_config_hooks_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let bare = TempProject::new("bare-fifo-config");
+        let status = git_cmd(bare.path())
+            .args(["init", "--bare", "--quiet"])
+            .status()
+            .expect("git init --bare");
+        assert!(status.success(), "git init --bare should succeed");
+        let cfg = bare.path().join("config");
+        fs::remove_file(&cfg).expect("remove config");
+        let c_cfg = std::ffi::CString::new(cfg.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_cfg.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let bare_path = bare.canonical_path().to_string_lossy().to_string();
+        let script = format!(
+            r#"
+if echo '#!/bin/sh' > "{bare_path}/hooks/post-receive" 2>/dev/null; then
+    echo "RESULT:bare_hook_write:OK"
+else
+    echo "RESULT:bare_hook_write:FAIL"
+fi
+if echo ok > "{bare_path}/scratch.txt" 2>/dev/null; then
+    echo "RESULT:write_control:OK"
+else
+    echo "RESULT:write_control:FAIL"
+fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &bare_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "write_control");
+        assert_result_fail(&stdout, "bare_hook_write");
+    }
+
     /// #214: the post-session audit runs git in `project_dir` only. A session
     /// that rewrote a repo granted via `allow.write` still printed "no project
     /// file changes" — an absence of information rendered as a clean bill of
@@ -2881,6 +2926,52 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
                 assert!(stderr.contains(text), "{what}: missing {text:?}\n{stderr}");
             }
         }
+    }
+
+    /// A FIFO at `.git/config` causes `git cat-file blob HEAD:.cplt.toml` to
+    /// time out. `load_repo_config` must fail closed instead of falling back
+    /// to a missing or relaxed working-tree `.cplt.toml`, so
+    /// `sandbox.refuse_invalid_repo_config = true` refuses the launch.
+    #[test]
+    fn fifo_git_config_fails_closed_when_committed_config_present() {
+        let project = TempProject::new("fifo-git-config-head");
+        project.write_file(".cplt.toml", "[deny]\npaths = [\".env\"]\n");
+        project.git_init();
+        // Relax the working-tree copy and replace `.git/config` with a FIFO.
+        project.write_file(
+            ".cplt.toml",
+            "[propose.allow]\ndomains = [\"example.com\"]\n",
+        );
+        let cfg = project.path().join(".git/config");
+        fs::remove_file(&cfg).expect("remove .git/config");
+        let c_cfg = std::ffi::CString::new(cfg.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_cfg.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let config_home = TempProject::new("fifo-git-config-refuse");
+        let on = config_home.path().join("on.toml");
+        fs::write(&on, "[sandbox]\nrefuse_invalid_repo_config = true\n").unwrap();
+
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--agent", "shell"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--", "-c", "echo LAUNCHED"])
+            .env("CPLT_CONFIG", &on)
+            .output()
+            .expect("cplt should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "FIFO .git/config must refuse launch when refuse_invalid_repo_config = true\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("LAUNCHED"),
+            "command must not run when launch is refused\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("Cannot load .cplt.toml") && stderr.contains("HEAD"),
+            "unexpected stderr: {stderr}"
+        );
     }
 
     /// A tree the session was never given stays unreachable. Without this the
