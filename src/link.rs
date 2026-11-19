@@ -421,10 +421,19 @@ pub fn verify_named(dir: &Path, project_dir: &Path, identity: &str) -> Result<Ca
             also: Vec::new(),
             worktrees: 0,
         }),
-        Some(found) => Err(format!(
-            "{shown_canonical} is {found}, not {identity}.\n  \
-             Link it as itself if that is what you meant:\n    cplt link {found}"
-        )),
+        Some(found) => {
+            let shown_found = crate::audit::escape_path(&found);
+            if is_valid_identity(&found) {
+                Err(format!(
+                    "{shown_canonical} is {shown_found}, not {identity}.\n  \
+                     Link it as itself if that is what you meant:\n    cplt link {found}"
+                ))
+            } else {
+                Err(format!(
+                    "{shown_canonical} is {shown_found}, not {identity}."
+                ))
+            }
+        }
         None => Err(format!(
             "Could not read a GitHub origin for {shown_canonical}, so cplt cannot confirm it is {identity}.\n  \
              A fork, a repository with no `origin`, or a non-GitHub remote all look like this."
@@ -1019,6 +1028,29 @@ mod tests {
         assert!(
             !err.lines().any(|l| l.starts_with("spoof")),
             "newline injected a line: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_named_escapes_invalid_origin_identity_and_omits_copyable_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let project = root.join("spleis");
+        make_repo(&project, "navikt/spleis");
+
+        let evil = root.join("evil-origin");
+        make_repo(&evil, "evil\x1b[31m/thing\tspoof");
+        let err =
+            verify_named(&evil, &project, "navikt/sykepenger-model").expect_err("must refuse");
+        assert!(!err.contains('\x1b'), "raw ESC leaked: {err}");
+        assert!(!err.contains('\t'), "raw tab leaked: {err}");
+        assert!(
+            err.contains("evil\\u{1b}[31m/thing\\tspoof"),
+            "escaped identity missing: {err}"
+        );
+        assert!(
+            !err.contains("cplt link "),
+            "must not offer copyable link command for invalid identity: {err}"
         );
     }
 }

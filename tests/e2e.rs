@@ -6980,6 +6980,97 @@ paths = [
             "{shown}"
         );
 
+        // 4. `offer_clone` clone hint (`cplt trust accept repos` for a missing repo
+        // whose parent directory contains newline + ANSI) uses `$'...'` quoting with
+        // no raw ESC or injected lines.
+        let evil_parent = parent.join("clone-parent\nSPOOF\x1b[31m-dir");
+        let missing_proj = evil_parent.join("proj");
+        init_with_origin(&missing_proj, "git@github.com:navikt/e2e-esc-clone.git");
+        std::fs::write(
+            missing_proj.join(".cplt.toml"),
+            "[propose]\nrepos = [\"navikt/e2e-esc-absent\"]\n",
+        )
+        .unwrap();
+        assert!(
+            git_cmd(&missing_proj)
+                .args(["add", ".cplt.toml"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            git_cmd(&missing_proj)
+                .args([
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@e",
+                    "commit",
+                    "-qm",
+                    "add",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let out = trust_cmd(&missing_proj, &trust_cfg)
+            .args(["trust", "accept", "repos"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("accept absent runs");
+        let err_str = String::from_utf8_lossy(&out.stderr);
+        assert!(!err_str.contains('\x1b'), "raw ESC leaked: {err_str}");
+        assert!(
+            !err_str.lines().any(|l| l.trim_start().starts_with("SPOOF")),
+            "newline injected a line: {err_str}"
+        );
+        assert!(
+            err_str.contains("$'") && err_str.contains("clone-parent\\nSPOOF\\x1b[31m-dir"),
+            "clone hint must use terminal-safe $'...' quoting: {err_str}"
+        );
+
+        // 5. `run_config_set_via` unset hint (`--unset` by leaf name matching a
+        // stored `sandbox.repo_dirs` entry containing newline + ANSI) uses `$'...'`.
+        let unset_lib = evil_parent.join("esc-unset-lib");
+        init_with_origin(&unset_lib, "git@github.com:navikt/esc-unset-lib.git");
+        let link_out = trust_cmd(&missing_proj, &trust_cfg)
+            .args(["link", "navikt/esc-unset-lib", unset_lib.to_str().unwrap()])
+            .output()
+            .expect("link unset lib runs");
+        assert!(
+            link_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&link_out.stderr)
+        );
+        let unset_out = trust_cmd(&missing_proj, &trust_cfg)
+            .args([
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                "./elsewhere/esc-unset-lib",
+                "--unset",
+            ])
+            .output()
+            .expect("unset hint runs");
+        assert!(unset_out.status.success(), "{unset_out:?}");
+        let unset_err = String::from_utf8_lossy(&unset_out.stderr);
+        assert!(!unset_err.contains('\x1b'), "raw ESC leaked: {unset_err}");
+        assert!(
+            !unset_err
+                .lines()
+                .any(|l| l.trim_start().starts_with("SPOOF")),
+            "newline injected a line: {unset_err}"
+        );
+        assert!(
+            unset_err.contains("One entry has that name")
+                && unset_err.contains("$'")
+                && unset_err.contains("clone-parent\\nSPOOF\\x1b[31m-dir/esc-unset-lib"),
+            "unset hint must use terminal-safe $'...' quoting: {unset_err}"
+        );
+
         let _ = std::fs::remove_dir_all(parent);
         let _ = std::fs::remove_dir_all(trust_cfg.parent().expect("cfg dir"));
     }

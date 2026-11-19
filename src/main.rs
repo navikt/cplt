@@ -8357,6 +8357,48 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn is_terminal_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// Quote a shell argument for terminal hints without emitting raw control or
+/// formatting characters. Falls back to POSIX `$'...'` ANSI-C quoting when
+/// control/bidi characters are present so pasting in bash/zsh/POSIX.1-2024 sh
+/// reconstructs the exact original argument.
+fn sh_quote_terminal(s: &str) -> String {
+    if !s.chars().any(is_terminal_unsafe_char) {
+        return sh_quote(s);
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push_str("$'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if is_terminal_unsafe_char(c) => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).as_bytes() {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Run a hermetic shell probe inside the resolved sandbox and return its exit
 /// code. `PROBE_SPAWN_FAILED` means the shell could not be resolved/spawned.
 fn probe_shell(
@@ -11381,7 +11423,7 @@ fn run_config_set_via(
                 "\n  One entry has that name:\n    {}\n  \
                  Remove that one:\n    {}",
                 cplt::audit::escape_path(&entry),
-                remove_cmd(&sh_quote(&entry))
+                remove_cmd(&sh_quote_terminal(&entry))
             ),
             cplt::link::Unlink::Several(many) => format!(
                 "\n  More than one entry has that name, so cplt is not picking one:\n    {}\n  \
@@ -12975,7 +13017,7 @@ fn offer_clone(project_dir: &Path, identity: &str) -> Option<cplt::link::Candida
     let (bin, args) = clone_command(identity, &dest);
     let mut shown_args = args.clone();
     if let Some(last) = shown_args.last_mut() {
-        *last = sh_quote(last);
+        *last = sh_quote_terminal(last);
     }
     let shown = format!(
         "{} {}",
@@ -18882,5 +18924,28 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("tracked_sensitive_files hung on a planted FIFO");
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn sh_quote_terminal_encodes_control_chars_and_roundtrips() {
+        assert_eq!(sh_quote_terminal("/tmp/my repo"), "'/tmp/my repo'");
+        assert_eq!(sh_quote_terminal("/tmp/it's"), "'/tmp/it'\\''s'");
+
+        let evil = "/tmp/bad\nSPOOF\x1b[31m\r\t'\\dir";
+        let quoted = sh_quote_terminal(evil);
+        assert!(
+            quoted.starts_with("$'") && quoted.ends_with('\''),
+            "{quoted}"
+        );
+        assert!(!quoted.chars().any(is_terminal_unsafe_char), "{quoted}");
+        assert_eq!(quoted, r"$'/tmp/bad\nSPOOF\x1b[31m\r\t\'\\dir'");
+
+        #[allow(clippy::disallowed_methods)] // test fixture: verify POSIX/bash $'...' round-trip
+        let out = std::process::Command::new("/bin/bash")
+            .args(["-c", &format!("printf '%s' {quoted}")])
+            .output()
+            .expect("bash runs");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), evil);
     }
 }
