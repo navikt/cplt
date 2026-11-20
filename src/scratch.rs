@@ -482,7 +482,8 @@ pub fn pnpm_cmd_shim_target(home_dir: &Path, pnpm: &Path) -> Option<PathBuf> {
 
 fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     // The agent can swap a FIFO in for the shim; this read is unsandboxed.
-    let script = crate::untrusted::read_regular_following(pnpm, 4096).ok()??;
+    // Generated NODE_PATH entries can push the trailing target marker past 4 KiB.
+    let script = crate::untrusted::read_regular_following(pnpm, 16 * 1024).ok()??;
     if !script.starts_with("#!/bin/sh") {
         return None;
     }
@@ -2698,6 +2699,12 @@ mod tests {
         };
 
         write_shim(&binary);
+        let script = std::fs::read_to_string(&shim).unwrap();
+        let script = script.replace(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\n#{}\n", " ".repeat(4460)),
+        );
+        std::fs::write(&shim, script).unwrap();
         let source = pnpm_shadow_source(home.path(), &shim)
             .unwrap()
             .expect("a plain binary under global/ needs a shadow");
