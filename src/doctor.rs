@@ -1392,10 +1392,10 @@ pub fn git_config_write_nudge(r: &crate::config::Resolved, bwrap_usable: bool) -
 #[must_use]
 pub fn no_user_config_finding(has_local: bool) -> Finding {
     let message = if has_local {
-        "No user config yet (only a per-repo --local config), so unset keys still run with the \
-         older defaults. `cplt config init` writes a user config with the secure defaults."
+        "No user config yet (only a per-repo --local config). `cplt config init` writes a \
+         user config with the secure defaults."
     } else {
-        "No cplt config yet, so cplt runs with the older defaults. `cplt config init` \
+        "No cplt config yet. `cplt config init` \
          writes a config with the secure defaults."
     };
     Finding::warning(message, Some("cplt config init".to_string()))
