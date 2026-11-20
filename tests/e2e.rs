@@ -6868,6 +6868,286 @@ paths = [
         let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
     }
 
+    /// #1013: repo/checkout paths in `cplt link` (including `Also matched` and
+    /// `sandbox.repo_dirs` output), ambiguous-resolve output, `cplt trust accept repos`,
+    /// and `cplt trust` must escape newlines and ANSI escape sequences.
+    #[test]
+    fn e2e_link_and_trust_accept_escape_newlines_and_ansi_in_paths() {
+        let cfg = tempfile::tempdir().unwrap();
+        let config_file = cfg.path().join("config.toml");
+
+        let init_with_origin = |dir: &Path, remote: &str| {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            for args in [
+                vec!["init", "--quiet"],
+                vec!["remote", "add", "origin", remote],
+            ] {
+                assert!(git_cmd(dir).args(&args).status().expect("git").success());
+            }
+        };
+
+        // 1. `cplt link` with a primary checkout and a weaker `Also matched` clone
+        // whose directory names contain both newlines and ANSI escape sequences.
+        let ws1 = tempfile::tempdir().unwrap();
+        let proj1 = ws1.path().join("proj");
+        init_with_origin(&proj1, "git@github.com:navikt/e2e-esc-proj1.git");
+        let primary = ws1.path().join("esc-lib");
+        init_with_origin(&primary, "git@github.com:navikt/esc-lib.git");
+        let evil_also = ws1.path().join("also\nSPOOF\x1b[31m-clone");
+        init_with_origin(&evil_also, "git@github.com:navikt/esc-lib.git");
+
+        let out = trust_cmd(&proj1, &config_file)
+            .args(["link", "navikt/esc-lib"])
+            .output()
+            .expect("link runs");
+        let out_str = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{out_str}");
+        assert!(!out_str.contains('\x1b'), "raw ESC leaked: {out_str}");
+        assert!(
+            out_str.contains("also\\nSPOOF\\u{1b}[31m-clone"),
+            "Also matched must escape path: {out_str}"
+        );
+        assert!(
+            !out_str.lines().any(|l| l.starts_with("SPOOF")),
+            "newline injected a line: {out_str}"
+        );
+
+        // Linking an explicit directory with newline + ANSI escapes both `→ <path>`
+        // and `sandbox.repo_dirs = [...]`.
+        let evil_named = ws1.path().join("named\nSPOOF\x1b[31m-dir");
+        init_with_origin(&evil_named, "git@github.com:navikt/esc-named.git");
+        let out = trust_cmd(&proj1, &config_file)
+            .args(["link", "navikt/esc-named", evil_named.to_str().unwrap()])
+            .output()
+            .expect("link named runs");
+        let out_str = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{out_str}");
+        assert!(!out_str.contains('\x1b'), "raw ESC leaked: {out_str}");
+        assert!(
+            out_str.contains("named\\nSPOOF\\u{1b}[31m-dir"),
+            "cplt link must escape named path: {out_str}"
+        );
+        assert!(
+            !out_str.lines().any(|l| l.starts_with("SPOOF")),
+            "newline injected a line: {out_str}"
+        );
+
+        // 2. Ambiguous resolve output (`ResolveError::Ambiguous`) escapes paths.
+        let ws2 = tempfile::tempdir().unwrap();
+        let proj2 = ws2.path().join("proj");
+        init_with_origin(&proj2, "git@github.com:navikt/e2e-esc-proj2.git");
+        let ambig_a = ws2.path().join("ambig\nSPOOF\x1b[31m-a");
+        let ambig_b = ws2.path().join("ambig\nSPOOF\x1b[31m-b");
+        init_with_origin(&ambig_a, "git@github.com:navikt/esc-ambig.git");
+        init_with_origin(&ambig_b, "git@github.com:navikt/esc-ambig.git");
+
+        let out = trust_cmd(&proj2, &config_file)
+            .args(["link", "navikt/esc-ambig"])
+            .output()
+            .expect("link ambig runs");
+        assert!(!out.status.success(), "ambiguous link must fail");
+        let err_str = String::from_utf8_lossy(&out.stderr);
+        assert!(!err_str.contains('\x1b'), "raw ESC leaked: {err_str}");
+        assert!(
+            err_str.contains("ambig\\nSPOOF\\u{1b}[31m-a")
+                && err_str.contains("ambig\\nSPOOF\\u{1b}[31m-b"),
+            "ambiguous resolve output must escape paths: {err_str}"
+        );
+        assert!(
+            !err_str.lines().any(|l| l.trim_start().starts_with("SPOOF")),
+            "newline injected a line: {err_str}"
+        );
+
+        // 3. `cplt trust accept repos` and `cplt trust` escape paths on both
+        // initial approval and re-approval ("already linked by an earlier approval"
+        // and "already linked; left as yours").
+        let (repo, trust_cfg) = make_trust_repo(
+            "propose-escape",
+            "[propose]\nrepos = [\"navikt/esc-prop\", \"navikt/esc-yours\"]\n",
+        );
+        let parent = repo.parent().expect("parent");
+        let prop_clone = parent.join("prop\nSPOOF\x1b[31m-clone");
+        let yours_clone = parent.join("yours\nSPOOF\x1b[31m-clone");
+        init_with_origin(&prop_clone, "git@github.com:navikt/esc-prop.git");
+        init_with_origin(&yours_clone, "git@github.com:navikt/esc-yours.git");
+
+        let out = trust_cmd(&repo, &trust_cfg)
+            .args(["link", "navikt/esc-yours"])
+            .output()
+            .expect("hand link runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // First `trust accept repos`: links `esc-prop` and reports `esc-yours` as left as yours.
+        let out = trust_cmd(&repo, &trust_cfg)
+            .args(["trust", "accept", "repos"])
+            .output()
+            .expect("accept 1 runs");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{combined}");
+        assert!(!combined.contains('\x1b'), "raw ESC leaked: {combined}");
+        assert!(
+            combined.contains("prop\\nSPOOF\\u{1b}[31m-clone")
+                && combined.contains("yours\\nSPOOF\\u{1b}[31m-clone")
+                && combined.contains("already linked; left as yours"),
+            "{combined}"
+        );
+        assert!(
+            !combined.lines().any(|l| l.starts_with("SPOOF")),
+            "newline injected a line: {combined}"
+        );
+
+        // Second `trust accept repos`: reports `esc-prop` as already linked by an earlier approval.
+        let out = trust_cmd(&repo, &trust_cfg)
+            .args(["trust", "accept", "repos"])
+            .output()
+            .expect("accept 2 runs");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{combined}");
+        assert!(!combined.contains('\x1b'), "raw ESC leaked: {combined}");
+        assert!(
+            combined.contains("prop\\nSPOOF\\u{1b}[31m-clone")
+                && combined.contains("already linked by an earlier approval"),
+            "{combined}"
+        );
+        assert!(
+            !combined.lines().any(|l| l.starts_with("SPOOF")),
+            "newline injected a line: {combined}"
+        );
+
+        // `cplt trust` escapes both `linked → ...` and `Linked by this approval`.
+        let out = trust_cmd(&repo, &trust_cfg)
+            .args(["trust"])
+            .output()
+            .expect("trust runs");
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{shown}");
+        assert!(!shown.contains('\x1b'), "raw ESC leaked: {shown}");
+        assert!(
+            shown.contains("linked → ")
+                && shown.contains("prop\\nSPOOF\\u{1b}[31m-clone")
+                && shown.contains("yours\\nSPOOF\\u{1b}[31m-clone"),
+            "{shown}"
+        );
+
+        // 4. `offer_clone` clone hint (`cplt trust accept repos` for a missing repo
+        // whose parent directory contains newline + ANSI) uses `$'...'` quoting with
+        // no raw ESC or injected lines.
+        let evil_parent = parent.join("clone-parent\nSPOOF\x1b[31m-dir");
+        let missing_proj = evil_parent.join("proj");
+        init_with_origin(&missing_proj, "git@github.com:navikt/e2e-esc-clone.git");
+        std::fs::write(
+            missing_proj.join(".cplt.toml"),
+            "[propose]\nrepos = [\"navikt/e2e-esc-absent\"]\n",
+        )
+        .unwrap();
+        assert!(
+            git_cmd(&missing_proj)
+                .args(["add", ".cplt.toml"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            git_cmd(&missing_proj)
+                .args([
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@e",
+                    "commit",
+                    "-qm",
+                    "add",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let out = trust_cmd(&missing_proj, &trust_cfg)
+            .args(["trust", "accept", "repos"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("accept absent runs");
+        let err_str = String::from_utf8_lossy(&out.stderr);
+        assert!(!err_str.contains('\x1b'), "raw ESC leaked: {err_str}");
+        assert!(
+            !err_str.lines().any(|l| l.trim_start().starts_with("SPOOF")),
+            "newline injected a line: {err_str}"
+        );
+        assert!(
+            err_str.contains("$'") && err_str.contains("clone-parent\\nSPOOF\\x1b[31m-dir"),
+            "clone hint must use terminal-safe $'...' quoting: {err_str}"
+        );
+
+        // 5. `run_config_set_via` unset hint (`--unset` by leaf name matching a
+        // stored `sandbox.repo_dirs` entry containing newline + ANSI) uses `$'...'`.
+        let unset_lib = evil_parent.join("esc-unset-lib");
+        init_with_origin(&unset_lib, "git@github.com:navikt/esc-unset-lib.git");
+        let link_out = trust_cmd(&missing_proj, &trust_cfg)
+            .args(["link", "navikt/esc-unset-lib", unset_lib.to_str().unwrap()])
+            .output()
+            .expect("link unset lib runs");
+        assert!(
+            link_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&link_out.stderr)
+        );
+        let unset_out = trust_cmd(&missing_proj, &trust_cfg)
+            .args([
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                "./elsewhere/esc-unset-lib",
+                "--unset",
+            ])
+            .output()
+            .expect("unset hint runs");
+        assert!(unset_out.status.success(), "{unset_out:?}");
+        let unset_err = String::from_utf8_lossy(&unset_out.stderr);
+        assert!(!unset_err.contains('\x1b'), "raw ESC leaked: {unset_err}");
+        assert!(
+            !unset_err
+                .lines()
+                .any(|l| l.trim_start().starts_with("SPOOF")),
+            "newline injected a line: {unset_err}"
+        );
+        assert!(
+            unset_err.contains("One entry has that name")
+                && unset_err.contains("$'")
+                && unset_err.contains("clone-parent\\nSPOOF\\x1b[31m-dir/esc-unset-lib"),
+            "unset hint must use terminal-safe $'...' quoting: {unset_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(parent);
+        let _ = std::fs::remove_dir_all(trust_cfg.parent().expect("cfg dir"));
+    }
+
     /// #993: `cplt link --unlink` on an approved repo is reported as not
     /// linked and a bare `trust accept` leaves it unlinked; a partial approval
     /// after a commit drops `repos` keeps the old list, so `cplt trust` still

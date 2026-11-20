@@ -6318,4 +6318,73 @@ done
             "the key-off session end names the worktree.\n{stderr}"
         );
     }
+
+    #[test]
+    fn stale_scratch_worktree_is_named_stale_not_tampering() {
+        require_sandbox!();
+        let project = TempProject::new("wt-stale");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = short_home("wt-stale-home");
+        let canonical_home = fs::canonicalize(home.path()).unwrap();
+        let (root, _) = managed_paths(&project, home.path());
+        fs::create_dir_all(&root).unwrap();
+
+        let session = cplt::scratch::ScratchDir::base(&canonical_home).join("old-session");
+        fs::create_dir_all(&session).unwrap();
+        let wt = session.join("spike");
+        let status = git_cmd(&project.canonical_path())
+            .args(["worktree", "add", "-q", "-b", "spike"])
+            .arg(&wt)
+            .status()
+            .expect("git worktree add");
+        assert!(status.success());
+        fs::remove_dir_all(&session).unwrap();
+
+        // With allow_git_worktrees on: refuses launch with stale message, not tampering.
+        let (stdout, stderr, ok) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            "echo RESULT:ran:OK\n",
+        );
+        assert!(!ok, "launch must fail until pruned.\n{stdout}\n{stderr}");
+        assert!(!stdout.contains("RESULT:ran"), "{stdout}");
+        assert!(
+            stderr.contains("stale worktree from an earlier session")
+                && stderr.contains("git worktree prune"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("do not match what git writes")
+                && !stderr.contains("agent-written config"),
+            "{stderr}"
+        );
+
+        // With allow_git_worktrees off (and existing root): warns as stale, not tampering.
+        let (stdout, stderr, _) =
+            run_exec_with_home(&project, home.path(), "", "echo RESULT:off:OK\n");
+        assert_result_ok(&stdout, &stderr, "off");
+        assert!(
+            stderr.contains("stale worktree from an earlier session")
+                && stderr.contains("git worktree prune"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("do not match what git writes"), "{stderr}");
+
+        // Pruning clears the stale admin entry so allow_git_worktrees succeeds.
+        let pruned = git_cmd(&project.canonical_path())
+            .args(["worktree", "prune"])
+            .status()
+            .expect("git worktree prune");
+        assert!(pruned.success());
+        let (stdout, stderr, ok) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            "echo RESULT:pruned:OK\n",
+        );
+        assert!(ok, "launch must succeed after prune.\n{stdout}\n{stderr}");
+        assert_result_ok(&stdout, &stderr, "pruned");
+    }
 }

@@ -1450,7 +1450,10 @@ fn approval_outlived(linked: &[trust::LinkedRepo]) -> (String, &'static str) {
             "`cplt trust accept --all` removes it, for every worktree of this repository.",
         )
     } else {
-        let roots: Vec<&str> = linked.iter().map(|r| r.path.as_str()).collect();
+        let roots: Vec<String> = linked
+            .iter()
+            .map(|r| cplt::audit::escape_path(&r.path))
+            .collect();
         (
             format!(
                 "{BASE} The repositories it linked are still granted (read+write+exec): {}.",
@@ -2077,21 +2080,35 @@ fn warn_worktrees_not_audited(
     // The session could not write into it, but it could rewrite `commondir`
     // in place, which only the key-on profile denies.
     let problems = match worktree_root {
-        Some(root) => cplt::worktrees::session_end_problems(project_dir, root, max_dirs),
+        Some(root) => cplt::worktrees::session_end_problems(home_dir, project_dir, root, max_dirs),
         None => cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs),
     };
     if !problems.is_empty() {
-        let dirs = cplt::worktrees::problem_dirs(&problems);
-        let details: Vec<String> = problems.iter().map(ToString::to_string).collect();
-        ui::error(&format!(
-            "WORKTREE LINKS CHANGED. Do not run git in these directories until this is \
-             fixed:\n    {}\n  git there would follow a link the agent wrote and could run \
-             agent-written config on this machine. Found:\n    {}\n  The next cplt launch \
-             with sandbox.allow_git_worktrees on refuses to start until they are fixed; with \
-             it off, the launch repeats this error.",
-            dirs.join("\n    "),
-            details.join("\n    ")
-        ));
+        let (tampering, stale) = cplt::worktrees::partition_problems(&problems);
+        if tampering.is_empty() {
+            ui::warn(&format!(
+                "{}.",
+                cplt::worktrees::format_stale_scratch_warning(&stale)
+            ));
+        } else {
+            let dirs = cplt::worktrees::problem_dirs_for(&tampering);
+            let details: Vec<&str> = tampering.iter().map(|p| p.detail.as_str()).collect();
+            let mut msg = format!(
+                "WORKTREE LINKS CHANGED. Do not run git in these directories until this is \
+                 fixed:\n    {}\n  git there would follow a link the agent wrote and could run \
+                 agent-written config on this machine. Found:\n    {}\n  The next cplt launch \
+                 with sandbox.allow_git_worktrees on refuses to start until they are fixed; with \
+                 it off, the launch repeats this error.",
+                dirs.join("\n    "),
+                details.join("\n    ")
+            );
+            if !stale.is_empty() {
+                msg.push_str("\n  Also found ");
+                msg.push_str(&cplt::worktrees::format_stale_scratch_warning(&stale));
+                msg.push('.');
+            }
+            ui::error(&msg);
+        }
     }
     // Detail tier: the table already names the worktree root as persisting.
     if let (true, Some(root)) = (audit_enabled && ui::verbose(), worktree_root) {
@@ -2137,19 +2154,32 @@ fn managed_worktree_root(
         }
         let problems = cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs);
         if !problems.is_empty() {
-            ui::error(&format!(
-                "sandbox.allow_git_worktrees is off, but the worktree root an earlier session \
-                 left has links that do not match what git writes. Do not run git in these \
-                 directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
-                 without git and remove the worktrees involved (delete the directories, then \
-                 run `git worktree prune` from this repository)",
-                cplt::worktrees::problem_dirs(&problems).join("\n    "),
-                problems
-                    .iter()
-                    .map(|p| p.detail.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n    ")
-            ));
+            let (tampering, stale) = cplt::worktrees::partition_problems(&problems);
+            if tampering.is_empty() {
+                ui::warn(&format!(
+                    "{}.",
+                    cplt::worktrees::format_stale_scratch_warning(&stale)
+                ));
+            } else {
+                let mut msg = format!(
+                    "sandbox.allow_git_worktrees is off, but the worktree root an earlier session \
+                     left has links that do not match what git writes. Do not run git in these \
+                     directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
+                     without git and remove the worktrees involved (delete the directories, then \
+                     run `git worktree prune` from this repository)",
+                    cplt::worktrees::problem_dirs_for(&tampering).join("\n    "),
+                    tampering
+                        .iter()
+                        .map(|p| p.detail.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n    ")
+                );
+                if !stale.is_empty() {
+                    msg.push_str("\n  Also found ");
+                    msg.push_str(&cplt::worktrees::format_stale_scratch_warning(&stale));
+                }
+                ui::error(&msg);
+            }
         }
         return Ok(None);
     }
@@ -3514,7 +3544,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                             let where_approved = if t.repo.path.is_empty() {
                                 "an unrecorded location".to_string()
                             } else {
-                                t.repo.path.clone()
+                                cplt::audit::escape_path(&t.repo.path)
                             };
                             // Nothing proposed: there is nothing to re-approve,
                             // and pointing at accept would repeat #560.
@@ -3648,16 +3678,16 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // content hash, and why `--accept-repo-config` alongside `--repo-dir` is
     // NOT refused: nothing here is ambiguous about what it applies to.
     for root in &repo_roots {
+        let shown_root = cplt::audit::escape_path(&root.dir.display().to_string());
         match repo_config::load_repo_config(&root.dir) {
             Ok(Some(loaded)) => {
                 if !resolved.quiet {
                     let proposed = repo_config::proposed_keys(&loaded.config.propose);
                     if !proposed.is_empty() {
                         ui::warn(&format!(
-                            "{} proposes {} in its .cplt.toml. Only the launch repository may \
+                            "{shown_root} proposes {} in its .cplt.toml. Only the launch repository may \
                              propose, so those are not consulted; its [deny] does \
                              apply.",
-                            root.dir.display(),
                             proposed.join(", ")
                         ));
                     }
@@ -3666,13 +3696,13 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // scoped to its own tree: env is process-wide, so this
                         // strips the variable for the whole session.
                         ui::info(&format!(
-                            "{} denies {} for the whole session.",
-                            root.dir.display(),
+                            "{shown_root} denies {} for the whole session.",
                             loaded.config.deny.env.join(", ")
                         ));
                     }
                 }
-                let label = root.dir.join(".cplt.toml").display().to_string();
+                let label =
+                    cplt::audit::escape_path(&root.dir.join(".cplt.toml").display().to_string());
                 warn_unknown_repo_config_keys(&loaded.config, &label);
                 warn_glob_like_deny_paths(
                     &repo_config::glob_like_deny_paths(&loaded.config, &loaded.dir),
@@ -8354,6 +8384,48 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn is_terminal_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// Quote a shell argument for terminal hints without emitting raw control or
+/// formatting characters. Falls back to POSIX `$'...'` ANSI-C quoting when
+/// control/bidi characters are present so pasting in bash/zsh/POSIX.1-2024 sh
+/// reconstructs the exact original argument.
+fn sh_quote_terminal(s: &str) -> String {
+    if !s.chars().any(is_terminal_unsafe_char) {
+        return sh_quote(s);
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push_str("$'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if is_terminal_unsafe_char(c) => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).as_bytes() {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Run a hermetic shell probe inside the resolved sandbox and return its exit
 /// code. `PROBE_SPAWN_FAILED` means the shell could not be resolved/spawned.
 fn probe_shell(
@@ -11375,18 +11447,25 @@ fn run_config_set_via(
         let hint = match cplt::link::choose_unlink(&stored, val, |_: &Path| None) {
             cplt::link::Unlink::NoMatch => String::new(),
             cplt::link::Unlink::Remove(entry) => format!(
-                "\n  One entry has that name:\n    {entry}\n  \
+                "\n  One entry has that name:\n    {}\n  \
                  Remove that one:\n    {}",
-                remove_cmd(&sh_quote(&entry))
+                cplt::audit::escape_path(&entry),
+                remove_cmd(&sh_quote_terminal(&entry))
             ),
             cplt::link::Unlink::Several(many) => format!(
                 "\n  More than one entry has that name, so cplt is not picking one:\n    {}\n  \
                  Remove the one you mean:\n    {}",
-                many.join("\n    "),
+                many.iter()
+                    .map(|s| cplt::audit::escape_path(s))
+                    .collect::<Vec<_>>()
+                    .join("\n    "),
                 remove_cmd("<VALUE>")
             ),
         };
-        ui::warn(&format!("{key}: {val} is not set, nothing removed{hint}"));
+        ui::warn(&format!(
+            "{key}: {} is not set, nothing removed{hint}",
+            cplt::audit::escape_path(val)
+        ));
     }
     if !missing.is_empty() && removed.is_empty() {
         return ExitCode::SUCCESS;
@@ -11402,9 +11481,12 @@ fn run_config_set_via(
         if removed.is_empty() {
             ui::ok(&format!("{key} removed (will use default)"));
         } else {
-            let val = removed.join(", ");
+            let val = cplt::audit::escape_path(&removed.join(", "));
             if let Some(remaining) = config::get_value_from_doc(&doc, op.key_info) {
-                ui::ok(&format!("{key}: removed {val} → {remaining}"));
+                ui::ok(&format!(
+                    "{key}: removed {val} → {}",
+                    cplt::audit::escape_path(&remaining)
+                ));
             } else {
                 ui::ok(&format!("{key}: removed {val} (now empty)"));
             }
@@ -11412,9 +11494,9 @@ fn run_config_set_via(
     } else if append || op.key_info.value_type.is_array() {
         let current =
             config::get_value_from_doc(&doc, op.key_info).unwrap_or_else(|| values.join(", "));
-        ui::ok(&format!("{key} = {current}"));
+        ui::ok(&format!("{key} = {}", cplt::audit::escape_path(&current)));
     } else {
-        ui::ok(&format!("{key} = {}", values[0]));
+        ui::ok(&format!("{key} = {}", cplt::audit::escape_path(values[0])));
     }
 
     // Config is read once, at launch. A session already running keeps the
@@ -11980,7 +12062,7 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
 
     ui::info(&format!(
         "{repo} → {} ({}, origin verified)",
-        found.dir.display(),
+        cplt::audit::escape_path(&found.dir.display().to_string()),
         found.how.describe()
     ));
     if found.worktrees > 0 {
@@ -12003,7 +12085,7 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
             found
                 .also
                 .iter()
-                .map(|c| c.dir.display().to_string())
+                .map(|c| cplt::audit::escape_path(&c.dir.display().to_string()))
                 .collect::<Vec<_>>()
                 .join(", "),
             ui::color(ui::RESET)
@@ -12081,7 +12163,10 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
             cplt::repo_config::REPO_CONFIG_FILE
         )),
         Err(e) => {
-            ui::error(&format!("Could not update {}: {e}", path.display()));
+            ui::error(&format!(
+                "Could not update {}: {e}",
+                cplt::audit::escape_path(&path.display().to_string())
+            ));
             return ExitCode::FAILURE;
         }
     }
@@ -12200,7 +12285,11 @@ fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
                 "Nothing linked here is {identity}. Linked:\n  {}\n  \
                  Remove one by path:\n    \
                  cplt config set --local sandbox.repo_dirs <DIR> --unset",
-                linked.join("\n  ")
+                linked
+                    .iter()
+                    .map(|p| cplt::audit::escape_path(p))
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
             ));
             ExitCode::FAILURE
         }
@@ -12210,7 +12299,10 @@ fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
                  picking one:\n  {}\n  \
                  Remove the one you mean:\n    \
                  cplt config set --local sandbox.repo_dirs <DIR> --unset",
-                many.join("\n  ")
+                many.iter()
+                    .map(|p| cplt::audit::escape_path(p))
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
             ));
             ExitCode::FAILURE
         }
@@ -12320,9 +12412,9 @@ fn trust_state(
                     ".cplt.toml for this remote was approved in a different repository ({}), \
                      so cplt is not auto-trusting it here.{}",
                     if t.repo.path.is_empty() {
-                        "an unrecorded location"
+                        "an unrecorded location".to_string()
                     } else {
-                        &t.repo.path
+                        cplt::audit::escape_path(&t.repo.path)
                     },
                     // `trust accept` refuses a live foreign entry.
                     if trust::approval_is_orphaned(t) {
@@ -12415,7 +12507,7 @@ fn proposed_repo_lines(
                     .find(|(_, id)| cplt::gh_proxy::repos_match(id, identity))
                     .map_or_else(
                         || "linked".to_string(),
-                        |(dir, _)| format!("linked → {dir}"),
+                        |(dir, _)| format!("linked → {}", cplt::audit::escape_path(dir)),
                     )
             };
             if new {
@@ -12624,7 +12716,11 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                 "{blue}[cplt]{nc}  {green}Linked by this approval{nc} (read+write+exec, removed by `cplt trust revoke repos`):"
             );
             for repo in &entry.accepted.linked {
-                println!("{blue}[cplt]{nc}    {} → {}", repo.identity, repo.path);
+                println!(
+                    "{blue}[cplt]{nc}    {} → {}",
+                    repo.identity,
+                    cplt::audit::escape_path(&repo.path)
+                );
             }
             println!();
         }
@@ -12659,9 +12755,9 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             println!(
                 "{blue}[cplt]{nc}  {red}⚠ Approved in a different repository ({}), not auto-trusted here.{nc}",
                 if entry.repo.path.is_empty() {
-                    "unrecorded"
+                    "unrecorded".to_string()
                 } else {
-                    &entry.repo.path
+                    cplt::audit::escape_path(&entry.repo.path)
                 }
             );
             // Nothing proposed: nothing to approve, so no accept to point at
@@ -12839,10 +12935,11 @@ fn link_proposed_repos(
             // repos` delete a root the user linked by hand (#496 review). A root
             // an earlier approval made is still that approval's, and revoke
             // removes it, so say which it is (#983).
+            let shown_path = cplt::audit::escape_path(&path);
             if prior.iter().any(|l| l.path == path) {
-                println!("  • {identity} → {path} (already linked by an earlier approval)");
+                println!("  • {identity} → {shown_path} (already linked by an earlier approval)");
             } else {
-                println!("  • {identity} → {path} (already linked; left as yours)");
+                println!("  • {identity} → {shown_path} (already linked; left as yours)");
             }
             let _ = config::set_linked_identity(project_dir, &path, Some(identity));
             continue;
@@ -12947,7 +13044,7 @@ fn offer_clone(project_dir: &Path, identity: &str) -> Option<cplt::link::Candida
     let (bin, args) = clone_command(identity, &dest);
     let mut shown_args = args.clone();
     if let Some(last) = shown_args.last_mut() {
-        *last = sh_quote(last);
+        *last = sh_quote_terminal(last);
     }
     let shown = format!(
         "{} {}",
@@ -12960,18 +13057,18 @@ fn offer_clone(project_dir: &Path, identity: &str) -> Option<cplt::link::Candida
     // Not `exists()`: that follows a symlink, and a dangling one is still
     // something cplt must not clone through.
     let occupied = std::fs::symlink_metadata(&dest).is_ok();
+    let shown_dest = cplt::audit::escape_path(&dest.display().to_string());
     if occupied || bin.is_none() || !interactive {
         if occupied {
             eprintln!(
-                "  {} exists but is not {identity}, so cplt will not clone into it.",
-                dest.display()
+                "  {shown_dest} exists but is not {identity}, so cplt will not clone into it."
             );
         }
         eprintln!("  Clone it beside this repository, then approve again:");
         eprintln!("    {shown} && cplt trust accept repos");
         return None;
     }
-    eprint!("Clone {identity} into {}? [Y/n] ", dest.display());
+    eprint!("Clone {identity} into {shown_dest}? [Y/n] ");
     let mut answer = String::new();
     let read = std::io::stdin()
         .read_line(&mut answer)
@@ -13067,7 +13164,8 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
             ui::warn(&format!(
                 "{} is recorded as linked for {} but is not in this checkout's config. \
                  If it is still in scope, remove it by path.",
-                repo.path, repo.identity
+                cplt::audit::escape_path(&repo.path),
+                repo.identity
             ));
             continue;
         };
@@ -13075,7 +13173,11 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
             identity: repo.identity.clone(),
             path: entry.clone(),
         };
-        println!("  • unlinking {} ({})", repo.identity, repo.path);
+        println!(
+            "  • unlinking {} ({})",
+            repo.identity,
+            cplt::audit::escape_path(&repo.path)
+        );
         let _ = config::set_linked_identity(project_dir, &repo.path, None);
         run_config_set(
             "sandbox.repo_dirs",
@@ -13224,7 +13326,7 @@ fn trust_accept(
              covered. To approve here instead, drop that approval first: run\n  \
              `cplt trust revoke --all` here, or in that checkout if it is still the\n  \
              repository you approved.",
-            t.repo.path
+            cplt::audit::escape_path(&t.repo.path)
         ));
         return ExitCode::FAILURE;
     }
@@ -18925,5 +19027,28 @@ mod tests {
             "{}",
             msgs[0]
         );
+    }
+
+    #[test]
+    fn sh_quote_terminal_encodes_control_chars_and_roundtrips() {
+        assert_eq!(sh_quote_terminal("/tmp/my repo"), "'/tmp/my repo'");
+        assert_eq!(sh_quote_terminal("/tmp/it's"), "'/tmp/it'\\''s'");
+
+        let evil = "/tmp/bad\nSPOOF\x1b[31m\r\t'\\dir";
+        let quoted = sh_quote_terminal(evil);
+        assert!(
+            quoted.starts_with("$'") && quoted.ends_with('\''),
+            "{quoted}"
+        );
+        assert!(!quoted.chars().any(is_terminal_unsafe_char), "{quoted}");
+        assert_eq!(quoted, r"$'/tmp/bad\nSPOOF\x1b[31m\r\t\'\\dir'");
+
+        #[allow(clippy::disallowed_methods)] // test fixture: verify POSIX/bash $'...' round-trip
+        let out = std::process::Command::new("/bin/bash")
+            .args(["-c", &format!("printf '%s' {quoted}")])
+            .output()
+            .expect("bash runs");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), evil);
     }
 }

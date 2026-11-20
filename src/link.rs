@@ -110,7 +110,11 @@ impl std::fmt::Display for ResolveError {
             Self::NotFound { searched, scanned } => {
                 writeln!(f, "No checkout of that repository was found. Looked at:")?;
                 for dir in searched {
-                    writeln!(f, "  {}", dir.display())?;
+                    writeln!(
+                        f,
+                        "  {}",
+                        crate::audit::escape_path(&dir.display().to_string())
+                    )?;
                 }
                 if *scanned > 0 {
                     // The scan reads origins, so naming every directory would be
@@ -134,7 +138,12 @@ impl std::fmt::Display for ResolveError {
                      picking one:"
                 )?;
                 for c in found {
-                    writeln!(f, "  {} ({})", c.dir.display(), c.how.describe())?;
+                    writeln!(
+                        f,
+                        "  {} ({})",
+                        crate::audit::escape_path(&c.dir.display().to_string()),
+                        c.how.describe()
+                    )?;
                 }
                 write!(
                     f,
@@ -382,24 +391,27 @@ pub fn verify_named(dir: &Path, project_dir: &Path, identity: &str) -> Result<Ca
     }
     let real_git =
         crate::git::trusted_git().ok_or_else(|| ResolveError::NoTrustedGit.to_string())?;
-    let canonical =
-        std::fs::canonicalize(dir).map_err(|e| format!("Cannot resolve {}: {e}", dir.display()))?;
+    let canonical = std::fs::canonicalize(dir).map_err(|e| {
+        format!(
+            "Cannot resolve {}: {e}",
+            crate::audit::escape_path(&dir.display().to_string())
+        )
+    })?;
+    let shown_canonical = crate::audit::escape_path(&canonical.display().to_string());
     // Same rule as the search, for the same reason: a tree inside the launch
     // repository is agent-writable, so linking it grants nothing new and
     // vouches for an identity a previous session could have written.
     let project = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
     if canonical.starts_with(&project) {
         return Err(format!(
-            "{} is inside the launch repository, which is already in scope — and is \
+            "{shown_canonical} is inside the launch repository, which is already in scope — and is \
              writable from the sandbox, so a checkout there may be one a previous \
-             session created.",
-            canonical.display()
+             session created."
         ));
     }
     if !is_toplevel(&canonical) {
         return Err(format!(
-            "{} is not the toplevel of a git repository.",
-            canonical.display()
+            "{shown_canonical} is not the toplevel of a git repository."
         ));
     }
     match identity_of(real_git, &canonical) {
@@ -409,15 +421,22 @@ pub fn verify_named(dir: &Path, project_dir: &Path, identity: &str) -> Result<Ca
             also: Vec::new(),
             worktrees: 0,
         }),
-        Some(found) => Err(format!(
-            "{} is {found}, not {identity}.\n  \
-             Link it as itself if that is what you meant:\n    cplt link {found}",
-            canonical.display()
-        )),
+        Some(found) => {
+            let shown_found = crate::audit::escape_path(&found);
+            if is_valid_identity(&found) {
+                Err(format!(
+                    "{shown_canonical} is {shown_found}, not {identity}.\n  \
+                     Link it as itself if that is what you meant:\n    cplt link {found}"
+                ))
+            } else {
+                Err(format!(
+                    "{shown_canonical} is {shown_found}, not {identity}."
+                ))
+            }
+        }
         None => Err(format!(
-            "Could not read a GitHub origin for {}, so cplt cannot confirm it is {identity}.\n  \
-             A fork, a repository with no `origin`, or a non-GitHub remote all look like this.",
-            canonical.display()
+            "Could not read a GitHub origin for {shown_canonical}, so cplt cannot confirm it is {identity}.\n  \
+             A fork, a repository with no `origin`, or a non-GitHub remote all look like this."
         )),
     }
 }
@@ -946,5 +965,92 @@ mod tests {
         )
         .expect_err("must fail closed");
         assert!(matches!(err, ResolveError::NotFound { .. }), "{err}");
+    }
+
+    #[test]
+    fn resolve_error_and_verify_named_escape_newlines_and_ansi() {
+        let evil_a = PathBuf::from("/tmp/evil\nspoof\x1b[31m-a");
+        let evil_b = PathBuf::from("/tmp/evil\nspoof\x1b[31m-b");
+
+        let ambig = ResolveError::Ambiguous(vec![
+            Candidate {
+                dir: evil_a.clone(),
+                how: Found::RenamedClone,
+                also: Vec::new(),
+                worktrees: 0,
+            },
+            Candidate {
+                dir: evil_b.clone(),
+                how: Found::RenamedClone,
+                also: Vec::new(),
+                worktrees: 0,
+            },
+        ])
+        .to_string();
+        assert!(!ambig.contains('\x1b'), "raw ESC leaked: {ambig}");
+        assert!(
+            ambig.contains("/tmp/evil\\nspoof\\u{1b}[31m-a"),
+            "escaped path missing: {ambig}"
+        );
+        assert!(
+            ambig.contains("/tmp/evil\\nspoof\\u{1b}[31m-b"),
+            "escaped path missing: {ambig}"
+        );
+        assert!(
+            !ambig.lines().any(|l| l.starts_with("spoof")),
+            "newline injected a line: {ambig}"
+        );
+
+        let not_found = ResolveError::NotFound {
+            searched: vec![evil_a],
+            scanned: 0,
+        }
+        .to_string();
+        assert!(!not_found.contains('\x1b'), "raw ESC leaked: {not_found}");
+        assert!(
+            not_found.contains("/tmp/evil\\nspoof\\u{1b}[31m-a"),
+            "{not_found}"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let project = root.join("spleis");
+        make_repo(&project, "navikt/spleis");
+        let evil_named = project.join("sub\nspoof\x1b[31mdir");
+        make_repo(&evil_named, "navikt/sykepenger-model");
+        let err = verify_named(&evil_named, &project, "navikt/sykepenger-model")
+            .expect_err("must refuse");
+        assert!(!err.contains('\x1b'), "raw ESC leaked: {err}");
+        assert!(
+            err.contains("sub\\nspoof\\u{1b}[31mdir"),
+            "escaped path missing: {err}"
+        );
+        assert!(
+            !err.lines().any(|l| l.starts_with("spoof")),
+            "newline injected a line: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_named_escapes_invalid_origin_identity_and_omits_copyable_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let project = root.join("spleis");
+        make_repo(&project, "navikt/spleis");
+
+        let evil = root.join("evil-origin");
+        make_repo(&evil, "evil\x1b[31m/thing\tspoof");
+        let err =
+            verify_named(&evil, &project, "navikt/sykepenger-model").expect_err("must refuse");
+        assert!(!err.contains('\x1b'), "raw ESC leaked: {err}");
+        assert!(!err.contains('\t'), "raw tab leaked: {err}");
+        assert!(
+            err.contains("evil\\u{1b}[31m/thing\\tspoof"),
+            "escaped identity missing: {err}"
+        );
+        assert!(
+            !err.contains("cplt link "),
+            "must not offer copyable link command for invalid identity: {err}"
+        );
     }
 }

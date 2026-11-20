@@ -1346,9 +1346,9 @@ two layers. Running `cplt check` from outside the sandbox reports the same
 policy either way.
 
 **`sandbox.brief`** — on in configs written by `cplt config init` (#967); a
-config without the key keeps it off, and `cplt doctor` suggests setting it
-either way. It writes two files into the per-session scratch directory (the one
-`$TMPDIR` points at inside the sandbox):
+config without the key keeps it off, and `cplt doctor` with `--verbose`
+suggests setting it either way. It writes two files into the per-session scratch
+directory (the one `$TMPDIR` points at inside the sandbox):
 
 | File | For | Named by |
 | --- | --- | --- |
