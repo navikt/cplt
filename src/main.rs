@@ -9545,6 +9545,21 @@ fn doctor_pnpm_state(
     let kind = if pinned {
         "the packageManager pin"
     } else if !shadowed {
+        if target.is_none()
+            && scratch::pnpm_home_roots(home_dir)
+                .iter()
+                .any(|root| pnpm == root.join("bin/pnpm"))
+            && let Some(size) = scratch::oversized_pnpm_shim(pnpm)
+        {
+            return Some(Err(cplt::doctor::Finding::warning(
+                format!(
+                    "pnpm entry point is {} bytes, above cplt's {}-byte launcher inspection limit; no sandbox copy was made.",
+                    size,
+                    scratch::PNPM_SHIM_LIMIT
+                ),
+                Some("report a cplt bug with the `cplt doctor` output".to_string()),
+            )));
+        }
         let target = target?;
         // A JS launcher hands the target to node, which only reads it.
         if launcher_runs_through_interpreter(pnpm, &target) {

@@ -480,9 +480,25 @@ pub fn pnpm_cmd_shim_target(home_dir: &Path, pnpm: &Path) -> Option<PathBuf> {
     pnpm_cmd_shim_target_in(pnpm, &roots)
 }
 
+pub const PNPM_SHIM_LIMIT: u64 = 16 * 1024;
+
+pub fn oversized_pnpm_shim(path: &Path) -> Option<u64> {
+    use std::io::Read;
+
+    let mut file = crate::untrusted::open_untrusted(path).ok()??;
+    let size = file.metadata().ok()?.len();
+    if size <= PNPM_SHIM_LIMIT {
+        return None;
+    }
+    let mut prefix = [0; 9];
+    file.read_exact(&mut prefix).ok()?;
+    (&prefix == b"#!/bin/sh").then_some(size)
+}
+
 fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     // The agent can swap a FIFO in for the shim; this read is unsandboxed.
-    let script = crate::untrusted::read_regular_following(pnpm, 4096).ok()??;
+    // Generated NODE_PATH entries can push the trailing target marker past 4 KiB.
+    let script = crate::untrusted::read_regular_following(pnpm, PNPM_SHIM_LIMIT).ok()??;
     if !script.starts_with("#!/bin/sh") {
         return None;
     }
@@ -2670,6 +2686,18 @@ mod tests {
     }
 
     #[test]
+    fn oversized_pnpm_shim_requires_shell_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm");
+        let mut bytes = vec![0; PNPM_SHIM_LIMIT as usize + 1];
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(oversized_pnpm_shim(&path), None);
+        bytes[..9].copy_from_slice(b"#!/bin/sh");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(oversized_pnpm_shim(&path), Some(PNPM_SHIM_LIMIT + 1));
+    }
+
+    #[test]
     fn pnpm_cmd_shim_target_in_global_without_store_alias_is_shadowed() {
         // #936: pnpm 12 installs `@pnpm/exe/pnpm` under `global/` as a plain
         // file (nlink 1), no hardlink into the store. The shim still execs it
@@ -2698,6 +2726,12 @@ mod tests {
         };
 
         write_shim(&binary);
+        let script = std::fs::read_to_string(&shim).unwrap();
+        let script = script.replace(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\n#{}\n", " ".repeat(4460)),
+        );
+        std::fs::write(&shim, script).unwrap();
         let source = pnpm_shadow_source(home.path(), &shim)
             .unwrap()
             .expect("a plain binary under global/ needs a shadow");
