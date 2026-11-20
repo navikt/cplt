@@ -480,10 +480,12 @@ pub fn pnpm_cmd_shim_target(home_dir: &Path, pnpm: &Path) -> Option<PathBuf> {
     pnpm_cmd_shim_target_in(pnpm, &roots)
 }
 
+pub const PNPM_SHIM_LIMIT: u64 = 16 * 1024;
+
 fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     // The agent can swap a FIFO in for the shim; this read is unsandboxed.
     // Generated NODE_PATH entries can push the trailing target marker past 4 KiB.
-    let script = crate::untrusted::read_regular_following(pnpm, 16 * 1024).ok()??;
+    let script = crate::untrusted::read_regular_following(pnpm, PNPM_SHIM_LIMIT).ok()??;
     if !script.starts_with("#!/bin/sh") {
         return None;
     }
