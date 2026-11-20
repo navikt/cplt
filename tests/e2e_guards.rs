@@ -246,7 +246,8 @@ fn git_gate_inner(
         std::path::PathBuf::from("/usr/bin/true")
     };
     let mut cmd = cplt_cmd();
-    cmd.arg("git-gate")
+    cmd.env_remove("CPLT_WORKTREE_SOCKET")
+        .arg("git-gate")
         .arg("--real-git")
         .arg(&real_git)
         .arg(format!("--mode={mode}"))
