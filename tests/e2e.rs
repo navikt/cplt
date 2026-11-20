@@ -8251,6 +8251,68 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// #1010: when a legacy whole-proposal entry (no `key_hashes`) lapses
+    /// because another key was added to `.cplt.toml`, `cplt trust accept`
+    /// must not claim the untouched keys "changed or were removed".
+    #[test]
+    fn e2e_trust_legacy_whole_hash_change_prints_precise_message() {
+        let (repo, config_file) = make_trust_repo(
+            "legacy-whole-hash-msg",
+            "[propose]\nallow_localhost_any = true\nallow_jvm_attach = true\n",
+        );
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(out.status.success(), "{out:?}");
+
+        let files = trust_store_files(&config_file);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let mut entry: cplt::trust::TrustEntry = toml::from_str(&files[0].1).unwrap();
+        assert!(!entry.accepted.content_hash.is_empty());
+        entry.accepted.key_hashes.clear();
+        std::fs::write(&files[0].0, toml::to_string(&entry).unwrap()).unwrap();
+
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\nallow_jvm_attach = true\nallow_docker = true\n",
+        )
+        .unwrap();
+        git_cmd(&repo).args(["add", ".cplt.toml"]).output().unwrap();
+        git_cmd(&repo)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "add allow_docker",
+                "--quiet",
+            ])
+            .output()
+            .unwrap();
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "allow_docker"])
+            .output()
+            .expect("accept should run");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("predates per-key value pinning"),
+            "legacy whole-hash lapse must explain why untouched keys lapsed:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("changed or were removed"),
+            "must not claim untouched keys changed or were removed:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("allow_jvm_attach, allow_localhost_any"),
+            "must still name the lapsed keys:\n{stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// The #1002 smoke test: proposing one more repository puts only `repos`
     /// back to pending. The other keys keep their approval.
     #[test]

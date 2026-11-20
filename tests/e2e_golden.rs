@@ -1611,6 +1611,18 @@ fn golden_doctor_reports_launch_refusals_and_ignored_repo_keys() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+fn assert_no_existing_config_nudges(out: &str, err: &str) {
+    for nudge in [
+        "cplt config set proxy.forced true",
+        "cplt config set sandbox.allow_copilot_host_persistence false",
+        "proxy.inject_github_token is not set",
+        "cplt config set sandbox.allow_git_config_write false",
+        "cplt config set sandbox.mask_missing_deny_paths true",
+    ] {
+        assert!(!out.contains(nudge), "unexpected `{nudge}`:\n{out}{err}");
+    }
+}
+
 /// #1005: a user with no config gets one pointer to `cplt config init`, not
 /// the per-key "New configs" nudges meant for an existing config, which
 /// still get them.
@@ -1624,10 +1636,7 @@ fn golden_doctor_new_user_gets_one_config_init_pointer() {
         out.contains("No cplt config yet"),
         "a new user must be pointed at `cplt config init`:\n{out}{err}"
     );
-    assert!(
-        !out.contains("New configs"),
-        "a new user must not get the existing-config nudges:\n{out}{err}"
-    );
+    assert_no_existing_config_nudges(&out, &err);
 
     let cfg = home.join(".config/cplt");
     std::fs::create_dir_all(&cfg).unwrap();
@@ -1640,6 +1649,55 @@ fn golden_doctor_new_user_gets_one_config_init_pointer() {
     assert!(
         out.contains("proxy.inject_github_token is not set"),
         "an existing config keeps its nudge as a warning:\n{out}{err}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #1010: a user with only a `--local` config (for example from `cplt link` or
+/// `cplt trust accept`) still has no global user config, so doctor keeps the
+/// `cplt config init` pointer instead of firing the per-key "New configs"
+/// nudges, while acknowledging that a local layer is present.
+#[test]
+fn golden_doctor_local_only_config_still_points_to_config_init() {
+    let home = make_config_home("golden-doctor-local-only");
+    let repo = temp_repo("navikt/probe");
+
+    let (_, set_err, set_status) = launch(
+        &home,
+        repo.path(),
+        &["config", "set", "--local", "allow.ports", "8080"],
+    );
+    assert!(
+        set_status.success(),
+        "set --local should succeed:\n{set_err}"
+    );
+
+    let (out, err, _) = launch(&home, repo.path(), &["--with-proxy", "doctor"]);
+    assert!(
+        out.contains("local (per-repo)"),
+        "doctor must show the local layer:\n{out}{err}"
+    );
+    assert!(
+        out.contains("No user config yet (only a per-repo --local config)"),
+        "local-only setup must point to `cplt config init` without claiming no config exists:\n{out}{err}"
+    );
+    assert!(
+        out.contains("cplt config init"),
+        "local-only setup must still suggest `cplt config init`:\n{out}{err}"
+    );
+    assert_no_existing_config_nudges(&out, &err);
+
+    let cfg = home.join(".config/cplt");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "# an older user config\n").unwrap();
+    let (out, err, _) = launch(&home, repo.path(), &["--with-proxy", "doctor"]);
+    assert!(
+        !out.contains("No user config yet"),
+        "an existing user config must not be told it has none:\n{out}{err}"
+    );
+    assert!(
+        out.contains("proxy.inject_github_token is not set"),
+        "an existing user config gets its per-key nudges:\n{out}{err}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

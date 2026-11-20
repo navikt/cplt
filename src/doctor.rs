@@ -1385,15 +1385,20 @@ pub fn git_config_write_nudge(r: &crate::config::Resolved, bwrap_usable: bool) -
     })
 }
 
-/// #1005: with no user config, the per-key "new configs" nudges would all
-/// fire on day one. One pointer to `cplt config init` replaces them.
+/// #1005 / #1010: with no global user config, the per-key "new configs" nudges
+/// would all fire on day one (including when only a `--local` file exists,
+/// e.g. from `cplt link` or `cplt trust accept`). One pointer to
+/// `cplt config init` replaces them.
 #[must_use]
-pub fn no_user_config_finding() -> Finding {
-    Finding::warning(
-        "No cplt config yet, so cplt runs with the older defaults. `cplt config init` \
-         writes a config with the secure defaults.",
-        Some("cplt config init".to_string()),
-    )
+pub fn no_user_config_finding(has_local: bool) -> Finding {
+    let message = if has_local {
+        "No user config yet (only a per-repo --local config). `cplt config init` writes a \
+         user config with the secure defaults."
+    } else {
+        "No cplt config yet. `cplt config init` \
+         writes a config with the secure defaults."
+    };
+    Finding::warning(message, Some("cplt config init".to_string()))
 }
 
 /// Exit non-zero iff something is blocking — the contract the old doctor had
@@ -2337,5 +2342,23 @@ mod tests {
             assert!(f.message.contains(key), "{key} missing: {}", f.message);
         }
         assert!(!f.message.contains("future"), "{}", f.message);
+    }
+
+    #[test]
+    fn no_user_config_finding_distinguishes_local_only_from_unconfigured() {
+        let none = no_user_config_finding(false);
+        assert_eq!(none.level, Level::Warning);
+        assert!(none.message.contains("No cplt config yet"), "{none:?}");
+        assert_eq!(none.fix.as_deref(), Some("cplt config init"));
+
+        let local_only = no_user_config_finding(true);
+        assert_eq!(local_only.level, Level::Warning);
+        assert!(
+            local_only
+                .message
+                .contains("No user config yet (only a per-repo --local config)"),
+            "{local_only:?}"
+        );
+        assert_eq!(local_only.fix.as_deref(), Some("cplt config init"));
     }
 }
