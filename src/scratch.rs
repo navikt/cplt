@@ -482,6 +482,19 @@ pub fn pnpm_cmd_shim_target(home_dir: &Path, pnpm: &Path) -> Option<PathBuf> {
 
 pub const PNPM_SHIM_LIMIT: u64 = 16 * 1024;
 
+pub fn oversized_pnpm_shim(path: &Path) -> Option<u64> {
+    use std::io::Read;
+
+    let mut file = crate::untrusted::open_untrusted(path).ok()??;
+    let size = file.metadata().ok()?.len();
+    if size <= PNPM_SHIM_LIMIT {
+        return None;
+    }
+    let mut prefix = [0; 9];
+    file.read_exact(&mut prefix).ok()?;
+    (&prefix == b"#!/bin/sh").then_some(size)
+}
+
 fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     // The agent can swap a FIFO in for the shim; this read is unsandboxed.
     // Generated NODE_PATH entries can push the trailing target marker past 4 KiB.
@@ -2670,6 +2683,18 @@ mod tests {
                 assert!(shadow.path().join("dist").join(file).exists());
             }
         }
+    }
+
+    #[test]
+    fn oversized_pnpm_shim_requires_shell_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm");
+        let mut bytes = vec![0; PNPM_SHIM_LIMIT as usize + 1];
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(oversized_pnpm_shim(&path), None);
+        bytes[..9].copy_from_slice(b"#!/bin/sh");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(oversized_pnpm_shim(&path), Some(PNPM_SHIM_LIMIT + 1));
     }
 
     #[test]

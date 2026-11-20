@@ -9477,14 +9477,12 @@ fn doctor_pnpm_state(
             && scratch::pnpm_home_roots(home_dir)
                 .iter()
                 .any(|root| pnpm == root.join("bin/pnpm"))
-            && let Ok(meta) = std::fs::metadata(pnpm)
-            && meta.is_file()
-            && meta.len() > scratch::PNPM_SHIM_LIMIT
+            && let Some(size) = scratch::oversized_pnpm_shim(pnpm)
         {
             return Some(Err(cplt::doctor::Finding::warning(
                 format!(
                     "pnpm entry point is {} bytes, above cplt's {}-byte launcher inspection limit; no sandbox copy was made.",
-                    meta.len(),
+                    size,
                     scratch::PNPM_SHIM_LIMIT
                 ),
                 Some("report a cplt bug with the `cplt doctor` output".to_string()),
