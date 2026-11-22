@@ -49,11 +49,13 @@ const EMBEDDING_VARS: &[&str] = &["OPENCODE_AUTH_CONTENT"];
 /// otherwise.
 pub const USER_CA_VARS: &[&str] = &["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO"];
 
-/// System root bundles, first hit wins: macOS / Alpine / Arch, Debian /
-/// Ubuntu, Fedora / RHEL, openSUSE.
+/// System root bundles, first hit wins: macOS / Alpine, Debian / Ubuntu,
+/// Arch, Fedora / RHEL, openSUSE. Arch only links to its bundle from
+/// `/etc/ssl`, and `read_ca_file` refuses symlinks, so list the real file.
 const SYSTEM_BUNDLES: &[&str] = &[
     "/etc/ssl/cert.pem",
     "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
     "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/ca-bundle.pem",
