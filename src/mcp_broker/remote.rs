@@ -136,18 +136,15 @@ pub struct Endpoint {
     pub(crate) pending: Mutex<Pending>,
 }
 
-/// The per-exchange view of an endpoint's policy: the audit line of the
-/// last `tools/call` this exchange answered is kept here, not in the
-/// shared `Pending`, so concurrent connections never log each other's.
+/// The per-exchange view of an endpoint's policy: the audit lines of the
+/// `tools/call`s this exchange answered are kept here, not in the shared
+/// `Pending`, so concurrent connections never log each other's.
 struct Filter<'a> {
     spec: &'a Spec,
     pending: &'a Mutex<Pending>,
-    audit: Option<String>,
+    audit: Vec<String>,
     /// This exchange's `Mcp-Session-Id` ("" if none): ids are per session.
     session: String,
-    /// An event with an `id:` passed, so the client may resume the stream
-    /// with `Last-Event-ID` and get the response there.
-    resumable: bool,
 }
 
 impl<'a> Filter<'a> {
@@ -173,15 +170,10 @@ struct OwnId<'a> {
     sent: std::time::Instant,
     /// The upstream status, or why there was none.
     outcome: String,
-    /// A resumable stream: leave the id for the resumed GET or eviction.
-    keep: bool,
 }
 
 impl Drop for OwnId<'_> {
     fn drop(&mut self) {
-        if self.keep {
-            return;
-        }
         let freed = self
             .ep
             .pending
@@ -580,9 +572,8 @@ impl Endpoint {
         let mut filter = self.policy.as_ref().map(|spec| Filter {
             spec,
             pending: &self.pending,
-            audit: None,
+            audit: Vec::new(),
             session: header("mcp-session-id").unwrap_or_default().to_string(),
-            resumable: false,
         });
         // A session-less `initialize` creates a session, so two of them
         // never share ids: each gets a namespace no header value can name.
@@ -594,6 +585,23 @@ impl Endpoint {
             static INIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = INIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             f.session = format!("\ninitialize {n}");
+        }
+        // Stream resume is not supported: every exchange frees its ids and
+        // writes its audit lines when it ends, so nothing is left to resume.
+        if self.policy.is_some() && header("last-event-id").is_some() {
+            let msg = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"SSE stream resume (Last-Event-ID) is not supported by cplt's MCP broker"}}"#;
+            let _ = write!(
+                client,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}",
+                msg.len()
+            );
+            return log.line(
+                &self.tag,
+                &self.upstream,
+                true,
+                method,
+                "FAIL stream resume not supported",
+            );
         }
         // Only a POST body is checked, so no other method may carry one.
         if self.policy.is_some() && method != "POST" && !body.is_empty() {
@@ -615,7 +623,7 @@ impl Endpoint {
                 // curl gives up at the same deadline, so nothing is left to cancel.
                 let evicted = p.evict(std::time::Duration::from_secs(self.timeout_secs));
                 let action = on_client(&String::from_utf8_lossy(&body), f.spec, &f.session, &mut p);
-                f.audit = p.1.take();
+                f.audit.extend(p.1.take());
                 if let Action::Forward(line) = &action {
                     let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
                     let id = v.get("id").filter(|_| v.get("method").is_some());
@@ -629,7 +637,6 @@ impl Endpoint {
                             id,
                             sent,
                             outcome: "upstream not reached".into(),
-                            keep: false,
                         })
                     });
                 }
@@ -744,10 +751,8 @@ impl Endpoint {
         if let Some(own) = &mut own {
             let code = status.as_ref().map(|(c, _)| c.as_str());
             own.outcome = code.unwrap_or("upstream").to_string();
-            own.keep = code.is_some_and(|c| c.starts_with('2'))
-                && filter.as_ref().is_some_and(|f| f.resumable);
         }
-        if let Some(audit) = filter.and_then(|f| f.audit) {
+        for audit in filter.map(|f| f.audit).unwrap_or_default() {
             log.line(
                 &self.tag,
                 &self.upstream,
@@ -911,9 +916,7 @@ fn filter_message(data: &[u8], f: &mut Filter) -> Result<String, &'static str> {
     let action = {
         let mut p = f.lock();
         let action = on_server(text, f.spec, &f.session, &mut p);
-        if let Some(a) = p.1.take() {
-            f.audit = Some(a);
-        }
+        f.audit.extend(p.1.take());
         action
     };
     Ok(match action {
@@ -973,7 +976,6 @@ fn filter_events(
                 return Err("unknown event field");
             }
         }
-        f.resumable |= fields.lines().any(|l| l.starts_with("id:"));
         let event = if data.is_empty() {
             fields + "\n"
         } else if data.iter().all(String::is_empty) {
@@ -1747,49 +1749,67 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
-    /// A stream that primed an event id and closed keeps the call in flight,
-    /// so the client's GET with `Last-Event-ID` gets the filtered response.
+    /// A primed stream that closes before the response frees the id and is
+    /// audited once, at exchange end: resume is not supported.
     #[test]
-    fn a_primed_stream_resumes_with_last_event_id() {
+    fn a_primed_stream_is_audited_once_at_exchange_end() {
         let Some(curl) = real_curl() else { return };
-        const ANSWERS: &[&[u8]] = &[
+        let (url, _got) = fake_upstream(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 1\nretry: 10\ndata:\n\n",
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 2\n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"},{\"name\":\"delete_repo\"}]}}\n\n",
-        ];
-        let (url, got) = fake_upstreams(ANSWERS.to_vec());
+        );
         let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
         ep.upstream = url;
         let (reply, log) = serve_on(&ep, "POST", CALL);
-        assert!(
-            reply.contains("id: 1\nretry: 10\ndata:\n\n"),
-            "priming not passed"
-        );
-        assert!(
-            !log.contains("tools/call"),
-            "audited before the response: {log}"
-        );
-        assert_eq!(
-            ep.pending.lock().unwrap().in_flight(),
-            1,
-            "resumable id freed"
-        );
-        let (reply, log) = serve_with(&ep, "GET", "", "Last-Event-ID: 1\r\n");
-        got.recv().unwrap();
-        assert!(
-            got.recv().unwrap().contains("Last-Event-ID: 1"),
-            "resume header not sent"
-        );
-        assert!(
-            reply.contains("get_me") && !reply.contains("delete_repo"),
-            "resume reply"
-        );
-        assert_eq!(
-            log.matches("tools/call get_me → ALLOWED ").count(),
-            1,
-            "{log}"
-        );
+        assert!(reply.contains("id: 1\nretry: 10\ndata:\n\n"), "{reply}");
+        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert!(log.contains("tools/call get_me → FAIL 200 "), "{log}");
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
+    }
+
+    /// An event with an `id:` whose message the policy drops pins nothing.
+    #[test]
+    fn a_dropped_event_with_an_id_pins_nothing() {
+        let Some(curl) = real_curl() else { return };
+        let (url, _got) = fake_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 5\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}\n\n",
+        );
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        let (_, log) = serve_on(&ep, "POST", CALL);
+        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
+    }
+
+    /// A session-less `initialize` on a primed stream never stays pinned.
+    #[test]
+    fn a_primed_initialize_is_not_pinned() {
+        let Some(curl) = real_curl() else { return };
+        let (url, _got) = fake_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 1\ndata:\n\n",
+        );
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        serve_on(&ep, "POST", init);
+        assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
+    }
+
+    /// A GET with `Last-Event-ID` is refused without reaching upstream.
+    #[test]
+    fn a_last_event_id_get_is_refused() {
+        let Some(curl) = real_curl() else { return };
+        let (url, got) = fake_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        let (reply, log) = serve_with(&ep, "GET", "", "Last-Event-ID: 1\r\n");
+        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+        assert!(
+            reply.contains("resume (Last-Event-ID) is not supported"),
+            "{reply}"
+        );
+        assert!(log.contains("FAIL stream resume not supported"), "{log}");
+        assert!(got.try_recv().is_err(), "upstream reached");
     }
 
     /// Two session-less `initialize` calls with the same id are separate
@@ -1872,8 +1892,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"}
             session: String::new(),
             spec: ep.policy.as_ref().unwrap(),
             pending: &ep.pending,
-            audit: None,
-            resumable: false,
+            audit: Vec::new(),
         };
         let mut input = std::io::Cursor::new(stream.as_bytes().to_vec());
         let why = filter_events(&mut input, &mut server, &mut f).err();
@@ -1948,8 +1967,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"}
             session: String::new(),
             spec: ep.policy.as_ref().unwrap(),
             pending: &ep.pending,
-            audit: None,
-            resumable: false,
+            audit: Vec::new(),
         };
         // The response answers a request in flight.
         on_client(LIST, f.spec, "", &mut f.lock());
