@@ -2058,6 +2058,8 @@ pub fn keychain_substitute(
     setting: Option<bool>,
     writable: &[PathBuf],
 ) -> Option<crate::agent::KeychainSubstitute> {
+    // Every stored-token lookup this process makes is checked against these.
+    let _ = crate::discover::GH_LOOKUP_WRITABLE.set(writable.to_vec());
     if cfg!(target_os = "linux") {
         return secret_service_substitute(
             agent,
@@ -2091,11 +2093,12 @@ pub fn keychain_substitute(
             // Maintainer call: never switch identity silently. gh signed in as
             // someone other than Copilot's own login keeps the grant (#696).
             if agent == Agent::Copilot {
-                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable).ok()?);
-                if let Some(why) = account_mismatch(
-                    gh.as_deref(),
-                    copilot_keychain_acct(gh.as_deref()).as_deref(),
-                ) {
+                // Fail closed (#1052, #1053): an agent-writable hosts.yml, or a
+                // Keychain answer cplt cannot pin to one account, keeps the grant.
+                let hosts = exec::gh_hosts_yml();
+                if let Err(why) =
+                    copilot_account_check(hosts.as_deref(), writable, copilot_keychain_acct)
+                {
                     let _ = ACCOUNT_MISMATCH.set(why);
                     return None;
                 }
@@ -2108,7 +2111,7 @@ pub fn keychain_substitute(
 /// gh is logged in on the host (its `hosts.yml` exists), so the sandbox will
 /// carry its token for `gh` and OpenCode (#693, #695).
 pub fn gh_configured() -> bool {
-    exec::gh_hosts_yml().is_some_and(|p| p.exists())
+    exec::gh_hosts_yml().is_some_and(|p| exec::is_regular_file(&p))
 }
 
 /// Why the substitute was skipped for an account mismatch, for the launch
@@ -2263,7 +2266,7 @@ fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Result<Option<String
 /// could re-point) or `real`, where it resolved, lies in a tree in `writable`.
 /// A dotfile-manager link to a tree the agent cannot write (stow, chezmoi,
 /// home-manager) stays usable.
-fn hosts_agent_writable(hosts: &Path, real: &Path, writable: &[PathBuf]) -> bool {
+pub(crate) fn hosts_agent_writable(hosts: &Path, real: &Path, writable: &[PathBuf]) -> bool {
     let inside = |p: &Path| {
         writable
             .iter()
@@ -2290,32 +2293,62 @@ fn gh_login(hosts_yml: &str) -> Option<String> {
     None
 }
 
+/// `Err(reason)` unless gh's login is anchored and matches Copilot's single
+/// Keychain account. An agent-writable `hosts.yml` or an unreadable or
+/// ambiguous Keychain answer fails closed (#1052, #1053).
+fn copilot_account_check(
+    hosts: Option<&Path>,
+    writable: &[PathBuf],
+    keychain: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    let gh = match hosts.map(|p| anchored_gh_login(p, writable)) {
+        Some(Err(())) => return Err("gh's hosts.yml is writable from the sandbox".into()),
+        gh => gh.and_then(Result::ok).flatten(),
+    };
+    let acct = keychain()?;
+    account_mismatch(gh.as_deref(), acct.as_deref()).map_or(Ok(()), Err)
+}
+
 /// The `acct` attribute of Copilot CLI's own Keychain item (`copilot-cli`),
-/// shaped `https://github.com:<login>`. Read on the host from the item's
-/// attributes only (no `-w`/`-g`), so the secret is never read and nothing
+/// shaped `https://github.com:<login>`. Read on the host from item attributes
+/// only (`dump-keychain` without `-d`), so the secret is never read and nothing
 /// prompts. Unlike `~/.copilot/config.json`, the sandboxed agent cannot
 /// rewrite this without the Keychain grant it is about to lose.
 ///
-/// Tries the item for `gh_login` first, so several stored accounts resolve to
-/// the matching one; otherwise whichever item `security` returns first.
-/// `None` when there is no item, `security` fails, or it outlives 1 s.
-fn copilot_keychain_acct(gh_login: Option<&str>) -> Option<String> {
+/// `Ok(None)` when there is no item. `Err` when `security` fails, outlives
+/// 1 s, or there are items for several accounts: cplt cannot tell which one
+/// Copilot uses, so the caller keeps the grant (#1053).
+fn copilot_keychain_acct() -> Result<Option<String>, String> {
     if !cfg!(target_os = "macos") {
-        return None;
+        return Ok(None);
     }
-    let query = |acct: Option<&str>| {
-        #[allow(clippy::disallowed_methods)] // absolute system path
-        let mut cmd = std::process::Command::new("/usr/bin/security");
-        cmd.args(["find-generic-password", "-s", "copilot-cli"]);
-        if let Some(a) = acct {
-            cmd.args(["-a", a]);
+    #[allow(clippy::disallowed_methods)] // absolute system path
+    let mut cmd = std::process::Command::new("/usr/bin/security");
+    cmd.arg("dump-keychain");
+    let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))
+        .ok_or("the Keychain did not answer within 1 s")?;
+    copilot_keychain_accts(&String::from_utf8_lossy(&out))
+}
+
+/// The single Copilot account in `security dump-keychain` output.
+fn copilot_keychain_accts(out: &str) -> Result<Option<String>, String> {
+    let mut accts: Vec<String> = Vec::new();
+    for item in out.split("keychain: ").skip(1) {
+        let svce = item
+            .lines()
+            .any(|l| l.trim() == "\"svce\"<blob>=\"copilot-cli\"");
+        if let (true, Some(a)) = (svce, keychain_acct(item))
+            && !accts.contains(&a)
+        {
+            accts.push(a);
         }
-        let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
-        keychain_acct(&String::from_utf8_lossy(&out))
-    };
-    gh_login
-        .and_then(|u| query(Some(&format!("https://github.com:{u}"))))
-        .or_else(|| query(None))
+    }
+    match accts.len() {
+        0 | 1 => Ok(accts.pop()),
+        n => Err(format!(
+            "the Keychain holds {n} Copilot accounts and cplt cannot tell which one Copilot uses"
+        )),
+    }
 }
 
 /// The `"acct"<blob>="..."` value from `security find-generic-password` output.
@@ -7752,9 +7785,10 @@ mod tests {
 mod account_tests {
     use super::{
         COPILOT_CONFIG_LIMIT, CopilotConfigAccount, ProcAdvice, SecretServiceSkip,
-        account_mismatch, anchored_gh_login, copilot_config_account, copilot_has_native_login,
-        gh_login, hosts_agent_writable, keychain_acct, proc_self_limit_text,
-        secret_service_substitute, secret_tool_args, unix_sockets_unrestricted,
+        account_mismatch, anchored_gh_login, copilot_account_check, copilot_config_account,
+        copilot_has_native_login, copilot_keychain_accts, gh_login, hosts_agent_writable,
+        keychain_acct, proc_self_limit_text, secret_service_substitute, secret_tool_args,
+        unix_sockets_unrestricted,
     };
 
     #[test]
@@ -7776,6 +7810,42 @@ mod account_tests {
             None
         );
         assert_eq!(keychain_acct(""), None);
+    }
+
+    #[test]
+    fn several_copilot_keychain_accounts_are_ambiguous() {
+        let item = |a: &str, svce: &str| {
+            format!(
+                "keychain: \"/k\"\nattributes:\n    \"acct\"<blob>=\"https://github.com:{a}\"\n    \"svce\"<blob>=\"{svce}\"\n"
+            )
+        };
+        let one =
+            item("alice", "copilot-cli") + &item("alice", "copilot-cli") + &item("x", "other");
+        assert_eq!(
+            copilot_keychain_accts(&one).unwrap().as_deref(),
+            Some("https://github.com:alice")
+        );
+        assert_eq!(copilot_keychain_accts(&item("x", "other")), Ok(None));
+        let two = item("alice", "copilot-cli") + &item("alice-work", "copilot-cli");
+        assert!(copilot_keychain_accts(&two).is_err());
+    }
+
+    #[test]
+    fn copilot_account_check_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rw = tmp.path().join("rw");
+        std::fs::create_dir(&rw).unwrap();
+        let hosts = rw.join("hosts.yml");
+        std::fs::write(&hosts, "github.com:\n    user: alice\n").unwrap();
+        let alice = || Ok(Some("https://github.com:alice".to_string()));
+        assert_eq!(copilot_account_check(Some(&hosts), &[], alice), Ok(()));
+        // Agent-writable hosts.yml no longer degrades to "unknown, proceed".
+        assert!(
+            copilot_account_check(Some(&hosts), std::slice::from_ref(&rw), || Ok(None)).is_err()
+        );
+        // A Keychain timeout or ambiguity keeps the grant.
+        assert!(copilot_account_check(Some(&hosts), &[], || Err("timeout".into())).is_err());
+        assert!(copilot_account_check(None, &[], || Err("2 accounts".into())).is_err());
     }
 
     #[test]

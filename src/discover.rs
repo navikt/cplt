@@ -136,7 +136,8 @@ fn discover_auth_with(
 
     let gh_cli_auth = stored_token().is_some();
 
-    let gh_config_exists = gh_hosts_yml(home_dir).is_some_and(|p| p.exists());
+    let gh_config_exists =
+        gh_hosts_yml(home_dir).is_some_and(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()));
 
     // macOS Keychain CLI — not applicable on Linux.
     let security_cli_exists = probe_security_cli();
@@ -170,8 +171,21 @@ fn stored_gh_credential() -> Option<&'static crate::agent::SecretToken> {
         std::sync::OnceLock::new();
     TOKEN
         .get_or_init(|| {
-            gh_auth_token(&crate::git::trusted_binary("gh")?, PROBE_TIMEOUT)
-                .map(crate::agent::SecretToken::new)
+            let home = PathBuf::from(std::env::var_os("HOME")?);
+            let writable = GH_LOOKUP_WRITABLE.get().map_or(&[][..], Vec::as_slice);
+            let dir = match gh_lookup_config_dir(&home, writable) {
+                Ok(dir) => dir,
+                Err(why) => {
+                    crate::ui::warn(&format!("gh's stored token was not read: {why}"));
+                    return None;
+                }
+            };
+            gh_auth_token_in(
+                &crate::git::trusted_binary("gh")?,
+                PROBE_TIMEOUT,
+                Some(&dir),
+            )
+            .map(crate::agent::SecretToken::new)
         })
         .as_ref()
 }
@@ -223,8 +237,56 @@ pub fn gh_token_cache_eligibility(
 
 /// Pin the host and discard exported tokens so discovery cannot mistake an
 /// ambient credential or a GHES login for gh's stored github.com credential.
-#[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
+#[cfg(test)]
 pub(crate) fn gh_auth_token(gh: &Path, timeout: Duration) -> Option<String> {
+    gh_auth_token_in(gh, timeout, None)
+}
+
+/// The session's agent-writable trees, set by the launch (and doctor) before
+/// the first stored-token lookup. Unset means none are known: the lookup still
+/// refuses a relative dir and a non-regular `hosts.yml`.
+pub static GH_LOOKUP_WRITABLE: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// gh's effective config dir, if cplt may let gh read its token from it (#1052).
+/// `GH_CONFIG_DIR` and `XDG_CONFIG_HOME` are inherited: a relative value or a
+/// dir the agent can write lets the agent choose whose token the host hands
+/// back, and a FIFO `hosts.yml` stalls the launch. `Err` says why not.
+pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<PathBuf, String> {
+    let Some(dir) = crate::sandbox::gh_config_dir(home) else {
+        return Err("GH_CONFIG_DIR or XDG_CONFIG_HOME is a relative path".into());
+    };
+    let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    if crate::sandbox::hosts_agent_writable(&dir, &real, writable) {
+        return Err(format!(
+            "gh's config dir {} is writable from the sandbox",
+            dir.display()
+        ));
+    }
+    let hosts = dir.join("hosts.yml");
+    match std::fs::symlink_metadata(&hosts) {
+        Err(_) => {}
+        Ok(m) if m.is_file() => {}
+        Ok(m) if m.file_type().is_symlink() => {
+            let target = std::fs::canonicalize(&hosts);
+            let ok = target.as_ref().is_ok_and(|t| {
+                std::fs::metadata(t).is_ok_and(|m| m.is_file())
+                    && !crate::sandbox::hosts_agent_writable(&hosts, t, writable)
+            });
+            if !ok {
+                return Err(format!(
+                    "{} links to a file the sandbox can write or that is not a regular file",
+                    hosts.display()
+                ));
+            }
+        }
+        Ok(_) => return Err(format!("{} is not a regular file", hosts.display())),
+    }
+    Ok(dir)
+}
+
+/// `config_dir` pins gh to the dir that was checked, so the lookup reads it.
+#[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
+fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> Option<String> {
     let probe = |no_refresh: bool| {
         let mut cmd = std::process::Command::new(gh);
         cmd.args(["auth", "token", "--hostname", "github.com"]);
@@ -232,6 +294,9 @@ pub(crate) fn gh_auth_token(gh: &Path, timeout: Duration) -> Option<String> {
         // writes the keyring; doctor and offline launches must not (#1063).
         if no_refresh {
             cmd.arg("--no-refresh");
+        }
+        if let Some(dir) = config_dir {
+            cmd.env("GH_CONFIG_DIR", dir);
         }
         for var in AUTH_ENV_VARS {
             cmd.env_remove(var);
@@ -1976,6 +2041,46 @@ fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    #[test]
+    fn gh_lookup_refuses_relative_writable_and_non_regular_config() {
+        use crate::untrusted::tests::mkfifo;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (safe, rw) = (root.join("safe"), root.join("rw"));
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&rw).unwrap();
+        let writable = vec![rw.clone()];
+        let with = |dir: &str, f: &dyn Fn()| {
+            temp_env::with_vars([("GH_CONFIG_DIR", Some(dir)), ("XDG_CONFIG_HOME", None)], f);
+        };
+        let check = || gh_lookup_config_dir(&root, &writable);
+        with("rel/gh", &|| {
+            assert!(check().is_err(), "relative");
+        });
+        with(rw.to_str().unwrap(), &|| {
+            assert!(check().is_err(), "writable dir");
+        });
+        with(safe.to_str().unwrap(), &|| {
+            assert_eq!(check(), Ok(safe.clone()), "no hosts.yml");
+        });
+        std::fs::write(rw.join("real.yml"), "github.com:\n").unwrap();
+        std::os::unix::fs::symlink(rw.join("real.yml"), safe.join("hosts.yml")).unwrap();
+        with(safe.to_str().unwrap(), &|| {
+            assert!(check().is_err(), "symlink into writable");
+        });
+        std::fs::remove_file(safe.join("hosts.yml")).unwrap();
+        mkfifo(&safe.join("hosts.yml"));
+        with(safe.to_str().unwrap(), &|| {
+            assert!(check().is_err(), "FIFO");
+        });
+        std::fs::remove_file(safe.join("hosts.yml")).unwrap();
+        std::fs::write(root.join("dotfiles.yml"), "github.com:\n").unwrap();
+        std::os::unix::fs::symlink(root.join("dotfiles.yml"), safe.join("hosts.yml")).unwrap();
+        with(safe.to_str().unwrap(), &|| {
+            assert!(check().is_ok(), "dotfile-manager link");
+        });
+    }
+
     use super::*;
 
     /// Run git in `dir`, ignoring the developer's own git config.

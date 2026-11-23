@@ -2504,6 +2504,12 @@ fn doctor_login_finding(hint: Option<String>) -> Option<cplt::doctor::Finding> {
     hint.map(|message| cplt::doctor::Finding::warning(message, None))
 }
 
+/// gh holds a github.com token cplt may read: the one predicate launch and
+/// doctor share (#1055). A GHE-only or stale `hosts.yml` does not count.
+fn host_gh_token_stored() -> bool {
+    cplt::sandbox::gh_configured() && discover::stored_gh_token_available()
+}
+
 fn copilot_stored_token_handover(
     resolved: &config::Resolved,
     substitute: Option<&agent::KeychainSubstitute>,
@@ -7647,10 +7653,11 @@ fn assemble_sandbox(
         &session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs),
     );
     // Doctor's suppression: a token handed over another way makes the keyring moot.
+    let gh_token_stored = host_gh_token_stored();
     let keyring_moot = copilot_stored_token_handover(
         resolved,
         keychain_substitute.as_ref(),
-        cplt::sandbox::gh_configured(),
+        gh_token_stored,
         cplt::sandbox::copilot_has_native_login(home_dir),
     );
     if !resolved.quiet
@@ -7677,8 +7684,8 @@ fn assemble_sandbox(
                 cfg!(target_os = "linux"),
                 keychain_substitute.is_some() || env_token,
                 // Same cached probe the token cache runs when keyring_moot holds.
-                keyring_moot && discover::stored_gh_token_available(),
-                cplt::sandbox::gh_configured(),
+                keyring_moot && gh_token_stored,
+                gh_token_stored,
                 cplt::sandbox::SECRET_SERVICE_SKIP
                     .get()
                     .map(|s| s.reason(home_dir)),
@@ -10317,10 +10324,10 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             copilot_stored_token_handover(
                 &resolved,
                 keychain_substitute.as_ref(),
-                auth.gh_cli_auth,
+                host_gh_token_stored(),
                 cplt::sandbox::copilot_has_native_login(&home_dir),
-            ) && auth.gh_cli_auth,
-            cplt::sandbox::gh_configured(),
+            ) && host_gh_token_stored(),
+            host_gh_token_stored(),
             cplt::sandbox::SECRET_SERVICE_SKIP
                 .get()
                 .map(|s| s.reason(&home_dir)),
