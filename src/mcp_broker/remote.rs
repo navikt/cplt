@@ -80,7 +80,10 @@ impl Log {
     /// failures reach the terminal at every level. The built-in GitHub
     /// endpoint keeps the proxy's level.
     fn to_terminal(&self, broker: bool, status: &str) -> bool {
-        self.level.should_log(status) || (broker && super::runtime::to_terminal(self.level, status))
+        // A per-tool failure or timeout is a failure even when the HTTP status is 200.
+        let tool_failed = status.contains("→ FAIL") || status.contains("→ TIMEOUT");
+        self.level.should_log(status)
+            || (broker && (tool_failed || super::runtime::to_terminal(self.level, status)))
     }
 
     /// `tag` and `upstream` are the endpoint's own, so a second endpoint
@@ -614,6 +617,16 @@ impl Endpoint {
                 "FAIL body on non-POST",
             );
         }
+        // A cancel's audit is taken here, so an early return must still log it.
+        let flush = |filter: &mut Option<Filter>| {
+            for audit in filter
+                .as_mut()
+                .map(|f| std::mem::take(&mut f.audit))
+                .unwrap_or_default()
+            {
+                log.line(&self.tag, &self.upstream, true, method, &audit);
+            }
+        };
         let mut own = None;
         if let Some(f) = &mut filter
             && method == "POST"
@@ -681,6 +694,7 @@ impl Endpoint {
             self.policy.is_some(),
         ) else {
             reply(&mut client, "400 Bad Request");
+            flush(&mut filter);
             return log.line(
                 &self.tag,
                 &self.upstream,
@@ -691,6 +705,7 @@ impl Endpoint {
         };
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             reply(&mut client, "503 Service Unavailable");
+            flush(&mut filter);
             return log.line(
                 &self.tag,
                 &self.upstream,
@@ -707,6 +722,7 @@ impl Endpoint {
             .spawn()
         else {
             reply(&mut client, "502 Bad Gateway");
+            flush(&mut filter);
             return log.line(
                 &self.tag,
                 &self.upstream,
@@ -752,15 +768,7 @@ impl Endpoint {
             let code = status.as_ref().map(|(c, _)| c.as_str());
             own.outcome = code.unwrap_or("upstream").to_string();
         }
-        for audit in filter.map(|f| f.audit).unwrap_or_default() {
-            log.line(
-                &self.tag,
-                &self.upstream,
-                self.policy.is_some(),
-                method,
-                &audit,
-            );
-        }
+        flush(&mut filter);
         if let Some((code, closed)) = status {
             // A GET answered 405 is the MCP spec's "no standalone SSE stream",
             // which GitHub returns on every session: not an error.
@@ -1793,6 +1801,18 @@ data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}\n\n",
         let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         serve_on(&ep, "POST", init);
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
+    }
+
+    /// A per-tool failure or timeout reaches the terminal at level none.
+    #[test]
+    fn tool_failures_reach_the_terminal_at_level_none() {
+        let log = Log {
+            level: ProxyLogLevel::None,
+            file: None,
+        };
+        assert!(log.to_terminal(true, "tools/call get_me → FAIL 200 3ms"));
+        assert!(log.to_terminal(true, "tools/call get_me → TIMEOUT 3ms"));
+        assert!(!log.to_terminal(true, "tools/call get_me → ALLOWED 3ms"));
     }
 
     /// A GET with `Last-Event-ID` is refused without reaching upstream.
