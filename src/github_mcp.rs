@@ -49,11 +49,13 @@ pub fn is_github_mcp_url(url: &str) -> bool {
 pub type Entry = (bool, String);
 
 /// The entries in `config` that point at GitHub's MCP, skipping any the user
-/// turned off with `"enabled": false`: no proxy for those, and the entry stays
-/// as written (#1062).
+/// turned off with `"enabled": false` (legacy) or `"disabled": true` (v2's own
+/// form, which OpenCode 2.3.2 rewrites `enabled: false` into): no proxy for
+/// those, and the entry stays as written (#1062).
 pub fn github_servers(config: &Value) -> Vec<Entry> {
     let is_github = |s: &Value| {
         s.get("enabled").and_then(Value::as_bool) != Some(false)
+            && s.get("disabled").and_then(Value::as_bool) != Some(true)
             && s.get("url")
                 .and_then(Value::as_str)
                 .is_some_and(is_github_mcp_url)
@@ -106,7 +108,7 @@ fn object_at<'a>(map: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut M
 }
 
 /// The GitHub MCP entries in the config files the user controls: the config
-/// dirs (`$XDG_CONFIG_HOME/opencode`, `OPENCODE_CONFIG_DIR`), `OPENCODE_CONFIG`
+/// dir (`OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`), `OPENCODE_CONFIG`
 /// and `OPENCODE_CONFIG_CONTENT`. Project files are agent-writable and never
 /// count: an agent must not be able to switch on spending the user's token.
 /// `nav-pilot mcp enable --client opencode` writes the user config dir.
@@ -115,8 +117,10 @@ pub fn configured_servers(
     config_file: Option<&Path>,
     content: Option<&str>,
 ) -> Vec<Entry> {
-    // OpenCode deep-merges these in order, so an entry is judged as merged:
-    // a URL in one file and `"enabled": false` in a later one is off.
+    // cplt deep-merges these in order and judges each entry as merged, so a
+    // URL in one file and an off switch in a later one counts as off. OpenCode
+    // 2.3.2 instead drops an entry lacking `type`/`url` from its document, so
+    // the two may disagree; that only ever leaves cplt not proxying (fail safe).
     let mut merged = Value::Object(Map::new());
     for c in user_configs(dirs, config_file, content) {
         deep_merge(&mut merged, c);
@@ -140,8 +144,8 @@ fn deep_merge(base: &mut Value, over: Value) {
     }
 }
 
-/// The user's OpenCode configs, parsed: `config.json`, `opencode.json` and
-/// `opencode.jsonc` in each of `dirs`, then `config_file`, then `content`.
+/// The user's OpenCode configs, parsed: `opencode.json` and `opencode.jsonc`
+/// in each of `dirs` (OpenCode 2.3.2 never loads `config.json`), then `config_file`, then `content`.
 /// Read as untrusted (no symlinks, size cap); unreadable or invalid ones are
 /// skipped. Project config is never among them.
 pub fn user_configs(
@@ -151,7 +155,7 @@ pub fn user_configs(
 ) -> Vec<Value> {
     let mut files: Vec<PathBuf> = dirs
         .iter()
-        .flat_map(|d| ["config.json", "opencode.json", "opencode.jsonc"].map(|f| d.join(f)))
+        .flat_map(|d| ["opencode.json", "opencode.jsonc"].map(|f| d.join(f)))
         .collect();
     files.extend(config_file.map(Path::to_path_buf));
     let mut texts: Vec<String> = files
@@ -283,6 +287,18 @@ mod tests {
     fn disabled_entries_are_not_routed() {
         let c: Value = serde_json::from_str(r#"{"mcp":{"servers":{"off":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"},"on":{"enabled":true,"url":"https://api.githubcopilot.com/mcp"}},"legacy":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"}}}"#).unwrap();
         assert_eq!(github_servers(&c), [(true, "on".to_string())]);
+    }
+
+    /// OpenCode v2's own off switch, `"disabled": true`, also means no proxy,
+    /// including when a later file adds it to an earlier file's entry.
+    #[test]
+    fn v2_disabled_entries_are_not_routed() {
+        let c: Value = serde_json::from_str(r#"{"mcp":{"servers":{"off":{"disabled":true,"url":"https://api.githubcopilot.com/mcp"},"on":{"disabled":false,"url":"https://api.githubcopilot.com/mcp"}},"legacy":{"disabled":true,"url":"https://api.githubcopilot.com/mcp"}}}"#).unwrap();
+        assert_eq!(github_servers(&c), [(true, "on".to_string())]);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), r#"{"mcp":{"servers":{"gh":{"type":"remote","url":"https://api.githubcopilot.com/mcp"}}}}"#).unwrap();
+        let later = r#"{"mcp":{"servers":{"gh":{"disabled":true}}}}"#;
+        assert!(configured_servers(&[], Some(file.path()), Some(later)).is_empty());
     }
 
     #[test]
