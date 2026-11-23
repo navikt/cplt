@@ -65,6 +65,15 @@ const GH_TOKEN_CLAIMED_PREFIX: &str = ".gh-token.claimed.";
 
 /// The fixed cache names plus any claimed copy a killed guard left behind.
 /// `symlink_metadata` does not follow links, so only regular files qualify.
+/// The claimed-copy file name is agent-chosen, so escape it before it reaches
+/// the user's terminal.
+fn orphan_token_warning(file: &Path, e: &std::io::Error) -> String {
+    format!(
+        "Warning: cannot remove orphaned GitHub token {}: {e}",
+        crate::audit::escape_path(&file.to_string_lossy())
+    )
+}
+
 fn gh_token_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = GH_TOKEN_FILES.iter().map(|f| dir.join(f)).collect();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1033,10 +1042,9 @@ fn gc_stale_session_dirs(base: &Path) {
             }
             for file in gh_token_files(&path) {
                 match std::fs::remove_file(&file) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => ui::warn(&format!(
-                        "Warning: cannot remove orphaned GitHub token {}: {e}",
-                        file.display()
-                    )),
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        ui::warn(&orphan_token_warning(&file, &e));
+                    }
                     _ => {}
                 }
             }
@@ -1989,7 +1997,8 @@ mod tests {
         // A guard killed between claim and unlink leaves a claimed copy.
         let claimed = orphan.join(".gh-token.claimed.123.456");
         std::fs::write(&claimed, "x").unwrap();
-        // A symlink with that prefix must not be followed to its target.
+        // A symlink with that prefix is skipped by gh_token_files (not a regular
+        // file), so it is neither followed nor removed.
         let target = home.join("victim");
         std::fs::write(&target, "keep").unwrap();
         std::os::unix::fs::symlink(&target, orphan.join(".gh-token.claimed.9.9")).unwrap();
@@ -2004,9 +2013,28 @@ mod tests {
         }
         assert!(!claimed.exists(), "orphan claimed token removed");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(
+            orphan
+                .join(".gh-token.claimed.9.9")
+                .symlink_metadata()
+                .is_ok(),
+            "symlink entry left alone"
+        );
         let live_path = live.path().to_path_buf();
         drop(live);
         assert!(!live_path.exists(), "Drop removes the session dir");
+    }
+
+    #[test]
+    fn orphan_token_warning_escapes_control_bytes() {
+        let name = ".gh-token.claimed.\x1b]0;x\x07\nFAKE";
+        let e = std::io::Error::other("boom");
+        let w = orphan_token_warning(Path::new("/s").join(name).as_path(), &e);
+        assert!(w.contains("FAKE"));
+        assert!(
+            !w.contains(['\x1b', '\x07', '\n']),
+            "raw control bytes: {w:?}"
+        );
     }
 
     #[allow(clippy::disallowed_methods)] // test fixture; trusted_git is absolute
