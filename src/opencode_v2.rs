@@ -495,6 +495,28 @@ fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
 /// `spec`: a gh-token remote broker spec (#909, only with `CPLT_MCP_REMOTE=1`).
 /// The overlay is the same; the endpoint then applies the spec's headers,
 /// timeout and `tools.allow`. `None` is the built-in endpoint, unchanged.
+/// Why [`github_mcp`] would leave GitHub MCP alone, for `cplt mcp status`
+/// (#909). Ignores the host `OPENCODE_CONFIG_CONTENT`.
+pub fn github_mcp_inactive(
+    home: &Path,
+    deny_env: &[String],
+    proxy_on: bool,
+) -> Option<&'static str> {
+    if deny_env.iter().any(|d| d == "GH_TOKEN") {
+        return Some("deny.env names GH_TOKEN");
+    }
+    if deny_env.iter().any(|d| d == "OPENCODE_CONFIG_CONTENT") {
+        return Some("deny.env names OPENCODE_CONFIG_CONTENT");
+    }
+    if !proxy_on {
+        return Some("cplt's proxy is off");
+    }
+    if crate::github_mcp::configured_servers(&user_config_dirs(home), None, None).is_empty() {
+        return Some("no GitHub MCP entry in the OpenCode config");
+    }
+    None
+}
+
 pub fn github_mcp(
     session: &mut Session,
     home: &Path,

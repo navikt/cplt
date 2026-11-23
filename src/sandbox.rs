@@ -4904,6 +4904,7 @@ mod tests {
             false,
             Some(&both),
             &[],
+            None,
         );
         assert_eq!(json["platform_supported"], false);
         assert_eq!(json["off_reason"], both.as_str());

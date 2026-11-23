@@ -15,6 +15,8 @@ use super::{SCHEMA_VERSIONS, STATUS_VERSION};
 /// `project`: the project the writable-tree checks ran against, `None`
 /// outside one (they then ran against an empty project).
 /// `clients`: the clients this launch would point at the broker.
+/// `remote_off`: why a gh-token remote would not serve OpenCode (#909).
+#[allow(clippy::too_many_arguments)] // one per status input
 pub fn status_json(
     found: &Detected,
     project: Option<&Path>,
@@ -23,6 +25,7 @@ pub fn status_json(
     supported: bool,
     off_reason: Option<&str>,
     clients: &[&str],
+    remote_off: Option<&str>,
 ) -> Value {
     // Remote specs are served on the proxy port, so the stdio broker's
     // platform refusal does not reach them.
@@ -63,7 +66,12 @@ pub fn status_json(
         };
         json!({
             "id": s.id,
-            "state": if remote_clients.is_empty() { "off" } else { "brokered" },
+            "state": match (remote_clients.is_empty(), remote_off) {
+                (true, _) => "off",
+                (false, Some(_)) => "inactive",
+                (false, None) => "brokered",
+            },
+            "reason": remote_off,
             "transport": "http",
             "mechanism": s.credential.name,
             "credential": s.credential,
@@ -101,6 +109,7 @@ pub fn status_json(
 /// `cplt mcp status [--json]`. Reads the specs as a launch from the current
 /// directory would, without starting anything; outside a project, as a
 /// launch from an empty one would.
+#[allow(clippy::too_many_arguments)] // one per status input
 pub fn run_status(
     as_json: bool,
     home: &Path,
@@ -109,9 +118,12 @@ pub fn run_status(
     enabled: bool,
     refusal: Option<&str>,
     clients: &[&str],
+    remote_off: Option<&str>,
 ) -> ExitCode {
     let supported = refusal.is_none();
-    let status = status_json(found, project, enabled, true, supported, refusal, clients);
+    let status = status_json(
+        found, project, enabled, true, supported, refusal, clients, remote_off,
+    );
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
@@ -144,7 +156,7 @@ mod tests {
             disabled: vec!["io.example/x".into()],
             ..Default::default()
         };
-        let v = status_json(&found, None, true, false, true, None, &["copilot"]);
+        let v = status_json(&found, None, true, false, true, None, &["copilot"], None);
         let row = &v["servers"][0];
         for k in [
             "id",
@@ -182,6 +194,7 @@ mod tests {
             false,
             Some("no"),
             &["copilot", "opencode"],
+            None,
         );
         let row = &v["servers"][0];
         assert_eq!(row["mechanism"], "gh-token");
@@ -189,7 +202,19 @@ mod tests {
         assert_eq!(row["transport"], "http");
         assert_eq!(row["egress_hosts"], json!(["api.githubcopilot.com"]));
         assert_eq!(row["clients"], json!(["opencode"]));
-        let v = status_json(&found, None, true, false, true, None, &["copilot"]);
+        let v = status_json(
+            &found,
+            None,
+            true,
+            false,
+            true,
+            None,
+            &["opencode"],
+            Some("deny.env names GH_TOKEN"),
+        );
+        assert_eq!(v["servers"][0]["state"], "inactive");
+        assert_eq!(v["servers"][0]["reason"], "deny.env names GH_TOKEN");
+        let v = status_json(&found, None, true, false, true, None, &["copilot"], None);
         assert_eq!(v["servers"][0]["state"], "off");
     }
 }

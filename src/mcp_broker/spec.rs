@@ -677,6 +677,8 @@ pub struct Detected {
     pub rejected: Vec<Rejected>,
     /// Skipped by `--no-mcp-broker`.
     pub disabled: Vec<String>,
+    /// A gh-token remote was among `disabled`: GitHub MCP is off (#909).
+    pub remote_disabled: bool,
 }
 
 impl Detected {
@@ -684,8 +686,44 @@ impl Detected {
     /// `--no-github-mcp-proxy`) alias the remote specs' `disabled[]` ids.
     pub fn disable_remotes(&mut self) {
         let off = std::mem::take(&mut self.remotes);
+        self.remote_disabled |= !off.is_empty();
         self.disabled.extend(off.into_iter().map(|s| s.id));
     }
+}
+
+/// The gh-token spec this launch's GitHub MCP serves (#909). `Ok(None)`: no
+/// spec, so the built-in endpoint serves. `Err(line)`: a spec exists but
+/// cannot serve, so GitHub MCP is off. Disabled means off: never a fallback
+/// to the built-in endpoint, which would serve the token without the spec's
+/// `tools.allow`.
+pub fn github_spec(
+    found: &Detected,
+    home: &Path,
+    writable: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<Option<Spec>, String> {
+    const OFF: &str = "GitHub MCP is off for this session";
+    if found.remote_disabled {
+        return Err(format!(
+            "{OFF}: its gh-token spec is disabled. Drop --no-mcp-broker <id> \
+             (and --no-github-mcp-proxy / sandbox.github_mcp_proxy = false) to turn it on."
+        ));
+    }
+    if found.remotes.len() > 1 {
+        let ids: Vec<&str> = found.remotes.iter().map(|s| s.id.as_str()).collect();
+        return Err(format!(
+            "{OFF}: more than one gh-token spec ({}) is ambiguous. Remove all but one.",
+            ids.join(", ")
+        ));
+    }
+    let mut f = Detected {
+        remotes: found.remotes.clone(),
+        ..Default::default()
+    };
+    drop_writable(&mut f, home, writable);
+    if let Some(r) = f.rejected.first() {
+        return Err(format!("{OFF}: {}", r.line()));
+    }
+    Ok(f.remotes.pop())
 }
 
 /// Load every spec in `dir`. A file in `writable` (a tree the sandbox can
@@ -787,7 +825,10 @@ pub(crate) fn load_with_gate(
             }
         };
         match result {
-            Ok(spec) if disabled.contains(&spec.id) => out.disabled.push(spec.id),
+            Ok(spec) if disabled.contains(&spec.id) => {
+                out.remote_disabled |= spec.remote.is_some();
+                out.disabled.push(spec.id);
+            }
             Ok(spec) if !seen.insert(spec.id.clone()) => {}
             Ok(mut spec) => {
                 spec.file.clone_from(&path);
@@ -1457,7 +1498,7 @@ pub(crate) mod tests {
         assert_eq!(found.remotes.len(), 1);
         // A writable spec dir drops it like any other spec.
         let mut f = load_with_gate(dir.path(), &[], &[], |_| None, true);
-        drop_writable(&mut f, |_| Some(PathBuf::from("/w")));
+        drop_writable(&mut f, Path::new("/nohome"), |_| Some(PathBuf::from("/w")));
         assert!(f.remotes.is_empty() && f.rejected.len() == 1);
         // --no-mcp-broker <id> turns it off.
         let id = found.remotes[0].id.clone();
