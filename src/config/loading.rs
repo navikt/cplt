@@ -351,7 +351,7 @@ impl Config {
             let alias = crate::proxy::is_ip_alias(d);
             if alias {
                 ui::warn(&format!(
-                    "Warning: proxy.allow_private_domains entry {d:?} is an IP address, not a DNS name, and is ignored. Give the host a DNS name and allow that."
+                    "proxy.allow_private_domains entry {d:?} is an IP address, not a DNS name, and is ignored. Give the host a DNS name and allow that."
                 ));
             }
             !alias

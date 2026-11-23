@@ -75,11 +75,16 @@ fn parse_value_for_key(
             // Comma-separated: "path1,path2" or single "path1"
             let mut arr = toml_edit::Array::new();
             for item in value.split(',') {
-                refuse_private_domain_ip(key_info, item.trim())?;
+                let item = if is_private_domains_key(key_info) {
+                    crate::proxy::normalize_hostname(item)
+                } else {
+                    item.trim().to_string()
+                };
+                refuse_private_domain_ip(key_info, &item)?;
                 if is_gh_hosts_key(key_info) {
-                    super::validation::validate_gh_host(item.trim())?;
+                    super::validation::validate_gh_host(&item)?;
                 }
-                arr.push(item.trim());
+                arr.push(item);
             }
             Ok(toml_edit::Value::Array(arr))
         }
@@ -105,6 +110,10 @@ fn refuse_private_domain_ip(key_info: &ConfigKeyInfo, value: &str) -> Result<(),
     Ok(())
 }
 
+fn is_private_domains_key(key_info: &ConfigKeyInfo) -> bool {
+    (key_info.section, key_info.key) == ("proxy", "allow_private_domains")
+}
+
 fn is_gh_hosts_key(key_info: &ConfigKeyInfo) -> bool {
     (key_info.section, key_info.key) == ("gh_guard", "hosts")
 }
@@ -123,6 +132,23 @@ fn parse_element_for_key(
     key_info: &ConfigKeyInfo,
     value: &str,
 ) -> Result<toml_edit::Value, ConfigError> {
+    parse_element(key_info, value, false)
+}
+
+/// `removing` skips every refusal and normalisation: an entry that is already
+/// in the file, bad or not, must always be removable.
+fn parse_element(
+    key_info: &ConfigKeyInfo,
+    value: &str,
+    removing: bool,
+) -> Result<toml_edit::Value, ConfigError> {
+    let normalised;
+    let value = if !removing && is_private_domains_key(key_info) {
+        normalised = crate::proxy::normalize_hostname(value);
+        normalised.as_str()
+    } else {
+        value
+    };
     match key_info.value_type {
         ConfigValueType::U16Array => {
             let n: u16 = value.parse().map_err(|_| {
@@ -134,14 +160,14 @@ fn parse_element_for_key(
             Ok(toml_edit::value(i64::from(n)).into_value().unwrap())
         }
         ConfigValueType::StrArray => {
-            if value.contains(',') {
+            if !removing && value.contains(',') {
                 return Err(ConfigError::Validation(format!(
                     "value contains a comma. Add one value at a time:\n  \
                      cplt config set {}.{} <VALUE>",
                     key_info.section, key_info.key
                 )));
             }
-            if is_gh_hosts_key(key_info) {
+            if !removing && is_gh_hosts_key(key_info) {
                 super::validation::validate_gh_host(value)?;
             }
             // A `*` in a domain matches nothing: matching is exact host plus
@@ -149,7 +175,8 @@ fn parse_element_for_key(
             // at launch; for a config array it can be refused at the point of
             // typing, which is better — the user is right there, and the
             // correction is mechanical.
-            if is_domain_key(key_info)
+            if !removing
+                && is_domain_key(key_info)
                 && let Some(bare) = value.strip_prefix("*.")
             {
                 return Err(ConfigError::Validation(format!(
@@ -159,14 +186,16 @@ fn parse_element_for_key(
                     key_info.section, key_info.key
                 )));
             }
-            if is_domain_key(key_info) && value.contains('*') {
+            if !removing && is_domain_key(key_info) && value.contains('*') {
                 return Err(ConfigError::Validation(format!(
                     "{value} contains a wildcard, which matches no host. Matching is exact \
                      host plus subdomains — name the domain itself and every subdomain is \
                      covered."
                 )));
             }
-            refuse_private_domain_ip(key_info, value)?;
+            if !removing {
+                refuse_private_domain_ip(key_info, value)?;
+            }
             // Expand ~ so stored values are always absolute paths.
             // For non-path keys (e.g. pass_env), expand_tilde is a no-op.
             let expanded = expand_tilde(value);
@@ -259,7 +288,7 @@ pub fn remove_array_element_in_doc(
     key_info: &ConfigKeyInfo,
     value: &str,
 ) -> Result<bool, ConfigError> {
-    let element = parse_element_for_key(key_info, value)?;
+    let element = parse_element(key_info, value, true)?;
 
     let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) else {
         return Ok(false); // Section doesn't exist — nothing to remove
@@ -662,6 +691,21 @@ mod tests {
         let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
         set_value_in_doc(&mut doc, info, "intern.nav.no").unwrap();
         parse_element_for_key(info, "1password.com").unwrap();
+    }
+
+    #[test]
+    fn allow_private_domains_normalises_before_validating_and_removal_always_works() {
+        let info = lookup_key("proxy.allow_private_domains").unwrap();
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(set_value_in_doc(&mut doc, info, " 167772161").is_err());
+        assert!(append_value_in_doc(&mut doc, info, " 167772161 ").is_err());
+        append_value_in_doc(&mut doc, info, " Intern.NAV.no. ").unwrap();
+        assert!(doc.to_string().contains("\"intern.nav.no\""), "{doc}");
+        let mut doc = "[proxy]\nallow_private_domains = [\"10.1\", \"a.no\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(remove_array_element_in_doc(&mut doc, info, "10.1").unwrap());
+        assert!(!doc.to_string().contains("10.1"), "{doc}");
     }
 
     #[test]

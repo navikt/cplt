@@ -92,6 +92,18 @@ pub fn github_token_allowed(args: &[&str], pin: Option<&str>, host_pin: Option<&
     github_token_allowed_for(args, pin, host_pin, gh_hosts())
 }
 
+/// Why [`github_token_allowed`] said no, for the notice `exec_real` prints.
+#[must_use]
+pub fn token_withheld_reason(args: &[&str]) -> &'static str {
+    if is_auth_git_credential_request(args) {
+        "GitHub token withheld: `gh auth git-credential` never gets it."
+    } else if scan_hostnames(args).1 {
+        "GitHub token withheld: cplt could not read the host in these `gh auth` arguments."
+    } else {
+        "GitHub token withheld: an argument mentions a non-github.com GitHub host (ghe.com / github.localhost). Use --body-file for text that names one."
+    }
+}
+
 fn github_token_allowed_for(
     args: &[&str],
     pin: Option<&str>,

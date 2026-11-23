@@ -1099,7 +1099,7 @@ fn gh_gate_pins_github_host_with_token_and_withholds_it_for_tenant_argv() {
 
     let (out, err) = run(&["repo", "list"]);
     assert_eq!(out, "github.com|gho_github_token|repo list");
-    assert!(!err.contains("without cplt's GitHub token"), "{err}");
+    assert!(!err.contains("GitHub token withheld"), "{err}");
 
     for tenant in [
         &["search", "code", "ghe.community"][..],
@@ -1111,10 +1111,7 @@ fn gh_gate_pins_github_host_with_token_and_withholds_it_for_tenant_argv() {
             out.starts_with("||"),
             "token must be withheld for {tenant:?}: {out}"
         );
-        assert!(
-            err.contains("without cplt's GitHub token"),
-            "{tenant:?}: {err}"
-        );
+        assert!(err.contains("GitHub token withheld"), "{tenant:?}: {err}");
     }
 }
 

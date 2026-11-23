@@ -6354,9 +6354,7 @@ fn exec_real(
             command.args(token_args);
         } else {
             // No silent grants: say why gh runs without the token (#1088).
-            eprintln!(
-                "cplt: gh runs without cplt's GitHub token for this command, because it targets a host other than github.com."
-            );
+            eprintln!("[cplt] {}", gh_proxy::token_withheld_reason(token_args));
             command.args(args);
         }
     } else {
