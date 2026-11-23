@@ -13519,15 +13519,6 @@ fn trust_accept(
         return ExitCode::FAILURE;
     }
 
-    let aliases = repo_config::ip_alias_private_domains(&loaded.config.propose);
-    if !aliases.is_empty() {
-        ui::error(&format!(
-            "proxy.allow_private_domains entry {:?} is an IP address, not a DNS name, so it cannot be approved. Give the host a DNS name, propose that in .cplt.toml, commit, and run `cplt trust accept` again.",
-            aliases[0]
-        ));
-        return ExitCode::FAILURE;
-    }
-
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
 
     let current_hash = trust::proposal_content_hash(&loaded.config.propose);
@@ -13777,6 +13768,23 @@ fn trust_accept(
         }
         keys.to_vec()
     };
+
+    // Only when approving that key (#1110): an alias must not block `trust accept allow_docker`.
+    let aliases = if keys_to_accept
+        .iter()
+        .any(|k| k == "proxy.allow_private_domains")
+    {
+        repo_config::ip_alias_private_domains(&loaded.config.propose)
+    } else {
+        Vec::new()
+    };
+    if !aliases.is_empty() {
+        ui::error(&format!(
+            "proxy.allow_private_domains entry {:?} is an IP address, not a DNS name, so it cannot be approved. Give the host a DNS name, propose that in .cplt.toml, commit, and run `cplt trust accept` again.",
+            aliases[0]
+        ));
+        return ExitCode::FAILURE;
+    }
 
     // Start from the carried-forward entry, or a fresh one when nothing could be
     // carried — so the accepted set is then exactly `keys_to_accept`.

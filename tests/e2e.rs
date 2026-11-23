@@ -6120,6 +6120,26 @@ paths = [
         );
     }
 
+    /// #1110: an IP alias in private domains does not block approving another key.
+    #[test]
+    fn e2e_trust_accept_other_key_despite_ip_alias_private_domain() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "ip-alias-partial",
+            "[propose]\nallow_localhost_any = true\n[propose.proxy]\nallow_private_domains = [\"10.1\"]\n",
+        );
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "allow_localhost_any"])
+            .output()
+            .expect("accept");
+        assert!(out.status.success(), "{out:?}");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "proxy.allow_private_domains"])
+            .output()
+            .expect("accept");
+        assert!(!out.status.success(), "{out:?}");
+    }
+
     /// #635: `trust show --json`, `config show` and the launch agree on every
     /// state, because all three read the launch gate's rule. The changed case
     /// keeps the same keys with a new value: `config show` used to judge by key

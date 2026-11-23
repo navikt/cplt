@@ -457,6 +457,7 @@ pub fn set_repo_value_in_doc(
                     proxy.remove(array_key);
                 }
             } else {
+                super::editing::refuse_private_domain_ip(key_info, value)?;
                 let arr = proxy
                     .entry(array_key)
                     .or_insert(Item::Value(Value::Array(Array::new())))
@@ -612,6 +613,26 @@ mod tests {
         let result = doc.to_string();
         assert!(result.contains("[propose.proxy]"));
         assert!(result.contains("intern.nav.no"));
+    }
+
+    #[test]
+    fn set_repo_value_refuses_private_domain_ip_alias_but_unsets_it() {
+        let mut doc = "[propose.proxy]\nallow_private_domains = [\"10.1\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("proxy.allow_private_domains").unwrap();
+        let err = set_repo_value_in_doc(
+            &mut doc,
+            info,
+            repo_key_target(info).unwrap(),
+            "0x0a.1.2.3",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is an IP address"), "{err}");
+        set_repo_value_in_doc(&mut doc, info, repo_key_target(info).unwrap(), "10.1", true)
+            .unwrap();
+        assert!(!doc.to_string().contains("10.1"));
     }
 
     #[test]

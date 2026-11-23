@@ -98,7 +98,10 @@ fn parse_value_for_key(
 /// `allow_private_domains` cannot allow an IP target, inet_aton aliases
 /// included (#1102): the proxy blocks those before DNS. Refuse while the user
 /// is at the keyboard instead of storing an entry that does nothing.
-fn refuse_private_domain_ip(key_info: &ConfigKeyInfo, value: &str) -> Result<(), ConfigError> {
+pub(crate) fn refuse_private_domain_ip(
+    key_info: &ConfigKeyInfo,
+    value: &str,
+) -> Result<(), ConfigError> {
     if (key_info.section, key_info.key) == ("proxy", "allow_private_domains")
         && crate::proxy::is_ip_alias(value)
     {
