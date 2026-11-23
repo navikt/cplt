@@ -307,6 +307,14 @@ A `*.ghe.com` tenant is not GHES: `gh` reads `GH_TOKEN` for it, so set
 `gh` then sends that tenant token to `github.com` as well, and a passed
 `GH_TOKEN` turns off the exec-token cache described above.
 
+`gh` also sends `GH_TOKEN` to `github.localhost` and `*.github.localhost`
+(bare `localhost` is treated as GHES). So any argument that mentions a
+`*.ghe.com` or `github.localhost` host withholds the github.com token, wherever
+it appears: a URL of any scheme, `HOST/owner/repo`, scp `git@HOST:owner/repo`,
+a `--repo` value, or free text in `--title` or `--body`. A title or body that
+merely mentions such a host therefore runs without the token; pass the text
+with `--body-file` instead.
+
 A `GH_TOKEN` environment variable would be inherited by every tool, MCP server,
 and subprocess the agent spawns. The file gives it to the first reader only,
 which is Copilot at startup. Copilot then caches it in memory, so one read is

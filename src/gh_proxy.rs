@@ -102,78 +102,63 @@ fn github_token_allowed_for(
         return false;
     }
     let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
-    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
-    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
-    // `*.ghe.com` destination can therefore receive the github.com token by
-    // mistake. A URL in a body or notes on any other host is just text.
-    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
-    // A destination that go-gh hands GH_TOKEN to but is not github.com.
-    let tenant = |h: &str| not_github(h) || h.eq_ignore_ascii_case("localhost");
-    if pin.and_then(foreign_pin_host).is_some_and(foreign)
-        || host_pin.is_some_and(|h| foreign(h) || not_github(h))
-        // Any named host but github.com: GHES never needs this token, and
-        // localhost or a `*.ghe.com` tenant would receive it (#1049).
-        // Every named host counts, not just the one gh keeps; and a `gh auth`
-        // argv the scan cannot read gets no token either.
+    // A GH_TOKEN pin naming a tenant, or any argv element naming one, withholds
+    // the token: see [`names_token_tenant`].
+    !(pin.and_then(foreign_pin_host).is_some_and(foreign)
+        || pin.is_some_and(names_token_tenant)
+        || host_pin.is_some_and(|h| foreign(h) || names_token_tenant(h))
+        // Any named host but github.com: GHES never needs this token, and a
+        // tenant would receive it (#1049). Every named host counts, not just
+        // the one gh keeps; and a `gh auth` argv the scan cannot read gets no
+        // token either.
         || {
             let (named, ambiguous) = scan_hostnames(args);
             ambiguous || named.iter().any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
         }
-    {
-        return false;
-    }
-    // gh honours an explicit selector over `GH_REPO`: a host-qualified `-R`
-    // or a URL argument decides where the request goes, so a destination off
-    // github.com gets no github.com token, whatever was pinned.
-    // Go's url.Parse lowercases the scheme, so `HTTPS://` is a URL too.
-    fn http_rest(arg: &str) -> Option<&str> {
-        let (scheme, rest) = arg.split_once("://")?;
-        (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
-            .then_some(rest)
-    }
-    // The host part: before the first `/`, after the last `@`, before a `:`. Covers
-    // URL authorities, `HOST/owner/repo` and scp `git@HOST:owner/repo`; a
-    // bare `owner/repo` yields `owner`, which is never a `*.ghe.com` host.
-    let host_of = |rest: &str| -> String {
-        let head = rest.split('/').next().unwrap_or(rest);
-        let head = head.rsplit('@').next().unwrap_or(head);
-        head.split(':').next().unwrap_or(head).to_string()
-    };
-    if let Some(r) = parse_command(args).and_then(|cmd| cmd.repo_flag) {
-        let rest = r.split_once("://").map_or(r.as_str(), |(_, rest)| rest);
-        if not_github(&host_of(rest)) {
-            return false;
+        || args.iter().any(|a| names_token_tenant(a)))
+}
+
+/// Whether `s` mentions, anywhere, a host other than github.com that gh hands
+/// the github.com `GH_TOKEN` to.
+///
+/// go-gh `auth.TokenForHost` sends `GH_TOKEN` to github.com, `*.ghe.com`
+/// tenants and `github.localhost`/`*.github.localhost`; every other host
+/// (bare `localhost` included) is GHES and reads `GH_ENTERPRISE_TOKEN`. So
+/// only a tenant can receive the token by mistake. Parsing every gh flag to
+/// find which argument is a destination did not converge (#1070), so the whole
+/// string is split into hostname-shaped tokens instead: URLs of any scheme,
+/// userinfo, ports, scp `user@host:path`, `--flag=value` and free text alike.
+/// A title or body that merely mentions a tenant also withholds the token;
+/// that is the safe direction, and `--body-file` avoids it.
+fn names_token_tenant(s: &str) -> bool {
+    // Go's url.Parse unescapes `%2e` in a host, so decode before splitting.
+    let decoded = percent_decode(s).to_ascii_lowercase();
+    decoded
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+        .map(|t| t.trim_end_matches('.'))
+        .any(|t| {
+            t.ends_with(".ghe.com") || t == "github.localhost" || t.ends_with(".github.localhost")
+        })
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
         }
     }
-    // `gh repo view|clone|fork|... HOST/OWNER/REPO` and `gh pr view URL` take
-    // the host from a positional too. A flag's free-text value (`--title`,
-    // `--body`, ...) is not a destination, so it is skipped; any other
-    // flag-less argument counts, as a false hit only withholds the token.
-    const TEXT_FLAGS: &[&str] = &[
-        "-t",
-        "--title",
-        "-b",
-        "--body",
-        "-S",
-        "--search",
-        "-n",
-        "--notes",
-        "-m",
-        "--message",
-        "-q",
-        "--jq",
-        "-T",
-        "--template",
-        "-d",
-        "--description",
-        "-c",
-        "--comment",
-    ];
-    !args.iter().enumerate().any(|(i, arg)| {
-        !(arg.starts_with('-') || (i > 0 && TEXT_FLAGS.contains(&args[i - 1])))
-            && (http_rest(arg).is_some_and(|rest| tenant(&host_of(rest)))
-                || (arg.contains('/') && tenant(&host_of(arg))))
-    })
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn host_allowed(host: &str, hosts: &[String]) -> bool {
@@ -3456,9 +3441,10 @@ fn root_command(args: &[&str]) -> (Option<usize>, bool) {
                 ("repo" | "hostname" | "help" | "version", _) => {}
                 _ => unknown = true,
             }
-        } else if a == "-R" {
+        } else if a == "-R" || a == "-h" {
+            // gh reads a root `-h` as `--hostname` under `gh auth`, so it takes a value.
             i += 1;
-        } else if !(a.starts_with("-R") || a == "-h") {
+        } else if !a.starts_with("-R") {
             // `-hX`, `-ah`: not a flag gh knows at the root.
             unknown = true;
         }
@@ -12361,21 +12347,36 @@ mod tests {
             assert!(ok(&["repo", sub, "github.com/o/r"]), "{sub}");
         }
         assert!(!ok(&["repo", "clone", "git@evil.ghe.com:o/r"]));
-        assert!(!ok(&["repo", "view", "localhost/o/r"]));
-        assert!(!ok(&[
-            "pr",
-            "view",
-            "--comments",
-            "https://localhost/o/r/pull/1"
-        ]));
-        // Free text naming a tenant is not a destination.
-        assert!(ok(&["pr", "create", "--title", "see x.ghe.com/o/r"]));
-        assert!(ok(&[
-            "issue",
-            "create",
-            "-b",
-            "https://x.ghe.com/o/r/issues/1"
-        ]));
+        // Bare localhost is GHES: gh sends it no GH_TOKEN.
+        assert!(ok(&["repo", "view", "localhost/o/r"]));
+        // Free text naming a tenant over-withholds, by design.
+        assert!(!ok(&["pr", "create", "--title", "see x.ghe.com/o/r"]));
+        for args in [
+            &["pr", "view", "-c", "https://evil.ghe.com/o/r/pull/1"][..],
+            &["issue", "view", "-c", "https://evil.ghe.com/o/r/issues/1"],
+            &["repo", "view", "ssh://git@evil.ghe.com/o/r"],
+            &["repo", "view", "git://evil.ghe.com/o/r"],
+            &["repo", "view", "git+ssh://git@EVIL.GHE.COM./o/r"],
+            &["repo", "view", "evil.ghe.com:443/o/r"],
+            &["repo", "view", "https://evil%2eghe.com/o/r"],
+            &["repo", "view", "github.localhost/o/r"],
+            &["repo", "view", "a.github.localhost/o/r"],
+            &["pr", "view", "http://github.localhost/o/r/pull/1"],
+            &["pr", "list", "-R", "github.localhost/o/r"],
+            &["pr", "list", "--repo=evil.ghe.com/o/r"],
+            &["-h", "evil.ghe.com", "auth", "status"],
+            &["-h", "ghes.example", "auth", "status"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        assert!(ok(&["repo", "view", "o/r"]));
+        assert!(ok(&["pr", "view", "https://github.com/o/r/pull/1"]));
+        assert!(!github_token_allowed_for(
+            &["pr", "list"],
+            Some("github.localhost/o/r"),
+            None,
+            &hosts
+        ));
     }
 
     /// Review of #1070 at 527ed6ee: `auth` as free text after a root `-R` is
