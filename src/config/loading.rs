@@ -106,9 +106,10 @@ impl Config {
     ) -> Result<Resolved, ConfigError> {
         match local {
             None => self.merge_with_no_proxy_env(cli, no_proxy_env_value()),
-            Some(local) => self
-                .overlay(local)
-                .merge_inner(Some(local), cli, no_proxy_env_value()),
+            Some(local) => {
+                self.overlay(local)
+                    .merge_inner(self, Some(local), cli, no_proxy_env_value())
+            }
         }
     }
 
@@ -137,18 +138,21 @@ impl Config {
         no_proxy_env: Option<String>,
     ) -> Result<Resolved, ConfigError> {
         match local {
-            None => self.merge_inner(None, cli, no_proxy_env),
+            None => self.merge_inner(self, None, cli, no_proxy_env),
             Some(local) => self
                 .overlay(local)
-                .merge_inner(Some(local), cli, no_proxy_env),
+                .merge_inner(self, Some(local), cli, no_proxy_env),
         }
     }
 
     /// The merge itself. `self` is the config to read scalars and lists from —
     /// already overlaid with `local` when there is one — and `local` is passed
     /// separately only so the boolean ladder can tell the two layers apart.
+    /// `global` is the config before the overlay, so a grant set in both files
+    /// is recorded against both (#1095).
     fn merge_inner(
         &self,
+        global: &Config,
         local: Option<&Config>,
         cli: CliFlags,
         no_proxy_env: Option<String>,
@@ -381,12 +385,14 @@ impl Config {
         for s in &self.allow.write {
             match resolve_allow_path(s, config_dir.as_ref()) {
                 Ok(p) => {
-                    let layer = if local.is_some_and(|l| l.allow.write.contains(s)) {
-                        GrantLayer::Local
-                    } else {
-                        GrantLayer::Global
-                    };
-                    allow_write_layers.push((p.clone(), layer));
+                    // Every layer that sets it: removing it from one leaves the other.
+                    let in_local = local.is_some_and(|l| l.allow.write.contains(s));
+                    if !in_local || global.allow.write.contains(s) {
+                        allow_write_layers.push((p.clone(), GrantLayer::Global));
+                    }
+                    if in_local {
+                        allow_write_layers.push((p.clone(), GrantLayer::Local));
+                    }
                     allow_write.push(p);
                 }
                 Err(e) => {
@@ -1903,9 +1909,9 @@ impl Resolved {
                 else {
                     continue;
                 };
+                self.allow_write_layers
+                    .push((path.clone(), GrantLayer::Repo));
                 if !self.allow_write.contains(&path) {
-                    self.allow_write_layers
-                        .push((path.clone(), GrantLayer::Repo));
                     self.allow_write.push(path);
                 }
             }
@@ -3599,6 +3605,60 @@ validate = false
         assert!(resolved.allow_localhost_any);
         assert!(!resolved.allow_docker); // not approved
         assert_eq!(unapproved, vec!["allow_docker"]);
+    }
+
+    /// A grant set in several layers is recorded against each, so the refusal
+    /// can name every place it must be removed from (#1095).
+    #[test]
+    fn duplicate_allow_write_keeps_every_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(dir.path()).unwrap();
+        let toml_w = format!("[allow]\nwrite = [{:?}]\n", w.to_str().unwrap());
+        let global: Config = toml::from_str(&toml_w).unwrap();
+        let local: Config = toml::from_str(&toml_w).unwrap();
+        let resolved = global
+            .merge_local_with_no_proxy_env(Some(&local), CliFlags::default(), None)
+            .unwrap();
+        assert_eq!(
+            resolved.allow_write_layers,
+            [
+                (w.clone(), GrantLayer::Global),
+                (w.clone(), GrantLayer::Local)
+            ]
+        );
+        assert_eq!(resolved.allow_write, [w]);
+    }
+
+    #[test]
+    fn repo_allow_write_duplicating_global_keeps_both_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(dir.path()).unwrap();
+        let toml_w = format!("[allow]\nwrite = [{:?}]\n", w.to_str().unwrap());
+        let global: Config = toml::from_str(&toml_w).unwrap();
+        let mut resolved = global.merge(CliFlags::default()).unwrap();
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                allow: crate::repo_config::ProposeAllowSection {
+                    write: vec![w.to_str().unwrap().into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/nonexistent-repo"),
+            &["allow.write"],
+        );
+        assert_eq!(
+            resolved.allow_write_layers,
+            [
+                (w.clone(), GrantLayer::Global),
+                (w.clone(), GrantLayer::Repo)
+            ]
+        );
+        assert_eq!(resolved.allow_write, [w]);
     }
 
     #[test]

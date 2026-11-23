@@ -12534,13 +12534,101 @@ mod agent_stubs {
             text.replace(narrow.to_str().unwrap(), cfg.to_str().unwrap()),
         )
         .unwrap();
+        // The same grant in the global file too: both remedies are printed,
+        // and following only the local one would leave launch failing.
+        let global = cfg.join("cplt/config.toml");
+        std::fs::write(
+            &global,
+            format!("[allow]\nwrite = [{:?}]\n", cfg.to_str().unwrap()),
+        )
+        .unwrap();
         let err = launch_err(&[]);
         assert!(
             err.contains("`cplt config unset --local allow.write ~/.config`"),
             "{err}"
         );
         assert!(
+            err.contains("`cplt config unset allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
             cplt(&["config", "unset", "--local", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        let out = cplt(&["exec", "--", "/bin/echo", "ok"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // An approved .cplt.toml proposal duplicating a global grant: both
+        // remedies are printed, and following both makes the launch succeed.
+        let commit = |msg: &str| {
+            assert!(git_ok(&proj, &["add", "-A"]));
+            assert!(git_ok(
+                &proj,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-qm",
+                    msg
+                ]
+            ));
+        };
+        assert!(git_ok(
+            &proj,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/proj.git"
+            ]
+        ));
+        std::fs::write(
+            proj.join(".cplt.toml"),
+            "[propose.allow]\nwrite = [\"~/.config\"]\n",
+        )
+        .unwrap();
+        commit("propose");
+        assert!(cplt(&["trust", "accept", "--all"]).status.success());
+        std::fs::write(
+            &global,
+            format!("[allow]\nwrite = [{:?}]\n", cfg.to_str().unwrap()),
+        )
+        .unwrap();
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset --repo allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`cplt config unset allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "--repo", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        commit("drop");
+        assert!(cplt(&["trust", "accept", "--all"]).status.success());
+        assert!(
+            cplt(&["config", "unset", "allow.write", "~/.config"])
                 .status
                 .success()
         );

@@ -1351,16 +1351,29 @@ pub fn refuse_state_ancestor_layers(
     layers: &[(PathBuf, GrantLayer)],
     home: &Path,
 ) -> Result<(), String> {
-    for (p, layer) in layers {
+    for (p, _) in layers {
         if let Some(dir) = policy::cplt_state_ancestor_grant(home, p)
             && dir.starts_with(p)
             && tool_env_var_for(p, home).is_none()
         {
+            // One remedy per layer that sets the path: the same grant can sit in
+            // several, and launch keeps failing until every one is removed.
+            let mut seen = Vec::new();
+            let remedies: Vec<String> = layers
+                .iter()
+                .filter(|(q, l)| {
+                    q == p && !seen.contains(l) && {
+                        seen.push(*l);
+                        true
+                    }
+                })
+                .map(|(_, l)| layer_remedy(p, home, Some(*l)))
+                .collect();
             return Err(format!(
                 "allow.write {} would make cplt's state directory {} writable in the sandbox. {}",
                 p.display(),
                 dir.display(),
-                layer_remedy(p, home, Some(*layer))
+                remedies.join("\n")
             ));
         }
     }
@@ -7397,6 +7410,25 @@ mod tests {
             });
             assert!(err.contains(want), "{layer:?}: {err}");
         }
+        // The same grant in two layers names both removals.
+        let err = temp_env::with_vars_unset(["GOCACHE"], || {
+            refuse_state_ancestor_layers(
+                &[
+                    (cfg.clone(), GrantLayer::Global),
+                    (cfg.clone(), GrantLayer::Local),
+                ],
+                &h,
+            )
+            .unwrap_err()
+        });
+        assert!(
+            err.contains("`cplt config unset allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`cplt config unset --local allow.write ~/.config`"),
+            "{err}"
+        );
         assert!(refuse_state_ancestor_layers(&[(cfg.join("gh"), GrantLayer::Local)], &h).is_ok());
         let writes = [cfg.clone()];
         let mut config = test_config(&h, &[]);
