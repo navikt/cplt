@@ -932,13 +932,14 @@ mod tests {
             "X\u{e9}",
         ] {
             assert_eq!(
-                curl_config(UPSTREAM, "POST", &hdrs(&[(k, "v")]), b"", "T"),
+                curl_config(UPSTREAM, None, "POST", &hdrs(&[(k, "v")]), b"", "T"),
                 None,
                 "{k:?}"
             );
         }
         let c = curl_config(
             UPSTREAM,
+            None,
             "POST",
             &hdrs(&[("X-a!#$%&'*+.^_`|~1", "@v")]),
             b"",
