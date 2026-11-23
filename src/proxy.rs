@@ -650,6 +650,10 @@ pub struct ProxyState {
     // aggregate totals even when a host record exceeds a retention limit.
     domain_collector: Arc<DomainCollector>,
 
+    // Set by `ProxyHandle::shutdown`; the GitHub MCP endpoint starts no curl
+    // after it, so none outlives the proxy.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+
     // Test-only: injectable DNS resolver to simulate fake DNS responses.
     #[cfg(test)]
     resolver: Option<ResolverFn>,
@@ -704,7 +708,6 @@ enum AcceptLoopOutcome {
 
 impl ProxyHandle {
     pub fn shutdown(&self) {
-        crate::github_mcp::kill_children(self.port);
         // The accept loop blocks in accept(); one connection of our own wakes
         // it to see the flag. Only the first call connects: once the loop has
         // stopped the port is closed and may belong to someone else. A failed
@@ -719,6 +722,8 @@ impl ProxyHandle {
                 Duration::from_secs(1),
             );
         }
+        // After the flag: a curl spawned from here on sees it and dies itself.
+        crate::github_mcp::kill_children(self.port);
     }
 
     /// Test reader for the live collector before snapshot finalization.
@@ -950,6 +955,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     let collection_started_at = Instant::now();
     let (domain_collector, classification_wake_rx) = DomainCollector::new();
 
+    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = Arc::new(ProxyState {
         policy,
         log_file: opts.log_file,
@@ -958,11 +964,11 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         upstream: opts.upstream,
         upstream_no_proxy: opts.upstream_no_proxy,
         domain_collector: domain_collector.clone(),
+        shutdown: shutdown_flag.clone(),
         #[cfg(test)]
         resolver: opts.resolver,
     });
 
-    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = shutdown_flag.clone();
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let accept_collector = domain_collector.clone();
@@ -1222,10 +1228,7 @@ fn handle_connection(
                 &target,
                 verdict.status(),
             );
-            reject(
-                &mut client,
-                b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n",
-            );
+            reject(&mut client, blocked_body(verdict));
             return;
         }
         let via = state
@@ -1241,7 +1244,7 @@ fn handle_connection(
             level: state.log_level,
             file: state.log_file.clone(),
         };
-        endpoint.serve(client, &head, &log, via, state.timeout);
+        endpoint.serve(client, &head, &log, via, timeout, &state.shutdown);
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
@@ -1264,6 +1267,18 @@ fn bad_connect_target(target: &str) -> &str {
         "***@<redacted>"
     } else {
         target
+    }
+}
+
+/// The 403 body for a host outside the allowlist, with the next step.
+const ALLOWLIST_BLOCK_BODY: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n";
+
+/// The 403 body for a refused GitHub MCP request: the allowlist hint where it
+/// applies, as `handle_connect` gives it.
+fn blocked_body(verdict: NetVerdict) -> &'static [u8] {
+    match verdict {
+        NetVerdict::BlockedAllowlist => ALLOWLIST_BLOCK_BODY,
+        _ => b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n",
     }
 }
 
@@ -1711,7 +1726,7 @@ fn handle_connect(
                 target,
                 "BLOCKED-ALLOWLIST",
             );
-            reject(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n");
+            reject(&mut client, ALLOWLIST_BLOCK_BODY);
             return;
         }
         NetVerdict::Blocked => {
@@ -3267,6 +3282,7 @@ mod tests {
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resolver: None,
         }
     }
@@ -4290,6 +4306,7 @@ mod tests {
         let up = TcpListener::bind("127.0.0.1:0").unwrap();
         let up_port = up.local_addr().unwrap().port();
         let up_again = up.try_clone().unwrap();
+        let up_zero = up.try_clone().unwrap();
         let upstream = format!("http://127.0.0.1:{up_port}/mcp/readonly");
         assert!(
             crate::github_mcp::install_for_test(&upstream, "TOKEN", "s3cr3t").is_some(),
@@ -4476,6 +4493,23 @@ mod tests {
         });
         c.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
         assert!(read_status_line(&mut c).starts_with("HTTP/1.1 400"));
+        p.shutdown();
+
+        // `--proxy-timeout 0` means the default, not an instant body deadline.
+        std::thread::spawn(move || {
+            let (s, _) = up_zero.accept().unwrap();
+            let mut r = std::io::BufReader::new(&s);
+            let mut l = String::new();
+            while r.read_line(&mut l).unwrap() > 2 {
+                l.clear();
+            }
+            let _ = (&s).write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        });
+        let p = head_test_proxy(up_port, Duration::ZERO, dir.path().join("l5"));
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(post).unwrap();
+        let status = read_status_line(&mut c);
+        assert!(status.starts_with("HTTP/1.1 204"), "{status}");
         p.shutdown();
     }
 

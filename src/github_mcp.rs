@@ -382,12 +382,13 @@ fn curl_config(
     opt("header", b"X-MCP-Readonly: true");
     opt("header", b"X-MCP-Lockdown: true");
     opt("header", b"Expect:");
-    if !body.is_empty() {
-        opt("data-raw", body);
-    }
     if via.is_some() {
         // A bare boolean: curl's config parser refuses a value here.
         c.extend_from_slice(b"proxytunnel\n");
+    }
+    if !body.is_empty() {
+        c.extend_from_slice(b"data-raw = ");
+        quote(&mut c, body);
     }
     Some(c)
 }
@@ -424,6 +425,41 @@ impl Endpoint {
         }
     }
 
+    /// The curl command line; the request itself goes in on stdin.
+    fn command(&self) -> Command {
+        #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
+        let mut cmd = Command::new(&self.curl);
+        // -q first: no ~/.curlrc. No redirects; https only for the real upstream.
+        cmd.args([
+            "-q",
+            "-sS",
+            "-N",
+            "-i",
+            "--http1.1",
+            "--suppress-connect-headers",
+            "--max-redirs",
+            "0",
+            "--connect-timeout",
+            CONNECT_TIMEOUT_SECS,
+            "--max-time",
+            MAX_TIME_SECS,
+            "-K",
+            "-",
+        ]);
+        if self.upstream.starts_with("https://") {
+            cmd.args(["--proto", "=https"]);
+        }
+        // A cleared env: HTTPS_PROXY, ALL_PROXY, NO_PROXY and CURL_* on the host
+        // must not decide where the token goes. Only CA locations pass.
+        cmd.env_clear();
+        for var in ["SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"] {
+            if let Some(v) = std::env::var_os(var) {
+                cmd.env(var, v);
+            }
+        }
+        cmd
+    }
+
     pub(crate) fn serve(
         &self,
         mut client: TcpStream,
@@ -431,6 +467,7 @@ impl Endpoint {
         log: &Log,
         via: Option<&UpstreamProxy>,
         body_limit: std::time::Duration,
+        shutdown: &std::sync::atomic::AtomicBool,
     ) {
         let head = String::from_utf8_lossy(head);
         let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
@@ -485,36 +522,11 @@ impl Endpoint {
             reply(&mut client, "400 Bad Request");
             return log.line(&method, "FAIL bad header");
         };
-        #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
-        let mut cmd = Command::new(&self.curl);
-        // -q first: no ~/.curlrc. No redirects; https only for the real upstream.
-        cmd.args([
-            "-q",
-            "-sS",
-            "-N",
-            "-i",
-            "--http1.1",
-            "--suppress-connect-headers",
-            "--max-redirs",
-            "0",
-            "--connect-timeout",
-            CONNECT_TIMEOUT_SECS,
-            "--max-time",
-            MAX_TIME_SECS,
-            "-K",
-            "-",
-        ]);
-        if self.upstream.starts_with("https://") {
-            cmd.args(["--proto", "=https"]);
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            reply(&mut client, "503 Service Unavailable");
+            return log.line(&method, "FAIL proxy shutting down");
         }
-        // A cleared env: HTTPS_PROXY, ALL_PROXY, NO_PROXY and CURL_* on the host
-        // must not decide where the token goes. Only CA locations pass.
-        cmd.env_clear();
-        for var in ["SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"] {
-            if let Some(v) = std::env::var_os(var) {
-                cmd.env(var, v);
-            }
-        }
+        let mut cmd = self.command();
         let port = client.local_addr().map_or(0, |a| a.port());
         let Ok(mut child) = cmd
             .stdin(Stdio::piped())
@@ -529,6 +541,11 @@ impl Endpoint {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((port, child.id()));
+        // Shutdown sets its flag before it kills: either it saw this PID, or
+        // this load sees the flag.
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = child.kill();
+        }
         // Bounded, and drained so curl never blocks on a full pipe.
         let stderr = child.stderr.take().map(|e| {
             std::thread::spawn(move || {
@@ -750,6 +767,126 @@ mod tests {
         }
         assert!(c.contains(r#"data-raw = "{\"a\":\n1}""#));
         assert!(c.contains("noproxy = \"*\""), "{c}");
+    }
+
+    #[test]
+    fn upstream_proxy_credential_and_tunnel_precede_the_body() {
+        let via = UpstreamProxy::parse("http://u:p@127.0.0.1:3128").unwrap();
+        let c =
+            String::from_utf8(curl_config(UPSTREAM, Some(&via), "POST", &[], b"{}", "T").unwrap())
+                .unwrap();
+        assert!(c.contains("proxy = \"http://127.0.0.1:3128\""), "{c}");
+        assert!(c.contains("noproxy = \"\""), "{c}");
+        assert!(
+            c.contains("proxy-header = \"Proxy-Authorization: Basic dTpw\""),
+            "{c}"
+        );
+        let tunnel = c.find("proxytunnel\n").expect("no proxytunnel");
+        assert!(tunnel < c.find("data-raw").unwrap(), "{c}");
+    }
+
+    /// The host env must not reach curl: proxy variables would reroute the
+    /// token, and SSLKEYLOGFILE would write its TLS keys to disk.
+    #[test]
+    fn curl_runs_with_a_cleared_env_and_bounded_times() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("curl");
+        let out = dir.path().join("env");
+        std::fs::write(&fake, format!("#!/bin/sh\nenv > '{}'\n", out.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ep = Endpoint {
+            token: SecretToken::new("T".into()),
+            path: "/x".into(),
+            curl: fake,
+            upstream: UPSTREAM.into(),
+        };
+        let vars = [
+            ("SSLKEYLOGFILE", Some("/keys")),
+            ("HTTPS_PROXY", Some("http://trap")),
+            ("SSL_CERT_FILE", Some("/ca.pem")),
+        ];
+        let mut cmd = temp_env::with_vars(vars, || ep.command());
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(&format!("--connect-timeout {CONNECT_TIMEOUT_SECS}")),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(&format!("--max-time {MAX_TIME_SECS}")),
+            "{joined}"
+        );
+        let status = temp_env::with_vars(vars, || cmd.stdin(Stdio::null()).status().unwrap());
+        assert!(status.success());
+        let env = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            !env.contains("SSLKEYLOGFILE") && !env.contains("HTTPS_PROXY"),
+            "{env}"
+        );
+        assert!(env.contains("SSL_CERT_FILE=/ca.pem"), "{env}");
+    }
+
+    #[test]
+    fn no_curl_starts_after_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("curl");
+        let ran = dir.path().join("ran");
+        std::fs::write(&fake, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ep = Endpoint {
+            token: SecretToken::new("T".into()),
+            path: "/x".into(),
+            curl: fake,
+            upstream: UPSTREAM.into(),
+        };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (server, _) = l.accept().unwrap();
+        let log = Log {
+            level: ProxyLogLevel::None,
+            file: None,
+        };
+        let shut = std::sync::atomic::AtomicBool::new(true);
+        ep.serve(
+            server,
+            b"GET /x HTTP/1.1\r\n\r\n",
+            &log,
+            None,
+            std::time::Duration::from_secs(5),
+            &shut,
+        );
+        let mut reply = String::new();
+        c.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+        assert_eq!(reply.matches("HTTP/1.1").count(), 1, "{reply}");
+        assert!(!ran.exists(), "curl ran after shutdown");
+    }
+
+    #[test]
+    fn kill_children_kills_only_that_port() {
+        let spawn = || {
+            #[allow(clippy::disallowed_methods)] // absolute path
+            Command::new("/bin/sleep").arg("30").spawn().unwrap()
+        };
+        let (mut mine, mut other) = (spawn(), spawn());
+        CHILDREN
+            .lock()
+            .unwrap()
+            .extend([(1, mine.id()), (2, other.id())]);
+        kill_children(1);
+        assert!(!mine.wait().unwrap().success(), "the curl child survived");
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "another proxy's child died"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+        CHILDREN.lock().unwrap().retain(|&(p, _)| p > 2);
     }
 
     #[test]
