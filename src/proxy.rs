@@ -723,7 +723,7 @@ impl ProxyHandle {
             );
             // After the flag: a curl spawned from here on sees it and dies
             // itself. Only once, like the wake-up: the port may be reused.
-            crate::github_mcp::kill_children(self.port);
+            crate::github_mcp::kill_children(&self.shutdown_flag);
         }
     }
 
@@ -3968,6 +3968,38 @@ mod tests {
     /// The accept loop blocks in accept(); `shutdown` must wake it at once,
     /// close the listening port and let the accept thread finish, with no
     /// polling interval to wait out. A second shutdown is a no-op.
+    #[test]
+    fn shutdown_kills_its_github_mcp_children() {
+        let (_, accept_done_rx) = mpsc::sync_channel(1);
+        let (collector, classification_wake_rx) = DomainCollector::new();
+        let handle = ProxyHandle {
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            port: 0,
+            domain_collector: collector,
+            collection_started_at: Instant::now(),
+            accept_done_rx,
+            classification_wake_rx,
+        };
+        #[allow(clippy::disallowed_methods)] // absolute path
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let key = Arc::as_ptr(&handle.shutdown_flag) as usize;
+        crate::github_mcp::CHILDREN
+            .lock()
+            .unwrap()
+            .push((key, child.id()));
+        handle.shutdown();
+        // SIGKILL ends it at once; a missed kill shows as sleep's clean exit.
+        let killed = !child.wait().unwrap().success();
+        crate::github_mcp::CHILDREN
+            .lock()
+            .unwrap()
+            .retain(|&(o, _)| o != key);
+        assert!(killed, "shutdown left the curl child running");
+    }
+
     #[test]
     fn shutdown_wakes_the_blocked_accept_loop_and_closes_the_port() {
         require_localhost_tcp!();

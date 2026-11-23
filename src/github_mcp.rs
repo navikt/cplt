@@ -40,17 +40,20 @@ const CONNECT_TIMEOUT_SECS: &str = "10";
 /// upstream cannot hold a proxy connection slot for ever (#1059).
 const MAX_TIME_SECS: &str = "600";
 
-/// Running curl children as (proxy port, PID), so proxy shutdown can kill
+/// Running curl children as (owning proxy's shutdown-flag address, PID), so proxy shutdown can kill
 /// them (#1059). A PID leaves the set before it is reaped, so it is never a
 /// reused PID.
-static CHILDREN: std::sync::Mutex<Vec<(u16, u32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static CHILDREN: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
 
-/// Kill the running curl children of the proxy on `port`, when it shuts down.
-pub(crate) fn kill_children(port: u16) {
+/// Kill the running curl children of one proxy instance, when it shuts down.
+/// `owner` is the address of that instance's shutdown flag: unique while the
+/// proxy lives, unlike its port, which a new proxy may reuse during shutdown.
+pub(crate) fn kill_children(owner: &std::sync::atomic::AtomicBool) {
+    let owner = std::ptr::from_ref(owner) as usize;
     let pids = CHILDREN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for &(_, pid) in pids.iter().filter(|(p, _)| *p == port) {
+    for &(_, pid) in pids.iter().filter(|(o, _)| *o == owner) {
         if let Ok(pid) = libc::pid_t::try_from(pid) {
             // SAFETY: plain syscall; the PID is unreaped (see CHILDREN).
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -528,7 +531,6 @@ impl Endpoint {
             return log.line(&method, "FAIL proxy shutting down");
         }
         let mut cmd = self.command();
-        let port = client.local_addr().map_or(0, |a| a.port());
         let Ok(mut child) = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -541,7 +543,7 @@ impl Endpoint {
         CHILDREN
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((port, child.id()));
+            .push((std::ptr::from_ref(shutdown) as usize, child.id()));
         // Shutdown sets its flag before it kills: either it saw this PID, or
         // this load sees the flag.
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -863,8 +865,8 @@ mod tests {
         );
         let mut reply = String::new();
         c.read_to_string(&mut reply).unwrap();
-        assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
-        assert_eq!(reply.matches("HTTP/1.1").count(), 1, "{reply}");
+        assert!(reply.starts_with("HTTP/1.1 503"), "{reply:?}");
+        assert_eq!(reply.matches("HTTP/1.1").count(), 1, "{reply:?}");
         assert!(!ran.exists(), "curl ran after shutdown");
     }
 
@@ -878,17 +880,23 @@ mod tests {
     }
 
     #[test]
-    fn kill_children_kills_only_that_port() {
+    fn kill_children_kills_only_that_proxy() {
         let spawn = || {
             #[allow(clippy::disallowed_methods)] // absolute path
             Command::new("/bin/sleep").arg("30").spawn().unwrap()
         };
+        // Two proxies that could share a port: ownership is the flag, not the port.
+        let (a, b) = (
+            std::sync::atomic::AtomicBool::new(true),
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        let key = |f: &std::sync::atomic::AtomicBool| std::ptr::from_ref(f) as usize;
         let (mut mine, mut other) = (spawn(), spawn());
         CHILDREN
             .lock()
             .unwrap()
-            .extend([(1, mine.id()), (2, other.id())]);
-        kill_children(1);
+            .extend([(key(&a), mine.id()), (key(&b), other.id())]);
+        kill_children(&a);
         assert!(!mine.wait().unwrap().success(), "the curl child survived");
         assert!(
             other.try_wait().unwrap().is_none(),
@@ -896,7 +904,24 @@ mod tests {
         );
         let _ = other.kill();
         let _ = other.wait();
-        CHILDREN.lock().unwrap().retain(|&(p, _)| p > 2);
+        CHILDREN
+            .lock()
+            .unwrap()
+            .retain(|&(o, _)| o != key(&a) && o != key(&b));
+    }
+
+    #[test]
+    fn log_line_escapes_control_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let log = Log {
+            level: ProxyLogLevel::None,
+            file: Some(path.clone()),
+        };
+        log.line("GET\r\n2099-01-01 POST", "OK\n\x1b[2K forged");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        assert!(!text.contains('\x1b') && !text.contains('\r'), "{text:?}");
     }
 
     #[test]
