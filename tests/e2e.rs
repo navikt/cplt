@@ -12627,6 +12627,34 @@ mod agent_stubs {
         );
         commit("drop");
         assert!(cplt(&["trust", "accept", "--all"]).status.success());
+
+        // The same proposal spelled as an absolute path: the printed `~/.config`
+        // remedy still removes it.
+        std::fs::write(
+            proj.join(".cplt.toml"),
+            format!("[propose.allow]\nwrite = [{:?}]\n", cfg.to_str().unwrap()),
+        )
+        .unwrap();
+        commit("propose absolute");
+        assert!(cplt(&["trust", "accept", "--all"]).status.success());
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset --repo allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "--repo", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        assert!(
+            !std::fs::read_to_string(proj.join(".cplt.toml"))
+                .unwrap()
+                .contains(".config"),
+            "absolute-path proposal was not removed"
+        );
+        commit("drop absolute");
+        assert!(cplt(&["trust", "accept", "--all"]).status.success());
         assert!(
             cplt(&["config", "unset", "allow.write", "~/.config"])
                 .status
