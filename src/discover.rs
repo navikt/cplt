@@ -264,7 +264,9 @@ pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<
     let real = crate::sandbox::resolve_unwritable(&dir, writable).map_err(|()| writable_err())?;
     // The named and the resolved hosts.yml both count: a file-only grant
     // (`allow.write = [".../gh/hosts.yml"]`) passes the dir check.
-    for hosts in [dir.join("hosts.yml"), real.join("hosts.yml")] {
+    // gh reads config.yml too, so a FIFO there stalls the probe the same way.
+    let names = ["hosts.yml", "config.yml"];
+    for hosts in names.iter().flat_map(|n| [dir.join(n), real.join(n)]) {
         let Ok(target) = crate::sandbox::resolve_unwritable(&hosts, writable) else {
             return Err(format!(
                 "{} is writable from the sandbox, or links through a path that is",
@@ -273,7 +275,8 @@ pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<
         };
         match std::fs::symlink_metadata(&target) {
             Err(_) => {}
-            Ok(m) if m.is_file() => {}
+            // A hard link from a writable tree shares the inode (#1080 review).
+            Ok(m) if m.is_file() && std::os::unix::fs::MetadataExt::nlink(&m) == 1 => {}
             Ok(_) => return Err(format!("{} is not a regular file", hosts.display())),
         }
     }
@@ -2108,6 +2111,19 @@ mod tests {
                 gh_lookup_config_dir(&root, &linked_grant).is_err(),
                 "file grant via symlinked dir, hosts.yml missing"
             );
+        });
+        // config.yml linked to a FIFO in the writable tree stalls gh too.
+        mkfifo(&rw.join("cfg.fifo"));
+        std::os::unix::fs::symlink(rw.join("cfg.fifo"), fresh.join("config.yml")).unwrap();
+        with(fresh.to_str().unwrap(), &|| {
+            assert!(check().is_err(), "config.yml into writable FIFO");
+        });
+        std::fs::remove_file(fresh.join("config.yml")).unwrap();
+        // A hosts.yml hard-linked from the writable tree.
+        std::fs::write(fresh.join("hosts.yml"), "github.com:\n").unwrap();
+        std::fs::hard_link(fresh.join("hosts.yml"), rw.join("hard.yml")).unwrap();
+        with(fresh.to_str().unwrap(), &|| {
+            assert!(check().is_err(), "hard link");
         });
         // A missing dir under an alias of a writable tree.
         std::os::unix::fs::symlink(&rw, root.join("alias")).unwrap();

@@ -2253,6 +2253,11 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
 /// path is resolved once, and the check and the read both use that result.
 fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Result<Option<String>, ()> {
     let real = resolve_unwritable(hosts, writable)?;
+    // A hard link inside a writable tree shares the inode: no path check sees it.
+    if std::fs::symlink_metadata(&real).is_ok_and(|m| std::os::unix::fs::MetadataExt::nlink(&m) > 1)
+    {
+        return Err(());
+    }
     let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT);
     Ok(text.ok().flatten().as_deref().and_then(gh_login))
 }
@@ -2276,6 +2281,9 @@ pub(crate) fn resolve_unwritable(path: &Path, writable: &[PathBuf]) -> Result<Pa
             Some(Component::RootDir | Component::Prefix(_)) => cur = PathBuf::from(&part),
             Some(Component::ParentDir) => {
                 cur.pop();
+                // `cur` held only resolved dirs before the missing name, so
+                // its parent exists: resume checking links (#1080 review).
+                missing = std::fs::symlink_metadata(&cur).is_err();
             }
             Some(Component::Normal(_)) => {
                 let next = cur.join(&part);
@@ -8180,6 +8188,15 @@ mod account_tests {
         // The check runs on the real path it is given, not a fresh resolution.
         assert!(hosts_agent_writable(&good, &planted, &writable));
         assert!(!hosts_agent_writable(&good, &good, &writable));
+        // A missing name then `..` resumes link checks: alias -> rw is seen.
+        std::os::unix::fs::symlink(&rw, ro.join("alias")).unwrap();
+        let back = ro.join("missing/../alias/hosts.yml");
+        assert_eq!(anchored_gh_login(&back, &writable), Err(()));
+        // A hard link from the writable tree shares the inode.
+        let hard = ro.join("hard.yml");
+        std::fs::write(&hard, yml).unwrap();
+        std::fs::hard_link(&hard, rw.join("hard.yml")).unwrap();
+        assert_eq!(anchored_gh_login(&hard, &writable), Err(()));
     }
 
     /// A writable root and the gh path may spell one dir differently: case on
