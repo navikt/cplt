@@ -107,6 +107,8 @@ fn github_token_allowed_for(
     // `*.ghe.com` destination can therefore receive the github.com token by
     // mistake. A URL in a body or notes on any other host is just text.
     let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
+    // A destination that go-gh hands GH_TOKEN to but is not github.com.
+    let tenant = |h: &str| not_github(h) || h.eq_ignore_ascii_case("localhost");
     if pin.and_then(foreign_pin_host).is_some_and(foreign)
         || host_pin.is_some_and(|h| foreign(h) || not_github(h))
         // Any named host but github.com: GHES never needs this token, and
@@ -143,12 +145,34 @@ fn github_token_allowed_for(
             return false;
         }
     }
-    // `gh repo view|clone|fork|... HOST/OWNER/REPO` takes the host from a
-    // positional too. Any `x.ghe.com/...` argument counts: a false hit only
-    // withholds the token.
-    !args.iter().any(|arg| {
-        http_rest(arg).is_some_and(|rest| not_github(&host_of(rest)))
-            || (arg.contains('/') && not_github(&host_of(arg)))
+    // `gh repo view|clone|fork|... HOST/OWNER/REPO` and `gh pr view URL` take
+    // the host from a positional too. A flag's free-text value (`--title`,
+    // `--body`, ...) is not a destination, so it is skipped; any other
+    // flag-less argument counts, as a false hit only withholds the token.
+    const TEXT_FLAGS: &[&str] = &[
+        "-t",
+        "--title",
+        "-b",
+        "--body",
+        "-S",
+        "--search",
+        "-n",
+        "--notes",
+        "-m",
+        "--message",
+        "-q",
+        "--jq",
+        "-T",
+        "--template",
+        "-d",
+        "--description",
+        "-c",
+        "--comment",
+    ];
+    !args.iter().enumerate().any(|(i, arg)| {
+        !(arg.starts_with('-') || (i > 0 && TEXT_FLAGS.contains(&args[i - 1])))
+            && (http_rest(arg).is_some_and(|rest| tenant(&host_of(rest)))
+                || (arg.contains('/') && tenant(&host_of(arg))))
     })
 }
 
@@ -3371,6 +3395,78 @@ fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
     scan_hostnames(args).0
 }
 
+/// gh's top-level command words, from `gh --help`.
+const GH_COMMANDS: &[&str] = &[
+    "agent-task",
+    "alias",
+    "api",
+    "attestation",
+    "auth",
+    "browse",
+    "cache",
+    "co",
+    "codespace",
+    "completion",
+    "config",
+    "copilot",
+    "discussion",
+    "extension",
+    "gist",
+    "gpg-key",
+    "issue",
+    "label",
+    "org",
+    "pr",
+    "preview",
+    "project",
+    "release",
+    "repo",
+    "ruleset",
+    "run",
+    "search",
+    "secret",
+    "skill",
+    "ssh-key",
+    "stack",
+    "status",
+    "variable",
+    "workflow",
+];
+
+/// Index of the first root-level positional, skipping the values of known
+/// value flags (`-R`/`--repo`/`--hostname`), and whether a root flag before it
+/// was unknown, so its value could have been mistaken for the command.
+fn root_command(args: &[&str]) -> (Option<usize>, bool) {
+    let mut unknown = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            return (Some(i + 1).filter(|&j| j < args.len()), unknown);
+        }
+        if !a.starts_with('-') || a == "-" {
+            return (Some(i), unknown);
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            match long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)))
+            {
+                ("repo" | "hostname", None) => i += 1,
+                ("repo" | "hostname" | "help" | "version", _) => {}
+                _ => unknown = true,
+            }
+        } else if a == "-R" {
+            i += 1;
+        } else if !(a.starts_with("-R") || a == "-h") {
+            // `-hX`, `-ah`: not a flag gh knows at the root.
+            unknown = true;
+        }
+        i += 1;
+    }
+    (None, unknown)
+}
+
 /// [`requested_hostnames`], plus whether the scan met a `gh auth` flag it does
 /// not know, so it cannot tell a value from a flag. The token check withholds
 /// the token then; the gate does not refuse on it alone.
@@ -3421,19 +3517,29 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
     // A flag before the subcommand (`gh -hX auth status`, `gh auth -hX status`)
     // could be a value or a host, so it is ambiguous; bare `gh auth -h` is help.
     // A flag value can look positional, so any later subcommand name counts.
-    let mut positionals = args.iter().enumerate().filter(|(_, a)| !a.starts_with('-'));
-    let auth_sub = match positionals.next() {
-        Some((_, &"auth")) => positionals
+    let (root, unknown) = root_command(args);
+    let auth_at = root.filter(|&i| args[i] == "auth");
+    let auth_sub = auth_at.and_then(|i| {
+        args.iter()
+            .enumerate()
+            .skip(i + 1)
+            .filter(|(_, a)| !a.starts_with('-'))
             .find(|(_, s)| AUTH_SUBCOMMANDS.contains(s))
-            .map(|(j, _)| j),
-        _ => None,
-    };
-    let auth = auth_sub == Some(1);
+            .map(|(j, _)| (i, j))
+    });
+    let auth = auth_sub.is_some_and(|(i, j)| j == i + 1);
     let mut found = Vec::new();
-    // A flag before the command can take a value (`gh --hostname x auth ...`),
-    // so `auth` anywhere after a leading flag may be the command: ambiguous.
-    let mut ambiguous = auth_sub.is_some_and(|j| j != 1)
-        || (args.first().is_some_and(|a| a.starts_with('-')) && args.contains(&"auth"));
+    // An unknown root flag may take a value (`gh --x v auth ...`): then any
+    // `auth` positional before another command word could be the command.
+    let mut ambiguous = auth_sub.is_some_and(|(i, j)| j != i + 1)
+        || (unknown
+            && root.is_some_and(|i| {
+                args[i..]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .find(|a| **a == "auth" || GH_COMMANDS.contains(a))
+                    == Some(&"auth")
+            }));
     let mut iter = args.iter().copied();
     while let Some(arg) = iter.next() {
         // pflag stops at `--` only when it is not a flag's value. The flag
@@ -12255,5 +12361,40 @@ mod tests {
             assert!(ok(&["repo", sub, "github.com/o/r"]), "{sub}");
         }
         assert!(!ok(&["repo", "clone", "git@evil.ghe.com:o/r"]));
+        assert!(!ok(&["repo", "view", "localhost/o/r"]));
+        assert!(!ok(&[
+            "pr",
+            "view",
+            "--comments",
+            "https://localhost/o/r/pull/1"
+        ]));
+        // Free text naming a tenant is not a destination.
+        assert!(ok(&["pr", "create", "--title", "see x.ghe.com/o/r"]));
+        assert!(ok(&[
+            "issue",
+            "create",
+            "-b",
+            "https://x.ghe.com/o/r/issues/1"
+        ]));
+    }
+
+    /// Review of #1070 at 527ed6ee: `auth` as free text after a root `-R` is
+    /// not the command, so the token stays.
+    #[test]
+    fn root_repo_flag_with_auth_text_keeps_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        assert!(ok(&[
+            "-R",
+            "o/r",
+            "pr",
+            "create",
+            "--title",
+            "fix auth bug"
+        ]));
+        assert!(ok(&["-R", "o/r", "issue", "list", "--search", "auth"]));
+        assert!(ok(&["--repo=o/r", "issue", "list", "--search", "auth"]));
+        assert!(!ok(&["-hevil.ghe.com", "auth", "status"]));
+        assert!(!ok(&["-ah", "evil.ghe.com", "auth", "status"]));
     }
 }
