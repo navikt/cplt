@@ -1223,6 +1223,14 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
         ("allow.socket", config.extra_socket),
     ] {
         for p in paths {
+            // A tool-path variable (`GOCACHE=~/.config`) lands in allow.write;
+            // name it here, the earliest refusal, not the grant (#1095).
+            if key == "allow.write"
+                && let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, p)
+                && let Some(var) = tool_env_var_for(p, config.home_dir)
+            {
+                return Err(state_ancestor_refusal(key, p, &dir, Some(var)));
+            }
             validate_grant_path(key, p, config.home_dir)?;
         }
     }
@@ -1248,9 +1256,12 @@ fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, env_var: Option<&str
         )
     } else {
         match what {
-            "allow.write" | "the allow.write grant" => "Narrow allow.write to the \
-                subdirectory you need, e.g. `cplt config set allow.write ~/.config/<tool>`."
-                .to_string(),
+            "allow.write" | "the allow.write grant" => format!(
+                "Remove the broad grant, then add the subdirectory you need: \
+                 `cplt config unset allow.write {0}` and `cplt config set allow.write \
+                 {0}/<tool>`. If it came from the command line, drop `--allow-write {0}`.",
+                p.display()
+            ),
             "the project directory" | "the named repository" => "Launch cplt from inside \
                 the repository, not from ~/.config, $HOME or a directory that contains them."
                 .to_string(),
@@ -7263,14 +7274,14 @@ mod tests {
         // allow.write at config-set time and at launch.
         let err = validate_grant_path("allow.write", &cfg, &h).unwrap_err();
         assert!(
-            err.contains("cplt config set allow.write ~/.config/<tool>"),
+            err.contains(&format!("cplt config unset allow.write {}", cfg.display())),
             "{err}"
         );
         let writes = [cfg.clone()];
         let mut config = test_config(&h, &[]);
         config.extra_write = &writes;
         let err = refuse(&config);
-        assert!(err.contains("Narrow allow.write"), "{err}");
+        assert!(err.contains("Remove the broad grant"), "{err}");
 
         // The same grant derived from GOCACHE names the variable.
         let err = temp_env::with_vars(
@@ -7281,7 +7292,16 @@ mod tests {
             || keep_cplt_state_out_of_grants(&config).unwrap_err(),
         );
         assert!(err.contains("environment variable GOCACHE"), "{err}");
-        assert!(!err.contains("Narrow allow.write"), "{err}");
+        assert!(!err.contains("Remove the broad grant"), "{err}");
+        // validate_hard_denied_grants runs first at launch and must name it too.
+        let err = temp_env::with_vars(
+            [
+                ("GOCACHE", Some(cfg.as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || validate_hard_denied_grants(&config).unwrap_err(),
+        );
+        assert!(err.contains("environment variable GOCACHE"), "{err}");
 
         // Project directory = ~/.config.
         let mut config = test_config(&h, &[]);

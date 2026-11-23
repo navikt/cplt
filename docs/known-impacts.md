@@ -366,9 +366,9 @@ cplt now refuses to launch when a tree the agent can write holds cplt's state di
 
 | Setup | One-step recovery |
 | --- | --- |
-| `allow.write ~/.config` (also in `config.toml`, where it fails every launch and `cplt check net`) | Narrow the grant to the subdirectory you need: `cplt config unset allow.write ~/.config`, then `cplt config set allow.write ~/.config/<tool>` |
-| `allow.write $HOME` | Grant the specific directories you need instead, e.g. `cplt config set allow.write ~/work` |
-| Launching with `~/.config` or `$HOME` as the project directory | Launch from inside the repository, e.g. `cd ~/src/myrepo && cplt` |
+| `allow.write ~/.config` (also in `config.toml`, where it fails every launch and `cplt check net`) | Remove the broad grant, then add the subdirectory you need: `cplt config unset allow.write ~/.config`, then `cplt config set allow.write ~/.config/<tool>`. Unset matches both `~/.config` and the expanded path. For a command-line grant, drop `--allow-write ~/.config` |
+| `allow.write $HOME` | Remove the broad grant, then grant the directories you need: `cplt config unset allow.write ~`, then `cplt config set allow.write ~/work`. For a command-line grant, drop `--allow-write ~` |
+| Launching with `~/.config` as the project directory (`$HOME` was already refused as too broad) | Launch from inside the repository, e.g. `cd ~/src/myrepo && cplt` |
 | `HOME` inside the project directory | Point `HOME` outside the project, or launch from a project that does not contain it |
 | A stow-style `~/.config/cplt` symlink into the project or an `allow.write` tree | Move the cplt directory out of that tree: `rm ~/.config/cplt && mv <dotfiles>/cplt ~/.config/cplt` |
 | A tool-path variable such as `GOCACHE=~/.config` | Point the variable at a directory that does not contain `~/.config/cplt`, or unset it. The error names the variable |

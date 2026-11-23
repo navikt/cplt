@@ -12445,6 +12445,29 @@ mod agent_stubs {
         extra_args: &'static str,
     }
 
+    /// `GOCACHE=~/.config` reaches the earliest launch refusal as a write
+    /// grant; the message must name GOCACHE, not blame allow.write (#1095).
+    #[test]
+    fn e2e_gocache_over_state_dir_names_the_variable() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-gocache-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(h.join(".config/cplt")).unwrap();
+        let out = cplt_cmd()
+            .args(["exec", "--", "/bin/echo", "ok"])
+            .current_dir(&h)
+            .env("HOME", &h)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("GOCACHE", h.join(".config"))
+            .output()
+            .expect("binary should run");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains("environment variable GOCACHE"), "{err}");
+    }
+
     fn run(c: &Case) {
         let dir = tempfile::Builder::new()
             .prefix(".cplt-e2e-stub-")
