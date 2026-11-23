@@ -367,6 +367,19 @@ mod tests {
     }
 
     #[test]
+    fn every_trusted_dir_is_inside_a_denied_dotfile_dir() {
+        // The deny that keeps agents out of the trusted dirs on both platforms.
+        for t in TRUSTED_DIRS {
+            assert!(
+                crate::sandbox::DENIED_DOTFILES
+                    .iter()
+                    .any(|d| Path::new(t).starts_with(d)),
+                "{t} must sit under a DENIED_DOTFILES entry"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_relative_path() {
         Home::new().refused(OsStr::new("managed.toml"), &[], "must be absolute");
     }
