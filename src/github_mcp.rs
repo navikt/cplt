@@ -157,25 +157,32 @@ pub fn new_secret() -> Result<String, String> {
 /// Serve the endpoint at `/<secret>` on the running proxy.
 pub fn install(token: SecretToken, secret: &str) -> Result<(), String> {
     let curl = crate::git::trusted_binary("curl").ok_or("no curl in the trusted dirs")?;
-    install_endpoint(Endpoint {
+    install_endpoint(endpoint(token, secret, curl, UPSTREAM))
+}
+
+fn endpoint(token: SecretToken, secret: &str, curl: PathBuf, upstream: &str) -> Endpoint {
+    Endpoint {
         token,
         path: format!("/{secret}"),
         curl,
-        upstream: UPSTREAM.into(),
-        forced: FORCED_HEADERS,
-    })
+        upstream: upstream.into(),
+        forced: FORCED_HEADERS.iter().map(ToString::to_string).collect(),
+        tag: "github-mcp".into(),
+        timeout_secs: crate::mcp_broker::remote::MAX_TIME_SECS,
+        policy: None,
+    }
 }
+
 /// Install a test endpoint with `upstream` (the real one is pinned).
 #[cfg(test)]
 pub(crate) fn install_for_test(upstream: &str, token: &str, secret: &str) -> Option<()> {
     let curl = crate::git::trusted_binary("curl")?;
-    install_endpoint(Endpoint {
-        token: SecretToken::new(token.into()),
-        path: format!("/{secret}"),
+    install_endpoint(endpoint(
+        SecretToken::new(token.into()),
+        secret,
         curl,
-        upstream: upstream.into(),
-        forced: FORCED_HEADERS,
-    })
+        upstream,
+    ))
     .ok()
 }
 

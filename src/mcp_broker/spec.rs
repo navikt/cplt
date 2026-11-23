@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::credential::Credential;
-use super::{META_KEY, OAUTH_GATE_ENV, SCHEMA_VERSIONS, SPEC_LIMIT};
+use super::{META_KEY, REMOTE_GATE_ENV, SCHEMA_VERSIONS, SPEC_LIMIT};
 
 pub const OAUTH_CLIENT_ID: &str = "https://ki-utvikling.nav.no/cplt/oauth-client.json";
 pub const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:62471/callback";
@@ -24,6 +24,11 @@ pub struct Spec {
     /// `command[0]` resolved in the trusted dirs.
     pub program: PathBuf,
     pub remote: Option<String>,
+    /// Header lines the remote leg forces on every request (`Name: value`),
+    /// from the remote's `headers`; the client's copies are dropped.
+    pub remote_headers: Vec<String>,
+    /// The remote leg's per-request limit (curl `--max-time`), seconds.
+    pub timeout_secs: u64,
     pub egress_hosts: Vec<String>,
     pub allow: BTreeSet<String>,
     /// Tools whose `query` argument must pass [`graphql_read_only`].
@@ -107,7 +112,20 @@ pub(crate) struct Ext {
     login: Option<Login>,
     #[serde(default)]
     oauth: Option<OAuth>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
+
+/// Bounds on a remote spec's `timeoutSecs`: long enough for a slow tool
+/// call, short enough that a stalled upstream frees its proxy slot (#1059).
+pub const REMOTE_TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 30..=3600;
+pub const REMOTE_TIMEOUT_DEFAULT: u64 = 600;
+/// The only upstream a gh-token spec may name: the host's gh token is sent
+/// there, so the spec cannot point it anywhere else.
+pub const GH_TOKEN_UPSTREAM: &str = "https://api.githubcopilot.com/mcp/readonly";
+/// The only headers a gh-token spec may force: GitHub MCP's mode switches.
+/// `Authorization` comes from cplt alone.
+const GH_TOKEN_HEADERS: &[&str] = &["X-MCP-Readonly", "X-MCP-Toolsets", "X-MCP-Lockdown"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -148,8 +166,8 @@ pub fn file_name(id: &str) -> String {
     format!("{}.json", id.replace('/', "__"))
 }
 
-fn oauth_gate_enabled() -> bool {
-    std::env::var(OAUTH_GATE_ENV).as_deref() == Ok("1")
+fn remote_gate_enabled() -> bool {
+    std::env::var(REMOTE_GATE_ENV).as_deref() == Ok("1")
 }
 
 /// Validate one spec (invariants 1-6 of design section 5.3). `resolve` finds a
@@ -160,7 +178,7 @@ pub fn validate(
     file: &str,
     resolve: impl Fn(&str) -> Option<PathBuf>,
 ) -> Result<Spec, String> {
-    validate_gated(text, file, resolve, oauth_gate_enabled())
+    validate_gated(text, file, resolve, remote_gate_enabled())
 }
 
 pub(crate) fn validate_gated(
@@ -204,12 +222,15 @@ pub(crate) fn validate_gated(
         Some(_) => return Err("remotes must be an array".into()),
     };
     let has_remotes = !remotes.is_empty();
-    // 4: remote upstreams require both the feature gate and credential = "oauth".
-    if has_remotes && !(oauth_gate && ext.credential == "oauth") {
+    // 4: remote upstreams require the feature gate and a remote mechanism.
+    if has_remotes && !(oauth_gate && matches!(ext.credential.as_str(), "oauth" | "gh-token")) {
         return Err("remote upstreams are not brokered yet; only a host command".into());
     }
     if !has_remotes && ext.oauth.is_some() {
         return Err("oauth block without an oauth remote".into());
+    }
+    if !has_remotes && ext.timeout_secs.is_some() {
+        return Err("timeoutSecs applies only to a remote upstream".into());
     }
     // `packages[]` is never run (`command` is), but it is part of the spec
     // nav-pilot hands over, so invariants 2 and 6 still hold for it.
@@ -230,6 +251,9 @@ pub(crate) fn validate_gated(
         for r in remotes {
             if let Some(u) = r.get("url").and_then(Value::as_str) {
                 strings.push(u);
+            }
+            if let Some(h) = r.get("headers") {
+                collect_strings(h, &mut strings);
             }
         }
     }
@@ -257,14 +281,11 @@ pub(crate) fn validate_gated(
     }
 
     // 1: the mechanism exists and fixes what may run or connect.
+    let mut remote_headers = Vec::new();
     let (credential, command, program, remote) = if has_remotes {
-        let url = validate_oauth_remote(remotes, &ext)?;
-        (
-            &super::credential::OAUTH,
-            Vec::new(),
-            PathBuf::new(),
-            Some(url),
-        )
+        let (credential, url, headers) = validate_remote(remotes, &ext)?;
+        remote_headers = headers;
+        (credential, Vec::new(), PathBuf::new(), Some(url))
     } else {
         let credential = Credential::parse(&ext.credential)?;
         if ext.command.is_empty() {
@@ -340,6 +361,8 @@ pub(crate) fn validate_gated(
         command,
         program,
         remote,
+        remote_headers,
+        timeout_secs: ext.timeout_secs.unwrap_or(REMOTE_TIMEOUT_DEFAULT),
         egress_hosts: ext.egress_hosts,
         allow: ext.tools.allow.into_iter().collect(),
         graphql,
@@ -363,45 +386,124 @@ fn plain_https_url(url: &str, what: &str) -> Result<(), String> {
     }
 }
 
-fn validate_oauth_remote(remotes: &[Value], ext: &Ext) -> Result<String, String> {
+/// A remote spec's one upstream, by mechanism: (mechanism, url, forced
+/// header lines). Shared rules first, then the mechanism's own.
+fn validate_remote(
+    remotes: &[Value],
+    ext: &Ext,
+) -> Result<(&'static Credential, String, Vec<String>), String> {
+    let mech = ext.credential.as_str();
     if remotes.len() != 1 {
-        return Err("oauth spec must have exactly one remote".into());
+        return Err(format!("{mech} spec must have exactly one remote"));
     }
     let remote = remotes[0]
         .as_object()
         .ok_or("remote entry must be an object")?;
-    if remote.contains_key("headers") {
-        return Err("remote headers are not allowed on an oauth spec".into());
+    let gh = mech == "gh-token";
+    if remote.contains_key("headers") && !gh {
+        return Err(format!("remote headers are not allowed on an {mech} spec"));
     }
-    // Only type and url: any other key would escape the secret checks.
-    if let Some(k) = remote.keys().find(|k| *k != "type" && *k != "url") {
+    // Only these keys: any other would escape the secret checks.
+    if let Some(k) = remote
+        .keys()
+        .find(|k| !(*k == "type" || *k == "url" || (gh && *k == "headers")))
+    {
         return Err(format!(
-            "unknown key {:?} on the oauth remote",
+            "unknown key {:?} on the {mech} remote",
             k.escape_debug().to_string()
         ));
     }
     if remote.get("type").and_then(Value::as_str) != Some("streamable-http") {
-        return Err("oauth remote type must be streamable-http".into());
+        return Err(format!("{mech} remote type must be streamable-http"));
     }
     let url = remote
         .get("url")
         .and_then(Value::as_str)
-        .ok_or("oauth remote must have a url string")?;
+        .ok_or_else(|| format!("{mech} remote must have a url string"))?;
     plain_https_url(url, "remote url")?;
     let rest = url
         .strip_prefix("https://")
-        .ok_or("oauth remote url must start with https://")?;
+        .ok_or_else(|| format!("{mech} remote url must start with https://"))?;
     let host = rest.split('/').next().unwrap_or("");
+    // No port at all, so always 443.
     if host.contains('@') || host.contains(':') {
-        return Err("oauth remote url must not contain userinfo or port".into());
+        return Err(format!(
+            "{mech} remote url must not contain userinfo or port"
+        ));
     }
     check_host(host)?;
     if !ext.egress_hosts.iter().any(|h| h == host) {
-        return Err(format!("oauth remote host {host} must be in egressHosts"));
+        return Err(format!("{mech} remote host {host} must be in egressHosts"));
     }
     if !ext.command.is_empty() {
-        return Err("oauth spec must not specify command".into());
+        return Err(format!("{mech} spec must not specify command"));
     }
+    if let Some(t) = ext.timeout_secs
+        && !REMOTE_TIMEOUT_SECS.contains(&t)
+    {
+        return Err(format!(
+            "timeoutSecs {t} is outside {}..={}",
+            REMOTE_TIMEOUT_SECS.start(),
+            REMOTE_TIMEOUT_SECS.end()
+        ));
+    }
+    if gh {
+        if ext.oauth.is_some() {
+            return Err("oauth block on a gh-token spec".into());
+        }
+        // The host's gh token goes to this one URL, nowhere else.
+        if url != GH_TOKEN_UPSTREAM {
+            return Err(format!("gh-token remote url must be {GH_TOKEN_UPSTREAM}"));
+        }
+        let headers = gh_token_headers(remote.get("headers"))?;
+        return Ok((&super::credential::GH_TOKEN, url.to_string(), headers));
+    }
+    validate_oauth(url, host, ext)?;
+    Ok((&super::credential::OAUTH, url.to_string(), Vec::new()))
+}
+
+/// A gh-token remote's `headers`: `[{name, value}]`, names from
+/// [`GH_TOKEN_HEADERS`] only (each once), values without control bytes.
+fn gh_token_headers(v: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(v) = v else {
+        return Ok(Vec::new());
+    };
+    let list = v.as_array().ok_or("remote headers must be an array")?;
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for h in list {
+        let o = h
+            .as_object()
+            .filter(|o| o.keys().all(|k| k == "name" || k == "value"))
+            .ok_or("each remote header must be {\"name\", \"value\"} only")?;
+        let (Some(name), Some(value)) = (
+            o.get("name").and_then(Value::as_str),
+            o.get("value").and_then(Value::as_str),
+        ) else {
+            return Err("each remote header needs a name and a value string".into());
+        };
+        let Some(&canon) = GH_TOKEN_HEADERS
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(name))
+        else {
+            return Err(format!(
+                "remote header {:?} is not allowed on a gh-token spec (only {}); the credential comes from cplt",
+                name.escape_debug().to_string(),
+                GH_TOKEN_HEADERS.join(", ")
+            ));
+        };
+        if super::remote::bad_header_byte(value) {
+            return Err(format!("remote header {canon} has a control character"));
+        }
+        if !seen.insert(canon) {
+            return Err(format!("remote header {canon} is set twice"));
+        }
+        out.push(format!("{canon}: {}", value.trim()));
+    }
+    Ok(out)
+}
+
+fn validate_oauth(url: &str, host: &str, ext: &Ext) -> Result<(), String> {
     let oauth = ext
         .oauth
         .as_ref()
@@ -430,7 +532,7 @@ fn validate_oauth_remote(remotes: &[Value], ext: &Ext) -> Result<String, String>
     if oauth.redirect_uri != OAUTH_REDIRECT_URI {
         return Err(format!("oauth.redirectUri must be {OAUTH_REDIRECT_URI}"));
     }
-    Ok(url.to_string())
+    Ok(())
 }
 
 pub(crate) fn collect_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
@@ -528,7 +630,7 @@ pub(crate) fn load_with(
     disabled: &[String],
     resolve: impl Fn(&str) -> Option<PathBuf>,
 ) -> Detected {
-    load_with_gate(dir, writable, disabled, resolve, oauth_gate_enabled())
+    load_with_gate(dir, writable, disabled, resolve, remote_gate_enabled())
 }
 
 pub(crate) fn load_with_gate(
@@ -599,10 +701,16 @@ pub(crate) fn load_with_gate(
             };
             match crate::untrusted::read_untrusted(&path, SPEC_LIMIT) {
                 Ok(Some(text)) => match validate_gated(&text, &file, &resolve, oauth_gate) {
-                    Ok(spec) if spec.remote.is_some() => Err((
+                    Ok(spec) if spec.remote.is_some() && spec.credential.name == "oauth" => Err((
                         "oauth remotes are validated but not served yet (no login in this cplt)"
                             .into(),
                         "remove the spec until cplt supports oauth login".into(),
+                    )),
+                    // ponytail: the gh-token remote leg exists (#909 PR2); no
+                    // client is pointed at it until PR3/PR4.
+                    Ok(spec) if spec.remote.is_some() => Err((
+                        "gh-token remotes are validated but not served to a client yet".into(),
+                        "remove the spec until cplt wires the GitHub MCP broker".into(),
                     )),
                     Ok(spec) => Ok(spec),
                     Err(r) => Err((r, enable())),
@@ -641,7 +749,7 @@ pub fn detect(home: &Path, writable: &[PathBuf], disabled: &[String]) -> Detecte
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// `load` with a fake trusted-dir lookup: every name resolves.
     fn load_test(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
         load_with(dir, writable, disabled, |n| {
@@ -688,7 +796,7 @@ mod tests {
         assert!(
             check(with(base(), "/credential", json!("gh-token")))
                 .unwrap_err()
-                .contains("built-in")
+                .contains("remotes[]")
         );
         assert!(
             check(with(
@@ -1068,5 +1176,167 @@ mod tests {
             found.rejected[0].fix,
             "remove the spec until cplt supports oauth login"
         );
+    }
+
+    pub(crate) fn gh_root() -> Value {
+        let ext = json!({
+            "v": 1,
+            "credential": "gh-token",
+            "egressHosts": ["api.githubcopilot.com"],
+            "tools": {"allow": ["get_me"], "classes": {}},
+        });
+        let mut root: Value = serde_json::from_str(&spec_json(ext)).unwrap();
+        root["remotes"] = json!([{
+            "type": "streamable-http",
+            "url": GH_TOKEN_UPSTREAM,
+            "headers": [
+                {"name": "X-MCP-Readonly", "value": "true"},
+                {"name": "x-mcp-toolsets", "value": "repos,issues"},
+                {"name": "X-MCP-Lockdown", "value": "true"},
+            ],
+        }]);
+        root
+    }
+
+    #[test]
+    fn gh_token_remote_accepted_only_when_gated() {
+        let spec = check_oauth(&gh_root(), true).unwrap();
+        assert_eq!(spec.credential.name, "gh-token");
+        assert_eq!(spec.remote.as_deref(), Some(GH_TOKEN_UPSTREAM));
+        assert_eq!(
+            spec.remote_headers,
+            [
+                "X-MCP-Readonly: true",
+                "X-MCP-Toolsets: repos,issues",
+                "X-MCP-Lockdown: true"
+            ]
+        );
+        assert_eq!(spec.timeout_secs, REMOTE_TIMEOUT_DEFAULT);
+        assert!(spec.command.is_empty());
+        // Gate off: refused exactly as before this mechanism existed.
+        assert_eq!(
+            check_oauth(&gh_root(), false).unwrap_err(),
+            "remote upstreams are not brokered yet; only a host command"
+        );
+    }
+
+    #[test]
+    fn gh_token_remote_rejects() {
+        let refused = |edit: &dyn Fn(&mut Value), want: &str| {
+            let mut r = gh_root();
+            edit(&mut r);
+            let e = check_oauth(&r, true).unwrap_err();
+            assert!(e.contains(want), "{want}: {e}");
+        };
+        let url = |u: &'static str| move |r: &mut Value| r["remotes"][0]["url"] = json!(u);
+        refused(&url("https://api.github.com/mcp/readonly"), "egressHosts");
+        refused(
+            &|r| {
+                r["_meta"][META_KEY]["egressHosts"] = json!(["api.github.com"]);
+                r["remotes"][0]["url"] = json!("https://api.github.com/mcp/readonly");
+            },
+            "gh-token remote url must be",
+        );
+        refused(
+            &url("https://api.githubcopilot.com/mcp"),
+            "must be https://api",
+        );
+        refused(
+            &url("https://api.githubcopilot.com/mcp/readonly/x"),
+            "must be https://api",
+        );
+        refused(
+            &url("https://api.githubcopilot.com:443/mcp/readonly"),
+            "port",
+        );
+        refused(
+            &url("https://api.githubcopilot.com:8443/mcp/readonly"),
+            "port",
+        );
+        refused(&url("http://api.githubcopilot.com/mcp/readonly"), "https");
+        let hdr = |n: &'static str, v: &'static str| {
+            move |r: &mut Value| r["remotes"][0]["headers"] = json!([{"name": n, "value": v}])
+        };
+        refused(&hdr("Authorization", "x"), "not allowed on a gh-token spec");
+        refused(&hdr("authorization", "x"), "not allowed on a gh-token spec");
+        refused(&hdr("X-MCP-Other", "x"), "not allowed");
+        refused(&hdr("Cookie", "x"), "not allowed");
+        refused(
+            &hdr("X-MCP-Toolsets", "a\r\nAuthorization: y"),
+            "control character",
+        );
+        refused(&hdr("X-MCP-Toolsets", "a\nb"), "control character");
+        refused(&hdr("X-MCP-Toolsets", "a\u{7f}"), "control character");
+        refused(
+            &|r| {
+                r["remotes"][0]["headers"] = json!([
+                    {"name": "X-MCP-Toolsets", "value": "a"},
+                    {"name": "x-mcp-toolsets", "value": "b"}
+                ]);
+            },
+            "twice",
+        );
+        refused(
+            &|r| {
+                r["remotes"][0]["headers"] =
+                    json!([{"name": "X-MCP-Readonly", "value": "true", "isSecret": false}]);
+            },
+            "only",
+        );
+        refused(&|r| r["remotes"][0]["headers"] = json!({}), "array");
+        refused(&|r| r["remotes"][0]["token"] = json!("x"), "unknown key");
+        refused(
+            &|r| r["_meta"][META_KEY]["command"] = json!(["gh", "mcp"]),
+            "must not specify command",
+        );
+        refused(
+            &|r| r["_meta"][META_KEY]["oauth"] = json!({"resource": GH_TOKEN_UPSTREAM, "clientId": OAUTH_CLIENT_ID, "redirectUri": OAUTH_REDIRECT_URI}),
+            "oauth block",
+        );
+        refused(
+            &|r| r["remotes"][0]["type"] = json!("sse"),
+            "streamable-http",
+        );
+        refused(
+            &|r| {
+                let one = r["remotes"][0].clone();
+                r["remotes"] = json!([one.clone(), one]);
+            },
+            "exactly one remote",
+        );
+        for t in [0, 29, 3601, u64::MAX] {
+            refused(
+                &|r| r["_meta"][META_KEY]["timeoutSecs"] = json!(t),
+                "timeoutSecs",
+            );
+        }
+        for t in [30, 900, 3600] {
+            let mut r = gh_root();
+            r["_meta"][META_KEY]["timeoutSecs"] = json!(t);
+            assert_eq!(check_oauth(&r, true).unwrap().timeout_secs, t);
+        }
+    }
+
+    #[test]
+    fn timeout_secs_on_a_command_spec_is_refused() {
+        let ext = with(base(), "/v", json!(1));
+        let mut ext = ext;
+        ext["timeoutSecs"] = json!(600);
+        assert!(check(ext).unwrap_err().contains("only to a remote"));
+    }
+
+    #[test]
+    fn load_does_not_serve_a_gh_token_remote_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), gh_root().to_string()).unwrap();
+        let found = load_with_gate(dir.path(), &[], &[], |_| None, true);
+        assert!(found.specs.is_empty());
+        assert!(
+            found.rejected[0].reason.contains("gh-token remotes"),
+            "{}",
+            found.rejected[0].reason
+        );
+        let found = load_with_gate(dir.path(), &[], &[], |_| None, false);
+        assert!(found.rejected[0].reason.contains("not brokered yet"));
     }
 }
