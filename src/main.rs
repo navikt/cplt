@@ -2499,6 +2499,22 @@ fn linux_login_hint(
     })
 }
 
+/// The agent's own login variable that reaches the child, for doctor's
+/// `auth:` line. Only the agent's own: GH_TOKEN is not Claude's login, and
+/// OpenCode's gh vars feed `OPENCODE_AUTH_CONTENT` instead (#1092).
+fn doctor_env_token(
+    agent: agent::Agent,
+    deny_env: &[String],
+    child_env: &dyn Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    agent
+        .keychain_substitute_env_vars()
+        .iter()
+        .copied()
+        .filter(|v| !deny_env.iter().any(|d| d == v))
+        .find(|v| child_env(v).is_some_and(|t| !t.trim().is_empty()))
+}
+
 /// [`linux_login_hint`] as a doctor warning (#933).
 fn doctor_login_finding(hint: Option<String>) -> Option<cplt::doctor::Finding> {
     hint.map(|message| cplt::doctor::Finding::warning(message, None))
@@ -2515,12 +2531,12 @@ fn host_gh_token_stored(
     use cplt::doctor::{GH_GUARD_OFF, GH_NO_LOGIN, NO_TRUSTED_GH, SCRATCH_OFF};
     if agent != agent::Agent::Copilot || !cplt::sandbox::gh_configured() {
         Err(GH_NO_LOGIN)
-    } else if cplt::git::trusted_binary("gh").is_none() {
-        Err(NO_TRUSTED_GH)
     } else if !resolved.gh_guard.enabled {
         Err(GH_GUARD_OFF)
     } else if !resolved.scratch_dir {
         Err(SCRATCH_OFF)
+    } else if cplt::git::trusted_binary("gh").is_none() {
+        Err(NO_TRUSTED_GH)
     } else if !discover::stored_gh_token_available() {
         Err(GH_NO_LOGIN)
     } else {
@@ -2557,7 +2573,7 @@ fn copilot_stored_token_handover(
         return Err(NATIVE_LOGIN);
     }
     if !resolved.gh_guard.block_auth_token {
-        return Err("gh_guard.block_auth_token is off");
+        return Err(cplt::doctor::BLOCK_AUTH_TOKEN_OFF);
     }
     let (serve, _) = discover::gh_token_cache_eligibility(
         agent::Agent::Copilot,
@@ -10315,13 +10331,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             std::env::var(k).ok()
         }
     };
-    let env_token = active_agent
-        .keychain_substitute_env_vars()
-        .iter()
-        .chain(&["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"])
-        .copied()
-        .filter(|v| !resolved.deny_env.iter().any(|d| d == v))
-        .find(|v| child_env(v).is_some_and(|t| !t.trim().is_empty()));
+    let env_token = doctor_env_token(active_agent, &resolved.deny_env, &child_env);
     let opencode_v2 = active_agent == agent::Agent::OpenCode
         && agent_bin_result
             .as_ref()
@@ -18108,6 +18118,34 @@ mod tests {
     }
 
     /// Doctor's auth line and blocking finding come from the launch's own
+    /// Doctor names only the agent's own login variable (#1092).
+    #[test]
+    fn doctor_env_token_is_the_agents_own_login() {
+        let all = |_: &str| Some("t".to_string());
+        for a in [
+            agent::Agent::Claude,
+            agent::Agent::Shell,
+            agent::Agent::Pi,
+            agent::Agent::OpenCode,
+        ] {
+            let got = doctor_env_token(a, &[], &all);
+            assert!(
+                got.is_none() || got == Some("CLAUDE_CODE_OAUTH_TOKEN"),
+                "{a:?}: {got:?}"
+            );
+        }
+        let gh_only = |k: &str| (k == "GH_TOKEN").then(|| "t".to_string());
+        assert_eq!(doctor_env_token(agent::Agent::Claude, &[], &gh_only), None);
+        assert_eq!(
+            doctor_env_token(agent::Agent::Copilot, &[], &gh_only),
+            Some("GH_TOKEN")
+        );
+        assert_eq!(
+            doctor_env_token(agent::Agent::Copilot, &["GH_TOKEN".into()], &gh_only),
+            None
+        );
+    }
+
     /// handover decision (#1092): each case runs the shared predicate and
     /// feeds that exact result to the report.
     #[test]
@@ -18178,6 +18216,29 @@ mod tests {
                 let (_, auth, f) = report(h, false);
                 assert!(auth.contains("may still use gh's own login"), "{auth}");
                 assert!(f.is_none());
+                // 4. scratch off, 5. block_auth_token off: Copilot may still run
+                // real `gh auth token`, so hedged like gh_guard off.
+                let mut scratch_off = base();
+                scratch_off.scratch_dir = false;
+                let mut unblocked = base();
+                unblocked.gh_guard.block_auth_token = false;
+                for (r, why) in [
+                    (scratch_off, cplt::doctor::SCRATCH_OFF),
+                    (unblocked, cplt::doctor::BLOCK_AUTH_TOKEN_OFF),
+                ] {
+                    let h = copilot_stored_token_handover(&r, None, Ok(()), false);
+                    assert_eq!(h, Err(why));
+                    let (_, auth, f) = report(h, false);
+                    assert!(auth.contains("may still use gh's own login"), "{auth}");
+                    assert!(f.is_none(), "{why}");
+                }
+                // gh_guard off outranks a missing trusted gh (mise-only gh).
+                let mut r = base();
+                r.gh_guard.enabled = false;
+                assert_ne!(
+                    host_gh_token_stored(&r, agent::Agent::Copilot),
+                    Err(cplt::doctor::NO_TRUSTED_GH)
+                );
             },
         );
     }

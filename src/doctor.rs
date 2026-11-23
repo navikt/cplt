@@ -1196,6 +1196,10 @@ pub const GH_NO_LOGIN: &str = "gh holds no github.com token cplt can read";
 /// gh_guard off: cplt hands nothing over, but Copilot may still run gh itself.
 pub const GH_GUARD_OFF: &str = "gh_guard is off";
 pub const SCRATCH_OFF: &str = "the scratch dir is off";
+pub const BLOCK_AUTH_TOKEN_OFF: &str = "gh_guard.block_auth_token is off";
+/// Reasons the handover is refused while Copilot may still run real
+/// `gh auth token` itself, so doctor hedges instead of blocking.
+const GH_SELF_SERVE: [&str; 3] = [GH_GUARD_OFF, SCRATCH_OFF, BLOCK_AUTH_TOKEN_OFF];
 pub const NO_TRUSTED_GH: &str = "no trusted gh found";
 /// Copilot has its own login (keytar or `~/.copilot/config.json`).
 pub const NATIVE_LOGIN: &str = "Copilot has its own login";
@@ -1256,10 +1260,14 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
             None if d.agent == Agent::Copilot && d.gh_handover == Some(Ok(())) => {
                 "stored gh token for github.com (handed over, validity not checked)".to_string()
             }
-            None if d.agent == Agent::Copilot && d.gh_handover == Some(Err(GH_GUARD_OFF)) => {
-                "not handed over by cplt: gh_guard is off; Copilot may still use gh's own \
-                 login if the sandbox can read gh's hosts.yml"
-                    .to_string()
+            None if d.agent == Agent::Copilot
+                && matches!(d.gh_handover, Some(Err(w)) if GH_SELF_SERVE.contains(&w)) =>
+            {
+                format!(
+                    "not handed over by cplt: {}; Copilot may still use gh's own login if \
+                     the sandbox can read gh's token store",
+                    d.gh_handover.and_then(Result::err).unwrap_or_default()
+                )
             }
             None if d.agent == Agent::Copilot
                 && matches!(d.gh_handover, Some(Err(w)) if w != GH_NO_LOGIN) =>
@@ -1306,7 +1314,7 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
             && d.env_token.is_none()
             && !d.other_login
             && matches!(d.gh_handover, Some(Err(w))
-                if ![GH_NO_LOGIN, GH_GUARD_OFF, NATIVE_LOGIN].contains(&w)) =>
+                if ![GH_NO_LOGIN, NATIVE_LOGIN].contains(&w) && !GH_SELF_SERVE.contains(&w)) =>
         {
             let why = d.gh_handover.and_then(Result::err).unwrap_or_default();
             Some(Finding::blocking(
