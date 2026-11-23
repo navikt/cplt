@@ -121,16 +121,9 @@ fn apply_puppeteer_cache(
     }
 }
 
-fn apply_session_env(
-    cmd: &mut Command,
-    opencode_v2: bool,
-    extra_env: &[(String, String)],
-    deny_env: &[String],
-) {
-    // v2 ignores the #695 handover: don't put the gh token where nothing reads it.
-    if opencode_v2 {
-        cmd.env_remove("OPENCODE_AUTH_CONTENT");
-    }
+fn apply_session_env(cmd: &mut Command, extra_env: &[(String, String)], deny_env: &[String]) {
+    // No v2 strip here: cplt never sets the #695 handover under v2
+    // (`opencode_handover_applies`), so only a user-passed value remains.
     cmd.envs(
         extra_env
             .iter()
@@ -523,7 +516,17 @@ pub(super) const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT
 /// answers from its own credential store rather than echoing back an ambient
 /// value.
 pub(super) fn extract_gh_token() -> Option<String> {
+    #[cfg(test)]
+    if let Some(token) = FAKE_GH_TOKEN.with(|t| t.borrow().clone()) {
+        return Some(token);
+    }
     crate::discover::stored_gh_token()
+}
+
+// Test seam: a synthetic stored gh credential, so tests never run real gh.
+#[cfg(test)]
+thread_local! {
+    static FAKE_GH_TOKEN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Whether the child will already have a usable GitHub token in its own
@@ -1723,7 +1726,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_session_env(&mut cmd, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
@@ -1875,7 +1878,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_session_env(&mut cmd, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
@@ -2120,7 +2123,7 @@ fn exec_bwrap(
         sandbox.opencode_v2,
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_session_env(&mut cmd, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
@@ -2970,6 +2973,80 @@ echo gho_stored_fixture"#,
         );
     }
 
+    /// #1051: Copilot's SecretService login means inject_token adds no GH_TOKEN,
+    /// even with a stored gh credential; without the substitute it would.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn secret_service_login_suppresses_token_injection() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                let ss = crate::agent::KeychainSubstitute::SecretService(
+                    crate::agent::SecretToken::new("t".into()),
+                );
+                let mut cmd = Command::new("true");
+                inject_gh_token_if_needed(&mut cmd, Agent::Copilot, &[], Some(&ss));
+                assert_eq!(cmd.get_envs().count(), 0, "SecretService: nothing injected");
+                let mut cmd = Command::new("true");
+                inject_gh_token_if_needed(&mut cmd, Agent::Copilot, &[], None);
+                assert!(
+                    child_env_has_gh_token(&cmd, &[], false),
+                    "control: injected"
+                );
+                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
+            },
+        );
+    }
+
+    /// #1051: a token inject_token already put on `cmd` suppresses `.gh-token`.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn injected_token_suppresses_serve_cache_file() {
+        let home = tempfile::tempdir().unwrap();
+        let home_s = home.path().to_str().unwrap();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home_s)),
+                ("GH_CONFIG_DIR", None),
+                ("XDG_CONFIG_HOME", None),
+                ("GH_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                for (preset, want) in [(true, false), (false, true)] {
+                    let scratch = tempfile::tempdir().unwrap();
+                    let mut cmd = Command::new("true");
+                    if preset {
+                        cmd.env("GH_TOKEN", "ghp_injected");
+                    }
+                    cache_gh_token_to_file(
+                        &mut cmd,
+                        scratch.path(),
+                        Agent::Copilot,
+                        &[],
+                        None,
+                        true,
+                        false,
+                        false,
+                    );
+                    assert_eq!(
+                        scratch.path().join(".gh-token").exists(),
+                        want,
+                        "preset={preset}"
+                    );
+                }
+                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
+            },
+        );
+    }
+
     /// #1056: never overwrite a user's OPENCODE_AUTH_CONTENT, and skip the
     /// handover when v2 ignores it or deny.env strips it.
     #[test]
@@ -3276,6 +3353,19 @@ mod keychain_substitute_tests {
         });
     }
 
+    /// OpenCode v2: a user-passed OPENCODE_AUTH_CONTENT is kept (SECURITY.md).
+    #[test]
+    fn session_env_keeps_user_opencode_auth_content() {
+        let mut cmd = Command::new("true");
+        cmd.env("OPENCODE_AUTH_CONTENT", "{}");
+        apply_session_env(&mut cmd, &[], &[]);
+        let set: Vec<_> = cmd.get_envs().collect();
+        assert_eq!(
+            set,
+            vec![("OPENCODE_AUTH_CONTENT".as_ref(), Some("{}".as_ref()))]
+        );
+    }
+
     #[test]
     fn session_env_skips_denied_names() {
         let mut cmd = Command::new("true");
@@ -3283,7 +3373,7 @@ mod keychain_substitute_tests {
             ("OPENAI_API_KEY".to_string(), "x".to_string()),
             ("KEEP".to_string(), "y".to_string()),
         ];
-        apply_session_env(&mut cmd, false, &extra, &["OPENAI_API_KEY".to_string()]);
+        apply_session_env(&mut cmd, &extra, &["OPENAI_API_KEY".to_string()]);
         let set: Vec<_> = cmd.get_envs().collect();
         assert_eq!(set, vec![("KEEP".as_ref(), Some("y".as_ref()))]);
     }
