@@ -1932,7 +1932,7 @@ fn merge_tool_path_env_overrides(
         let extra: Vec<&Path> = std::iter::once(project_dir)
             .chain(temp.iter().map(PathBuf::as_path))
             .collect();
-        if !cplt::sandbox::env_tool_dir_allowed(&path, home, ovr.write, &extra) {
+        if !cplt::sandbox::env_tool_dir_allowed(ovr.name, &path, home, ovr.write, &extra) {
             // An explicit `allow.*` grant already covers it: nothing to report.
             let reads: &[PathBuf] = if ovr.write { &[] } else { &resolved.allow_read };
             let covered = resolved
@@ -1945,11 +1945,16 @@ fn merge_tool_path_env_overrides(
             if !resolved.quiet && !covered {
                 ui::warn(&format!(
                     "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
-                 under ~/.cache, ~/Library/Caches, another cplt tool cache, the project or \
-                 /tmp, so no grant is added. Move it under ~/.cache, or grant it with \
-                 `allow.{}` if you mean to.",
+                 under ~/.cache, ~/Library/Caches (not a personal-app cache), another cplt \
+                 tool cache, {}the project or /tmp, so no grant is added. Move it there, or \
+                 grant it with `allow.{}` if you mean to.",
                     ovr.name,
                     path.to_string_lossy().escape_debug(),
+                    if ovr.write {
+                        ""
+                    } else {
+                        "a known SDK root (~/.jdks, ~/.dotnet, /usr/lib/jvm, mise, ...), "
+                    },
                     if ovr.write { "write" } else { "read" }
                 ));
             }
@@ -7395,19 +7400,19 @@ fn accept_tool_dir(
         if !quiet {
             ui::warn(&format!(
                 "Ignoring {var} = {}: it resolves into protected path {}.",
-                path.display(),
-                prot.display()
+                path.to_string_lossy().escape_debug(),
+                prot.to_string_lossy().escape_debug()
             ));
         }
         return None;
     }
-    if !cplt::sandbox::env_tool_dir_allowed(&path, home_dir, false, &[]) {
+    if !cplt::sandbox::env_tool_dir_allowed(var, &path, home_dir, false, &[]) {
         if !quiet {
             ui::warn(&format!(
                 "Ignoring {var} = {}: an env-set SDK dir is granted read only under a known SDK or tool \
              root (~/.sdkman, ~/.jdks, /usr/lib/jvm, /Library/Java, mise, asdf, ...). Grant it \
              with `allow.read` if you mean to.",
-                path.display()
+                path.to_string_lossy().escape_debug()
             ));
         }
         return None;

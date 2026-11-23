@@ -305,6 +305,7 @@ pub fn ensure_pnpm_package_manager_stores(
         if from_env
             && !default
             && (!crate::sandbox::env_tool_dir_allowed(
+                "PNPM_HOME",
                 &canonical_root,
                 &canonical_home,
                 true,

@@ -6631,6 +6631,70 @@ except Exception as e:
         assert_env_tool_dir_not_granted("NPM_CONFIG_CACHE", ".config/fish", &[], "m.toml");
     }
 
+    /// `~/Library/Caches` is a safe root, but a personal-app cache in it is
+    /// denied by the profile; an env grant must not override that (#1104).
+    #[test]
+    fn env_tool_dir_in_denied_app_cache_is_not_granted() {
+        assert_env_tool_dir_not_granted(
+            "PIP_CACHE_DIR",
+            "Library/Caches/com.google.Chrome",
+            &[],
+            "x",
+        );
+        assert_env_tool_dir_not_granted("GOCACHE", "Library/Caches/Firefox/p", &[], "x");
+    }
+
+    /// A relocated toolchain home is writable only for its own var: another
+    /// var must not get write over its `bin` (#1104).
+    #[test]
+    fn env_tool_dir_toolchain_bin_via_other_var_is_not_granted() {
+        assert_env_tool_dir_not_granted(
+            "PIP_CACHE_DIR",
+            ".local/share/cargo/bin",
+            &[("CARGO_HOME", ".local/share/cargo")],
+            "cargo",
+        );
+    }
+
+    /// An SDK var naming a dir with control bytes is reported escaped, so the
+    /// name cannot rewrite the terminal.
+    #[test]
+    fn env_sdk_dir_refusal_escapes_control_bytes() {
+        require_sandbox!();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let evil = home.path().join("jdk\x1b[31m");
+        std::fs::create_dir_all(&evil).unwrap();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                "true",
+            ])
+            .env("HOME", home.path())
+            .env("JAVA_HOME", &evil)
+            .output()
+            .expect("run cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Ignoring JAVA_HOME") && stderr.contains("jdk\\u{1b}[31m"),
+            "refusal must be reported escaped: {stderr:?}"
+        );
+        assert!(!stderr.contains('\x1b'), "raw ESC leaked: {stderr:?}");
+    }
+
     /// `TMPDIR` is as attacker-set as `GOCACHE`: pointing it at `$HOME` must
     /// not make a home persistence path a "temp" safe root.
     #[test]
@@ -6735,6 +6799,10 @@ except Exception as e:
         assert!(
             !file.exists(),
             "planted suffix must not grant write: {stderr}"
+        );
+        assert!(
+            stderr.contains("Ignoring GOCACHE"),
+            "the refusal must be reported: {stderr}"
         );
     }
 }

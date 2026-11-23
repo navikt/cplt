@@ -2684,9 +2684,15 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
 ];
 
 /// Toolchain homes a relocated `CARGO_HOME` or `GOPATH` may use outside a
-/// cache. Under `~/.cache` their `bin` loses exec, so these are the documented
-/// alternative. Only these two names, never `~/.local/share` itself.
-pub const ENV_TOOL_HOME_ROOTS: &[&str] = &["~/.local/share/cargo", "~/.local/share/go"];
+/// cache, each paired with the only variable that may claim it for write.
+/// Under `~/.cache` their `bin` loses exec, so these are the documented
+/// alternative. Only these two names, never `~/.local/share` itself. Another
+/// writable var (`PIP_CACHE_DIR=~/.local/share/cargo/bin`) must not get write
+/// over the toolchain's binaries.
+pub const ENV_TOOL_HOME_ROOTS: &[(&str, &str)] = &[
+    ("CARGO_HOME", "~/.local/share/cargo"),
+    ("GOPATH", "~/.local/share/go"),
+];
 
 /// Read-only SDK roots an env-named toolchain (`JAVA_HOME`, `DOTNET_ROOT`,
 /// `RUSTUP_HOME`, `NODE_PATH`) may live under, beyond [`HOME_TOOL_DIRS`] and
@@ -2716,15 +2722,41 @@ pub const ENV_SDK_READ_ROOTS: &[&str] = &[
 /// - write: a writable [`HOME_TOOL_DIRS`] entry (`~/.cache`,
 ///   `~/Library/Caches`, `~/.npm`, `~/.gradle`, the pnpm stores, ...) or one of
 ///   `extra` (the project, the session scratch, the system temp dir), or
-///   [`ENV_TOOL_HOME_ROOTS`];
+///   the [`ENV_TOOL_HOME_ROOTS`] entry paired with `var`;
 /// - read: any of those, any [`HOME_TOOL_DIRS`] entry, [`TOOL_READ_DIRS`] or
 ///   [`ENV_SDK_READ_ROOTS`].
+///
+/// `~/Library/Caches` itself and any personal-app cache in it
+/// ([`DENIED_CACHE_PREFIXES`], minus `com.apple.dt.`) is refused: an automatic
+/// grant there would override the deny that protects browser and app state.
 #[must_use]
-pub fn env_tool_dir_allowed(path: &Path, home: &Path, write: bool, extra: &[&Path]) -> bool {
+pub fn env_tool_dir_allowed(
+    var: &str,
+    path: &Path,
+    home: &Path,
+    write: bool,
+    extra: &[&Path],
+) -> bool {
     use std::os::unix::fs::MetadataExt;
     let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
     if !path.is_dir() || id(path).is_none() || id(path) == id(home) {
         return false;
+    }
+    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    // Lowercased: APFS is case-insensitive, so `com.Google.Chrome` is the same dir.
+    let caches = canon_home.join("Library/Caches");
+    let lower = |p: &Path| p.to_string_lossy().to_ascii_lowercase();
+    if let Some(rel) = lower(path).strip_prefix(&lower(&caches)) {
+        let first = rel.trim_start_matches('/').split('/').next().unwrap_or("");
+        if (rel.is_empty() || rel.starts_with('/'))
+            && (first.is_empty()
+                || (!first.starts_with("com.apple.dt.")
+                    && DENIED_CACHE_PREFIXES
+                        .iter()
+                        .any(|d| first.starts_with(&d.to_ascii_lowercase()))))
+        {
+            return false;
+        }
     }
     let mut roots: Vec<PathBuf> = HOME_TOOL_DIRS
         .iter()
@@ -2736,7 +2768,12 @@ pub fn env_tool_dir_allowed(path: &Path, home: &Path, write: bool, extra: &[&Pat
         Some(rel) => home.join(rel),
         None => PathBuf::from(r),
     };
-    roots.extend(ENV_TOOL_HOME_ROOTS.iter().map(home_rel));
+    roots.extend(
+        ENV_TOOL_HOME_ROOTS
+            .iter()
+            .filter(|(v, _)| !write || *v == var)
+            .map(|(_, r)| home_rel(r)),
+    );
     if !write {
         roots.extend(TOOL_READ_DIRS.iter().map(PathBuf::from));
         roots.extend(
@@ -2751,7 +2788,6 @@ pub fn env_tool_dir_allowed(path: &Path, home: &Path, write: bool, extra: &[&Pat
     // A home root reached through a symlink is skipped: the agent can plant
     // `~/.local/share/go -> ~/Library/LaunchAgents` and so turn any target
     // into a "safe root".
-    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let ids: Vec<_> = roots
         .iter()
         .filter(|r| match r.strip_prefix(home) {
