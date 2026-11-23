@@ -106,7 +106,10 @@ fn e2e_planted_launch_state_is_never_touched_before_the_refusal() {
         std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
         assert!(!status.success(), "{kind}: {stderr}");
         assert!(
-            stderr.contains("Move it out of that tree"),
+            // `granted` holds the linked state dir, so the allow.write ancestor
+            // check (#1095) may refuse before the resolved-link check.
+            stderr.contains("Move it out of that tree")
+                || stderr.contains("would make cplt's state directory"),
             "{kind}: {stderr}"
         );
         assert_eq!(

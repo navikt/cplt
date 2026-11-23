@@ -6142,8 +6142,12 @@ mod tests {
         let Err(error) = prepare(&config) else {
             panic!("writable parent must be refused");
         };
+        // The parent is `~/.config` (Linux) or `~/Library/Application Support`
+        // (macOS). On Linux it also contains cplt's state dir, and that earlier
+        // refusal (#1095) wins.
         assert!(
-            error.contains("could replace the state directory"),
+            error.contains("could replace the state directory")
+                || error.contains("would make cplt's state directory"),
             "{error}"
         );
         assert!(error.contains(&writes[0].display().to_string()), "{error}");
