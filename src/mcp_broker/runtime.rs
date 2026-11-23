@@ -1223,8 +1223,9 @@ fn start_bus_proxy(
     Ok(ready)
 }
 
-/// How long xdg-dbus-proxy gets to say it listens. Well under
-/// `discover::PROBE_TIMEOUT`, so a status probe still finishes in time.
+/// How long xdg-dbus-proxy gets to say it listens. `cplt mcp status` waits
+/// this before its own `mcp_broker::PROBE_TIMEOUT` (10 s) starts, so the two
+/// add up: at most 2 s + 10 s.
 const BUS_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Read the one readiness byte from `r`, giving up after `timeout`.
@@ -1238,17 +1239,26 @@ fn read_ready_byte(
         events: libc::POLLIN,
         revents: 0,
     };
-    let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
-    // SAFETY: one valid pollfd for the duration of the call.
-    match unsafe { libc::poll(&raw mut pfd, 1, ms) } {
-        0 => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("xdg-dbus-proxy was not ready within {}s", timeout.as_secs()),
-            ));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let ms = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&raw mut pfd, 1, ms) } {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("xdg-dbus-proxy was not ready within {}s", timeout.as_secs()),
+                ));
+            }
+            n if n < 0 => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+            _ => break,
         }
-        n if n < 0 => return Err(std::io::Error::last_os_error()),
-        _ => {}
     }
     r.read_exact(&mut [0u8])
         .map_err(|_| std::io::Error::other("xdg-dbus-proxy exited before it was ready"))
@@ -1722,6 +1732,59 @@ mod tests {
             super::start_bus_proxy(Some(fake), dir.path(), &dir.path().join("s")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
         assert!(start.elapsed() < crate::discover::PROBE_TIMEOUT);
+    }
+
+    /// A signal landing during the wait (EINTR) does not end it.
+    #[test]
+    fn read_ready_byte_survives_eintr() {
+        use std::io::Write;
+        extern "C" fn noop(_: libc::c_int) {}
+        // SAFETY: a no-op handler, so SIGUSR1 interrupts poll instead of
+        // killing the test process.
+        unsafe { libc::signal(libc::SIGUSR1, noop as *const () as libc::sighandler_t) };
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        // SAFETY: the calling thread's own handle.
+        let me = unsafe { libc::pthread_self() } as usize;
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: `me` is blocked in read_ready_byte below until `w` writes.
+            unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGUSR1) };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            w.write_all(b"x").unwrap();
+        });
+        super::read_ready_byte(&mut r, std::time::Duration::from_secs(5)).unwrap();
+        t.join().unwrap();
+    }
+
+    /// #1060: the wedged proxy is killed on timeout, not left running.
+    #[test]
+    fn bus_proxy_is_killed_on_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("xdg-dbus-proxy");
+        let pidfile = dir.path().join("pid");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::start_bus_proxy(Some(fake), dir.path(), &dir.path().join("s")).unwrap_err();
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The reaper thread waits on it; give it a moment.
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: signal 0 only checks that the pid exists.
+            (unsafe { libc::kill(pid, 0) }) != 0
+        });
+        assert!(gone, "proxy {pid} still running after the timeout");
     }
 
     #[test]

@@ -115,13 +115,29 @@ pub fn configured_servers(
     config_file: Option<&Path>,
     content: Option<&str>,
 ) -> Vec<Entry> {
-    let mut names: Vec<Entry> = user_configs(dirs, config_file, content)
-        .iter()
-        .flat_map(github_servers)
-        .collect();
+    // OpenCode deep-merges these in order, so an entry is judged as merged:
+    // a URL in one file and `"enabled": false` in a later one is off.
+    let mut merged = Value::Object(Map::new());
+    for c in user_configs(dirs, config_file, content) {
+        deep_merge(&mut merged, c);
+    }
+    let mut names = github_servers(&merged);
     names.sort();
     names.dedup();
     names
+}
+
+/// `over` merged into `base`, objects key by key, anything else replaced:
+/// OpenCode's merge of its config layers.
+fn deep_merge(base: &mut Value, over: Value) {
+    match (base, over) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                deep_merge(b.entry(k).or_insert(Value::Null), v);
+            }
+        }
+        (b, o) => *b = o,
+    }
 }
 
 /// The user's OpenCode configs, parsed: `config.json`, `opencode.json` and
@@ -186,6 +202,30 @@ pub(crate) fn install_for_test(upstream: &str, token: &str, secret: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fable/Copilot on #1083: `enabled` is judged on the merged config.
+    #[test]
+    fn enabled_is_judged_after_merging_the_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = r#"{"mcp":{"gh":{"url":"https://api.githubcopilot.com/mcp"}}}"#;
+        std::fs::write(dir.path().join("opencode.json"), url).unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        let off = r#"{"mcp":{"gh":{"enabled":false}}}"#;
+        assert!(configured_servers(&dirs, None, Some(off)).is_empty());
+        let on = r#"{"mcp":{"gh":{"enabled":true}}}"#;
+        assert_eq!(
+            configured_servers(&dirs, None, Some(on)),
+            [(false, "gh".to_string())]
+        );
+        // A disabled, B enabled: on, since the merged entry has the URL.
+        let a = r#"{"mcp":{"gh":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"}}}"#;
+        std::fs::write(dir.path().join("opencode.json"), a).unwrap();
+        assert_eq!(
+            configured_servers(&dirs, None, Some(on)),
+            [(false, "gh".to_string())]
+        );
+        assert!(configured_servers(&dirs, None, None).is_empty());
+    }
 
     #[test]
     fn url_detection() {
