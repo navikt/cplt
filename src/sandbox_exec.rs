@@ -2801,6 +2801,27 @@ echo gho_old"#,
         );
     }
 
+    /// A denied or locked Keychain read also exits 1. Retrying without
+    /// `--no-refresh` would prompt a second time with refresh back on.
+    #[test]
+    fn a_failing_gh_is_not_retried_without_no_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls");
+        let gh = gh_stub(
+            dir.path(),
+            &format!(
+                r#"echo "$*" >> '{}'
+echo "failed to read keyring" >&2; exit 1"#,
+                log.display()
+            ),
+        );
+        assert_eq!(gh_auth_token(&gh, Duration::from_secs(10)), None);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "auth token --hostname github.com --no-refresh\n"
+        );
+    }
+
     /// A `gh` that fails hands over nothing — including when it prints to
     /// stdout on the way out, which `.trim()` alone would have accepted.
     #[test]

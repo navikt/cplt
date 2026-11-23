@@ -236,24 +236,48 @@ pub(crate) fn gh_auth_token(gh: &Path, timeout: Duration) -> Option<String> {
         for var in AUTH_ENV_VARS {
             cmd.env_remove(var);
         }
-        bounded_stdout(cmd, timeout)
+        bounded_run(cmd, timeout, true)
     };
-    let start = std::time::Instant::now();
-    // An older gh rejects the unknown flag, and has no refresh to suppress.
-    // Skip the retry when the first try timed out, so a hung gh costs one timeout.
-    let buf =
-        probe(true).or_else(|| (start.elapsed() < timeout).then(|| probe(false)).flatten())?;
+    // Retry only when gh names the flag as unknown (an older gh, which has no
+    // refresh to suppress). A denied Keychain read also exits 1; retrying it
+    // would prompt again with refresh back on. A timeout (None) never retries.
+    let (ok, mut buf, stderr) = probe(true)?;
+    if !ok {
+        if !String::from_utf8_lossy(&stderr).contains("unknown flag: --no-refresh") {
+            return None;
+        }
+        let (ok, retry, _) = probe(false)?;
+        if !ok {
+            return None;
+        }
+        buf = retry;
+    }
     let token = String::from_utf8_lossy(&buf).trim().to_string();
     (!token.is_empty()).then_some(token)
 }
 
 /// Bound both the child and its stdout: a descendant can keep the pipe open
 /// after gh exits. Null stdin prevents credential prompts from reading the TTY.
-pub(crate) fn bounded_stdout(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+pub(crate) fn bounded_stdout(cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    let (ok, buf, _) = bounded_run(cmd, timeout, false)?;
+    ok.then_some(buf)
+}
+
+/// Like `bounded_stdout`, but returns the exit outcome and, when asked, up to
+/// 16 KiB of stderr. `None` means spawn failure, timeout or an unread pipe.
+fn bounded_run(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+    capture_stderr: bool,
+) -> Option<(bool, Vec<u8>, Vec<u8>)> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
@@ -263,9 +287,24 @@ pub(crate) fn bounded_stdout(mut cmd: std::process::Command, timeout: Duration) 
         let result = stdout.read_to_end(&mut buf);
         let _ = tx.send(result.map(|_| buf));
     });
+    let err_rx = child.stderr.take().map(|stderr| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut stderr = stderr;
+            let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut buf);
+            // Drain the rest so a chatty child cannot block on a full pipe.
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            let _ = tx.send(buf);
+        });
+        rx
+    });
     let status = crate::audit::wait_timeout(&mut child, timeout)?;
     let buf = rx.recv_timeout(READ_GRACE).ok()?.ok()?;
-    status.success().then_some(buf)
+    let err = err_rx
+        .map(|rx| rx.recv_timeout(READ_GRACE).unwrap_or_default())
+        .unwrap_or_default();
+    Some((status.success(), buf, err))
 }
 
 /// Match gh's config lookup; relative overrides cannot be granted by cplt.
