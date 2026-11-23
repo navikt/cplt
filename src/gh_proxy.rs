@@ -3532,7 +3532,19 @@ fn misplaced_flag<'a>(args: &[&'a str]) -> Option<&'a str> {
         "status",
     ];
     let (root, unknown) = root_command(args);
-    let root = root?;
+    // An unknown flag may have eaten every positional as values that cobra
+    // reads as the command (`gh --body -R pr --body -R merge` runs `pr merge`).
+    let Some(root) = root else {
+        return args
+            .iter()
+            .find(|a| a.starts_with('-'))
+            .copied()
+            .filter(|_| unknown);
+    };
+    // cobra drops empty arguments, so `gh "" pr merge` runs `pr merge`.
+    if args[..=root].contains(&"") {
+        return Some("");
+    }
     if unknown {
         return args[..root].iter().find(|a| a.starts_with('-')).copied();
     }
@@ -3541,6 +3553,9 @@ fn misplaced_flag<'a>(args: &[&'a str]) -> Option<&'a str> {
     }
     let mut i = root + 1;
     while let Some(&a) = args.get(i) {
+        if a.is_empty() {
+            return Some(a);
+        }
         if !a.starts_with('-') || a == "-" {
             return None;
         }
@@ -3622,7 +3637,15 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
             .find(|(_, s)| AUTH_SUBCOMMANDS.contains(s))
             .map(|(j, _)| (i, j))
     });
-    let auth = auth_sub.is_some_and(|(i, j)| j == i + 1);
+    // `-h <v>`, `-h<v>`, `-h=<v>` may sit between `auth` and the subcommand,
+    // as parse_command allows; the scan must still see that host.
+    let auth = auth_sub.is_some_and(|(i, j)| {
+        let mut k = i + 1;
+        while k < j && args[k].starts_with("-h") {
+            k += if args[k] == "-h" { 2 } else { 1 };
+        }
+        k == j
+    });
     let mut found = Vec::new();
     // An unknown root flag may take a value (`gh --x v auth ...`): then any
     // `auth` positional before another command word could be the command.
@@ -6597,6 +6620,47 @@ mod tests {
         assert_eq!(misplaced_flag(&["pr", "-R", "o/r", "list"]), None);
         assert_eq!(misplaced_flag(&["pr", "list", "--web"]), None);
         assert_eq!(misplaced_flag(&["api", "-X", "GET", "user"]), None);
+    }
+
+    #[test]
+    fn short_hostname_before_auth_subcommand_is_scanned() {
+        for args in [
+            &["auth", "-h", "evil.ghe.com", "status"][..],
+            &["auth", "-hevil.ghe.com", "status"],
+            &["auth", "-h=evil.ghe.com", "token"],
+        ] {
+            assert_eq!(requested_hostnames(args), vec!["evil.ghe.com"], "{args:?}");
+        }
+        let policy = GatePolicy::default();
+        assert!(
+            gate(
+                &["auth", "-h", "evil.ghe.com", "status"],
+                Path::new("."),
+                &policy
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_flag_consuming_every_positional_is_refused() {
+        let args = ["--body", "-R", "pr", "--body", "-R", "merge"];
+        assert_eq!(misplaced_flag(&args), Some("--body"));
+        assert!(gate(&args, Path::new("."), &GatePolicy::default()).is_err());
+        assert_eq!(misplaced_flag(&["--help"]), None);
+        assert_eq!(misplaced_flag(&["--version"]), None);
+    }
+
+    #[test]
+    fn empty_argument_before_subcommand_is_refused() {
+        let policy = GatePolicy {
+            unknown_command: UnknownCommandDecision::Allow,
+            ..GatePolicy::default()
+        };
+        for args in [&["pr", "", "merge"][..], &["", "pr", "merge"]] {
+            assert_eq!(misplaced_flag(args), Some(""), "{args:?}");
+            assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
+        }
     }
 
     #[test]
