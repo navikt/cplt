@@ -87,7 +87,8 @@ fn gh_token_spec_filters_opencode_github_mcp() {
             .contains("disabled")
     );
     // A spec the final policy can write is refused, and GitHub MCP is off.
-    let err = mcp_broker::github_spec(&found, Path::new("/nohome"), |_| Some(home.clone())).unwrap_err();
+    let err =
+        mcp_broker::github_spec(&found, Path::new("/nohome"), |_| Some(home.clone())).unwrap_err();
     assert!(err.contains("writable"), "{err}");
     // Two specs are ambiguous.
     found.remotes.push(found.remotes[0].clone());
@@ -97,7 +98,9 @@ fn gh_token_spec_filters_opencode_github_mcp() {
             .contains("ambiguous")
     );
     found.remotes.pop();
-    let spec = mcp_broker::github_spec(&found, Path::new("/nohome"), none).unwrap().unwrap();
+    let spec = mcp_broker::github_spec(&found, Path::new("/nohome"), none)
+        .unwrap()
+        .unwrap();
 
     // The upstream: a fake upstream proxy, so the pinned https URL stays.
     let up = TcpListener::bind("127.0.0.1:0").unwrap();
