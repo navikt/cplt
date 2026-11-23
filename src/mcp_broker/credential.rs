@@ -10,6 +10,7 @@ use serde::{Serialize, Serializer};
 
 use super::PROBE_TIMEOUT;
 use super::spec::Spec;
+use crate::agent::SecretToken;
 
 /// One credential mechanism.
 #[derive(Debug, PartialEq, Eq)]
@@ -86,11 +87,44 @@ pub static OAUTH: Credential = Credential {
     linux_read_paths: &[],
 };
 
+/// The host's gh login, for a remote spec (#909): cplt runs the trusted
+/// `gh auth token` once at launch and the broker's remote leg adds the
+/// token as `Authorization`. Kept out of `MECHANISMS` so a command spec
+/// cannot name it: the token never reaches a spawned server.
+pub static GH_TOKEN: Credential = Credential {
+    name: "gh-token",
+    command: None,
+    probe: None,
+    keychain: false,
+    write_dirs: &[],
+    linux_write_dirs: &[],
+    linux_read_paths: &[],
+};
+
+/// Where a remote leg's bearer token comes from. gh-token reads once at
+/// launch; OAuth (#910) plugs in with refresh. `None` means not logged in:
+/// the endpoint is not started.
+pub trait CredentialSource {
+    fn bearer(&self) -> Option<SecretToken>;
+}
+
+/// The gh-token source: the same trusted, once-per-process `gh auth token`
+/// lookup as launch and `cplt doctor` (`discover::stored_gh_secret`), never
+/// a new path. Never logged: [`SecretToken`] redacts itself.
+#[allow(dead_code)] // wired to clients in #909 PR3/PR4
+pub struct GhToken;
+
+impl CredentialSource for GhToken {
+    fn bearer(&self) -> Option<SecretToken> {
+        crate::discover::stored_gh_secret()
+    }
+}
+
 impl Credential {
     pub(crate) fn parse(name: &str) -> Result<&'static Self, String> {
         if name == "gh-token" {
             return Err(
-                "credential gh-token is served by cplt's built-in GitHub MCP proxy, not by a broker spec"
+                "credential gh-token cannot serve a command; it is only for a remote upstream, which is behind CPLT_MCP_REMOTE=1"
                     .into(),
             );
         }
@@ -119,6 +153,10 @@ impl Serialize for Credential {
 /// whether the login is usable, `None` when unknown, with a note saying why
 /// it is unknown. `(None, None)` when the mechanism has no probe.
 pub fn credential_ok(spec: &Spec) -> (Option<bool>, Option<&'static str>) {
+    // Status probe for gh-token: the lookup itself succeeds.
+    if spec.credential.name == GH_TOKEN.name {
+        return (Some(crate::discover::stored_gh_token_available()), None);
+    }
     let Some(args) = spec.credential.probe else {
         return (None, None);
     };

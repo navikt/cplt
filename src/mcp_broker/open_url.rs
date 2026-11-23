@@ -935,6 +935,8 @@ mod tests {
             command: vec!["https://cmd.example/mcp".into()],
             program: PathBuf::new(),
             remote: Some("https://FGW.example/mcp".into()),
+            remote_headers: Vec::new(),
+            timeout_secs: 600,
             egress_hosts: vec![
                 "fgw.example".into(),
                 "cmd.example".into(),

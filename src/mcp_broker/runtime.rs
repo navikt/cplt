@@ -27,7 +27,7 @@ pub struct Log {
 
 /// DENIED, failed egress dials, auth and other failures reach the terminal at every level (D12);
 /// the rest only at `--proxy-log-level all`.
-fn to_terminal(level: crate::proxy::ProxyLogLevel, text: &str) -> bool {
+pub(super) fn to_terminal(level: crate::proxy::ProxyLogLevel, text: &str) -> bool {
     text.contains("DENIED")
         || text.contains("connect failed")
         || text.starts_with("FAIL")
@@ -1601,7 +1601,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
                 }
                 let action = match pending.lock() {
                     Ok(mut p) => {
-                        let a = on_server(&line, &spec, &mut p);
+                        let a = on_server(&line, &spec, "", &mut p);
                         if let Some(text) = p.1.take() {
                             log.line(&spec.id, &text);
                         }
@@ -1652,7 +1652,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         std::thread::spawn(move || {
             while !done.load(Ordering::Acquire) {
                 let Ok(mut p) = pending.lock() else { break };
-                for (error, cancel) in p.evict(CALL_TIMEOUT) {
+                for (error, cancel, _) in p.evict(CALL_TIMEOUT) {
                     log.line(&id, "FAIL request timed out");
                     write_line(&client, &error);
                     // Best effort: a full queue means the child is stuck.
@@ -1671,7 +1671,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     while let Some(line) = read_line(&mut reader, MAX_MESSAGE) {
         let action = match pending.lock() {
             Ok(mut p) => {
-                let a = on_client(&line, spec, &mut p);
+                let a = on_client(&line, spec, "", &mut p);
                 if let Some(text) = p.1.take() {
                     shared.log.line(&spec.id, &text);
                 }
