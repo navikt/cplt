@@ -1969,6 +1969,8 @@ Two guards keep that visible rather than silent:
 
 Neither guard covers a repository that writes a config *outside* the project and points `CPLT_CONFIG` at that. The warning is what makes that case visible.
 
+`CPLT_MANAGED_CONFIG` (#1095) lets a wrapper add organisation defaults. It comes from the same ambient environment, so the path is treated as hostile. cplt refuses the file, with one line, and launches without it when: the path is relative; the file, any ancestor or any symlink hop lies in a tree the session can write (project, named repositories, scratch, agent dirs, caches, every `allow.write` including file grants), compared by `(dev, ino)` so a case or Unicode variant of a writable root still matches; the last component is a symlink or not a regular file; it has more than one hard link; the current user does not own it; or the `managed_by`/`schema` header is missing or unknown. It is opened with `O_NOFOLLOW`, checked with `fstat` on the open descriptor, and read with a 64 KiB cap. The file can only add to an explicit allowlist of keys, today `proxy.allow_private_domains`; any other key is refused by name. It can never widen file access or change the sandbox preset. `config show` and `doctor` tag its values `managed:<name>`.
+
 ### Scratch directory session IDs
 
 Session IDs for per-session scratch directories come from `/dev/urandom` (16 random bytes, hex-encoded), falling back to PID plus nanosecond timestamp if `/dev/urandom` is unavailable, which is not expected on standard macOS or Linux. The fallback is predictable, but the failure mode is denial-of-service (directory creation fails if it already exists), not compromise.

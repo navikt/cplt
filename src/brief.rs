@@ -1154,6 +1154,7 @@ mod tests {
             },
             allow_private_domains: Vec::new(),
             repo_private_domains: Vec::new(),
+            managed: None,
             allow_read: Vec::new(),
             allow_write: Vec::new(),
             tool_roots: Vec::new(),

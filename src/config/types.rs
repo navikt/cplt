@@ -1030,6 +1030,9 @@ pub struct Resolved {
     /// Tracked separately because nothing re-reads that source mid-session, so
     /// the proxy must not put these under its 5-second config reload (#186).
     pub repo_private_domains: Vec<String>,
+    /// The managed layer (#1095) applied to this config, if any. Its domains
+    /// are frozen for the session like the repo ones: nothing re-reads it.
+    pub managed: Option<super::managed::ManagedConfig>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
     /// Tool roots relocated by parent env (`CARGO_HOME`, ...), set by the host

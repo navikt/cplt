@@ -4942,10 +4942,25 @@ fn start_proxy_if_enabled(
                     .iter()
                     .any(|c| proxy::normalize_hostname(c) == **d)
                     && !resolved.repo_private_domains.contains(d)
+                    && resolved
+                        .managed
+                        .as_ref()
+                        .is_none_or(|m| !m.allow_private_domains.contains(d))
             })
             .cloned()
             .collect(),
-        repo_private_domains: resolved.repo_private_domains.clone(),
+        // The managed file is read once, like the repo proposals: frozen too.
+        repo_private_domains: resolved
+            .repo_private_domains
+            .iter()
+            .chain(
+                resolved
+                    .managed
+                    .iter()
+                    .flat_map(|m| &m.allow_private_domains),
+            )
+            .cloned()
+            .collect(),
         config_file: config_path.cloned(),
         log_file: resolved.proxy_log_file.clone(),
         log_level: proxy_log_level(
@@ -7777,6 +7792,18 @@ fn assemble_sandbox(
     // AGENTS.md layer writes into the user's repo and must not run until the
     // launch is confirmed — see `apply_persistent_sandbox_brief`, which the
     // `exec` and `check` paths deliberately never call.
+    // Managed layer (#1095): checked against every tree this session can
+    // write, so it is applied only now that the agent dirs are known.
+    match config::load_managed(&session_writable_everywhere(
+        probe,
+        opts.repos.dirs,
+        &resolved.allow_write,
+        &agent_dirs,
+    )) {
+        Some(Ok(managed)) => resolved.apply_managed(&managed),
+        Some(Err(line)) => ui::warn(&line),
+        None => {}
+    }
     write_session_sandbox_brief(
         resolved,
         active_agent,
@@ -10171,6 +10198,35 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         resolved.keychain_substitute,
         &session_writable_everywhere(&probe, &repo_paths, &resolved.allow_write, &agent_dirs),
     );
+    match config::load_managed(&session_writable_everywhere(
+        &probe,
+        &repo_paths,
+        &resolved.allow_write,
+        &agent_dirs,
+    )) {
+        Some(Ok(managed)) => {
+            ok.push(format!(
+                "managed config: {} [{}]",
+                tilde(&managed.path),
+                managed.tag()
+            ));
+            for d in &managed.allow_private_domains {
+                ok.push(format!(
+                    "proxy.allow_private_domains: {d} [{}]",
+                    managed.tag()
+                ));
+            }
+            resolved.apply_managed(&managed);
+        }
+        Some(Err(line)) => findings.push(Finding::warning(
+            line,
+            Some(format!(
+                "fix the file, or unset {}",
+                config::MANAGED_CONFIG_ENV
+            )),
+        )),
+        None => {}
+    }
     let doctor_pnpm = resolve_exec_binary("pnpm").ok();
     let doctor_pnpm_shadowed = doctor_pnpm
         .as_ref()
@@ -11111,6 +11167,7 @@ fn run_config_show() -> ExitCode {
 
     // Show repo config if present
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
+    show_managed_config(loaded.as_ref(), local.as_ref(), project_dir.as_deref());
     if let Some(ref dir) = project_dir {
         match repo_config::load_repo_config(dir) {
             Ok(Some(loaded_repo)) => {
@@ -11130,6 +11187,43 @@ fn run_config_show() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// The managed layer (#1095) in `config show`: each value tagged with its
+/// source. Checked against the project, `allow.write`, scratch and the
+/// home/temp trees; a launch also checks the agent's own dirs.
+fn show_managed_config(
+    loaded: Option<&config::LoadedConfig>,
+    local: Option<&config::LoadedConfig>,
+    project_dir: Option<&Path>,
+) {
+    if std::env::var_os(config::MANAGED_CONFIG_ENV).is_none_or(|v| v.is_empty()) {
+        return;
+    }
+    let resolved = loaded
+        .map(|l| l.config.clone())
+        .unwrap_or_default()
+        .merge_with_local(local.map(|l| &l.config), config::CliFlags::default());
+    let allow_write = resolved.map(|r| r.allow_write).unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let scratch = home.as_deref().map(scratch::ScratchDir::base);
+    let mut writable = project_dir.map_or_else(Vec::new, |p| {
+        sandbox::session_writable_roots(p, &[], &allow_write, scratch.as_deref())
+    });
+    if let Some(home) = &home {
+        writable.extend(cplt::sandbox::home_and_temp_writable_roots(home, &[], None));
+    }
+    println!();
+    match config::load_managed(&writable) {
+        Some(Ok(m)) => {
+            println!("Managed config ({}):", m.path.display());
+            for d in &m.allow_private_domains {
+                println!("  proxy.allow_private_domains = {d}  [{}]", m.tag());
+            }
+        }
+        Some(Err(line)) => ui::warn(&line),
+        None => {}
+    }
 }
 
 /// Whether an `--unset` left the repo config's content as it was. Compares

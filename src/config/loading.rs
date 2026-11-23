@@ -665,6 +665,7 @@ impl Config {
             with_proxy,
             bool_layers: bools.layers.clone(),
             repo_private_domains: Vec::new(),
+            managed: None,
             proxy_forced,
             deny_dns: bools.deny_dns,
             netns: bools.netns,

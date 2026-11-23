@@ -576,6 +576,13 @@ What passes through:
 
 **Always blocked:** `AWS_*`, `AZURE_*`, `NPM_TOKEN`, `DATABASE_URL`, `VAULT_TOKEN`, `SSH_AUTH_SOCK`, Docker vars, CI tokens, and anything not in the allowlist.
 
+Variables cplt itself reads:
+
+| Variable | What it does |
+| --- | --- |
+| `CPLT_CONFIG` | Use this config file instead of `~/.config/cplt/config.toml`. See [docs/configuration.md](docs/configuration.md#precedence) |
+| `CPLT_MANAGED_CONFIG` | Absolute path to a managed config from a wrapper (nav-pilot). Adds its `proxy.allow_private_domains` to yours; refused if the session can write it. See [docs/configuration.md](docs/configuration.md#managed-config-from-a-wrapper-cplt_managed_config) |
+
 | Flag | What it does |
 | --- | --- |
 | `--pass-env <VAR>` | Pass one environment variable through to the agent. Repeatable |
