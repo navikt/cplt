@@ -169,12 +169,28 @@ fn names_token_tenant(s: &str) -> bool {
     // Go's url.Parse unescapes `%2e` in a host, so decode before splitting.
     // Unicode lowercase as Go's strings.ToLower, which maps U+0130 `İ` to `i`
     // where Rust yields `i` plus a combining dot.
-    let decoded = percent_decode(s).replace('\u{130}', "i").to_lowercase();
+    // gh may decode more than once (`%25C4` -> `%C4` -> byte), so decode
+    // until stable, bounded.
+    let mut decoded = s.to_string();
+    for _ in 0..4 {
+        let next = percent_decode(&decoded);
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+    let decoded = decoded.replace('\u{130}', "i").to_lowercase();
+    let tenant = |t: &str| {
+        t.ends_with(".ghe.com") || t == "github.localhost" || t.ends_with(".github.localhost")
+    };
     decoded
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
         .map(|t| t.trim_end_matches('.'))
+        // `-Rgithub.localhost/o/r`: pflag reads a short flag's attached value.
         .any(|t| {
-            t.ends_with(".ghe.com") || t == "github.localhost" || t.ends_with(".github.localhost")
+            tenant(t)
+                || t.strip_prefix('-')
+                    .is_some_and(|r| tenant(r.get(1..).unwrap_or("")))
         })
 }
 
@@ -3600,6 +3616,9 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
                     break;
                 } else if !AUTH_SHORT_BOOL.contains(c) {
                     ambiguous = true;
+                    break;
+                } else if cluster[pos + c.len_utf8()..].starts_with('=') {
+                    // pflag: `-a=false` gives the rest of the cluster to `a`.
                     break;
                 }
             }
@@ -12246,9 +12265,41 @@ mod tests {
         );
         let refs: Vec<&str> = pinned.iter().map(String::as_str).collect();
         assert!(ok(&refs));
-        for sub in ["refresh", "setup-git", "switch", "logout", "token"] {
+        for sub in [
+            "status",
+            "refresh",
+            "setup-git",
+            "switch",
+            "logout",
+            "token",
+        ] {
             assert!(!ok(&["auth", sub]), "{sub}");
-            assert!(pin_auth_hostname(&["auth", sub]).is_some(), "{sub}");
+            assert_eq!(
+                pin_auth_hostname(&["auth", sub, "--", "x"]).unwrap(),
+                ["auth", sub, "--hostname", "github.com", "--", "x"],
+                "{sub}"
+            );
+        }
+        // pflag gives `-a=false` its value; `-h=` still names a host.
+        assert!(ok(&[
+            "auth",
+            "status",
+            "--hostname",
+            "github.com",
+            "-a=false"
+        ]));
+        assert!(!ok(&["auth", "status", "-a=false", "-h=evil.ghe.com"]));
+        // Attached short-flag values and `=` forms name a tenant too.
+        for args in [
+            &["pr", "list", "-Rgithub.localhost/o/r"][..],
+            &["pr", "list", "-Rx.ghe.com/o/r"],
+            &["pr", "list", "--repo=github.localhost/o/r"],
+            &["pr", "list", "-R=github.localhost/o/r"],
+            // gh decodes again: double and triple encoding of `İ`.
+            &["repo", "clone", "https://g%25C4%25B0thub.localhost/o/r"],
+            &["repo", "clone", "https://g%2525C4%2525B0thub.localhost/o/r"],
+        ] {
+            assert!(!ok(args), "{args:?}");
         }
         assert_eq!(
             pin_auth_hostname(&["auth", "status", "-h", "github.com"]),
