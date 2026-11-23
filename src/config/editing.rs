@@ -328,12 +328,24 @@ pub fn remove_array_element_in_doc(
         )));
     };
 
-    // Only the first spelling that matches; its manual duplicates all go.
+    // Every entry any rule matches: each rule names the same path or domain,
+    // so removing all of them never widens what is removed.
     let mut removed = false;
-    if let Some(c) = candidates.iter().find(|c| array_index_of(arr, c).is_some()) {
+    for c in &candidates {
         while let Some(idx) = array_index_of(arr, c) {
             arr.remove(idx);
             removed = true;
+        }
+    }
+    if is_private_domains_key(key_info) {
+        let want = crate::proxy::normalize_hostname(value);
+        if !want.is_empty() {
+            let before = arr.len();
+            arr.retain(|v| {
+                v.as_str()
+                    .is_none_or(|s| crate::proxy::normalize_hostname(s) != want)
+            });
+            removed |= arr.len() != before;
         }
     }
 
@@ -779,6 +791,12 @@ mod tests {
         assert!(doc.to_string().contains("\"a.no\"") && !doc.to_string().contains("A.no"));
         let mut doc = parse("[proxy]\nallow_private_domains = [\"a.no\"]\n");
         assert!(remove_array_element_in_doc(&mut doc, info, "A.no.").unwrap());
+        // every spelling goes, whichever rule matches it.
+        let mut doc = parse("[proxy]\nallow_private_domains = [\"A.no.\", \"b.no\", \"B.no\"]\n");
+        assert!(remove_array_element_in_doc(&mut doc, info, "B.NO").unwrap());
+        assert!(!doc.to_string().to_lowercase().contains("b.no"), "{doc}");
+        assert!(remove_array_element_in_doc(&mut doc, info, "a.no").unwrap());
+        assert!(!doc.to_string().contains("allow_private_domains"), "{doc}");
     }
 
     #[test]

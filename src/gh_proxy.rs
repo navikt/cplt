@@ -100,7 +100,7 @@ pub fn token_withheld_reason(
     args: &[&str],
     pin: Option<&str>,
     host_pin: Option<&str>,
-) -> &'static str {
+) -> Option<&'static str> {
     token_withheld_reason_for(args, pin, host_pin, gh_hosts())
 }
 
@@ -109,30 +109,37 @@ fn token_withheld_reason_for(
     pin: Option<&str>,
     host_pin: Option<&str>,
     hosts: &[String],
-) -> &'static str {
+) -> Option<&'static str> {
     let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
     let (named, ambiguous) = scan_hostnames(args);
+    // git runs `store` and `erase` after every HTTPS auth, and the helper never
+    // takes the token, so a notice would be noise or wrong.
     if is_auth_git_credential_request(args) {
-        "GitHub token withheld: `gh auth git-credential` never gets it."
-    } else if pin.and_then(foreign_pin_host).is_some_and(foreign)
-        || host_pin.is_some_and(|h| foreign(h) || names_token_tenant(h))
-        || pin.is_some_and(names_token_tenant)
-    {
-        "GitHub token withheld: this repository is pinned to a non-github.com GitHub host."
-    } else if ambiguous {
-        "GitHub token withheld: cplt could not read the host in these `gh auth` arguments."
-    } else if named
-        .iter()
-        .any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
-    {
-        "GitHub token withheld: --hostname names a non-github.com host."
-    } else if args.iter().any(|a| decode_stable(a).is_none()) {
-        "GitHub token withheld: cplt could not decode an argument (failing closed)."
-    } else if args.iter().any(|a| names_token_tenant(a)) {
-        "GitHub token withheld: an argument mentions a non-github.com GitHub host (ghe.com / github.localhost). Use --body-file for text that names one."
-    } else {
-        "GitHub token withheld: this command could reach a non-github.com GitHub host."
+        return None;
     }
+    // Judge the pin by its parsed host, not a substring of the repo name.
+    let pin_names_tenant = |p: &str| foreign_pin_host(p).is_some_and(names_token_tenant);
+    Some(
+        if pin.and_then(foreign_pin_host).is_some_and(foreign) || pin.is_some_and(pin_names_tenant)
+        {
+            "GitHub token withheld: this repository is pinned to a non-github.com GitHub host."
+        } else if host_pin.is_some_and(|h| foreign(h) || names_token_tenant(h)) {
+            "GitHub token withheld: the pinned GitHub host is not github.com."
+        } else if ambiguous {
+            "GitHub token withheld: cplt could not read the host in these `gh auth` arguments."
+        } else if named
+            .iter()
+            .any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
+        {
+            "GitHub token withheld: --hostname names a non-github.com host."
+        } else if args.iter().any(|a| decode_stable(a).is_none()) {
+            "GitHub token withheld: cplt could not decode an argument (failing closed)."
+        } else if args.iter().any(|a| names_token_tenant(a)) {
+            "GitHub token withheld: an argument mentions a non-github.com GitHub host (ghe.com / github.localhost). Use --body-file for text that names one."
+        } else {
+            "GitHub token withheld: this command could reach a non-github.com GitHub host."
+        },
+    )
 }
 
 fn github_token_allowed_for(
@@ -7421,9 +7428,16 @@ mod tests {
     fn token_withheld_reason_is_accurate() {
         let hosts = ghe_hosts();
         let r = |args: &[&str], pin, hp| token_withheld_reason_for(args, pin, hp, &hosts);
-        assert!(r(&["auth", "git-credential", "get"], None, None).contains("git-credential"));
-        assert!(r(&["pr", "list"], None, Some("example.ghe.com")).contains("pinned"));
-        assert!(r(&["pr", "list"], Some("example.ghe.com/o/r"), None).contains("pinned"));
+        for op in ["get", "store", "erase"] {
+            assert_eq!(r(&["auth", "git-credential", op], None, None), None);
+        }
+        let r = |args: &[&str], pin, hp| r(args, pin, hp).expect("notice");
+        assert!(r(&["pr", "list"], None, Some("example.ghe.com")).contains("pinned GitHub host"));
+        assert!(
+            r(&["pr", "list"], Some("example.ghe.com/o/r"), None).contains("repository is pinned")
+        );
+        // A github.com repo whose name merely contains `ghe.com`.
+        assert!(!r(&["pr", "list"], Some("navikt/ghe.community"), None).contains("pinned"));
         assert!(r(&["api", "--hostname", "ghes.corp", "user"], None, None).contains("--hostname"));
         assert!(r(&["auth", "status", "-Z"], None, None).contains("could not read"));
         assert!(r(&["pr", "create", "--body", "%2525252567he.com"], None, None).contains("decode"));
