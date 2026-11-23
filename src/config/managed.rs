@@ -182,6 +182,11 @@ pub fn load_managed_from(
     }
     let under = || refuse(&format!("it must lie under ~/{TRUSTED_DIR}"));
     let trusted = std::fs::canonicalize(home.join(TRUSTED_DIR)).map_err(|_| under())?;
+    // A linked `.config/cplt` or `managed.d` points trust at a tree an
+    // earlier session may have written.
+    if trusted != home.join(TRUSTED_DIR) {
+        return Err(refuse(&format!("~/{TRUSTED_DIR} or a parent is a symlink")));
+    }
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| refuse(&format!("cannot resolve it ({})", esc(&e.to_string()))))?;
     let rel = canonical.strip_prefix(&trusted).map_err(|_| under())?;
@@ -550,6 +555,20 @@ mod tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         flipper.join().unwrap();
+    }
+
+    #[test]
+    fn refuses_a_symlinked_trusted_dir() {
+        let h = Home::new();
+        let old = tempfile::tempdir().unwrap();
+        write(old.path(), "m.toml", GOOD);
+        std::fs::remove_dir(h.managed_d()).unwrap();
+        std::os::unix::fs::symlink(old.path(), h.managed_d()).unwrap();
+        h.refused(
+            h.managed_d().join("m.toml").as_os_str(),
+            &[],
+            "is a symlink",
+        );
     }
 
     #[test]

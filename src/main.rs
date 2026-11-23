@@ -10183,10 +10183,36 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         ));
     }
 
-    // Managed layer (#1095) before the network snapshot, so doctor agrees with launch.
-    let writable =
-        managed_layer_writable(&home_dir, &project_dir, &repo_paths, &resolved.allow_write);
-    match apply_managed_layer(&mut resolved, || writable) {
+    // ── the policy a launch would build, for the rules below ──
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
+    if active_agent == agent::Agent::OpenCode {
+        agent_dirs.extend(agent::opencode_launch_config_grants(
+            &home_dir,
+            &project_dir,
+        ));
+    }
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
+    agent::drop_script_grants_under(
+        &mut agent_dirs,
+        &[
+            std::slice::from_ref(&project_dir),
+            &repo_paths[..],
+            &resolved.allow_write,
+            &cplt::sandbox::home_and_temp_writable_roots(
+                &home_dir,
+                &probe.existing_home_tool_dirs,
+                probe.git_common_dir.as_deref(),
+            ),
+        ]
+        .concat(),
+    );
+    // Managed layer (#1095) before the network snapshot, with the same
+    // writable set a launch uses, so doctor agrees with launch.
+    let allow_write = resolved.allow_write.clone();
+    match apply_managed_layer(&mut resolved, || {
+        session_writable_everywhere(&probe, &repo_paths, &allow_write, &agent_dirs)
+    }) {
         Some(Ok(managed)) => {
             ok.push(format!(
                 "managed config: {} [{}]",
@@ -10239,30 +10265,6 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         }
     }
 
-    // ── the policy a launch would build, for the rules below ──
-    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
-    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
-    if active_agent == agent::Agent::OpenCode {
-        agent_dirs.extend(agent::opencode_launch_config_grants(
-            &home_dir,
-            &project_dir,
-        ));
-    }
-    agent::canonicalize_agent_dirs(&mut agent_dirs);
-    agent::drop_script_grants_under(
-        &mut agent_dirs,
-        &[
-            std::slice::from_ref(&project_dir),
-            &repo_paths[..],
-            &resolved.allow_write,
-            &cplt::sandbox::home_and_temp_writable_roots(
-                &home_dir,
-                &probe.existing_home_tool_dirs,
-                probe.git_common_dir.as_deref(),
-            ),
-        ]
-        .concat(),
-    );
     let keychain_substitute = cplt::sandbox::keychain_substitute(
         active_agent,
         &home_dir,
