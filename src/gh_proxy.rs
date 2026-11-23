@@ -3542,7 +3542,7 @@ fn misplaced_flag<'a>(args: &[&'a str]) -> Option<&'a str> {
             .iter()
             .find(|a| a.starts_with('-'))
             .copied()
-            .filter(|_| unknown);
+            .filter(|_| unknown && args.iter().any(|a| !a.starts_with('-')));
     };
     // cobra drops empty arguments, so `gh "" pr merge` runs `pr merge`.
     if args[..=root].contains(&"") {
@@ -6652,6 +6652,7 @@ mod tests {
         assert!(gate(&args, Path::new("."), &GatePolicy::default()).is_err());
         assert_eq!(misplaced_flag(&["--help"]), None);
         assert_eq!(misplaced_flag(&["--version"]), None);
+        assert_eq!(misplaced_flag(&["--verbose", "--help"]), None);
     }
 
     #[test]
