@@ -16931,7 +16931,9 @@ mod tests {
     fn cargo_home_changes_the_policy_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let cargo = dir.path().join("cargo");
+        // Under the project (here also home): a temp CARGO_HOME is not a safe
+        // root when TMPDIR is not the confstr user temp dir, as on CI runners.
+        let cargo = home.join("cargo");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cargo).unwrap();
         let fp = |cargo_home: Option<&Path>| {

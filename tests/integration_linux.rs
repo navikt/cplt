@@ -5611,6 +5611,18 @@ finally:
     /// `env` adds vars whose values are paths relative to the fake home;
     /// `file` is the name written under the target.
     fn assert_env_tool_dir_not_granted(var: &str, rel: &str, env: &[(&str, &str)], file: &str) {
+        env_tool_dir_case(var, rel, env, file, true);
+    }
+
+    /// `expect_denied: false` checks only the refusal, for targets the default
+    /// policy already makes writable on Linux.
+    fn env_tool_dir_case(
+        var: &str,
+        rel: &str,
+        env: &[(&str, &str)],
+        file: &str,
+        expect_denied: bool,
+    ) {
         let project = tempfile::Builder::new()
             .prefix(".cplt-envdeny-project-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -5648,7 +5660,9 @@ finally:
         let output = cmd.output().expect("run cplt");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(marker.exists(), "the sandboxed shell must run: {stderr}");
-        assert!(!file.exists(), "{var}={rel} must not grant write: {stderr}");
+        if expect_denied {
+            assert!(!file.exists(), "{var}={rel} must not grant write: {stderr}");
+        }
         assert!(
             stderr.contains(&format!("Ignoring {var}")),
             "the refusal must be reported: {stderr}"
@@ -5681,9 +5695,12 @@ finally:
 
     /// The deny-set second layer on its own: `~/.gradle` passes the positive
     /// rule (a writable tool dir), but contains the denied
-    /// `gradle.properties`, so the grant is refused rather than re-opening it.
+    /// `gradle.properties`, so the grant is refused. Only the refusal is
+    /// checked: Landlock cannot deny `gradle.properties` inside the default
+    /// writable `~/.gradle` (documented gap on `DENIED_HOME_SUBPATHS`), so the
+    /// write succeeds with or without the env grant.
     #[test]
     fn env_tool_dir_under_safe_root_but_protected_is_not_granted() {
-        assert_env_tool_dir_not_granted("GOCACHE", ".gradle", &[], "gradle.properties");
+        env_tool_dir_case("GOCACHE", ".gradle", &[], "gradle.properties", false);
     }
 }
