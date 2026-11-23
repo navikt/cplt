@@ -143,9 +143,13 @@ fn github_token_allowed_for(
             return false;
         }
     }
-    !args
-        .iter()
-        .any(|arg| http_rest(arg).is_some_and(|rest| not_github(&host_of(rest))))
+    // `gh repo view|clone|fork|... HOST/OWNER/REPO` takes the host from a
+    // positional too. Any `x.ghe.com/...` argument counts: a false hit only
+    // withholds the token.
+    !args.iter().any(|arg| {
+        http_rest(arg).is_some_and(|rest| not_github(&host_of(rest)))
+            || (arg.contains('/') && not_github(&host_of(arg)))
+    })
 }
 
 fn host_allowed(host: &str, hosts: &[String]) -> bool {
@@ -3426,7 +3430,10 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
     };
     let auth = auth_sub == Some(1);
     let mut found = Vec::new();
-    let mut ambiguous = auth_sub.is_some_and(|j| j != 1);
+    // A flag before the command can take a value (`gh --hostname x auth ...`),
+    // so `auth` anywhere after a leading flag may be the command: ambiguous.
+    let mut ambiguous = auth_sub.is_some_and(|j| j != 1)
+        || (args.first().is_some_and(|a| a.starts_with('-')) && args.contains(&"auth"));
     let mut iter = args.iter().copied();
     while let Some(arg) = iter.next() {
         // pflag stops at `--` only when it is not a flag's value. The flag
@@ -12199,10 +12206,54 @@ mod tests {
             &["-hevil.ghe.com", "auth", "status"],
             &["auth", "-h", "evil.ghe.com", "status"],
             &["--bogus", "auth", "status"],
+            &[
+                "--hostname",
+                "github.com",
+                "auth",
+                "status",
+                "-h",
+                "evil.ghe.com",
+            ],
+            &[
+                "--hostname",
+                "github.com",
+                "auth",
+                "status",
+                "-hevil.ghe.com",
+            ],
+            &[
+                "--hostname",
+                "github.com",
+                "auth",
+                "status",
+                "-ah",
+                "evil.ghe.com",
+            ],
+            &[
+                "--hostname=github.com",
+                "auth",
+                "status",
+                "-h",
+                "evil.ghe.com",
+            ],
         ] {
             assert!(!ok(args), "{args:?}");
         }
         assert!(ok(&["auth", "status"]));
         assert!(requested_hostnames(&["auth", "-h"]).is_empty());
+    }
+
+    /// Review of #1070 at 8623d4fc: a positional `HOST/OWNER/REPO` picks the
+    /// host like `-R` does.
+    #[test]
+    fn positional_host_repo_withholds_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        for sub in ["view", "clone", "fork", "edit", "delete", "archive"] {
+            assert!(!ok(&["repo", sub, "evil.ghe.com/o/r"]), "{sub}");
+            assert!(ok(&["repo", sub, "o/r"]), "{sub}");
+            assert!(ok(&["repo", sub, "github.com/o/r"]), "{sub}");
+        }
+        assert!(!ok(&["repo", "clone", "git@evil.ghe.com:o/r"]));
     }
 }
