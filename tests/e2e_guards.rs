@@ -1390,6 +1390,25 @@ fn gh_gate_default_still_blocks_api_post() {
 }
 
 #[test]
+fn gh_gate_refuses_lone_dash_before_subcommand() {
+    for args in [
+        &["gist", "-", "-d", "view", "create"][..],
+        &["ssh-key", "-", "-t", "list", "add"],
+        &["pr", "-", "--body", "view", "merge"],
+        &["-", "gist", "-d", "view", "create"],
+        &["-", "pr", "--body", "view", "merge"],
+        &["-", "--body", "-R", "pr", "--body", "-R", "merge"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert!(!ok, "{args:?} should be refused");
+        assert!(
+            stderr.contains("'-' before the gh subcommand"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn gh_gate_allows_empty_args() {
     // `gh` with no args shows help — harmless, should be allowed
     let (_, _, ok) = gh_gate(&[]);

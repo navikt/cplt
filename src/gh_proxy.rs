@@ -3544,9 +3544,11 @@ fn misplaced_flag<'a>(args: &[&'a str]) -> Option<&'a str> {
             .copied()
             .filter(|_| unknown && args.iter().any(|a| !a.starts_with('-')));
     };
-    // cobra drops empty arguments, so `gh "" pr merge` runs `pr merge`.
-    if args[..=root].contains(&"") {
-        return Some("");
+    // cobra drops empty arguments, so `gh "" pr merge` runs `pr merge`, and
+    // leaves a lone `-` out of command resolution while keeping it as a
+    // positional, so `gh - gist -d view create` runs `gist create -`.
+    if let Some(&a) = args[..=root].iter().find(|a| a.is_empty() || **a == "-") {
+        return Some(a);
     }
     if unknown {
         return args[..root].iter().find(|a| a.starts_with('-')).copied();
@@ -3556,10 +3558,10 @@ fn misplaced_flag<'a>(args: &[&'a str]) -> Option<&'a str> {
     }
     let mut i = root + 1;
     while let Some(&a) = args.get(i) {
-        if a.is_empty() {
+        if a.is_empty() || a == "-" {
             return Some(a);
         }
-        if !a.starts_with('-') || a == "-" {
+        if !a.starts_with('-') {
             return None;
         }
         match a {
@@ -6665,6 +6667,25 @@ mod tests {
             assert_eq!(misplaced_flag(args), Some(""), "{args:?}");
             assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn lone_dash_before_subcommand_is_refused() {
+        // Default policy: cobra skips `-` when resolving the command (#1089).
+        let policy = GatePolicy::default();
+        for args in [
+            &["gist", "-", "-d", "view", "create"][..],
+            &["ssh-key", "-", "-t", "list", "add"],
+            &["pr", "-", "--body", "view", "merge"],
+            &["-", "gist", "-d", "view", "create"],
+            &["-", "pr", "--body", "view", "merge"],
+            &["-", "--body", "-R", "pr", "--body", "-R", "merge"],
+            &["-", "auth", "token"],
+        ] {
+            assert_eq!(misplaced_flag(args), Some("-"), "{args:?}");
+            assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
+        }
+        assert_eq!(misplaced_flag(&["gist", "create", "-"]), None);
     }
 
     #[test]
