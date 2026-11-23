@@ -136,13 +136,33 @@ struct Filter<'a> {
     spec: &'a Spec,
     pending: &'a Mutex<Pending>,
     audit: Option<String>,
+    /// This exchange's `Mcp-Session-Id` ("" if none): ids are per session.
+    session: String,
 }
 
 impl<'a> Filter<'a> {
     fn lock(&self) -> std::sync::MutexGuard<'a, Pending> {
-        self.pending
+        let mut p = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.2.clone_from(&self.session);
+        p
+    }
+}
+
+/// Frees the exchange's own request id when the exchange ends, whether or
+/// not a response for it came back (upstream error, curl failure): else
+/// every such failure would hold an in-flight slot until the timeout.
+/// The `Instant` makes sure a later request reusing the id is left alone.
+struct OwnId<'a>(&'a Mutex<Pending>, String, String, std::time::Instant);
+
+impl Drop for OwnId<'_> {
+    fn drop(&mut self) {
+        self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.1, &self.2, self.3);
     }
 }
 
@@ -481,21 +501,35 @@ impl Endpoint {
             spec,
             pending: &self.pending,
             audit: None,
+            session: header("mcp-session-id").unwrap_or_default().to_string(),
         });
         // Only a POST body is checked, so no other method may carry one.
         if self.policy.is_some() && method != "POST" && !body.is_empty() {
             reply(&mut client, "400 Bad Request");
             return log.line(&self.tag, &self.upstream, method, "FAIL body on non-POST");
         }
+        let mut _own = None;
         if let Some(f) = &mut filter
             && method == "POST"
         {
             let action = {
                 let mut p = f.lock();
                 // curl gives up at the same deadline, so nothing is left to cancel.
-                let _ = p.evict(std::time::Duration::from_secs(self.timeout_secs));
+                let evicted = p.evict(std::time::Duration::from_secs(self.timeout_secs));
+                for audit in evicted.into_iter().filter_map(|(_, _, a)| a) {
+                    log.line(&self.tag, &self.upstream, method, &audit);
+                }
                 let action = on_client(&String::from_utf8_lossy(&body), f.spec, &mut p);
                 f.audit = p.1.take();
+                if let Action::Forward(line) = &action {
+                    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+                    let id = v.get("id").filter(|_| v.get("method").is_some());
+                    _own = id.and_then(|id| {
+                        let id = id.to_string();
+                        let sent = p.sent(&f.session, &id)?;
+                        Some(OwnId(&self.pending, f.session.clone(), id, sent))
+                    });
+                }
                 action
             };
             match action {
@@ -1249,6 +1283,10 @@ mod tests {
 
     /// One request on a fresh connection to `ep`: the reply and the log.
     fn serve_on(ep: &Endpoint, method: &str, body: &str) -> (String, String) {
+        serve_with(ep, method, body, "")
+    }
+
+    fn serve_with(ep: &Endpoint, method: &str, body: &str, extra: &str) -> (String, String) {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("log");
         let log = Log {
@@ -1259,7 +1297,7 @@ mod tests {
         let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (server, _) = l.accept().unwrap();
         let head = format!(
-            "{method} /x HTTP/1.1\r\nContent-Type: application/json\r\nX-MCP-Lockdown: false\r\nContent-Length: {}\r\n\r\n",
+            "{method} /x HTTP/1.1\r\nContent-Type: application/json\r\nX-MCP-Lockdown: false\r\n{extra}Content-Length: {}\r\n\r\n",
             body.len()
         );
         c.write_all(body.as_bytes()).unwrap();
@@ -1348,6 +1386,43 @@ mod tests {
         );
         assert_eq!(in_flight(), 0, "slot not freed");
         let _ = first.join();
+    }
+
+    #[test]
+    fn failed_exchanges_free_their_ids() {
+        let Some(curl) = real_curl() else { return };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for n in 0..9 {
+                let (mut c, _) = l.accept().unwrap();
+                let (mut got, mut buf) = (Vec::new(), [0; 4096]);
+                while !got.ends_with(b"}") {
+                    match c.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let reply: &[u8] = if n < 8 {
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\n\r\nbad"
+                } else {
+                    let b = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+                    &format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).into_bytes()
+                };
+                let _ = c.write_all(reply);
+            }
+        });
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        for id in 1..=8 {
+            let list = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#);
+            let (reply, _) = serve_on(&ep, "POST", &list);
+            assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
+        }
+        assert_eq!(ep.pending.lock().unwrap().in_flight(), 0, "slots leaked");
+        // Past the cap, and id 1 reused.
+        let (reply, _) = serve_on(&ep, "POST", LIST);
+        assert!(reply.contains(r#""result""#), "{reply}");
     }
 
     const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
@@ -1466,6 +1541,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (mut server, _) = l.accept().unwrap();
         let mut f = Filter {
+            session: String::new(),
             spec: ep.policy.as_ref().unwrap(),
             pending: &ep.pending,
             audit: None,

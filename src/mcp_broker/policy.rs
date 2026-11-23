@@ -24,10 +24,14 @@ pub enum Action {
 /// itself, when it was sent, the tool for a `tools/call`). `done` holds the
 /// audit line for the last `tools/call` answered (design 6.4), for the
 /// caller to log: tool, outcome and duration, never arguments or results.
+/// Keys are (session, id): the third field is the session the next message
+/// belongs to (the remote `Mcp-Session-Id`, "" for stdio), so two clients
+/// sharing an endpoint neither collide on ids nor cancel each other's.
 #[derive(Default)]
 pub struct Pending(
-    HashMap<String, (Value, Instant, Option<String>)>,
+    HashMap<(String, String), (Value, Instant, Option<String>)>,
     pub Option<String>,
+    pub String,
 );
 
 impl Pending {
@@ -36,12 +40,28 @@ impl Pending {
         self.0.len()
     }
 
+    /// When the request `id` of `session` was sent, if it is in flight.
+    pub fn sent(&self, session: &str, id: &str) -> Option<Instant> {
+        self.0
+            .get(&(session.to_string(), id.to_string()))
+            .map(|e| e.1)
+    }
+
+    /// Forget a request that will get no response (its exchange ended),
+    /// unless the id has since been reused by a request sent at another time.
+    pub fn remove(&mut self, session: &str, id: &str, sent: Instant) {
+        let key = (session.to_string(), id.to_string());
+        if self.0.get(&key).is_some_and(|e| e.1 == sent) {
+            self.0.remove(&key);
+        }
+    }
+
     /// Drop requests older than `deadline` (design 5.6). For each, a timeout
-    /// error for the client and a cancel for the server; a late response is
-    /// then dropped as unsolicited.
-    pub fn evict(&mut self, deadline: Duration) -> Vec<(String, String)> {
+    /// error for the client, a cancel for the server and, for a `tools/call`,
+    /// an audit line; a late response is then dropped as unsolicited.
+    pub fn evict(&mut self, deadline: Duration) -> Vec<(String, String, Option<String>)> {
         let mut out = Vec::new();
-        self.0.retain(|_, (id, sent, _)| {
+        self.0.retain(|_, (id, sent, tool)| {
             if sent.elapsed() < deadline {
                 return true;
             }
@@ -50,6 +70,8 @@ impl Pending {
                 json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
                        "params": {"requestId": id, "reason": "cplt: timed out"}})
                 .to_string(),
+                tool.as_ref()
+                    .map(|t| format!("tools/call {t} → TIMEOUT {}ms", sent.elapsed().as_millis())),
             ));
             false
         });
@@ -75,6 +97,8 @@ fn log_token<'a>(s: &'a str, extra: &[u8]) -> &'a str {
             .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b));
     if ok { s } else { "<invalid>" }
 }
+
+const MAX_ID_LEN: usize = 256;
 
 pub(crate) fn error_line(id: &Value, code: i64, message: &str) -> String {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
@@ -121,7 +145,8 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
         // for an id not in flight has nothing to cancel.
         if method == "notifications/cancelled" {
             let req = msg.pointer("/params/requestId").map(Value::to_string);
-            let Some((_, sent, tool)) = req.and_then(|r| pending.0.remove(&r)) else {
+            let session = pending.2.clone();
+            let Some((_, sent, tool)) = req.and_then(|r| pending.0.remove(&(session, r))) else {
                 return Action::Drop;
             };
             if let Some(tool) = tool {
@@ -137,7 +162,15 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
             Action::Drop
         };
     };
-    if pending.0.contains_key(&id.to_string()) {
+    // Only what JSON-RPC allows as an id, and short: it keys `Pending`.
+    if !(id.is_number() || id.as_str().is_some_and(|s| s.len() <= MAX_ID_LEN)) {
+        return Action::Reply(
+            error_line(&Value::Null, -32600, "cplt: invalid request id"),
+            Some(format!("{} → DENIED invalid id", log_method(method))),
+        );
+    }
+    let key = (pending.2.clone(), id.to_string());
+    if pending.0.contains_key(&key) {
         return Action::Reply(
             error_line(id, DENIED, "cplt: request id already in flight"),
             Some(format!("{} → DENIED duplicate id", log_method(method))),
@@ -216,9 +249,7 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
         .then(|| msg.pointer("/params/name").and_then(Value::as_str))
         .flatten()
         .map(|t| log_name(t).to_string());
-    pending
-        .0
-        .insert(id.to_string(), (id.clone(), Instant::now(), tool));
+    pending.0.insert(key, (id.clone(), Instant::now(), tool));
     // Re-serialized: the server parses exactly what was checked, whatever
     // its JSON parser does with duplicate keys or odd escapes.
     Action::Forward(msg.to_string())
@@ -281,7 +312,7 @@ pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     }
     let Some((_, sent, tool)) = obj
         .get("id")
-        .and_then(|id| pending.0.remove(&id.to_string()))
+        .and_then(|id| pending.0.remove(&(pending.2.clone(), id.to_string())))
     else {
         return Action::Drop;
     };
@@ -440,6 +471,48 @@ mod tests {
             ),
             Action::Reply(..)
         ));
+    }
+
+    #[test]
+    fn ids_are_per_session_and_a_cancel_stays_in_its_session() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let cancel =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+        p.2 = "A".into();
+        assert!(matches!(on_client(list, &s, &mut p), Action::Forward(_)));
+        p.2 = "B".into();
+        assert!(matches!(on_client(list, &s, &mut p), Action::Forward(_)));
+        assert_eq!(p.in_flight(), 2);
+        // B cancels its own id 1, then has nothing left to cancel.
+        assert!(matches!(on_client(cancel, &s, &mut p), Action::Forward(_)));
+        assert_eq!(on_client(cancel, &s, &mut p), Action::Drop);
+        assert_eq!(p.in_flight(), 1, "B's cancel reached A's request");
+        p.2 = "A".into();
+        let resp = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        assert!(matches!(on_server(resp, &s, &mut p), Action::Forward(_)));
+        assert_eq!(p.in_flight(), 0);
+    }
+
+    #[test]
+    fn odd_request_ids_are_refused() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        let long = format!("\"{}\"", "a".repeat(257));
+        for id in ["null", "{}", "[1]", "true", long.as_str()] {
+            let msg = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#);
+            assert!(
+                matches!(on_client(&msg, &s, &mut p), Action::Reply(..)),
+                "id {id} accepted"
+            );
+        }
+        assert_eq!(p.in_flight(), 0);
+        let ok = format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/list"}}"#,
+            "a".repeat(256)
+        );
+        assert!(matches!(on_client(&ok, &s, &mut p), Action::Forward(_)));
     }
 
     #[test]

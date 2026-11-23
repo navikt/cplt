@@ -1606,7 +1606,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         std::thread::spawn(move || {
             while !done.load(Ordering::Acquire) {
                 let Ok(mut p) = pending.lock() else { break };
-                for (error, cancel) in p.evict(CALL_TIMEOUT) {
+                for (error, cancel, _) in p.evict(CALL_TIMEOUT) {
                     log.line(&id, "FAIL request timed out");
                     write_line(&client, &error);
                     // Best effort: a full queue means the child is stuck.
