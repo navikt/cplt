@@ -6309,6 +6309,7 @@ fn exec_real(
     let mut command = std::process::Command::new(real_binary);
     command.env_remove("GH_HOST");
     command.env_remove("GH_REPO");
+    let mut host_pinned = false;
     if let Some(repo) = repo_scope {
         command.env("GH_REPO", repo);
         // With `gh_guard.hosts` set, every pin also pins its host, so a bare
@@ -6317,9 +6318,11 @@ fn exec_real(
         // Unset, the env stays as it always was.
         if gh_proxy::hosts_configured() {
             command.env("GH_HOST", gh_proxy::pin_host(repo));
+            host_pinned = true;
         }
     } else if let Some(host) = host_pin {
         command.env("GH_HOST", host);
+        host_pinned = true;
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     if name == "gh"
@@ -6338,12 +6341,24 @@ fn exec_real(
         .as_ref()
         .map(|p| p.iter().map(String::as_str).collect());
     let token_args = pinned_refs.as_deref().unwrap_or(&arg_refs);
-    if name == "gh"
-        && gh_proxy::github_token_allowed(token_args, repo_scope, host_pin)
-        && let Some(token) = exec_gh_token()
-    {
-        command.env("GH_TOKEN", token);
-        command.args(token_args);
+    let token = (name == "gh").then(exec_gh_token).flatten();
+    if let Some(token) = token {
+        if gh_proxy::github_token_allowed(token_args, repo_scope, host_pin) {
+            command.env("GH_TOKEN", token);
+            // The approval assumed github.com. With no host in argv, gh's
+            // default host comes from hosts.yml, which the agent can write and
+            // may list only a tenant: pin it so the token cannot follow (#1088).
+            if !host_pinned {
+                command.env("GH_HOST", "github.com");
+            }
+            command.args(token_args);
+        } else {
+            // No silent grants: say why gh runs without the token (#1088).
+            eprintln!(
+                "cplt: gh runs without cplt's GitHub token for this command, because it targets a host other than github.com."
+            );
+            command.args(args);
+        }
     } else {
         command.args(args);
     }
