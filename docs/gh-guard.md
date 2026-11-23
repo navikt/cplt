@@ -310,11 +310,10 @@ A `*.ghe.com` tenant is not GHES: `gh` reads `GH_TOKEN` for it, so set
 `GH_TOKEN` turns off the exec-token cache described above.
 
 `gh` also sends `GH_TOKEN` to `github.localhost` and `*.github.localhost`
-(bare `localhost` is treated as GHES). So any argument that mentions a
-`*.ghe.com` or `github.localhost` host withholds the github.com token, wherever
-it appears: a URL of any scheme, `HOST/owner/repo`, scp `git@HOST:owner/repo`,
-a `--repo` value, or free text in `--title` or `--body`. A title or body that
-merely mentions such a host therefore runs without the token; pass the text
+(bare `localhost` is treated as GHES). So any argument, `GH_REPO` or `GH_HOST`
+that mentions the text `ghe.com` or `github.localhost` anywhere, even
+percent-encoded, withholds the github.com token. A title or body that mentions
+either string therefore runs without the token; pass the text
 with `--body-file` instead. A `gh auth` command that names no host, such as
 plain `gh auth status`, runs as `--hostname github.com` when it gets the token,
 since gh would otherwise send the token to every host it is logged in to.

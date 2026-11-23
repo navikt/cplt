@@ -153,45 +153,37 @@ pub fn pin_auth_hostname(args: &[&str]) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Whether `s` mentions, anywhere, a host other than github.com that gh hands
-/// the github.com `GH_TOKEN` to.
+/// Whether `s` mentions `github.localhost` or `ghe.com` anywhere.
 ///
 /// go-gh `auth.TokenForHost` sends `GH_TOKEN` to github.com, `*.ghe.com`
 /// tenants and `github.localhost`/`*.github.localhost`; every other host
 /// (bare `localhost` included) is GHES and reads `GH_ENTERPRISE_TOKEN`. So
-/// only a tenant can receive the token by mistake. Parsing every gh flag to
-/// find which argument is a destination did not converge (#1070), so the whole
-/// string is split into hostname-shaped tokens instead: URLs of any scheme,
-/// userinfo, ports, scp `user@host:path`, `--flag=value` and free text alike.
-/// A title or body that merely mentions a tenant also withholds the token;
-/// that is the safe direction, and `--body-file` avoids it.
+/// only a tenant can receive the token by mistake. Finding which argument gh
+/// reads as a host failed review five times (#1070: attached short flags,
+/// bool clusters, re-encoding), so this is a plain substring match with no
+/// boundary checks. A title or body that mentions either string also withholds
+/// the token; that is the safe direction, and `--body-file` avoids it.
 fn names_token_tenant(s: &str) -> bool {
-    // Go's url.Parse unescapes `%2e` in a host, so decode before splitting.
-    // Unicode lowercase as Go's strings.ToLower, which maps U+0130 `İ` to `i`
-    // where Rust yields `i` plus a combining dot.
-    // gh may decode more than once (`%25C4` -> `%C4` -> byte), so decode
-    // until stable, bounded.
+    // gh and Go's url package may percent-decode more than once (`%25C4` ->
+    // `%C4` -> byte), so decode until stable. Still changing after 4 rounds:
+    // fail closed rather than guess how many rounds gh applies.
     let mut decoded = s.to_string();
+    let mut stable = false;
     for _ in 0..4 {
         let next = percent_decode(&decoded);
         if next == decoded {
+            stable = true;
             break;
         }
         decoded = next;
     }
+    if !stable {
+        return true;
+    }
+    // Unicode lowercase as Go's strings.ToLower, which maps U+0130 `İ` to `i`
+    // where Rust yields `i` plus a combining dot.
     let decoded = decoded.replace('\u{130}', "i").to_lowercase();
-    let tenant = |t: &str| {
-        t.ends_with(".ghe.com") || t == "github.localhost" || t.ends_with(".github.localhost")
-    };
-    decoded
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
-        .map(|t| t.trim_end_matches('.'))
-        // `-Rgithub.localhost/o/r`: pflag reads a short flag's attached value.
-        .any(|t| {
-            tenant(t)
-                || t.strip_prefix('-')
-                    .is_some_and(|r| tenant(r.get(1..).unwrap_or("")))
-        })
+    decoded.contains("github.localhost") || decoded.contains("ghe.com")
 }
 
 fn percent_decode(s: &str) -> String {
@@ -12298,6 +12290,14 @@ mod tests {
             // gh decodes again: double and triple encoding of `İ`.
             &["repo", "clone", "https://g%25C4%25B0thub.localhost/o/r"],
             &["repo", "clone", "https://g%2525C4%2525B0thub.localhost/o/r"],
+            // Bool flags clustered ahead of an attached `-R` value.
+            &["pr", "list", "-dRgithub.localhost/o/r"],
+            &["pr", "view", "-cRgithub.localhost/o/r"],
+            &["run", "list", "-aRgithub.localhost"],
+            &["pr", "list", "-wRx.ghe.com/o/r"],
+            // Still changing after 4 decode rounds: fail closed.
+            &["pr", "list", "-R", "x.ghe%252525252Ecom/o/r"],
+            &["pr", "list", "-R", "%2525252525"],
         ] {
             assert!(!ok(args), "{args:?}");
         }
@@ -12318,6 +12318,20 @@ mod tests {
         ] {
             assert!(!ok(args), "{args:?}");
         }
+        for args in [
+            &["pr", "list"][..],
+            &["pr", "list", "-R", "o/r"],
+            &["repo", "view", "navikt/cplt"],
+            &["pr", "view", "https://github.com/o/r/pull/1"],
+        ] {
+            assert!(ok(args), "{args:?}");
+        }
+        assert!(!github_token_allowed_for(
+            &["pr", "list"],
+            Some("x.g%252525252Ehe.com/o/r"),
+            None,
+            &hosts
+        ));
         // Outside `gh auth`, -h is help, not a host.
         assert!(ok(&["pr", "list", "-h"]));
         assert_eq!(
