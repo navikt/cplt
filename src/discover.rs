@@ -225,12 +225,24 @@ pub fn gh_token_cache_eligibility(
 /// ambient credential or a GHES login for gh's stored github.com credential.
 #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
 pub(crate) fn gh_auth_token(gh: &Path, timeout: Duration) -> Option<String> {
-    let mut cmd = std::process::Command::new(gh);
-    cmd.args(["auth", "token", "--hostname", "github.com"]);
-    for var in AUTH_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    let buf = bounded_stdout(cmd, timeout)?;
+    let probe = |no_refresh: bool| {
+        let mut cmd = std::process::Command::new(gh);
+        cmd.args(["auth", "token", "--hostname", "github.com"]);
+        // Without it gh refreshes an expiring token over the network and
+        // writes the keyring; doctor and offline launches must not (#1063).
+        if no_refresh {
+            cmd.arg("--no-refresh");
+        }
+        for var in AUTH_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        bounded_stdout(cmd, timeout)
+    };
+    let start = std::time::Instant::now();
+    // An older gh rejects the unknown flag, and has no refresh to suppress.
+    // Skip the retry when the first try timed out, so a hung gh costs one timeout.
+    let buf =
+        probe(true).or_else(|| (start.elapsed() < timeout).then(|| probe(false)).flatten())?;
     let token = String::from_utf8_lossy(&buf).trim().to_string();
     (!token.is_empty()).then_some(token)
 }

@@ -1004,8 +1004,22 @@ fn gc_stale_session_dirs(base: &Path) {
         // live sessions of an older cplt: leave them alone.
         let held = session_lock_held(&path);
         if held == Some(false) {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // The agent may have left its TMPDIR read-only (#1054). Only our
+            // own dirs, opened without following a symlink.
+            if metadata.uid() == unsafe { libc::getuid() }
+                && let Ok(dir) = open_dir_nofollow(&path)
+            {
+                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+            }
             for file in GH_TOKEN_FILES {
-                let _ = std::fs::remove_file(path.join(file));
+                match std::fs::remove_file(path.join(file)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => ui::warn(&format!(
+                        "Warning: cannot remove orphaned GitHub token {}: {e}",
+                        path.join(file).display()
+                    )),
+                    _ => {}
+                }
             }
         }
 
@@ -1953,6 +1967,9 @@ mod tests {
                 std::fs::write(dir.join(f), "x").unwrap();
             }
         }
+        // The agent can leave its TMPDIR read-only (#1054).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o500)).unwrap();
         ScratchDir::gc_stale(&home);
         for f in GH_TOKEN_FILES {
             assert!(live.path().join(f).exists(), "live {f} kept");
