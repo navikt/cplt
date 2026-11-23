@@ -1374,7 +1374,12 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
 fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
     // Every writable tree, env-derived agent and tool dirs included, not just
     // `allow.write`: none may be cplt's state dir or an ancestor of it (#1095).
-    for (tree, why) in writable_trees(config) {
+    // Not the system temp dir: a `$HOME` under it (test fakes) is no grant to
+    // refuse, and the managed loader refuses a file in a writable tree anyway.
+    for (tree, why) in writable_trees(config)
+        .into_iter()
+        .filter(|(_, why)| *why != TEMP_DIR_SOURCE)
+    {
         if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, &tree) {
             return Err(state_ancestor_refusal(why, &tree, &dir));
         }
