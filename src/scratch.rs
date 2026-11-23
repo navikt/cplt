@@ -63,8 +63,10 @@ const GH_TOKEN_FILES: [&str; 2] = [".gh-exec-token", ".gh-token"];
 /// `take_cached_gh_token` renames `.gh-token` to this prefix plus pid and time.
 const GH_TOKEN_CLAIMED_PREFIX: &str = ".gh-token.claimed.";
 
-/// The fixed cache names plus any claimed copy a killed guard left behind.
-/// `symlink_metadata` does not follow links, so only regular files qualify.
+/// `sandbox_exec::write_token_file` writes `<name>.tmp.<pid>` before the rename;
+/// a crash in between leaves that copy.
+const GH_TOKEN_TMP_PREFIXES: [&str; 2] = [".gh-exec-token.tmp.", ".gh-token.tmp."];
+
 /// The claimed-copy file name is agent-chosen, so escape it before it reaches
 /// the user's terminal.
 fn orphan_token_warning(file: &Path, e: &std::io::Error) -> String {
@@ -74,15 +76,18 @@ fn orphan_token_warning(file: &Path, e: &std::io::Error) -> String {
     )
 }
 
+/// The fixed cache names plus any claimed or temp copy a killed guard or
+/// launch left behind. `symlink_metadata` does not follow links, so only
+/// regular files qualify.
 fn gh_token_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = GH_TOKEN_FILES.iter().map(|f| dir.join(f)).collect();
     if let Ok(entries) = std::fs::read_dir(dir) {
         files.extend(entries.flatten().filter_map(|e| {
             let path = e.path();
-            (e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(GH_TOKEN_CLAIMED_PREFIX))
-                && path.symlink_metadata().is_ok_and(|m| m.is_file()))
+            (e.file_name().to_str().is_some_and(|n| {
+                n.starts_with(GH_TOKEN_CLAIMED_PREFIX)
+                    || GH_TOKEN_TMP_PREFIXES.iter().any(|p| n.starts_with(p))
+            }) && path.symlink_metadata().is_ok_and(|m| m.is_file()))
             .then_some(path)
         }));
     }
@@ -1997,6 +2002,9 @@ mod tests {
         // A guard killed between claim and unlink leaves a claimed copy.
         let claimed = orphan.join(".gh-token.claimed.123.456");
         std::fs::write(&claimed, "x").unwrap();
+        // A launch killed between write and rename leaves a temp copy (#1078).
+        let tmp_copy = orphan.join(".gh-exec-token.tmp.77");
+        std::fs::write(&tmp_copy, "x").unwrap();
         // A symlink with that prefix is skipped by gh_token_files (not a regular
         // file), so it is neither followed nor removed.
         let target = home.join("victim");
@@ -2012,6 +2020,7 @@ mod tests {
             assert!(!orphan.join(f).exists(), "orphan {f} removed");
         }
         assert!(!claimed.exists(), "orphan claimed token removed");
+        assert!(!tmp_copy.exists(), "orphan temp token removed");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
         assert!(
             orphan

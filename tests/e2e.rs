@@ -5865,6 +5865,14 @@ paths = [
             eprintln!("Skipping: GitHub API rate limit hit");
             return;
         }
+        // GitHub outages are not this test's subject (#1081): skip on a 5xx
+        // or a connection failure, and say which.
+        let outage = stderr.contains("Cannot reach GitHub")
+            || (500..600).any(|c| stderr.contains(&format!("returned error: {c}")));
+        if outage {
+            eprintln!("Skipping: GitHub unreachable or returned 5xx: {stderr}");
+            return;
+        }
 
         assert!(
             output.status.success(),
