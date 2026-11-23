@@ -1797,6 +1797,9 @@ fn handle_connect(
                 target,
                 refusal.status(),
             );
+            if refusal == Refusal::ResolvedPrivate && state.log_level.should_log(refusal.status()) {
+                eprintln!("{}", private_resolved_hint(&host));
+            }
             reject(&mut client, refusal.response());
         }
         ConnectRoute::Upstream => {
@@ -2500,6 +2503,24 @@ impl Refusal {
     }
 }
 
+/// The terminal line printed after a `BLOCKED-PRIVATE-RESOLVED` verdict: the
+/// exact command that waives the guard for this host. A hint only, it grants
+/// nothing. `host` is agent-controlled, so the copy-pasteable command is only
+/// shown for a plain DNS name; anything else gets the generic advice.
+pub(crate) fn private_resolved_hint(host: &str) -> String {
+    let plain = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+    if plain {
+        format!(
+            "[proxy] {host} resolved to a private IP. If it is a trusted internal host, allow it (and its subdomains) with:\n  cplt config set proxy.allow_private_domains {host}\n  or for this run only: cplt --allow-private-domain {host}"
+        )
+    } else {
+        "[proxy] Resolved to a private IP. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain).".to_string()
+    }
+}
+
 /// What to do with a CONNECT target once DNS has answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectRoute {
@@ -2843,6 +2864,19 @@ mod tests {
     /// the private-domain list — that list is only read by the post-DNS guard in
     /// `classify_resolved`. A repository URL written as `https://10.20.30.40/...`
     /// therefore has no remedy short of giving the host a DNS name.
+    #[test]
+    fn private_resolved_hint_names_host_and_exact_fix() {
+        let hint = private_resolved_hint("svc.intern.example.com");
+        assert!(
+            hint.contains("cplt config set proxy.allow_private_domains svc.intern.example.com")
+        );
+        assert!(hint.contains("cplt --allow-private-domain svc.intern.example.com"));
+        // Agent-controlled junk never lands in a copy-pasteable command.
+        let odd = private_resolved_hint("evil.com;rm -rf ~");
+        assert!(!odd.contains("rm -rf"));
+        assert!(!odd.contains("cplt config set"));
+    }
+
     #[test]
     fn ip_literal_stays_private_blocked_even_when_listed_as_a_private_domain() {
         let mut policy = np(&[], &[], &[443]);
