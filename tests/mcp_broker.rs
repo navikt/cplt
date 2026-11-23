@@ -61,7 +61,21 @@ def reach(path):
         return "open"
     except OSError:
         return "closed"
+def can_write(d):
+    try:
+        f = os.path.join(d, "cplt-1058-%d" % os.getpid())
+        open(f, "w").close()
+        os.unlink(f)
+        return "open"
+    except OSError:
+        return "denied"
 def sandbox():
+    if sys.platform == "darwin":
+        # #1058: TMPDIR is the child's own; the user temp dir the agent can
+        # read and write is not writable. 65537 is _CS_DARWIN_USER_TEMP_DIR.
+        t = os.environ.get("TMPDIR", "")
+        return ("|MTMP:" + ("private" if "/.config/cplt/mcp-tmp/" in t else "shared " + t)
+                + ":" + can_write(t) + "|SHARED:" + can_write(os.confstr(65537)))
     if not sys.platform.startswith("linux"):
         return ""
     home = os.environ["HOME"]
@@ -298,6 +312,9 @@ if sys.platform.startswith("linux"):
         let probe = resp[4]["result"]["content"][0]["text"].as_str().unwrap();
         let (probe, direct) = probe.split_once("|DIRECT:").unwrap();
         let (direct, sandbox) = direct.split_once('|').unwrap_or((direct, ""));
+        if cfg!(target_os = "macos") {
+            assert_eq!(sandbox, "MTMP:private:open|SHARED:denied", "{stdout}");
+        }
         if cfg!(target_os = "linux") {
             // An empty, read-only HOME (no grants for credential `none`), so
             // no socket in it; no Nix daemon; a private /tmp holding only

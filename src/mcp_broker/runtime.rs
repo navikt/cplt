@@ -646,11 +646,16 @@ fn spawn_child_with(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
+    let tmp = setup.tmp;
     // The bus proxy's sync pipe now lives in bwrap alone.
-    drop(setup);
+    drop(setup.sync);
     if let Some(err) = child.stderr.take() {
         let (log, id) = (shared.log.clone(), spec.id.clone());
-        std::thread::spawn(move || log_stderr(BufReader::new(err), &log, &id));
+        std::thread::spawn(move || {
+            log_stderr(BufReader::new(err), &log, &id);
+            // EOF: the child and everything holding its stderr are gone.
+            drop(tmp);
+        });
     }
     Ok(child)
 }
@@ -762,7 +767,8 @@ fn child_command(
             "no sandbox for the MCP server child on this OS",
         ));
     }
-    let mut dirs = vec![std::env::temp_dir()];
+    let tmp = child_temp_dir(home)?;
+    let mut dirs = vec![tmp.path().to_path_buf()];
     dirs.extend(spec.credential.write_dirs.iter().map(|d| home.join(d)));
     // Seatbelt matches resolved paths (/var is /private/var). A dir that does
     // not exist yet (a fresh login creates it) resolves through its parents.
@@ -778,7 +784,30 @@ fn child_command(
         .arg("--")
         .arg(&spec.program)
         .args(&args);
-    Ok((cmd, ChildSetup::default()))
+    let setup = ChildSetup {
+        env: vec![("TMPDIR", tmp.path().as_os_str().to_owned())],
+        tmp: Some(tmp),
+        ..ChildSetup::default()
+    };
+    Ok((cmd, setup))
+}
+
+/// The macOS child's own temp dir (#1058): 0700, random name, under
+/// cplt's legacy state dir, which every agent profile denies with no
+/// override, so the child shares no temp files with the agent (whose grants
+/// cover `/private/tmp` and `/private/var/folders`). Removed on drop.
+fn child_temp_dir(home: &Path) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::DirBuilderExt;
+    let base = home.join(crate::sandbox::CPLT_STATE_DIR).join("mcp-tmp");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&base)?;
+    // Canonical: Seatbelt matches resolved paths (a symlinked HOME).
+    tempfile::Builder::new()
+        .prefix("child-")
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(base.canonicalize()?)
 }
 
 /// What the child's command needs past [`host_env`], and what must live
@@ -790,6 +819,8 @@ struct ChildSetup {
     /// The read end of the bus proxy's `--fd` pipe, handed to bwrap as its
     /// `--sync-fd`: the proxy exits when bwrap, and so the child, is gone.
     sync: Option<std::io::PipeReader>,
+    /// The macOS child's private temp dir, kept until its stderr closes.
+    tmp: Option<tempfile::TempDir>,
 }
 
 /// Where the filtered session bus appears inside the Linux child.
@@ -1213,7 +1244,7 @@ fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
 }
 
 /// The host child's environment, also the credential probe's, so the two
-/// never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR, LANG, and
+/// never disagree. Cleared, then: HOME, the trusted PATH, LANG, and
 /// on Linux, for a `keychain` mechanism only, the session bus
 /// (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`), which go-keyring needs
 /// to reach the Secret Service on the host, and
@@ -1234,7 +1265,6 @@ fn host_env_pairs(
     let mut env = vec![
         ("HOME", home.as_os_str().to_owned()),
         ("PATH", crate::git::TRUSTED_BIN_DIRS.join(":").into()),
-        ("TMPDIR", std::env::temp_dir().into_os_string()),
     ];
     let mut keep = vec!["LANG"];
     if cfg!(target_os = "linux") {
@@ -1872,6 +1902,67 @@ mod tests {
         }
     }
 
+    /// #1050: a child without the keychain grant (credential `none`) must
+    /// not read a keychain item: no SecurityServer lookup, no keychain
+    /// change notification. keychain=true is the control. Temp keychain only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
+    fn child_profile_keychain_read_needs_the_keychain_grant() {
+        if !sandbox_usable() {
+            return;
+        }
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("cplt-1050-kc-{}", std::process::id()));
+        let dir = home.join("Library/Keychains");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kc = dir.join("login.keychain-db");
+        let kc = kc.to_str().unwrap();
+        let sec = |args: &[&str]| Command::new("/usr/bin/security").args(args).output();
+        let Ok(made) = sec(&["create-keychain", "-p", "test", kc]) else {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        };
+        struct Cleanup<'a>(&'a str, &'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("/usr/bin/security")
+                    .args(["delete-keychain", self.0])
+                    .output();
+                let _ = std::fs::remove_dir_all(self.1);
+            }
+        }
+        let _cleanup = Cleanup(kc, &home);
+        assert!(made.status.success(), "create-keychain failed");
+        let added = sec(&[
+            "add-generic-password",
+            "-a",
+            "a",
+            "-s",
+            "cplt-1050",
+            "-w",
+            "secret",
+            "-A",
+            kc,
+        ])
+        .unwrap();
+        assert!(added.status.success(), "add-generic-password failed");
+        let read = |keychain: bool| {
+            let profile = crate::sandbox::mcp_child_profile(&home, &[], keychain, None).unwrap();
+            let out = Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/security"])
+                .args(["find-generic-password", "-s", "cplt-1050", "-w", kc])
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("secret")
+        };
+        assert!(read(true), "control: keychain=true could not read the item");
+        assert!(!read(false), "keychain=false read a keychain item");
+    }
+
     /// The kernel, not the profile text: the child cannot look up
     /// nsurlsessiond, which would fetch URLs past the egress rule. It is
     /// not on the measured Mach list (#911); the control adds a blanket allow.
@@ -2126,12 +2217,31 @@ mod tests {
     fn the_macos_probe_runs_under_the_child_profile() {
         let b = cat_broker();
         let server = b.shared.servers.values().next().unwrap();
-        let (cmd, _) = child_command(&b.shared, server, Some(&["-n", "x"])).unwrap();
+        let (cmd, setup) = child_command(&b.shared, server, Some(&["-n", "x"])).unwrap();
+        // #1058: its own 0700 temp dir, not the agent's, removed on drop.
+        let tmp = setup.tmp.as_ref().unwrap().path().to_path_buf();
+        assert_eq!(setup.env, [("TMPDIR", tmp.clone().into_os_string())]);
+        let shared_tmp = std::env::temp_dir().canonicalize().unwrap();
+        assert!(!tmp.starts_with(&shared_tmp), "{}", tmp.display());
+        assert!(
+            tmp.starts_with(
+                b.shared
+                    .home
+                    .canonicalize()
+                    .unwrap()
+                    .join(".config/cplt/mcp-tmp")
+            )
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(cmd.get_program(), "/usr/bin/sandbox-exec");
         let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
         let profile = crate::sandbox::mcp_child_profile(
             &b.shared.home,
-            &[std::env::temp_dir()]
+            &[tmp.clone()]
                 .into_iter()
                 .chain(
                     server
@@ -2148,6 +2258,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args, ["-p", profile.as_str(), "--", "/bin/cat", "-n", "x"]);
+        assert!(
+            !profile.contains(&*shared_tmp.to_string_lossy()),
+            "{profile}"
+        );
+        drop(setup);
+        assert!(!tmp.exists(), "temp dir left behind");
     }
 
     fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {
