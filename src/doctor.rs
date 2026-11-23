@@ -1333,7 +1333,9 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
             && d.env_token.is_none()
             && !d.gh_login
             && !d.other_login
-            && !d.macos =>
+            && !d.macos
+            // Copilot may run gh itself; the auth line already hedges.
+            && !matches!(d.gh_handover, Some(Err(w)) if GH_SELF_SERVE.contains(&w)) =>
         {
             Some(Finding::blocking(
                 "No credential source discovered for Copilot: no stored gh token for github.com \

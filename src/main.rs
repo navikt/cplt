@@ -2528,14 +2528,27 @@ fn host_gh_token_stored(
     resolved: &config::Resolved,
     agent: agent::Agent,
 ) -> Result<(), &'static str> {
+    host_gh_token_stored_with(resolved, agent, cplt::sandbox::gh_configured, &|| {
+        cplt::git::trusted_binary("gh").is_some()
+    })
+}
+
+/// [`host_gh_token_stored`] with the host lookups injected, so tests control
+/// "gh configured" and "trusted gh present" and can check the ranking.
+fn host_gh_token_stored_with(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    gh_configured: fn() -> bool,
+    trusted_gh: &dyn Fn() -> bool,
+) -> Result<(), &'static str> {
     use cplt::doctor::{GH_GUARD_OFF, GH_NO_LOGIN, NO_TRUSTED_GH, SCRATCH_OFF};
-    if agent != agent::Agent::Copilot || !cplt::sandbox::gh_configured() {
+    if agent != agent::Agent::Copilot || !gh_configured() {
         Err(GH_NO_LOGIN)
     } else if !resolved.gh_guard.enabled {
         Err(GH_GUARD_OFF)
     } else if !resolved.scratch_dir {
         Err(SCRATCH_OFF)
-    } else if cplt::git::trusted_binary("gh").is_none() {
+    } else if !trusted_gh() {
         Err(NO_TRUSTED_GH)
     } else if !discover::stored_gh_token_available() {
         Err(GH_NO_LOGIN)
@@ -7736,6 +7749,12 @@ fn assemble_sandbox(
     );
     // Doctor's suppression: a token handed over another way makes the keyring moot.
     let gh_token_stored = host_gh_token_stored(resolved, active_agent);
+    if !resolved.quiet && gh_token_stored == Err(cplt::doctor::NO_TRUSTED_GH) {
+        ui::warn(&format!(
+            "gh's stored token was not read: no gh in {}",
+            cplt::git::TRUSTED_BIN_DIRS.join(", ")
+        ));
+    }
     let keyring_moot = copilot_stored_token_handover(
         resolved,
         keychain_substitute.as_ref(),
@@ -18117,7 +18136,6 @@ mod tests {
         );
     }
 
-    /// Doctor's auth line and blocking finding come from the launch's own
     /// Doctor names only the agent's own login variable (#1092).
     #[test]
     fn doctor_env_token_is_the_agents_own_login() {
@@ -18128,11 +18146,8 @@ mod tests {
             agent::Agent::Pi,
             agent::Agent::OpenCode,
         ] {
-            let got = doctor_env_token(a, &[], &all);
-            assert!(
-                got.is_none() || got == Some("CLAUDE_CODE_OAUTH_TOKEN"),
-                "{a:?}: {got:?}"
-            );
+            let want = (a == agent::Agent::Claude).then_some("CLAUDE_CODE_OAUTH_TOKEN");
+            assert_eq!(doctor_env_token(a, &[], &all), want, "{a:?}");
         }
         let gh_only = |k: &str| (k == "GH_TOKEN").then(|| "t".to_string());
         assert_eq!(doctor_env_token(agent::Agent::Claude, &[], &gh_only), None);
@@ -18146,6 +18161,7 @@ mod tests {
         );
     }
 
+    /// Doctor's auth line and blocking finding come from the launch's own
     /// handover decision (#1092): each case runs the shared predicate and
     /// feeds that exact result to the report.
     #[test]
@@ -18232,13 +18248,40 @@ mod tests {
                     assert!(auth.contains("may still use gh's own login"), "{auth}");
                     assert!(f.is_none(), "{why}");
                 }
-                // gh_guard off outranks a missing trusted gh (mise-only gh).
-                let mut r = base();
-                r.gh_guard.enabled = false;
-                assert_ne!(
-                    host_gh_token_stored(&r, agent::Agent::Copilot),
-                    Err(cplt::doctor::NO_TRUSTED_GH)
-                );
+                // gh_guard off and scratch off outrank a missing trusted gh
+                // (mise-only gh), and a logged-in user gets no blocking finding.
+                let no_gh = || false;
+                let stored = |r: &config::Resolved| {
+                    host_gh_token_stored_with(r, agent::Agent::Copilot, || true, &no_gh)
+                };
+                assert_eq!(stored(&base()), Err(cplt::doctor::NO_TRUSTED_GH));
+                let mut guard_off = base();
+                guard_off.gh_guard.enabled = false;
+                let mut scratch_off = base();
+                scratch_off.scratch_dir = false;
+                for (r, why) in [
+                    (guard_off, GH_GUARD_OFF),
+                    (scratch_off, cplt::doctor::SCRATCH_OFF),
+                ] {
+                    let h = stored(&r);
+                    assert_eq!(h, Err(why));
+                    let h = copilot_stored_token_handover(&r, None, h, false);
+                    let d = AuthDecision {
+                        agent: agent::Agent::Copilot,
+                        substitute: None,
+                        setting: None,
+                        kept_reason: None,
+                        macos: false,
+                        env_token: None,
+                        gh_login: false,
+                        other_login: false,
+                        gh_handover: Some(h),
+                        opencode_handover: false,
+                    };
+                    let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
+                    assert!(auth.contains("may still use gh's own login"), "{auth}");
+                    assert!(f.is_none(), "{why}: {f:?}");
+                }
             },
         );
     }
