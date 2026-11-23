@@ -1513,12 +1513,12 @@ mod tests {
         for id in 1..=8 {
             let list = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#);
             let (reply, _) = serve_on(&ep, "POST", &list);
-            assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
+            assert!(reply.starts_with("HTTP/1.1 502"), "reply assertion");
         }
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0, "slots leaked");
         // Past the cap, and id 1 reused.
         let (reply, _) = serve_on(&ep, "POST", LIST);
-        assert!(reply.contains(r#""result""#), "{reply}");
+        assert!(reply.contains(r#""result""#), "reply assertion");
     }
 
     const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
@@ -1739,7 +1739,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             );
             let (reply, got) = relay_of(&input);
             assert_eq!(got, Some(("200".to_string(), None)), "{interim}");
-            assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+            assert!(reply.starts_with("HTTP/1.1 200"), "reply assertion");
             assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
         }
     }
@@ -1752,9 +1752,9 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
 data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"},{\"name\":\"delete_repo\"}]}}\n\n",
         );
         let (reply, log) = through(url, curl, LIST);
-        assert!(reply.contains("id: 1\ndata:\n\n"), "{reply}");
+        assert!(reply.contains("id: 1\ndata:\n\n"), "reply assertion");
         assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
-        assert!(log.contains("FORWARDED 200"), "{log}");
+        assert!(log.contains("FORWARDED 200"), "log assertion");
     }
 
     /// Ids are keyed by `Mcp-Session-Id`: the same id in a second session
@@ -1803,10 +1803,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"}
             .expect("session A never reached upstream");
         let b = in_session("B");
         let got = seen.recv_timeout(t).expect("session B id 7 not forwarded");
-        assert!(got.contains("Mcp-Session-Id: B"), "{got}");
+        assert!(got.contains("Mcp-Session-Id: B"), "got assertion");
         let (reply, log) = serve_with(&ep, "POST", call, "Mcp-Session-Id: A\r\n");
-        assert!(reply.contains("already in flight"), "{reply}");
-        assert!(log.contains("DENIED duplicate id"), "{log}");
+        assert!(reply.contains("already in flight"), "reply assertion");
+        assert!(log.contains("DENIED duplicate id"), "log assertion");
         go_tx.send(()).unwrap();
         for h in [a, b] {
             assert!(h.join().unwrap().0.starts_with("HTTP/1.1 200"));
