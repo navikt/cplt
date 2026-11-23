@@ -6554,4 +6554,47 @@ except Exception as e:
             "renaming intermediate ancestor of nested named_root must be denied"
         );
     }
+
+    /// An env-relocated tool dir inside a protected path grants nothing (#1067):
+    /// `GOCACHE=~/.nav-pilot/x` from a hostile `.envrc` must not open
+    /// nav-pilot's state for writing.
+    #[test]
+    fn env_tool_dir_in_protected_path_is_not_granted() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create project");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
+        let target = home.path().join(".nav-pilot/pakker");
+        std::fs::create_dir_all(&target).expect("create protected dir");
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                "echo pwned > \"$GOCACHE/m.toml\"",
+            ])
+            .env("HOME", home.path())
+            .env("GOCACHE", &target)
+            .output()
+            .expect("run cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !target.join("m.toml").exists(),
+            "GOCACHE inside ~/.nav-pilot must not grant write: {stderr}"
+        );
+        assert!(
+            stderr.contains("Ignoring GOCACHE"),
+            "the refusal must be reported: {stderr}"
+        );
+    }
 }

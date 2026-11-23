@@ -3757,6 +3757,41 @@ pub fn tool_override_path_is_safe(path: &Path, home: &Path) -> bool {
     true
 }
 
+/// The protected path an env-derived tool grant on `path` would reach, if any.
+///
+/// `GOCACHE`, `PIP_CACHE_DIR`, `CARGO_HOME` and the rest come from the
+/// environment, which a project `.envrc` or mise `[env]` can set. Their grants
+/// are automatic, not typed by the user, so they must never open a path the
+/// deny lists close: the macOS profile emits them after the denies, and Linux
+/// is grant-only, so either backend would honour them. Refused when `path`
+/// lies in, equals, or contains a [`DENIED_DOTFILES`] dir, a [`DENIED_FILES`]
+/// or [`DENIED_HOME_SUBPATHS`] entry, or a cplt state dir.
+///
+/// Compared by identity (dev, ino), not spelling, so a symlink into a
+/// protected dir or a case variant on case-insensitive APFS still matches.
+/// `path` must exist and be canonical; a missing protected entry is resolved
+/// to its deepest existing ancestor, so a grant above it is still refused.
+#[must_use]
+pub fn env_tool_path_protected(home: &Path, path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let me = id(path)?;
+    let canon = resolver(home);
+    DENIED_DOTFILES
+        .iter()
+        .chain(DENIED_FILES)
+        .chain(DENIED_HOME_SUBPATHS)
+        .map(|rel| home.join(rel))
+        .chain(cplt_state_dirs(home).into_iter().flatten())
+        .find(|d| {
+            let real = canon(d);
+            // `path` above or equal to the protected entry.
+            real.ancestors().any(|a| id(a) == Some(me))
+                // `path` inside the protected entry.
+                || id(&real).is_some_and(|did| path.ancestors().any(|a| id(a) == Some(did)))
+        })
+}
+
 /// Validate that a path is safe for interpolation into SBPL profile strings.
 /// Returns an error if the path contains characters that could break or inject SBPL rules.
 pub fn validate_sbpl_path(path: &Path) -> Result<(), String> {

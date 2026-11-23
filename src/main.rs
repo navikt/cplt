@@ -1909,6 +1909,19 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
             ));
             continue;
         }
+        // An env-derived grant must never open a protected path: it is
+        // automatic, and a project `.envrc` or mise `[env]` can set it.
+        if let Some(prot) = cplt::sandbox::env_tool_path_protected(home, &path) {
+            ui::warn(&format!(
+                "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
+                 added and writes there stay denied. Point {} at a directory outside it.",
+                ovr.name,
+                path.display(),
+                prot.display(),
+                ovr.name
+            ));
+            continue;
+        }
         // One root per default tree: a second segment of a list var
         // (`GOPATH=/a:/b`) keeps the plain whole-tree grant below.
         if let Some(default) = cplt::sandbox::relocatable_tool_prefix(ovr.name)

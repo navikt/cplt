@@ -574,6 +574,7 @@ name (`~/.cache -> ~/dotfiles` with `~/.npmrc -> ~/dotfiles/npmrc`), lies in
 cplt's state directory, or is `/`, `$HOME`, an ancestor of `$HOME` or a platform
 system root — the same bar a relocated `CARGO_HOME` meets. On macOS a target
 the profile cannot name (one containing `( ) " ; \`) is refused the same way.
+An env-relocated tool dir (`GOCACHE`, `PIP_CACHE_DIR`, `CARGO_HOME` and the rest) that lies in, above or links into a protected path is refused with a warning naming the variable, compared by identity (dev, ino), on both backends.
 When an executable tool directory's grant lands in the same tree as a writable
 one (`~/.cargo/bin` and `~/.cargo/registry` linked to one directory, or
 `CARGO_HOME=~/.cache/cargo`), cplt drops the executable one with a warning,

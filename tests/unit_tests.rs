@@ -11998,3 +11998,55 @@ fn shim_pointing_outside_every_exec_grant_is_reported() {
         "an ungranted shim is not a shim-target problem"
     );
 }
+
+/// An env-derived tool dir (GOCACHE, PIP_CACHE_DIR, ...) must never be granted
+/// in, above, or through a symlink into a protected path (#1067).
+#[test]
+fn env_tool_path_refused_under_protected_paths() {
+    use cplt::sandbox::{TOOL_PATH_ENV_VARS, env_tool_path_protected, tool_path_env_overrides};
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    let protected = [
+        ".nav-pilot",
+        ".ssh",
+        ".aws/sso",
+        ".kube/cache",
+        ".config/gcloud",
+    ];
+    for p in protected {
+        std::fs::create_dir_all(home.join(p).join("x")).unwrap();
+    }
+    std::fs::create_dir_all(home.join("ok/cache")).unwrap();
+    std::fs::create_dir_all(home.join(".config/other")).unwrap();
+    std::os::unix::fs::symlink(home.join(".ssh"), home.join("link")).unwrap();
+
+    for tv in TOOL_PATH_ENV_VARS {
+        for p in protected {
+            for target in [format!("{p}/x"), p.to_string()] {
+                let env = vec![(tv.name.to_string(), format!("~/{target}"))];
+                for ovr in tool_path_env_overrides(&env, &home) {
+                    let real = std::fs::canonicalize(&ovr.path).unwrap();
+                    assert!(
+                        env_tool_path_protected(&home, &real).is_some(),
+                        "{}={target} must be refused",
+                        tv.name
+                    );
+                }
+            }
+        }
+    }
+    // Above a protected dir.
+    assert!(env_tool_path_protected(&home, &home.join(".config")).is_some());
+    assert!(env_tool_path_protected(&home, &home.join(".aws")).is_some());
+    // Through a symlink: canonicalized at the merge site, so the target is checked.
+    let via_link = std::fs::canonicalize(home.join("link")).unwrap();
+    assert!(env_tool_path_protected(&home, &via_link).is_some());
+    // Unrelated dirs stay grantable.
+    assert!(env_tool_path_protected(&home, &home.join("ok/cache")).is_none());
+    assert!(env_tool_path_protected(&home, &home.join(".config/other")).is_none());
+    // Case variant: on case-insensitive APFS this names the same dir.
+    let upper = home.join(".NAV-PILOT/x");
+    if upper.exists() {
+        assert!(env_tool_path_protected(&home, &upper).is_some());
+    }
+}
