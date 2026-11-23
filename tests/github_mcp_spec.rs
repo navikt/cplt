@@ -160,7 +160,10 @@ fn gh_token_spec_filters_opencode_github_mcp() {
     let body = reply.split("\r\n\r\n").nth(1).unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(body).expect("JSON-RPC body");
     assert_eq!(v["id"], 7);
-    assert!(v["error"].is_object(), "{reply}");
+    assert!(
+        v["error"].is_object(),
+        "denied call did not return a JSON-RPC error"
+    );
     up.set_nonblocking(true).unwrap();
     assert!(up.accept().is_err(), "a denied call reached upstream");
     up.set_nonblocking(false).unwrap();
@@ -178,7 +181,7 @@ fn gh_token_spec_filters_opencode_github_mcp() {
     BufReader::new(s).read_line(&mut line).unwrap();
     assert!(
         line.starts_with("CONNECT api.githubcopilot.com:443 "),
-        "{line}"
+        "upstream did not receive the pinned CONNECT"
     );
     let _ = call.join();
 }
