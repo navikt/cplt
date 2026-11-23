@@ -285,7 +285,9 @@ RFC 1918 — see `is_private_ip` for the authority:
 
 `proxy.allow_private_domains` waives that check for names you trust. Suffix
 matching, like every other list: `nav.cloud.nais.io` covers every subdomain, but
-does **not** cover `dev-nais.cloud.nais.io`, which is a different domain.
+does **not** cover `dev-nais.cloud.nais.io`, which is a different domain. An entry matches the host itself and its subdomains, never its siblings.
+When the guard refuses a host, the `[proxy]` line after the `BLOCKED-PRIVATE-RESOLVED`
+verdict prints the exact command to allow it.
 
 ```bash
 cplt config set proxy.allow_private_domains intern.nav.no
