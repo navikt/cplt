@@ -1876,7 +1876,11 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 /// different postures (`CARGO_HOME` → `.cargo/{bin,registry,git}`) are not
 /// granted as one tree: they come back as `ToolRoot`s that relocate those
 /// entries, so `$CARGO_HOME/bin` stays exec-only and never writable (#152).
-fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -> Vec<ToolRoot> {
+fn merge_tool_path_env_overrides(
+    resolved: &mut config::Resolved,
+    home: &Path,
+    project_dir: &Path,
+) -> Vec<ToolRoot> {
     let mut roots = Vec::new();
     // Read only the handful of recognized tool-path vars rather than snapshotting
     // the entire parent environment — no need to copy unrelated secrets (tokens,
@@ -1909,8 +1913,36 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
             ));
             continue;
         }
-        // An env-derived grant must never open a protected path: it is
-        // automatic, and a project `.envrc` or mise `[env]` can set it.
+        // The same tree as the default, reached through a link
+        // (`~/.cargo -> ~/dotfiles/cargo`): the base policy already covers it.
+        let same_as_default = cplt::sandbox::TOOL_PATH_ENV_VARS
+            .iter()
+            .filter(|tv| tv.name == ovr.name)
+            .flat_map(|tv| tv.default_subpaths)
+            .any(|d| std::fs::canonicalize(home.join(d)).is_ok_and(|c| c == path));
+        if same_as_default {
+            continue;
+        }
+        // Positive rule: an env-derived grant is automatic, and a project
+        // `.envrc` or mise `[env]` can set it, so it is granted only under a
+        // known safe root, never at an arbitrary persistence path.
+        let temp = std::fs::canonicalize(std::env::temp_dir()).ok();
+        let extra: Vec<&Path> = std::iter::once(project_dir)
+            .chain(temp.as_deref())
+            .collect();
+        if !cplt::sandbox::env_tool_dir_allowed(&path, home, ovr.write, &extra) {
+            ui::warn(&format!(
+                "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
+                 under ~/.cache, ~/Library/Caches, another cplt tool cache, the project or the \
+                 temp dir, so no grant is added. Move it under ~/.cache, or grant it with \
+                 `allow.{}` if you mean to.",
+                ovr.name,
+                path.display(),
+                if ovr.write { "write" } else { "read" }
+            ));
+            continue;
+        }
+        // Second layer: never open a protected path.
         if let Some(prot) = cplt::sandbox::env_tool_path_protected(home, &path) {
             ui::warn(&format!(
                 "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
@@ -7286,7 +7318,7 @@ impl HostProbe {
     /// by mutating `resolved`: the grant and the tool discovery share the same
     /// tool roots, so they must not be able to drift apart.
     fn probe(resolved: &mut config::Resolved, home_dir: &Path, project_dir: &Path) -> Self {
-        let tool_roots = merge_tool_path_env_overrides(resolved, home_dir);
+        let tool_roots = merge_tool_path_env_overrides(resolved, home_dir, project_dir);
         if resolved.allow_build_credentials {
             merge_build_credentials(resolved, home_dir);
         }
@@ -7322,7 +7354,7 @@ impl HostProbe {
 /// An env var naming a tool directory, accepted only when it exists and does not
 /// resolve to an unsafe root that would defeat the sandbox.
 fn tool_dir_from_env(var: &str, home_dir: &Path) -> Option<PathBuf> {
-    accept_tool_dir(std::env::var(var).ok(), home_dir)
+    accept_tool_dir(var, std::env::var(var).ok(), home_dir)
 }
 
 /// The value half of [`tool_dir_from_env`], separate so it can be tested without
@@ -7334,11 +7366,21 @@ fn tool_dir_from_env(var: &str, home_dir: &Path) -> Option<PathBuf> {
 /// `/`, `/tmp` or `$HOME` because `JAVA_HOME` points there would defeat the
 /// sandbox, so the same `is_unsafe_root` veto that guards the relocatable tool
 /// roots guards these too.
-fn accept_tool_dir(value: Option<String>, home_dir: &Path) -> Option<PathBuf> {
-    value
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .filter(|p| !crate::is_unsafe_root(p, home_dir))
+fn accept_tool_dir(var: &str, value: Option<String>, home_dir: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(value?).ok()?;
+    if crate::is_unsafe_root(&path, home_dir) {
+        return None;
+    }
+    if !cplt::sandbox::env_tool_dir_allowed(&path, home_dir, false, &[]) {
+        ui::warn(&format!(
+            "Ignoring {var} = {}: an env-set SDK dir is granted read only under a known SDK or tool \
+             root (~/.sdkman, ~/.jdks, /usr/lib/jvm, /Library/Java, mise, asdf, ...). Grant it \
+             with `allow.read` if you mean to.",
+            path.display()
+        ));
+        return None;
+    }
+    Some(path)
 }
 
 /// The agent-specific inputs to the sandbox assembly. Everything else about a
@@ -16874,7 +16916,7 @@ mod tests {
                 let mut r = config::Config::default()
                     .merge(config::CliFlags::default())
                     .unwrap();
-                merge_tool_path_env_overrides(&mut r, &home);
+                merge_tool_path_env_overrides(&mut r, &home, &home);
                 r.policy_fingerprint()
             })
         };
@@ -17096,14 +17138,18 @@ mod tests {
     #[test]
     fn tool_dir_env_var_that_is_unset_or_missing_grants_nothing() {
         let home = tempfile::env::temp_dir();
-        assert_eq!(accept_tool_dir(None, &home), None);
+        assert_eq!(accept_tool_dir("JAVA_HOME", None, &home), None);
         assert_eq!(
-            accept_tool_dir(Some(String::new()), &home),
+            accept_tool_dir("JAVA_HOME", Some(String::new()), &home),
             None,
             "an exported-but-empty JAVA_HOME must not resolve to the cwd"
         );
         assert_eq!(
-            accept_tool_dir(Some("/definitely/not/a/jdk".to_string()), &home),
+            accept_tool_dir(
+                "JAVA_HOME",
+                Some("/definitely/not/a/jdk".to_string()),
+                &home
+            ),
             None
         );
     }
@@ -17114,20 +17160,45 @@ mod tests {
         // HOME itself, and the filesystem root: granting either would hand the
         // sandbox read access to everything the guard exists to withhold.
         assert_eq!(
-            accept_tool_dir(Some(home.to_string_lossy().into_owned()), &home),
+            accept_tool_dir(
+                "JAVA_HOME",
+                Some(home.to_string_lossy().into_owned()),
+                &home
+            ),
             None
         );
-        assert_eq!(accept_tool_dir(Some("/".to_string()), &home), None);
+        assert_eq!(
+            accept_tool_dir("JAVA_HOME", Some("/".to_string()), &home),
+            None
+        );
     }
 
     #[test]
     fn tool_dir_env_var_pointing_at_a_real_directory_is_granted() {
         let dir = tempfile::tempdir().unwrap();
-        let jdk = dir.path().join("jdk-21");
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let jdk = home.join(".sdkman/candidates/java/21");
         std::fs::create_dir_all(&jdk).unwrap();
         assert_eq!(
-            accept_tool_dir(Some(jdk.to_string_lossy().into_owned()), dir.path()),
+            accept_tool_dir("JAVA_HOME", Some(jdk.to_string_lossy().into_owned()), &home),
             Some(jdk)
+        );
+    }
+
+    #[test]
+    fn tool_dir_env_var_outside_sdk_roots_is_refused() {
+        // `JAVA_HOME=~/Library/Keychains` must not grant read (#1067).
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let keychains = home.join("Library/Keychains");
+        std::fs::create_dir_all(&keychains).unwrap();
+        assert_eq!(
+            accept_tool_dir(
+                "JAVA_HOME",
+                Some(keychains.to_string_lossy().into_owned()),
+                &home
+            ),
+            None
         );
     }
 

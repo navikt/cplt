@@ -283,6 +283,20 @@ fn ensure_pnpm_package_manager_stores(home_dir: &Path) -> Result<(), String> {
         }
         let canonical_root = std::fs::canonicalize(&root)
             .map_err(|e| format!("Cannot resolve pnpm home {}: {e}", root.display()))?;
+        // A `PNPM_HOME` the env-tool-dir rule refuses gets no grant, so
+        // nothing is created under it either (#1067).
+        let from_env = std::env::var_os("PNPM_HOME").is_some_and(|v| {
+            let v = PathBuf::from(v);
+            root == if v.is_absolute() { v } else { home_dir.join(v) }
+        });
+        let default =
+            root == home_dir.join("Library/pnpm") || root == home_dir.join(".local/share/pnpm");
+        if from_env
+            && !default
+            && !crate::sandbox::env_tool_dir_allowed(&canonical_root, &canonical_home, true, &[])
+        {
+            continue;
+        }
         if let Ok(relative) = root.strip_prefix(home_dir) {
             let expected = canonical_home.join(relative);
             if canonical_root != expected {

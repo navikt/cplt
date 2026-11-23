@@ -12050,3 +12050,107 @@ fn env_tool_path_refused_under_protected_paths() {
         assert!(env_tool_path_protected(&home, &upper).is_some());
     }
 }
+
+/// The positive rule for env-derived tool dirs (#1067): only directories under
+/// a safe root are granted, so no env var can open a persistence path.
+#[test]
+fn env_tool_dir_allowed_only_under_safe_roots() {
+    use cplt::sandbox::env_tool_dir_allowed;
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("src/proj");
+    let mk = |rel: &str| {
+        let p = home.join(rel);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    };
+    let safe = [
+        ".cache/go-build-x",
+        "Library/Caches/pip",
+        ".npm/x",
+        ".gradle/caches",
+        ".m2/repository",
+        ".cargo/registry",
+        ".local/share/pnpm/store",
+        "src/proj/.cache",
+        ".local/share/cargo",
+        ".local/share/go/pkg",
+    ];
+    let unsafe_ = [
+        "Library/LaunchAgents",
+        "Library/Keychains",
+        "Library",
+        ".config/fish",
+        ".config/gh",
+        ".local/bin",
+        ".local/share",
+        ".claude",
+        ".cargo",
+        "go/src/other-repo",
+    ];
+    for rel in safe {
+        assert!(
+            env_tool_dir_allowed(&mk(rel), &home, true, &[&project]),
+            "{rel} must be granted"
+        );
+    }
+    for rel in unsafe_ {
+        assert!(
+            !env_tool_dir_allowed(&mk(rel), &home, true, &[&project]),
+            "{rel} must be refused"
+        );
+    }
+    // $HOME itself, and a file value (`~/.zshrc`).
+    assert!(!env_tool_dir_allowed(&home, &home, true, &[]));
+    assert!(!env_tool_dir_allowed(&home, &home, false, &[]));
+    std::fs::write(home.join(".zshrc"), "").unwrap();
+    assert!(!env_tool_dir_allowed(
+        &home.join(".zshrc"),
+        &home,
+        true,
+        &[]
+    ));
+    std::fs::write(home.join(".cache/f"), "").unwrap();
+    assert!(!env_tool_dir_allowed(
+        &home.join(".cache/f"),
+        &home,
+        true,
+        &[]
+    ));
+    // A link from a safe root into an unsafe one is judged by its target.
+    std::os::unix::fs::symlink(home.join("Library/LaunchAgents"), home.join(".cache/la")).unwrap();
+    let via = std::fs::canonicalize(home.join(".cache/la")).unwrap();
+    assert!(!env_tool_dir_allowed(&via, &home, true, &[]));
+    // Read: SDK roots pass, persistence paths do not.
+    assert!(env_tool_dir_allowed(
+        &mk(".sdkman/candidates/java/21"),
+        &home,
+        false,
+        &[]
+    ));
+    assert!(env_tool_dir_allowed(
+        &mk(".jdks/temurin-21"),
+        &home,
+        false,
+        &[]
+    ));
+    assert!(!env_tool_dir_allowed(
+        &home.join("Library/Keychains"),
+        &home,
+        false,
+        &[]
+    ));
+    assert!(!env_tool_dir_allowed(
+        &home.join(".config/gh"),
+        &home,
+        false,
+        &[]
+    ));
+    // Read-only roots never satisfy a write grant.
+    assert!(!env_tool_dir_allowed(
+        &home.join(".sdkman"),
+        &home,
+        true,
+        &[]
+    ));
+}

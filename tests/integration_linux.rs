@@ -5605,11 +5605,10 @@ finally:
         assert!(!main.join(".git/wtx").exists());
     }
 
-    /// An env-relocated tool dir inside a protected path grants nothing (#1067):
-    /// `GOCACHE=~/.nav-pilot/x` from a hostile `.envrc` must not open
-    /// nav-pilot's state for writing.
-    #[test]
-    fn env_tool_dir_in_protected_path_is_not_granted() {
+    /// An env-relocated tool dir outside the safe roots grants nothing (#1067).
+    /// The child writes to the absolute target, not `$VAR`, because cplt
+    /// rewrites some cache vars to scratch inside the sandbox.
+    fn assert_env_tool_dir_not_granted(var: &str, rel: &str) {
         let project = tempfile::Builder::new()
             .prefix(".cplt-envdeny-project-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -5618,8 +5617,9 @@ finally:
             .prefix(".cplt-envdeny-home-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
             .expect("create fake home");
-        let target = home.path().join(".nav-pilot/pakker");
-        std::fs::create_dir_all(&target).expect("create protected dir");
+        let target = std::fs::canonicalize(home.path()).unwrap().join(rel);
+        std::fs::create_dir_all(&target).expect("create target dir");
+        let file = target.join("m.toml");
         let output = cplt_cmd()
             .args([
                 "--yes",
@@ -5630,20 +5630,28 @@ finally:
                 &project.path().to_string_lossy(),
                 "--",
                 "-c",
-                "echo pwned > \"$GOCACHE/m.toml\"",
+                &format!("echo pwned > '{}'", file.display()),
             ])
             .env("HOME", home.path())
-            .env("GOCACHE", &target)
+            .env(var, &target)
             .output()
             .expect("run cplt");
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!file.exists(), "{var}={rel} must not grant write: {stderr}");
         assert!(
-            !target.join("m.toml").exists(),
-            "GOCACHE inside ~/.nav-pilot must not grant write: {stderr}"
-        );
-        assert!(
-            stderr.contains("Ignoring GOCACHE"),
+            stderr.contains(&format!("Ignoring {var}")),
             "the refusal must be reported: {stderr}"
         );
+    }
+
+    #[test]
+    fn env_tool_dir_in_protected_path_is_not_granted() {
+        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".nav-pilot/pakker");
+    }
+
+    #[test]
+    fn env_tool_dir_at_persistence_path_is_not_granted() {
+        assert_env_tool_dir_not_granted("GOCACHE", "Library/LaunchAgents");
+        assert_env_tool_dir_not_granted("NPM_CONFIG_CACHE", ".config/fish");
     }
 }

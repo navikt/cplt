@@ -2683,6 +2683,73 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
 ];
 
+/// Toolchain homes a relocated `CARGO_HOME` or `GOPATH` may use outside a
+/// cache. Under `~/.cache` their `bin` loses exec, so these are the documented
+/// alternative. Only these two names, never `~/.local/share` itself.
+pub const ENV_TOOL_HOME_ROOTS: &[&str] = &["~/.local/share/cargo", "~/.local/share/go"];
+
+/// Read-only SDK roots an env-named toolchain (`JAVA_HOME`, `DOTNET_ROOT`,
+/// `RUSTUP_HOME`, `NODE_PATH`) may live under, beyond [`HOME_TOOL_DIRS`] and
+/// [`TOOL_READ_DIRS`]. Entries starting with `~/` are home-relative.
+pub const ENV_SDK_READ_ROOTS: &[&str] = &[
+    "/usr/lib/jvm",
+    "/usr/share/dotnet",
+    "/usr/lib/dotnet",
+    "/usr/local/share/dotnet",
+    "/opt/hostedtoolcache",
+    "~/.jdks",
+    "~/.local/share/mise",
+];
+
+/// Whether an env-derived tool dir may be granted: the positive rule (#1067).
+///
+/// `GOCACHE`, `CARGO_HOME`, `JAVA_HOME` and the rest come from the
+/// environment, which a project `.envrc` or mise `[env]` can set, and their
+/// grants are automatic. A deny list cannot name every persistence path
+/// (`~/Library/LaunchAgents`, `~/.zshrc`, `~/.local/bin`, ...), so a grant is
+/// allowed only when `path` (canonical, all hops resolved) is a directory,
+/// is not `$HOME`, and lies at or under a safe root, compared by identity
+/// (dev, ino) so case variants and links match:
+/// - write: a writable [`HOME_TOOL_DIRS`] entry (`~/.cache`,
+///   `~/Library/Caches`, `~/.npm`, `~/.gradle`, the pnpm stores, ...) or one of
+///   `extra` (the project, the session scratch, the system temp dir), or
+///   [`ENV_TOOL_HOME_ROOTS`];
+/// - read: any of those, any [`HOME_TOOL_DIRS`] entry, [`TOOL_READ_DIRS`] or
+///   [`ENV_SDK_READ_ROOTS`].
+#[must_use]
+pub fn env_tool_dir_allowed(path: &Path, home: &Path, write: bool, extra: &[&Path]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    if !path.is_dir() || id(path).is_none() || id(path) == id(home) {
+        return false;
+    }
+    let mut roots: Vec<PathBuf> = HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.write || !write)
+        .map(|d| home.join(d.path))
+        .chain(extra.iter().map(|p| p.to_path_buf()))
+        .collect();
+    let home_rel = |r: &&str| match r.strip_prefix("~/") {
+        Some(rel) => home.join(rel),
+        None => PathBuf::from(r),
+    };
+    roots.extend(ENV_TOOL_HOME_ROOTS.iter().map(home_rel));
+    if !write {
+        roots.extend(TOOL_READ_DIRS.iter().map(PathBuf::from));
+        roots.extend(
+            ENV_SDK_READ_ROOTS
+                .iter()
+                .map(|r| match r.strip_prefix("~/") {
+                    Some(rel) => home.join(rel),
+                    None => PathBuf::from(r),
+                }),
+        );
+    }
+    let ids: Vec<_> = roots.iter().filter_map(|r| id(r)).collect();
+    path.ancestors()
+        .any(|a| id(a).is_some_and(|i| ids.contains(&i)))
+}
+
 /// Return the home tool directory list.
 ///
 /// A single unified list covers both macOS and Linux paths. Entries for
@@ -3783,6 +3850,10 @@ pub fn env_tool_path_protected(home: &Path, path: &Path) -> Option<PathBuf> {
         .chain(DENIED_HOME_SUBPATHS)
         .map(|rel| home.join(rel))
         .chain(cplt_state_dirs(home).into_iter().flatten())
+        // `CPLT_CONFIG=~/cplt.toml` makes the config dir `$HOME`: that would
+        // refuse every dir under it with a confusing message, and `$HOME`
+        // itself is never granted by the positive rule anyway.
+        .filter(|d| id(&canon(d)) != id(home))
         .find(|d| {
             let real = canon(d);
             // `path` above or equal to the protected entry.
