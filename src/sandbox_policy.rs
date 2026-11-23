@@ -2766,28 +2766,16 @@ pub fn env_tool_dir_allowed(path: &Path, home: &Path, write: bool, extra: &[&Pat
 
 /// The system temp roots an env-set tool dir may live under (#1067).
 ///
-/// Never derived from `TMPDIR`: a project `.envrc` sets that as easily as
-/// `GOCACHE`, so `TMPDIR=$HOME` would turn any home path into a "temp" grant.
-/// macOS uses `confstr(_CS_DARWIN_USER_TEMP_DIR)` plus `/private/tmp`; Linux
-/// uses `/tmp`. A root that is `home` or an ancestor of it is dropped.
+/// Fixed paths only: `/private/tmp` on macOS, `/tmp` elsewhere. The per-user
+/// temp dir is deliberately absent. `confstr(_CS_DARWIN_USER_TEMP_DIR)` falls
+/// back to `TMPDIR` verbatim when `DIRHELPER_USER_DIR_SUFFIX` is invalid, and a
+/// valid suffix can name a symlink an earlier session planted under `T/`, so
+/// both are steered by a project `.envrc`. A root that is `home` or an
+/// ancestor of it is dropped.
 #[must_use]
 pub fn env_tool_temp_roots(home: &Path) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
-    let raw = {
-        use std::os::unix::ffi::OsStrExt;
-        let mut buf = [0 as libc::c_char; 1024];
-        // SAFETY: buf is valid for buf.len() bytes; confstr NUL-terminates.
-        let n =
-            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
-        let user = (n > 0 && n <= buf.len()).then(|| {
-            // SAFETY: confstr wrote a NUL-terminated string into buf.
-            let c = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-            PathBuf::from(std::ffi::OsStr::from_bytes(c.to_bytes()))
-        });
-        user.into_iter()
-            .chain([PathBuf::from("/private/tmp")])
-            .collect::<Vec<_>>()
-    };
+    let raw = vec![PathBuf::from("/private/tmp")];
     #[cfg(not(target_os = "macos"))]
     let raw = vec![PathBuf::from("/tmp")];
     let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());

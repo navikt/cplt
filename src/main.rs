@@ -7391,6 +7391,16 @@ fn accept_tool_dir(
     if crate::is_unsafe_root(&path, home_dir) {
         return None;
     }
+    if let Some(prot) = cplt::sandbox::env_tool_path_protected(home_dir, &path) {
+        if !quiet {
+            ui::warn(&format!(
+                "Ignoring {var} = {}: it resolves into protected path {}.",
+                path.display(),
+                prot.display()
+            ));
+        }
+        return None;
+    }
     if !cplt::sandbox::env_tool_dir_allowed(&path, home_dir, false, &[]) {
         if !quiet {
             ui::warn(&format!(

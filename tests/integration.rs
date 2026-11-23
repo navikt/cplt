@@ -6561,6 +6561,17 @@ except Exception as e:
     /// `env` adds vars whose values are paths relative to the fake home;
     /// `file` is the name written under the target.
     fn assert_env_tool_dir_not_granted(var: &str, rel: &str, env: &[(&str, &str)], file: &str) {
+        assert_env_tool_dir_not_granted_raw(var, rel, env, &[], file);
+    }
+
+    /// As above; `raw` vars are passed verbatim, not joined to the fake home.
+    fn assert_env_tool_dir_not_granted_raw(
+        var: &str,
+        rel: &str,
+        env: &[(&str, &str)],
+        raw: &[(&str, &str)],
+        file: &str,
+    ) {
         require_sandbox!();
         let project = tempfile::Builder::new()
             .prefix(".cplt-envdeny-project-")
@@ -6595,6 +6606,9 @@ except Exception as e:
         .env(var, &target);
         for (k, v) in env {
             cmd.env(k, home.path().join(v));
+        }
+        for (k, v) in raw {
+            cmd.env(k, v);
         }
         let output = cmd.output().expect("run cplt");
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6636,5 +6650,91 @@ except Exception as e:
     #[test]
     fn env_tool_dir_under_safe_root_but_protected_is_not_granted() {
         assert_env_tool_dir_not_granted("GOCACHE", ".gradle", &[], "gradle.properties");
+    }
+
+    /// `confstr(_CS_DARWIN_USER_TEMP_DIR)` returns `TMPDIR` verbatim when
+    /// `DIRHELPER_USER_DIR_SUFFIX` is invalid, so the per-user temp dir is not
+    /// a safe root: neither this nor `TMPDIR` alone may open `~/Library`.
+    #[test]
+    fn env_tool_dir_dirhelper_suffix_does_not_steer_temp_root() {
+        assert_env_tool_dir_not_granted_raw(
+            "GOCACHE",
+            "Library/LaunchAgents",
+            &[("TMPDIR", "Library")],
+            &[("DIRHELPER_USER_DIR_SUFFIX", "a/b")],
+            "m.toml",
+        );
+        assert_env_tool_dir_not_granted(
+            "GOCACHE",
+            "Library/LaunchAgents",
+            &[("TMPDIR", "Library")],
+            "m.toml",
+        );
+    }
+
+    /// A valid suffix is appended to the real per-user temp dir, where an
+    /// earlier session can plant `T/<suffix> -> ~/Library`.
+    #[test]
+    fn env_tool_dir_planted_dirhelper_symlink_is_not_a_safe_root() {
+        require_sandbox!();
+        let out = std::process::Command::new("/usr/bin/getconf")
+            .arg("DARWIN_USER_TEMP_DIR")
+            .env_remove("TMPDIR")
+            .env_remove("DIRHELPER_USER_DIR_SUFFIX")
+            .output()
+            .expect("getconf");
+        let user_tmp = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-plant-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let suffix = format!("cplt-plant-{}", std::process::id());
+        let link = user_tmp.join(&suffix);
+        let library = std::fs::canonicalize(home.path()).unwrap().join("Library");
+        std::fs::create_dir_all(library.join("LaunchAgents")).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&library, &link).unwrap();
+        struct Unlink(PathBuf);
+        impl Drop for Unlink {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = Unlink(link);
+        // The helper makes its own home; point it at ours via the abs target.
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let file = library.join("LaunchAgents/m.toml");
+        let marker = project.path().join("ran");
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                &format!(
+                    "touch '{}'; echo pwned > '{}'",
+                    marker.display(),
+                    file.display()
+                ),
+            ])
+            .env("HOME", home.path())
+            .env_remove("TMPDIR")
+            .env("DIRHELPER_USER_DIR_SUFFIX", &suffix)
+            .env("GOCACHE", library.join("LaunchAgents"))
+            .output()
+            .expect("run cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(marker.exists(), "the sandboxed shell must run: {stderr}");
+        assert!(
+            !file.exists(),
+            "planted suffix must not grant write: {stderr}"
+        );
     }
 }
