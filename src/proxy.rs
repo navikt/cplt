@@ -704,7 +704,7 @@ enum AcceptLoopOutcome {
 
 impl ProxyHandle {
     pub fn shutdown(&self) {
-        crate::github_mcp::kill_children();
+        crate::github_mcp::kill_children(self.port);
         // The accept loop blocks in accept(); one connection of our own wakes
         // it to see the flag. Only the first call connects: once the loop has
         // stopped the port is closed and may belong to someone else. A failed

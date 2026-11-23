@@ -40,16 +40,17 @@ const CONNECT_TIMEOUT_SECS: &str = "10";
 /// upstream cannot hold a proxy connection slot for ever (#1059).
 const MAX_TIME_SECS: &str = "600";
 
-/// PIDs of running curl children, so proxy shutdown can kill them (#1059).
-/// A PID leaves the set before it is reaped, so it is never a reused PID.
-static CHILDREN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+/// Running curl children as (proxy port, PID), so proxy shutdown can kill
+/// them (#1059). A PID leaves the set before it is reaped, so it is never a
+/// reused PID.
+static CHILDREN: std::sync::Mutex<Vec<(u16, u32)>> = std::sync::Mutex::new(Vec::new());
 
-/// Kill every running curl child. Called when the proxy shuts down.
-pub(crate) fn kill_children() {
+/// Kill the running curl children of the proxy on `port`, when it shuts down.
+pub(crate) fn kill_children(port: u16) {
     let pids = CHILDREN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for &pid in pids.iter() {
+    for &(_, pid) in pids.iter().filter(|(p, _)| *p == port) {
         if let Ok(pid) = libc::pid_t::try_from(pid) {
             // SAFETY: plain syscall; the PID is unreaped (see CHILDREN).
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -514,6 +515,7 @@ impl Endpoint {
                 cmd.env(var, v);
             }
         }
+        let port = client.local_addr().map_or(0, |a| a.port());
         let Ok(mut child) = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -526,7 +528,7 @@ impl Endpoint {
         CHILDREN
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(child.id());
+            .push((port, child.id()));
         // Bounded, and drained so curl never blocks on a full pipe.
         let stderr = child.stderr.take().map(|e| {
             std::thread::spawn(move || {
@@ -548,7 +550,7 @@ impl Endpoint {
         CHILDREN
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|&p| p != child.id());
+            .retain(|&(_, p)| p != child.id());
         let _ = child.kill();
         let _ = child.wait();
         if let Some(code) = status {
