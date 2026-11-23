@@ -2885,6 +2885,11 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         .iter()
         .map(|d| spell(d, true))
         .chain(state.map(|s| spell(&s.to_string_lossy(), false)))
+        // The passwd home's state dir when `$HOME` is elsewhere (#1095).
+        .chain(
+            crate::sandbox::passwd_state_dir(Path::new(home))
+                .map(|s| spell(&s.to_string_lossy(), false)),
+        )
         .collect();
     // Hard-denied files, then the credential files inside allowed tool dirs
     // (the latter overridable with --allow-read, so no warning).

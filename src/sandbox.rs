@@ -128,17 +128,18 @@ pub use policy::{
     SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
     TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, XDG_PINNED_MARKER,
     active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
-    copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_dir, cplt_state_file,
-    credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
-    cypress_runtime_intent, dir_overlaps_credentials, env_tool_dir_allowed,
-    env_tool_path_protected, env_tool_temp_roots, exec_write_conflicts, first_party_read_target,
-    grant_is_refused, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
-    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
-    pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
-    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
+    copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_ancestor_grant, cplt_state_dir,
+    cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
+    env_tool_dir_allowed, env_tool_path_protected, env_tool_temp_roots, exec_write_conflicts,
+    first_party_read_target, grant_is_refused, home_config_link_targets, home_tool_dirs,
+    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_temp_dir_over,
+    no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs, pin_legacy_state_dir_if_inside,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, report_state_pinned,
+    shim_ro_protect_paths, socket_mask_paths, state_pinned_message, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
+    xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -1228,6 +1229,15 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path) -> String {
+    format!(
+        "{what} {} would make cplt's state directory {} writable in the sandbox. \
+         Grant a narrower directory that does not contain it.",
+        p.display(),
+        dir.display()
+    )
+}
+
 /// Refuse one grant that no launch can honour, with the reason.
 ///
 /// Shared with `cplt config set` (#306). The tool used to accept
@@ -1243,6 +1253,11 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
 /// # Errors
 /// The refusal text, ready to print.
 pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), String> {
+    if key == "allow.write"
+        && let Some(dir) = policy::cplt_state_ancestor_grant(home_dir, p)
+    {
+        return Err(state_ancestor_refusal(key, p, &dir));
+    }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
             "{key} names {} — inside cplt's own state directory ({}). Nothing in there \
@@ -1357,6 +1372,13 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
 /// When the legacy root is exposed too (linked into a granted tree), there is
 /// nowhere safe to keep state, and the launch is refused.
 fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
+    // Every writable tree, env-derived agent and tool dirs included, not just
+    // `allow.write`: none may be cplt's state dir or an ancestor of it (#1095).
+    for (tree, why) in writable_trees(config) {
+        if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, &tree) {
+            return Err(state_ancestor_refusal(why, &tree, &dir));
+        }
+    }
     let trees: Vec<PathBuf> = canonical_writable_trees(config)
         .into_iter()
         .map(|(t, _)| t)
@@ -7129,6 +7151,59 @@ mod tests {
             validate_config_paths(&config).expect_err("must be refused")
         });
         assert!(error.contains("cp)lt"), "{error}");
+    }
+
+    /// #1095: a write grant on cplt's state dir or an ancestor (`~/.config`,
+    /// `$HOME`) is refused, at config-set time and for every writable tree at
+    /// launch; read grants and unrelated write grants are not.
+    #[test]
+    fn write_grant_on_state_dir_ancestor_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        for p in [h.to_path_buf(), h.join(".config"), h.join(".config/cplt")] {
+            assert!(validate_grant_path("allow.write", &p, h).is_err(), "{p:?}");
+        }
+        assert!(validate_grant_path("allow.write", &h.join(".config/gh"), h).is_ok());
+        assert!(validate_grant_path("allow.read", &h.join(".config"), h).is_ok());
+        // An env-derived writable tree (agent dir) at launch.
+        let agent = [crate::agent::AgentDir {
+            path: h.join(".config"),
+            write: true,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+            create_dirs: vec![],
+            via: vec![],
+            is_file: false,
+        }];
+        let mut config = test_config(h, &[]);
+        config.agent_dirs = &agent;
+        let err = keep_cplt_state_out_of_grants(&config).unwrap_err();
+        assert!(err.contains("cplt's state directory"), "{err}");
+    }
+
+    /// #1095: with `$HOME` relocated, the passwd home's state dir is still
+    /// refused as a grant target and denied in the profile.
+    #[test]
+    fn passwd_home_state_dir_is_protected_when_home_is_relocated() {
+        let fake = tempfile::tempdir().unwrap();
+        let real = crate::config::account_home().unwrap();
+        let state = real.join(CPLT_STATE_DIR);
+        assert_eq!(policy::passwd_state_dir(fake.path()), Some(state.clone()));
+        assert!(validate_grant_path("allow.write", &real, fake.path()).is_err());
+        assert!(validate_grant_path("allow.write", &state.join("managed.d"), fake.path()).is_err());
+        #[cfg(target_os = "macos")]
+        {
+            let profile = generate_profile(&test_config(fake.path(), &[]), &[]);
+            let canon = crate::config::canonicalize_deepest(&state);
+            assert!(
+                profile.contains(&format!(
+                    "(deny file-write* (subpath \"{}\"))",
+                    canon.display()
+                )),
+                "{profile}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
