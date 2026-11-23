@@ -723,7 +723,7 @@ impl ProxyHandle {
             );
             // After the flag: a curl spawned from here on sees it and dies
             // itself. Only once, like the wake-up: the port may be reused.
-            crate::github_mcp::kill_children(&self.shutdown_flag);
+            crate::mcp_broker::remote::kill_children(&self.shutdown_flag);
         }
     }
 
@@ -1210,7 +1210,7 @@ fn handle_connection(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         handle_connect(client, target, state, &mut classification);
-    } else if let Some(endpoint) = crate::github_mcp::endpoint_for(target) {
+    } else if let Some(endpoint) = crate::mcp_broker::remote::endpoint_for(target) {
         // OpenCode's GitHub MCP entry (#797): served on this port so the
         // sandbox needs no new one. The head was read under this proxy's size
         // cap and deadline, and the connection counts against its limit.
@@ -1241,7 +1241,7 @@ fn handle_connection(
             None => "CONNECTED (github-mcp)".to_string(),
         };
         log_connection(state, Some(&mut classification), "CONNECT", &target, &route);
-        let log = crate::github_mcp::Log {
+        let log = crate::mcp_broker::remote::Log {
             level: state.log_level,
             file: state.log_file.clone(),
         };
@@ -3986,14 +3986,14 @@ mod tests {
             .spawn()
             .unwrap();
         let key = Arc::as_ptr(&handle.shutdown_flag) as usize;
-        crate::github_mcp::CHILDREN
+        crate::mcp_broker::remote::CHILDREN
             .lock()
             .unwrap()
             .push((key, child.id()));
         handle.shutdown();
         // SIGKILL ends it at once; a missed kill shows as sleep's clean exit.
         let killed = !child.wait().unwrap().success();
-        crate::github_mcp::CHILDREN
+        crate::mcp_broker::remote::CHILDREN
             .lock()
             .unwrap()
             .retain(|&(o, _)| o != key);
@@ -4480,7 +4480,7 @@ mod tests {
         p.shutdown();
 
         // The ambient-proxy guarantee is covered without touching the process
-        // env: see `github_mcp::tests::curl_runs_with_a_cleared_env_and_bounded_times`.
+        // env: see `mcp_broker::remote::tests::curl_runs_with_a_cleared_env_and_bounded_times`.
 
         // A body trickled in under the per-read timeout still meets one deadline.
         let p = head_test_proxy(up_port, Duration::from_secs(2), dir.path().join("l4"));

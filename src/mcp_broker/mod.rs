@@ -57,6 +57,7 @@ mod egress;
 mod graphql;
 mod open_url;
 mod policy;
+pub(crate) mod remote;
 mod retry;
 mod runtime;
 mod shim;
