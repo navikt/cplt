@@ -206,6 +206,8 @@ fn configure_command(
     // The Keychain substitute this run resolved. A `GhToken` one already puts
     // gh's token in the child, so neither channel below runs `gh` again.
     keychain_substitute: Option<&crate::agent::KeychainSubstitute>,
+    // An OpenCode v2 session ignores the OPENCODE_AUTH_CONTENT handover (#710).
+    opencode_v2: bool,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -440,6 +442,8 @@ fn configure_command(
                 deny_env,
                 keychain_substitute,
                 gh_guard.block_auth_token,
+                inherit_env,
+                opencode_v2,
             );
         }
         install_command_wrappers(
@@ -560,6 +564,8 @@ fn inject_gh_token_if_needed(
     if agent != Agent::Copilot
         || child_keeps_a_github_token(deny_env)
         || substitute_carries_gh_token(substitute)
+        // Copilot's own login arrives as COPILOT_GITHUB_TOKEN (#1051).
+        || matches!(substitute, Some(crate::agent::KeychainSubstitute::SecretService(_)))
     {
         return;
     }
@@ -670,19 +676,39 @@ pub const GH_TOKEN_DIR_ENV: &str = "__CPLT_GH_TOKEN_DIR";
 /// scratch path.
 pub const SCRATCH_DIR_ENV: &str = "__CPLT_SCRATCH_DIR";
 
-/// The effective child env, `--pass-env` included: a token gh will use there
-/// makes the host credential in `.gh-exec-token` pointless. Blank counts as
-/// unset, as in `cplt gh-gate`.
-fn child_env_has_gh_token(cmd: &Command, deny_env: &[String]) -> bool {
-    cmd.get_envs().any(|(k, v)| {
-        (k == "GH_TOKEN" || k == "GITHUB_TOKEN")
-            // Cache setup precedes the deny sweep in every launch backend.
-            // A credential removed there must not suppress the guard's cache.
-            && !deny_env.iter().any(|d| k == d.as_str())
-            && v.is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+/// The value `k` will have in the child, before the deny sweep: what `cmd`
+/// sets, or under `--inherit-env` the parent's value `cmd` leaves in place
+/// (#1048). In sanitized mode `cmd` was cleared, so unset means absent.
+fn child_env_value(cmd: &Command, k: &str, inherit_env: bool) -> Option<String> {
+    match cmd.get_envs().find(|(n, _)| *n == k) {
+        Some((_, v)) => v.map(|v| v.to_string_lossy().into_owned()),
+        None => inherit_env.then(|| std::env::var(k).ok()).flatten(),
+    }
+}
+
+/// Whether the effective child env, `--pass-env` and `--inherit-env`
+/// included, carries a token under one of `vars`: then a host credential in
+/// `.gh-exec-token` or `.gh-token` is pointless. Blank counts as unset, as in
+/// `cplt gh-gate`.
+fn child_env_has_token(
+    cmd: &Command,
+    vars: &[&str],
+    deny_env: &[String],
+    inherit_env: bool,
+) -> bool {
+    vars.iter().any(|k| {
+        // Cache setup precedes the deny sweep in every launch backend.
+        // A credential removed there must not suppress the guard's cache.
+        !deny_env.iter().any(|d| d == k)
+            && child_env_value(cmd, k, inherit_env).is_some_and(|v| !v.trim().is_empty())
     })
 }
 
+fn child_env_has_gh_token(cmd: &Command, deny_env: &[String], inherit_env: bool) -> bool {
+    child_env_has_token(cmd, &["GH_TOKEN", "GITHUB_TOKEN"], deny_env, inherit_env)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cache_gh_token_to_file(
     cmd: &mut Command,
     scratch_dir: &Path,
@@ -690,9 +716,19 @@ fn cache_gh_token_to_file(
     deny_env: &[String],
     substitute: Option<&crate::agent::KeychainSubstitute>,
     block_auth_token: bool,
+    inherit_env: bool,
+    opencode_v2: bool,
 ) {
-    let serve = block_auth_token && should_cache_token(agent, deny_env, substitute);
-    let exec = !child_env_has_gh_token(cmd, deny_env)
+    // `inject_token` may have just set one in `cmd` (#1051).
+    let serve = block_auth_token
+        && should_cache_token(agent, deny_env, substitute)
+        && !child_env_has_token(
+            cmd,
+            &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            deny_env,
+            inherit_env,
+        );
+    let exec = !child_env_has_gh_token(cmd, deny_env, inherit_env)
         && should_cache_exec_token(
             agent,
             deny_env,
@@ -722,14 +758,29 @@ fn cache_gh_token_to_file(
         // OpenCode: the same token as its GitHub Copilot login, when the user
         // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
         // instead of auth.json, so the real file is never read or rewritten
-        // for this; the value carries the user's other providers too.
-        if agent == Agent::OpenCode
+        // for this; the value carries the user's other providers too. Skipped
+        // when v2 ignores it, deny.env strips it, or the user passed their
+        // own, which must not be overwritten (#1056).
+        if opencode_handover_applies(cmd, agent, deny_env, inherit_env, opencode_v2)
             && let Some(home) = std::env::var_os("HOME")
             && let Some(auth) = crate::agent::opencode_host_login(Path::new(&home), &token)
         {
             cmd.env("OPENCODE_AUTH_CONTENT", auth);
         }
     }
+}
+
+fn opencode_handover_applies(
+    cmd: &Command,
+    agent: Agent,
+    deny_env: &[String],
+    inherit_env: bool,
+    opencode_v2: bool,
+) -> bool {
+    agent == Agent::OpenCode
+        && !opencode_v2
+        && !deny_env.iter().any(|d| d == "OPENCODE_AUTH_CONTENT")
+        && child_env_value(cmd, "OPENCODE_AUTH_CONTENT", inherit_env).is_none()
 }
 
 fn write_token_file(token_path: &Path, token: &str) {
@@ -1668,6 +1719,7 @@ pub fn exec(
         sandbox.worktree_root.as_deref(),
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
+        sandbox.opencode_v2,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -1819,6 +1871,7 @@ pub fn exec(
         sandbox.worktree_root.as_deref(),
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
+        sandbox.opencode_v2,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -2064,6 +2117,7 @@ fn exec_bwrap(
         sandbox.worktree_root.as_deref(),
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
+        sandbox.opencode_v2,
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
@@ -2854,7 +2908,7 @@ echo gho_stored_fixture"#,
             for (k, v) in vars {
                 cmd.env(k, v);
             }
-            child_env_has_gh_token(&cmd, &[])
+            child_env_has_gh_token(&cmd, &[], false)
         };
         assert!(!has(&[]));
         assert!(has(&[("GH_TOKEN", "ghp_x")]));
@@ -2863,7 +2917,112 @@ echo gho_stored_fixture"#,
         assert!(!has(&[("COPILOT_GITHUB_TOKEN", "ghp_x")]), "gh ignores it");
         let mut cmd = Command::new("true");
         cmd.env("GH_TOKEN", "ghp_x").env_remove("GH_TOKEN");
-        assert!(!child_env_has_gh_token(&cmd, &[]), "removed is unset");
+        assert!(
+            !child_env_has_gh_token(&cmd, &[], false),
+            "removed is unset"
+        );
+    }
+
+    /// #1048: under --inherit-env a passed GH_TOKEN is inherited, not set on
+    /// `cmd`, and must still count as the child's own token.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn inherited_gh_token_skips_exec_cache() {
+        temp_env::with_vars(
+            [("GH_TOKEN", Some("ghp_scoped")), ("GITHUB_TOKEN", None)],
+            || {
+                let mut cmd = Command::new("true");
+                assert!(child_env_has_gh_token(&cmd, &[], true));
+                assert!(
+                    !child_env_has_gh_token(&cmd, &[], false),
+                    "sanitized: cleared"
+                );
+                assert!(!child_env_has_gh_token(&cmd, &["GH_TOKEN".into()], true));
+                cmd.env_remove("GH_TOKEN");
+                assert!(!child_env_has_gh_token(&cmd, &[], true), "removed is unset");
+            },
+        );
+    }
+
+    /// #1051: a token already in the child (inject_token) or Copilot's own
+    /// SecretService login suppresses the `.gh-token` serve cache.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn copilot_token_in_child_skips_serve_cache() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                let ss = crate::agent::KeychainSubstitute::SecretService(
+                    crate::agent::SecretToken::new("t".into()),
+                );
+                assert!(should_cache_token(Agent::Copilot, &[], None));
+                assert!(!should_cache_token(Agent::Copilot, &[], Some(&ss)));
+                let mut cmd = Command::new("true");
+                cmd.env("COPILOT_GITHUB_TOKEN", "t");
+                let all = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+                assert!(child_env_has_token(&cmd, &all, &[], false));
+                assert!(!child_env_has_gh_token(&cmd, &[], false));
+            },
+        );
+    }
+
+    /// #1056: never overwrite a user's OPENCODE_AUTH_CONTENT, and skip the
+    /// handover when v2 ignores it or deny.env strips it.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn opencode_handover_respects_user_value_v2_and_deny() {
+        temp_env::with_var("OPENCODE_AUTH_CONTENT", Some("{}"), || {
+            let cmd = Command::new("true");
+            let deny = vec!["OPENCODE_AUTH_CONTENT".to_string()];
+            assert!(opencode_handover_applies(
+                &cmd,
+                Agent::OpenCode,
+                &[],
+                false,
+                false
+            ));
+            assert!(!opencode_handover_applies(
+                &cmd,
+                Agent::OpenCode,
+                &[],
+                true,
+                false
+            ));
+            assert!(!opencode_handover_applies(
+                &cmd,
+                Agent::OpenCode,
+                &[],
+                false,
+                true
+            ));
+            assert!(!opencode_handover_applies(
+                &cmd,
+                Agent::OpenCode,
+                &deny,
+                false,
+                false
+            ));
+            assert!(!opencode_handover_applies(
+                &cmd,
+                Agent::Copilot,
+                &[],
+                false,
+                false
+            ));
+            let mut passed = Command::new("true");
+            passed.env("OPENCODE_AUTH_CONTENT", "{}");
+            assert!(!opencode_handover_applies(
+                &passed,
+                Agent::OpenCode,
+                &[],
+                false,
+                false
+            ));
+        });
     }
 
     /// The exec cache is written for every agent once gh is configured, and
@@ -2933,8 +3092,8 @@ echo gho_stored_fixture"#,
                 let mut cmd = Command::new("true");
                 cmd.env_clear().env("GITHUB_TOKEN", "gho_denied_fixture");
                 cmd.env("COPILOT_GITHUB_TOKEN", "gho_copilot_fixture");
-                assert!(child_env_has_gh_token(&cmd, &[]));
-                assert!(!child_env_has_gh_token(&cmd, &deny));
+                assert!(child_env_has_gh_token(&cmd, &[], false));
+                assert!(!child_env_has_gh_token(&cmd, &deny, false));
                 assert!(should_cache_exec_token(
                     Agent::Copilot,
                     &deny,
@@ -2948,7 +3107,7 @@ echo gho_stored_fixture"#,
                     true
                 ));
                 apply_deny_env_and_credential(&mut cmd, &deny, Some(&sub));
-                assert!(!child_env_has_gh_token(&cmd, &deny));
+                assert!(!child_env_has_gh_token(&cmd, &deny, false));
                 assert!(
                     !cmd.get_envs()
                         .any(|(k, v)| k == "GITHUB_TOKEN" && v.is_some())

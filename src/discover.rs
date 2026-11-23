@@ -210,7 +210,10 @@ pub fn gh_token_cache_eligibility(
                 && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
         })
     };
-    let serve = agent == Agent::Copilot && !kept(AUTH_ENV_VARS);
+    // A SecretService substitute already hands Copilot its own login (#1051).
+    let serve = agent == Agent::Copilot
+        && !kept(AUTH_ENV_VARS)
+        && !matches!(substitute, Some(KeychainSubstitute::SecretService(_)));
     let exec = hosts_yml_exists
         && !child_gh_token
         && (agent != Agent::Copilot
