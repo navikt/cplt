@@ -27,7 +27,7 @@ pub struct Log {
 
 /// DENIED, failed egress dials, auth and other failures reach the terminal at every level (D12);
 /// the rest only at `--proxy-log-level all`.
-fn to_terminal(level: crate::proxy::ProxyLogLevel, text: &str) -> bool {
+pub(super) fn to_terminal(level: crate::proxy::ProxyLogLevel, text: &str) -> bool {
     text.contains("DENIED")
         || text.contains("connect failed")
         || text.starts_with("FAIL")

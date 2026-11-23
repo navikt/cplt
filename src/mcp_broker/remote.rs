@@ -76,13 +76,20 @@ pub struct Log {
 }
 
 impl Log {
+    /// A spec endpoint (`broker`) follows the broker's rule: DENIED and
+    /// failures reach the terminal at every level. The built-in GitHub
+    /// endpoint keeps the proxy's level.
+    fn to_terminal(&self, broker: bool, status: &str) -> bool {
+        self.level.should_log(status) || (broker && super::runtime::to_terminal(self.level, status))
+    }
+
     /// `tag` and `upstream` are the endpoint's own, so a second endpoint
     /// never logs as GitHub's.
-    fn line(&self, tag: &str, upstream: &str, method: &'static str, status: &str) {
+    fn line(&self, tag: &str, upstream: &str, broker: bool, method: &'static str, status: &str) {
         let status = status.escape_debug().to_string();
         let tag = tag.escape_debug().to_string();
         let upstream = upstream.escape_debug().to_string();
-        if self.level.should_log(&status) {
+        if self.to_terminal(broker, &status) {
             eprintln!(
                 "{}[{tag}]{} {} {method} {upstream} → {status}",
                 crate::ui::color(crate::ui::YELLOW),
@@ -461,7 +468,13 @@ impl Endpoint {
             Some("DELETE") => "DELETE",
             _ => {
                 reply(&mut client, "405 Method Not Allowed");
-                return log.line(&self.tag, &self.upstream, "<other>", "BLOCKED-METHOD");
+                return log.line(
+                    &self.tag,
+                    &self.upstream,
+                    self.policy.is_some(),
+                    "<other>",
+                    "BLOCKED-METHOD",
+                );
             }
         };
         let headers: Vec<(String, String)> = lines
@@ -480,20 +493,38 @@ impl Endpoint {
         };
         if header("transfer-encoding").is_some() {
             reply(&mut client, "411 Length Required");
-            return log.line(&self.tag, &self.upstream, method, "FAIL chunked request");
+            return log.line(
+                &self.tag,
+                &self.upstream,
+                self.policy.is_some(),
+                method,
+                "FAIL chunked request",
+            );
         }
         let len = match header("content-length").map(str::parse::<usize>) {
             None => 0,
             Some(Ok(n)) if n <= MAX_BODY => n,
             _ => {
                 reply(&mut client, "413 Content Too Large");
-                return log.line(&self.tag, &self.upstream, method, "FAIL body length");
+                return log.line(
+                    &self.tag,
+                    &self.upstream,
+                    self.policy.is_some(),
+                    method,
+                    "FAIL body length",
+                );
             }
         };
         let mut body = vec![0; len];
         if !read_body(&mut client, &mut body, body_limit) || body.contains(&0) {
             reply(&mut client, "400 Bad Request");
-            return log.line(&self.tag, &self.upstream, method, "FAIL bad body");
+            return log.line(
+                &self.tag,
+                &self.upstream,
+                self.policy.is_some(),
+                method,
+                "FAIL bad body",
+            );
         }
         // The spec's tool policy, as for a stdio server: one JSON-RPC
         // message per POST (batches refused), checked and re-serialised.
@@ -506,7 +537,13 @@ impl Endpoint {
         // Only a POST body is checked, so no other method may carry one.
         if self.policy.is_some() && method != "POST" && !body.is_empty() {
             reply(&mut client, "400 Bad Request");
-            return log.line(&self.tag, &self.upstream, method, "FAIL body on non-POST");
+            return log.line(
+                &self.tag,
+                &self.upstream,
+                self.policy.is_some(),
+                method,
+                "FAIL body on non-POST",
+            );
         }
         let mut _own = None;
         if let Some(f) = &mut filter
@@ -517,7 +554,13 @@ impl Endpoint {
                 // curl gives up at the same deadline, so nothing is left to cancel.
                 let evicted = p.evict(std::time::Duration::from_secs(self.timeout_secs));
                 for audit in evicted.into_iter().filter_map(|(_, _, a)| a) {
-                    log.line(&self.tag, &self.upstream, method, &audit);
+                    log.line(
+                        &self.tag,
+                        &self.upstream,
+                        self.policy.is_some(),
+                        method,
+                        &audit,
+                    );
                 }
                 let action = on_client(&String::from_utf8_lossy(&body), f.spec, &mut p);
                 f.audit = p.1.take();
@@ -537,11 +580,23 @@ impl Endpoint {
                 Action::Reply(line, why) => {
                     json_reply(&mut client, &line);
                     let why = why.unwrap_or_else(|| "DENIED".into());
-                    return log.line(&self.tag, &self.upstream, method, &why);
+                    return log.line(
+                        &self.tag,
+                        &self.upstream,
+                        self.policy.is_some(),
+                        method,
+                        &why,
+                    );
                 }
                 Action::Drop => {
                     reply(&mut client, "202 Accepted");
-                    return log.line(&self.tag, &self.upstream, method, "DROPPED");
+                    return log.line(
+                        &self.tag,
+                        &self.upstream,
+                        self.policy.is_some(),
+                        method,
+                        "DROPPED",
+                    );
                 }
             }
         }
@@ -556,13 +611,20 @@ impl Endpoint {
             self.policy.is_some(),
         ) else {
             reply(&mut client, "400 Bad Request");
-            return log.line(&self.tag, &self.upstream, method, "FAIL bad header");
+            return log.line(
+                &self.tag,
+                &self.upstream,
+                self.policy.is_some(),
+                method,
+                "FAIL bad header",
+            );
         };
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             reply(&mut client, "503 Service Unavailable");
             return log.line(
                 &self.tag,
                 &self.upstream,
+                self.policy.is_some(),
                 method,
                 "FAIL proxy shutting down",
             );
@@ -575,7 +637,13 @@ impl Endpoint {
             .spawn()
         else {
             reply(&mut client, "502 Bad Gateway");
-            return log.line(&self.tag, &self.upstream, method, "FAIL curl did not start");
+            return log.line(
+                &self.tag,
+                &self.upstream,
+                self.policy.is_some(),
+                method,
+                "FAIL curl did not start",
+            );
         };
         CHILDREN
             .lock()
@@ -611,7 +679,13 @@ impl Endpoint {
         let _ = child.kill();
         let _ = child.wait();
         if let Some(audit) = filter.and_then(|f| f.audit) {
-            log.line(&self.tag, &self.upstream, method, &audit);
+            log.line(
+                &self.tag,
+                &self.upstream,
+                self.policy.is_some(),
+                method,
+                &audit,
+            );
         }
         if let Some((code, closed)) = status {
             // A GET answered 405 is the MCP spec's "no standalone SSE stream",
@@ -626,6 +700,7 @@ impl Endpoint {
             log.line(
                 &self.tag,
                 &self.upstream,
+                self.policy.is_some(),
                 method,
                 &format!("{verdict} {code}{note}"),
             );
@@ -638,6 +713,7 @@ impl Endpoint {
             log.line(
                 &self.tag,
                 &self.upstream,
+                self.policy.is_some(),
                 method,
                 &format!("FAIL upstream: {}", err.trim()),
             );
@@ -662,7 +738,24 @@ fn relay(
     let mut out = BufReader::new(out);
     let mut status = String::new();
     out.read_line(&mut status).ok()?;
-    let code = status.split_whitespace().nth(1)?.to_string();
+    let mut code = status.split_whitespace().nth(1)?.to_string();
+    // curl -i prints interim 1xx blocks (100 Continue, 103 Early Hints)
+    // before the final response: skip them. 101 would switch protocols,
+    // which curl never asks for here.
+    while code.starts_with('1') && code != "101" {
+        loop {
+            let mut line = String::new();
+            if out.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
+            if line.trim_end_matches(['\r', '\n']).is_empty() {
+                break;
+            }
+        }
+        status.clear();
+        out.read_line(&mut status).ok()?;
+        code = status.split_whitespace().nth(1)?.to_string();
+    }
     let mut head = status.trim_end().to_string() + "\r\n";
     let mut ctype = String::new();
     loop {
@@ -813,6 +906,9 @@ fn filter_events(
         }
         let event = if data.is_empty() {
             fields + "\n"
+        } else if data.iter().all(String::is_empty) {
+            // An empty-data event (an MCP priming event) carries no message.
+            format!("{fields}data:\n\n")
         } else {
             let msg = filter_message(data.join("\n").as_bytes(), f)?;
             if msg.is_empty() {
@@ -1059,7 +1155,7 @@ mod tests {
             level: ProxyLogLevel::None,
             file: Some(path.clone()),
         };
-        log.line("t\x1b", "u\r\n", "GET", "OK\n\x1b[2K forged");
+        log.line("t\x1b", "u\r\n", false, "GET", "OK\n\x1b[2K forged");
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(!text.contains('\x1b') && !text.contains('\r'));
@@ -1595,5 +1691,125 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         let (reply, log) = through(url, curl, LIST);
         assert!(!reply.contains("delete_repo"));
         assert!(log.contains("FAIL 200 (not JSON)"));
+    }
+
+    #[test]
+    fn broker_denials_and_failures_reach_the_terminal_at_every_level() {
+        let log = Log {
+            level: ProxyLogLevel::None,
+            file: None,
+        };
+        assert!(log.to_terminal(true, "tools/call delete_repo → DENIED"));
+        assert!(log.to_terminal(true, "FAIL 200 (not JSON)"));
+        assert!(!log.to_terminal(true, "FORWARDED 200"));
+        // The built-in endpoint keeps the proxy's level.
+        assert!(!log.to_terminal(false, "tools/call x → DENIED"));
+    }
+
+    fn relay_of(input: &str) -> (String, Option<(String, Option<&'static str>)>) {
+        let ep = for_spec(&gh_spec(), &Fixed(Some("T")), PathBuf::from("/c"), "x").unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut server, _) = l.accept().unwrap();
+        let mut f = Filter {
+            session: String::new(),
+            spec: ep.policy.as_ref().unwrap(),
+            pending: &ep.pending,
+            audit: None,
+        };
+        // The response answers a request in flight.
+        on_client(LIST, f.spec, &mut f.lock());
+        let got = relay(input.as_bytes(), &mut server, Some(&mut f));
+        drop(server);
+        let mut reply = String::new();
+        c.read_to_string(&mut reply).unwrap();
+        (reply, got)
+    }
+
+    #[test]
+    fn interim_responses_are_skipped() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"get_me"},{"name":"delete_repo"}]}}"#;
+        for interim in [
+            "HTTP/1.1 100 Continue\r\n\r\n",
+            "HTTP/1.1 103 Early Hints\r\nLink: </x>; rel=preload\r\n\r\n",
+        ] {
+            let input = format!(
+                "{interim}HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let (reply, got) = relay_of(&input);
+            assert_eq!(got, Some(("200".to_string(), None)), "{interim}");
+            assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+            assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
+        }
+    }
+
+    #[test]
+    fn sse_priming_event_passes() {
+        let Some(curl) = real_curl() else { return };
+        let (url, _got) = fake_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 1\ndata:\n\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"},{\"name\":\"delete_repo\"}]}}\n\n",
+        );
+        let (reply, log) = through(url, curl, LIST);
+        assert!(reply.contains("id: 1\ndata:\n\n"), "{reply}");
+        assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
+        assert!(log.contains("FORWARDED 200"), "{log}");
+    }
+
+    /// Ids are keyed by `Mcp-Session-Id`: the same id in a second session
+    /// goes through while the first is in flight; in the same session it
+    /// is a duplicate.
+    #[test]
+    fn session_id_header_keys_in_flight_ids() {
+        let Some(curl) = real_curl() else { return };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", l.local_addr().unwrap());
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let (mut c, _) = l.accept().unwrap();
+                let (mut got, mut buf) = (Vec::new(), [0; 4096]);
+                while !got.ends_with(b"}}") {
+                    match c.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = seen_tx.send(String::from_utf8_lossy(&got).into_owned());
+                held.push(c);
+            }
+            let _ = go.recv();
+            let b = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+            for mut c in held {
+                let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).as_bytes());
+            }
+        });
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        let ep = std::sync::Arc::new(ep);
+        let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#;
+        let t = std::time::Duration::from_secs(10);
+        let in_session = |s: &'static str| {
+            let ep = ep.clone();
+            std::thread::spawn(move || {
+                serve_with(&ep, "POST", call, &format!("Mcp-Session-Id: {s}\r\n"))
+            })
+        };
+        let a = in_session("A");
+        seen.recv_timeout(t)
+            .expect("session A never reached upstream");
+        let b = in_session("B");
+        let got = seen.recv_timeout(t).expect("session B id 7 not forwarded");
+        assert!(got.contains("Mcp-Session-Id: B"), "{got}");
+        let (reply, log) = serve_with(&ep, "POST", call, "Mcp-Session-Id: A\r\n");
+        assert!(reply.contains("already in flight"), "{reply}");
+        assert!(log.contains("DENIED duplicate id"), "{log}");
+        go_tx.send(()).unwrap();
+        for h in [a, b] {
+            assert!(h.join().unwrap().0.starts_with("HTTP/1.1 200"));
+        }
     }
 }
