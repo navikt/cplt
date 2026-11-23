@@ -59,6 +59,9 @@ impl Log {
     }
 }
 
+#[cfg(test)]
+type TeardownHook = Box<dyn FnOnce(&Server) + Send>;
+
 pub(crate) struct Server {
     spec: Spec,
     /// The live child, if a client is connected. One per server.
@@ -73,6 +76,9 @@ pub(crate) struct Server {
     /// Linux, `keychain` mechanisms: where this server's xdg-dbus-proxy
     /// listens, in the broker's 0700 socket dir.
     bus_socket: PathBuf,
+    /// Runs in connection teardown between the kill and the slot clear.
+    #[cfg(test)]
+    teardown_hook: Mutex<Option<TeardownHook>>,
 }
 
 pub(crate) struct Shared {
@@ -87,7 +93,12 @@ pub(crate) struct Shared {
     open_off: AtomicBool,
     /// Open connections (socket clients and egress tunnels together).
     open: Arc<AtomicUsize>,
+    /// Live macOS children's temp dirs, by path: dropped when the child
+    /// exits, and all at once when the broker drops.
+    tmps: ChildTmps,
 }
+
+type ChildTmps = Arc<Mutex<BTreeMap<PathBuf, tempfile::TempDir>>>;
 
 /// Connections served at once; past this an accepted one is closed at once,
 /// before any thread is spawned. Each holds a thread until it ends, and a
@@ -346,10 +357,15 @@ impl Broker {
                 egress_port,
                 egress_socket,
                 bus_socket: dir.path().join(format!("b{n}")),
+                #[cfg(test)]
+                teardown_hook: Mutex::new(None),
             };
             servers.insert(server.spec.id.clone(), server);
         }
         let open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
+        // A crashed broker's children left their temp dirs behind (#1072).
+        #[cfg(target_os = "macos")]
+        sweep_child_temp_dirs(home);
         let shared = Arc::new(Shared {
             servers,
             open_hosts,
@@ -359,6 +375,7 @@ impl Broker {
             log,
             stop: AtomicBool::new(false),
             open: Arc::new(AtomicUsize::new(0)),
+            tmps: ChildTmps::default(),
         });
         for (id, l) in egress {
             let s = Arc::clone(&shared);
@@ -565,6 +582,11 @@ impl Drop for Broker {
             let _ = t.join();
         }
         let _ = std::fs::remove_file(&self.socket);
+        // Children are reaped above; their temp dirs go now, not whenever
+        // the exit watchers run.
+        if let Ok(mut t) = self.shared.tmps.lock() {
+            t.clear();
+        }
     }
 }
 
@@ -646,8 +668,15 @@ fn spawn_child_with(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
+    let tmp = setup.tmp;
     // The bus proxy's sync pipe now lives in bwrap alone.
-    drop(setup);
+    drop(setup.sync);
+    #[cfg(target_os = "macos")]
+    if let Some(tmp) = tmp {
+        remove_tmp_on_exit(child.id(), tmp, &shared.tmps);
+    }
+    #[cfg(not(target_os = "macos"))]
+    drop(tmp);
     if let Some(err) = child.stderr.take() {
         let (log, id) = (shared.log.clone(), spec.id.clone());
         std::thread::spawn(move || log_stderr(BufReader::new(err), &log, &id));
@@ -762,7 +791,8 @@ fn child_command(
             "no sandbox for the MCP server child on this OS",
         ));
     }
-    let mut dirs = vec![std::env::temp_dir()];
+    let tmp = child_temp_dir(home)?;
+    let mut dirs = vec![tmp.path().to_path_buf()];
     dirs.extend(spec.credential.write_dirs.iter().map(|d| home.join(d)));
     // Seatbelt matches resolved paths (/var is /private/var). A dir that does
     // not exist yet (a fresh login creates it) resolves through its parents.
@@ -778,7 +808,159 @@ fn child_command(
         .arg("--")
         .arg(&spec.program)
         .args(&args);
-    Ok((cmd, ChildSetup::default()))
+    let setup = ChildSetup {
+        env: vec![("TMPDIR", tmp.path().as_os_str().to_owned())],
+        tmp: Some(tmp),
+        ..ChildSetup::default()
+    };
+    Ok((cmd, setup))
+}
+
+/// `~/.config/cplt/mcp-tmp`, created 0700 if missing and then checked
+/// without following links: a real directory, ours, mode 0700, whose
+/// canonical path is the canonical cplt state dir plus `mcp-tmp`. Anything
+/// else (a planted symlink, a FIFO, a foreign or loose dir) is refused, so
+/// a child's temp files never land somewhere another party can reach.
+fn child_temp_base(home: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let state = home.join(crate::sandbox::CPLT_STATE_DIR);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&state)?;
+    // Canonical: Seatbelt matches resolved paths (a symlinked HOME).
+    let base = state.canonicalize()?.join("mcp-tmp");
+    match std::fs::DirBuilder::new().mode(0o700).create(&base) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    check_private_dir(&base)?;
+    Ok(base)
+}
+
+/// Refuse unless `dir` itself (not a link target) is a directory owned by
+/// this uid with mode 0700.
+fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir)?;
+    // SAFETY: getuid(2) cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !m.file_type().is_dir() || m.uid() != uid || m.mode() & 0o777 != 0o700 {
+        return Err(std::io::Error::other(format!(
+            "refusing MCP server temp dir {}: not a 0700 directory owned by you; remove it and retry",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The macOS child's own temp dir (#1058): 0700, `child-<broker pid>-`
+/// plus a random tail, under cplt's legacy state dir, which every agent
+/// profile denies with no override, so the child shares no temp files with
+/// the agent (whose grants cover `/private/tmp` and `/private/var/folders`).
+/// Removed when the child exits ([`remove_tmp_on_exit`]) or the broker drops,
+/// or by the next broker's [`sweep_child_temp_dirs`] after a crash.
+fn child_temp_dir(home: &Path) -> std::io::Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("child-{}-", std::process::id()))
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(child_temp_base(home)?)?;
+    check_private_dir(dir.path())?;
+    Ok(dir)
+}
+
+/// Remove `child-<pid>-*` dirs whose broker pid is gone (a crash left
+/// them). Best effort: only real directories are removed, a symlink entry
+/// is left alone.
+#[cfg(target_os = "macos")]
+fn sweep_child_temp_dirs(home: &Path) {
+    let Ok(base) = child_temp_base(home) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    let me = std::process::id();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("child-"))
+            .and_then(|n| n.split('-').next())
+            .and_then(|p| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // SAFETY: signal 0 only checks existence. shortcut: a reused pid
+        // keeps a dir until that pid is gone too.
+        let gone = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        let stale = pid as u32 != me && gone;
+        if stale && e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Drop `tmp` once process `pid` (our unreaped child) has exited, without
+/// reaping it: kqueue `NOTE_EXIT`. Not on stderr EOF, since a server can
+/// close stderr and keep serving.
+#[cfg(target_os = "macos")]
+fn remove_tmp_on_exit(pid: u32, tmp: tempfile::TempDir, tmps: &ChildTmps) {
+    let key = tmp.path().to_path_buf();
+    let Ok(mut held) = tmps.lock() else { return };
+    held.insert(key.clone(), tmp);
+    drop(held);
+    let tmps = tmps.clone();
+    std::thread::spawn(move || {
+        // SAFETY: plain kqueue/kevent calls on a local fd and event.
+        unsafe {
+            let kq = libc::kqueue();
+            if kq < 0 {
+                // Kept until broker drop rather than removed under a live child.
+                return;
+            }
+            let mut ev: libc::kevent = std::mem::zeroed();
+            ev.ident = pid as libc::uintptr_t;
+            ev.filter = libc::EVFILT_PROC;
+            ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
+            ev.fflags = libc::NOTE_EXIT;
+            let mut out: libc::kevent = std::mem::zeroed();
+            // ESRCH on register: already exited. Otherwise block until exit.
+            let exited = loop {
+                let n = libc::kevent(kq, &raw const ev, 1, &raw mut out, 1, std::ptr::null());
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if n >= 0 || errno != Some(libc::EINTR) {
+                    break watcher_saw_exit(n, errno, &out);
+                }
+            };
+            libc::close(kq);
+            // Any other watcher error: the child may still run, so the dir
+            // stays for broker drop, as when kqueue() fails.
+            if !exited {
+                return;
+            }
+        }
+        if let Ok(mut t) = tmps.lock() {
+            t.remove(&key);
+        }
+    });
+}
+
+/// Whether a `kevent` result proves the child gone: `NOTE_EXIT`, or ESRCH
+/// (already exited) as errno or as an `EV_ERROR` event.
+#[cfg(target_os = "macos")]
+fn watcher_saw_exit(n: i32, errno: Option<i32>, out: &libc::kevent) -> bool {
+    if n < 0 {
+        return errno == Some(libc::ESRCH);
+    }
+    if n == 0 {
+        return false;
+    }
+    if out.flags & libc::EV_ERROR != 0 {
+        return out.data == libc::ESRCH as isize;
+    }
+    out.fflags & libc::NOTE_EXIT != 0
 }
 
 /// What the child's command needs past [`host_env`], and what must live
@@ -790,6 +972,8 @@ struct ChildSetup {
     /// The read end of the bus proxy's `--fd` pipe, handed to bwrap as its
     /// `--sync-fd`: the proxy exits when bwrap, and so the child, is gone.
     sync: Option<std::io::PipeReader>,
+    /// The macOS child's private temp dir, kept until the child exits.
+    tmp: Option<tempfile::TempDir>,
 }
 
 /// Where the filtered session bus appears inside the Linux child.
@@ -1213,7 +1397,7 @@ fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
 }
 
 /// The host child's environment, also the credential probe's, so the two
-/// never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR, LANG, and
+/// never disagree. Cleared, then: HOME, the trusted PATH, LANG, and
 /// on Linux, for a `keychain` mechanism only, the session bus
 /// (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`), which go-keyring needs
 /// to reach the Secret Service on the host, and
@@ -1234,7 +1418,6 @@ fn host_env_pairs(
     let mut env = vec![
         ("HOME", home.as_os_str().to_owned()),
         ("PATH", crate::git::TRUSTED_BIN_DIRS.join(":").into()),
-        ("TMPDIR", std::env::temp_dir().into_os_string()),
     ];
     let mut keep = vec!["LANG"];
     if cfg!(target_os = "linux") {
@@ -1470,12 +1653,18 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     // Client gone (or the socket was closed): end the child.
     done.store(true, Ordering::Release);
     drop(stdin);
+    // Kill before freeing the slot: a broker shutdown in between must still
+    // find the child, and its temp dir must outlive it.
+    kill(&child);
+    #[cfg(test)]
+    if let Some(hook) = server.teardown_hook.lock().unwrap().take() {
+        hook(server);
+    }
     if let Ok(mut slot) = server.child.lock()
         && slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &child))
     {
         *slot = None;
     }
-    kill(&child);
     let _ = out.join();
     let _ = ticker.join();
     let _ = canceller.join();
@@ -1872,6 +2061,67 @@ mod tests {
         }
     }
 
+    /// #1050: a child without the keychain grant (credential `none`) must
+    /// not read a keychain item: no SecurityServer lookup, no keychain
+    /// change notification. keychain=true is the control. Temp keychain only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
+    fn child_profile_keychain_read_needs_the_keychain_grant() {
+        if !sandbox_usable() {
+            return;
+        }
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("cplt-1050-kc-{}", std::process::id()));
+        let dir = home.join("Library/Keychains");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kc = dir.join("login.keychain-db");
+        let kc = kc.to_str().unwrap();
+        let sec = |args: &[&str]| Command::new("/usr/bin/security").args(args).output();
+        let Ok(made) = sec(&["create-keychain", "-p", "test", kc]) else {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        };
+        struct Cleanup<'a>(&'a str, &'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("/usr/bin/security")
+                    .args(["delete-keychain", self.0])
+                    .output();
+                let _ = std::fs::remove_dir_all(self.1);
+            }
+        }
+        let _cleanup = Cleanup(kc, &home);
+        assert!(made.status.success(), "create-keychain failed");
+        let added = sec(&[
+            "add-generic-password",
+            "-a",
+            "a",
+            "-s",
+            "cplt-1050",
+            "-w",
+            "secret",
+            "-A",
+            kc,
+        ])
+        .unwrap();
+        assert!(added.status.success(), "add-generic-password failed");
+        let read = |keychain: bool| {
+            let profile = crate::sandbox::mcp_child_profile(&home, &[], keychain, None).unwrap();
+            let out = Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/security"])
+                .args(["find-generic-password", "-s", "cplt-1050", "-w", kc])
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("secret")
+        };
+        assert!(read(true), "control: keychain=true could not read the item");
+        assert!(!read(false), "keychain=false read a keychain item");
+    }
+
     /// The kernel, not the profile text: the child cannot look up
     /// nsurlsessiond, which would fetch URLs past the egress rule. It is
     /// not on the measured Mach list (#911); the control adds a blanket allow.
@@ -2126,12 +2376,31 @@ mod tests {
     fn the_macos_probe_runs_under_the_child_profile() {
         let b = cat_broker();
         let server = b.shared.servers.values().next().unwrap();
-        let (cmd, _) = child_command(&b.shared, server, Some(&["-n", "x"])).unwrap();
+        let (cmd, setup) = child_command(&b.shared, server, Some(&["-n", "x"])).unwrap();
+        // #1058: its own 0700 temp dir, not the agent's, removed on drop.
+        let tmp = setup.tmp.as_ref().unwrap().path().to_path_buf();
+        assert_eq!(setup.env, [("TMPDIR", tmp.clone().into_os_string())]);
+        let shared_tmp = std::env::temp_dir().canonicalize().unwrap();
+        assert!(!tmp.starts_with(&shared_tmp), "{}", tmp.display());
+        assert!(
+            tmp.starts_with(
+                b.shared
+                    .home
+                    .canonicalize()
+                    .unwrap()
+                    .join(".config/cplt/mcp-tmp")
+            )
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(cmd.get_program(), "/usr/bin/sandbox-exec");
         let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
         let profile = crate::sandbox::mcp_child_profile(
             &b.shared.home,
-            &[std::env::temp_dir()]
+            &[tmp.clone()]
                 .into_iter()
                 .chain(
                     server
@@ -2148,6 +2417,141 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args, ["-p", profile.as_str(), "--", "/bin/cat", "-n", "x"]);
+        assert!(
+            !profile.contains(&*shared_tmp.to_string_lossy()),
+            "{profile}"
+        );
+        drop(setup);
+        assert!(!tmp.exists(), "temp dir left behind");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_temp_base_refuses_a_symlink_a_fifo_and_a_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join(crate::sandbox::CPLT_STATE_DIR);
+        std::fs::create_dir_all(&state).unwrap();
+        let base = state.join("mcp-tmp");
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &base).unwrap();
+        assert!(child_temp_dir(home.path()).is_err(), "symlink followed");
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+        std::fs::remove_file(&base).unwrap();
+        let c = std::ffi::CString::new(base.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo on a path we own.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(child_temp_dir(home.path()).is_err(), "FIFO accepted");
+        std::fs::remove_file(&base).unwrap();
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(child_temp_dir(home.path()).is_err(), "0755 dir accepted");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(child_temp_dir(home.path()).is_ok());
+        // Each child dir gets the same check.
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
+        assert!(check_private_dir(&link).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_removes_only_dead_brokers_temp_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let base = child_temp_base(home.path()).unwrap();
+        #[allow(clippy::disallowed_methods)] // fixed absolute path
+        let mut dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let stale = base.join(format!("child-{dead_pid}-x"));
+        let mine = base.join(format!("child-{}-y", std::process::id()));
+        let live = base.join("child-1-z");
+        for d in [&stale, &mine, &live] {
+            std::fs::create_dir(d).unwrap();
+            std::fs::write(d.join("f"), "").unwrap();
+        }
+        sweep_child_temp_dirs(home.path());
+        assert!(!stale.exists(), "dead broker's dir kept");
+        assert!(mine.exists() && live.exists(), "live broker's dir removed");
+    }
+
+    /// #1072: a server that closes stderr and keeps serving keeps its
+    /// TMPDIR until it exits.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_temp_dir_outlives_stderr_and_goes_at_exit() {
+        let b = sh_broker("exit 0");
+        let id = b.shared.servers.keys().next().unwrap().clone();
+        let child = b
+            .spawn_probe(&id, &["-c", "exec 2>&-; exec /bin/sleep 30"])
+            .unwrap();
+        let tmp = b.shared.tmps.lock().unwrap().keys().next().unwrap().clone();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(tmp.exists(), "temp dir removed while the child runs");
+        let child = Mutex::new(child);
+        kill(&child);
+        let start = Instant::now();
+        while tmp.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "temp dir left after exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Only NOTE_EXIT or ESRCH frees the temp dir; other watcher errors
+    /// keep it for broker drop.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn watcher_errors_keep_the_temp_dir() {
+        // SAFETY: an all-zero kevent is a valid value.
+        let ev = |flags: u16, fflags: u32, data: isize| {
+            let mut e: libc::kevent = unsafe { std::mem::zeroed() };
+            e.flags = flags;
+            e.fflags = fflags;
+            e.data = data;
+            e
+        };
+        let none = ev(0, 0, 0);
+        assert!(watcher_saw_exit(1, None, &ev(0, libc::NOTE_EXIT, 0)));
+        assert!(watcher_saw_exit(
+            1,
+            None,
+            &ev(libc::EV_ERROR, 0, libc::ESRCH as isize)
+        ));
+        assert!(watcher_saw_exit(-1, Some(libc::ESRCH), &none));
+        assert!(!watcher_saw_exit(
+            1,
+            None,
+            &ev(libc::EV_ERROR, 0, libc::EBADF as isize)
+        ));
+        assert!(!watcher_saw_exit(-1, Some(libc::EBADF), &none));
+        assert!(!watcher_saw_exit(-1, Some(libc::ENOMEM), &none));
+        assert!(!watcher_saw_exit(0, None, &none));
+    }
+
+    /// A shutdown racing connection teardown still finds the child: it stays
+    /// in the slot until killed and reaped.
+    #[test]
+    fn teardown_kills_before_freeing_the_slot() {
+        let b = cat_broker();
+        let server = &b.shared.servers["io.github.nais/nais-mcp"];
+        let (tx, rx) = std::sync::mpsc::channel();
+        *server.teardown_hook.lock().unwrap() = Some(Box::new(move |s: &Server| {
+            let slot = s.child.lock().unwrap().clone();
+            let gone = slot.map(|c| !matches!(c.lock().unwrap().try_wait(), Ok(None)));
+            tx.send(gone).unwrap();
+        }));
+        let (mut a, mut ra) = connect(&b);
+        writeln!(a, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+        let mut l = String::new();
+        ra.read_line(&mut l).unwrap();
+        drop((a, ra));
+        let seen = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(seen, Some(true), "slot freed before the child was gone");
+        wait_free(&b);
     }
 
     fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {

@@ -342,7 +342,7 @@ pub(crate) const MCP_CHILD_MACH_SERVICES: &[&str] = &["com.apple.SecurityServer"
 
 /// The Seatbelt profile for a brokered MCP server child (#849). It runs on
 /// the host with the user's own login, so reads stay open (its credential
-/// file, the keychain via securityd, the system); what it loses is the
+/// file, the system, and with `keychain` securityd); what it loses is the
 /// network and most writes. Outbound TCP reaches only `localhost:{proxy_port}`,
 /// its egress proxy, through the same proxy-forced rules as the agent
 /// (no port means no TCP at all). Writes go only to `write_dirs`, which the
@@ -365,19 +365,22 @@ pub(crate) fn mcp_child_profile(
     // Only the Mach services a real `nais alpha mcp serve` looked up (#911),
     // not every service: one that acts for its caller (nsurlsessiond) would
     // be a way around the network rules. bsd.sb's own allows still apply.
-    sbpl!(sb, ";; Mach IPC: measured services only");
-    for name in MCP_CHILD_MACH_SERVICES {
-        sbpl!(sb, "(allow mach-lookup (global-name \"{name}\"))");
-    }
-    // `security add-generic-password` (go-keyring's refresh) posts this.
-    sbpl!(
-        sb,
-        "(allow ipc-posix-shm* (ipc-posix-name \"com.apple.AppleDatabaseChanged\"))"
-    );
     for d in write_dirs {
         sbpl!(sb, "(allow file-write* (subpath \"{}\"))", d.display());
     }
     if keychain {
+        // Both are the keychain itself: securityd decrypts items for any
+        // caller that can reach it, so a child without the grant gets
+        // neither (#1050).
+        sbpl!(sb, ";; Mach IPC: measured services only");
+        for name in MCP_CHILD_MACH_SERVICES {
+            sbpl!(sb, "(allow mach-lookup (global-name \"{name}\"))");
+        }
+        // `security add-generic-password` (go-keyring's refresh) posts this.
+        sbpl!(
+            sb,
+            "(allow ipc-posix-shm* (ipc-posix-name \"com.apple.AppleDatabaseChanged\"))"
+        );
         // Security.framework rewrites the file keychain in the caller's
         // process: a temp file beside login.keychain-db, then a rename.
         // Only that file and its temp siblings, not the Keychains dir.
@@ -4079,6 +4082,9 @@ mod mcp_child_profile_tests {
             ["(allow mach-lookup (global-name \"com.apple.SecurityServer\"))"],
             "{p}"
         );
+        let none = mcp_child_profile(Path::new("/Users/u"), &[], false, Some(1)).unwrap();
+        assert!(!none.contains("mach-lookup (global"), "{none}");
+        assert!(!none.contains("AppleDatabaseChanged"), "{none}");
     }
 
     #[test]
