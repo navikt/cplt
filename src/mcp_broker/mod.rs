@@ -30,6 +30,8 @@ pub const SOCKET_ENV: &str = "CPLT_MCP_SOCKET";
 /// Default-off gate for remote MCP specs (`remotes[]`: gh-token and oauth);
 /// active only when `"1"`. One gate for every remote mechanism (#909).
 pub const REMOTE_GATE_ENV: &str = "CPLT_MCP_REMOTE";
+/// The gate's old name, honoured for one release with a deprecation notice.
+pub const REMOTE_GATE_ENV_OLD: &str = "CPLT_MCP_OAUTH_REMOTE";
 /// MCP versions that carry one JSON-RPC message per line on stdio.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
 const SPEC_LIMIT: u64 = 256 * 1024;

@@ -124,7 +124,7 @@ impl Credential {
     pub(crate) fn parse(name: &str) -> Result<&'static Self, String> {
         if name == "gh-token" {
             return Err(
-                "credential gh-token serves only a remote upstream (remotes[]), not a command"
+                "credential gh-token cannot serve a command; it is only for a remote upstream, which is behind CPLT_MCP_REMOTE=1"
                     .into(),
             );
         }

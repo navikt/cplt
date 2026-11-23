@@ -219,6 +219,9 @@ fn forwarded(name: &str, forced: &[String], policy: bool) -> bool {
             || matches!(
                 n.as_str(),
                 "authorization"
+                    | "x-http-method-override"
+                    | "x-http-method"
+                    | "x-method-override"
                     | "cookie"
                     | "host"
                     | "content-length"
@@ -452,6 +455,11 @@ impl Endpoint {
         // The spec's tool policy, as for a stdio server: one JSON-RPC
         // message per POST (batches refused), checked and re-serialised.
         let mut pending = Pending::default();
+        // Only a POST body is checked, so no other method may carry one.
+        if self.policy.is_some() && method != "POST" && !body.is_empty() {
+            reply(&mut client, "400 Bad Request");
+            return log.line(&self.tag, &self.upstream, &method, "FAIL body on non-POST");
+        }
         if let Some(spec) = &self.policy
             && method == "POST"
         {
@@ -542,6 +550,9 @@ impl Endpoint {
             .retain(|&(_, p)| p != child.id());
         let _ = child.kill();
         let _ = child.wait();
+        if let Some(audit) = pending.1.take() {
+            log.line(&self.tag, &self.upstream, &method, &audit);
+        }
         if let Some((code, closed)) = status {
             // A GET answered 405 is the MCP spec's "no standalone SSE stream",
             // which GitHub returns on every session: not an error.
@@ -718,11 +729,19 @@ fn filter_events(
             if line.is_empty() {
                 break;
             }
+            // Only known fields pass; a BOM or unknown field could hide a
+            // `data:` line from this parser that the client still reads.
             if let Some(d) = line.strip_prefix("data:") {
                 data.push(d.strip_prefix(' ').unwrap_or(d).to_string());
-            } else {
+            } else if line.starts_with(':')
+                || ["event:", "id:", "retry:"]
+                    .iter()
+                    .any(|f| line.starts_with(f))
+            {
                 fields += line;
                 fields += "\n";
+            } else {
+                return Err("unknown event field");
             }
         }
         let event = if data.is_empty() {
@@ -1190,6 +1209,10 @@ mod tests {
 
     /// One request through a policy endpoint for `upstream` with the real curl.
     fn through(upstream: String, curl: PathBuf, body: &str) -> (String, String) {
+        through_as("POST", upstream, curl, body)
+    }
+
+    fn through_as(method: &str, upstream: String, curl: PathBuf, body: &str) -> (String, String) {
         let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
         ep.upstream = upstream;
         let dir = tempfile::tempdir().unwrap();
@@ -1202,7 +1225,7 @@ mod tests {
         let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (server, _) = l.accept().unwrap();
         let head = format!(
-            "POST /x HTTP/1.1\r\nContent-Type: application/json\r\nX-MCP-Lockdown: false\r\nContent-Length: {}\r\n\r\n",
+            "{method} /x HTTP/1.1\r\nContent-Type: application/json\r\nX-MCP-Lockdown: false\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         c.write_all(body.as_bytes()).unwrap();
@@ -1308,6 +1331,88 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             "{reply}"
         );
         assert!(log.contains("FAIL 200 (unparsable message)"), "{log}");
+    }
+
+    #[test]
+    fn non_post_body_is_refused_under_a_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ran) = fake_curl(dir.path());
+        let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"delete_repo","arguments":{}}}"#;
+        for m in ["GET", "DELETE"] {
+            let (reply, log) = through_as(
+                m,
+                "https://up.example/mcp".into(),
+                dir.path().join("curl"),
+                call,
+            );
+            assert!(reply.starts_with("HTTP/1.1 400"), "{m}: {reply}");
+            assert!(log.contains("FAIL body on non-POST"), "{log}");
+        }
+        assert!(!ran.exists(), "curl ran for a non-POST body");
+    }
+
+    #[test]
+    fn method_override_headers_are_never_forwarded() {
+        for h in [
+            "X-HTTP-Method-Override",
+            "x-http-method",
+            "X-Method-Override",
+        ] {
+            assert!(!forwarded(h, &[], true) && !forwarded(h, &[], false), "{h}");
+        }
+    }
+
+    #[test]
+    fn allowed_tools_call_logs_the_audit_line() {
+        let Some(curl) = real_curl() else { return };
+        let (url, _got) = fake_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 47\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"x\":1}}    ",
+        );
+        let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#;
+        let (_, log) = through(url, curl, call);
+        assert!(log.contains("tools/call get_me → ALLOWED "), "{log}");
+    }
+
+    /// `filter_events` over `stream`: what the client got, and why it closed.
+    fn sse(stream: &str) -> (String, Option<&'static str>) {
+        let ep = for_spec(&gh_spec(), &Fixed(Some("T")), PathBuf::from("/c"), "x").unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut server, _) = l.accept().unwrap();
+        let mut pending = Pending::default();
+        let mut input = std::io::Cursor::new(stream.as_bytes().to_vec());
+        let why = filter_events(
+            &mut input,
+            &mut server,
+            ep.policy.as_ref().unwrap(),
+            &mut pending,
+        )
+        .err();
+        drop(server);
+        let mut got = String::new();
+        c.read_to_string(&mut got).unwrap();
+        (got, why)
+    }
+
+    #[test]
+    fn sse_only_known_fields_pass() {
+        let list = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"delete_repo"}]}}"#;
+        let (got, why) = sse(&format!("\u{feff}data: {list}\n\n"));
+        assert_eq!((got.as_str(), why), ("", Some("unknown event field")));
+        let (got, why) = sse(&format!("foo: x\ndata: {list}\n\n"));
+        assert_eq!((got.as_str(), why), ("", Some("unknown event field")));
+        let (got, why) = sse("event: m\nid: 1\nretry: 5\n: c\n\n");
+        assert_eq!(
+            (got.as_str(), why),
+            ("event: m\nid: 1\nretry: 5\n: c\n\n", None)
+        );
+        let big = format!("data: {}\n", "x".repeat(MAX_BODY));
+        assert_eq!(sse(&big).1, Some("event too large"));
+        // A server request and a batch are dropped, not delivered.
+        let req = r#"{"jsonrpc":"2.0","id":9,"method":"sampling/createMessage","params":{}}"#;
+        let batch = format!("[{list}]");
+        let (got, why) = sse(&format!("data: {req}\n\ndata: {batch}\n\n"));
+        assert_eq!((got.as_str(), why), ("", None));
     }
 
     #[test]

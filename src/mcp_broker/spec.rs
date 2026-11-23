@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::credential::Credential;
-use super::{META_KEY, REMOTE_GATE_ENV, SCHEMA_VERSIONS, SPEC_LIMIT};
+use super::{META_KEY, REMOTE_GATE_ENV, REMOTE_GATE_ENV_OLD, SCHEMA_VERSIONS, SPEC_LIMIT};
 
 pub const OAUTH_CLIENT_ID: &str = "https://ki-utvikling.nav.no/cplt/oauth-client.json";
 pub const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:62471/callback";
@@ -123,9 +123,9 @@ pub const REMOTE_TIMEOUT_DEFAULT: u64 = 600;
 /// The only upstream a gh-token spec may name: the host's gh token is sent
 /// there, so the spec cannot point it anywhere else.
 pub const GH_TOKEN_UPSTREAM: &str = "https://api.githubcopilot.com/mcp/readonly";
-/// The only headers a gh-token spec may force: GitHub MCP's mode switches.
-/// `Authorization` comes from cplt alone.
-const GH_TOKEN_HEADERS: &[&str] = &["X-MCP-Readonly", "X-MCP-Toolsets", "X-MCP-Lockdown"];
+/// The only header a gh-token spec may set. Read-only and lockdown are forced
+/// by cplt on every gh-token endpoint, and `Authorization` comes from cplt alone.
+const GH_TOKEN_HEADERS: &[&str] = &["X-MCP-Toolsets"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -167,7 +167,18 @@ pub fn file_name(id: &str) -> String {
 }
 
 fn remote_gate_enabled() -> bool {
-    std::env::var(REMOTE_GATE_ENV).as_deref() == Ok("1")
+    if std::env::var(REMOTE_GATE_ENV).as_deref() == Ok("1") {
+        return true;
+    }
+    // shortcut: drop the old name one release after the rename.
+    let old = std::env::var(REMOTE_GATE_ENV_OLD).as_deref() == Ok("1");
+    if old {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            eprintln!("cplt: {REMOTE_GATE_ENV_OLD} is deprecated; set {REMOTE_GATE_ENV}=1 instead");
+        });
+    }
+    old
 }
 
 /// Validate one spec (invariants 1-6 of design section 5.3). `resolve` finds a
@@ -224,7 +235,9 @@ pub(crate) fn validate_gated(
     let has_remotes = !remotes.is_empty();
     // 4: remote upstreams require the feature gate and a remote mechanism.
     if has_remotes && !(oauth_gate && matches!(ext.credential.as_str(), "oauth" | "gh-token")) {
-        return Err("remote upstreams are not brokered yet; only a host command".into());
+        return Err(format!(
+            "remote upstreams are not brokered yet; only a host command (remotes[] needs {REMOTE_GATE_ENV}=1 and credential gh-token or oauth)"
+        ));
     }
     if !has_remotes && ext.oauth.is_some() {
         return Err("oauth block without an oauth remote".into());
@@ -462,15 +475,20 @@ fn validate_remote(
     Ok((&super::credential::OAUTH, url.to_string(), Vec::new()))
 }
 
-/// A gh-token remote's `headers`: `[{name, value}]`, names from
-/// [`GH_TOKEN_HEADERS`] only (each once), values without control bytes.
+/// A gh-token remote's forced headers: `X-MCP-Readonly: true` and
+/// `X-MCP-Lockdown: true` always, plus the spec's `X-MCP-Toolsets` (the only
+/// header it may set, non-empty, `[a-z0-9_,-]` only). The host's token goes
+/// to this endpoint, so the spec can narrow it but never widen it.
 fn gh_token_headers(v: Option<&Value>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = crate::github_mcp::FORCED_HEADERS
+        .iter()
+        .map(|h| (*h).to_string())
+        .collect();
     let Some(v) = v else {
-        return Ok(Vec::new());
+        return Ok(out);
     };
     let list = v.as_array().ok_or("remote headers must be an array")?;
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = false;
     for h in list {
         let o = h
             .as_object()
@@ -487,18 +505,24 @@ fn gh_token_headers(v: Option<&Value>) -> Result<Vec<String>, String> {
             .find(|n| n.eq_ignore_ascii_case(name))
         else {
             return Err(format!(
-                "remote header {:?} is not allowed on a gh-token spec (only {}); the credential comes from cplt",
+                "remote header {:?} is not allowed on a gh-token spec (only {}); cplt sets the credential and forces X-MCP-Readonly and X-MCP-Lockdown itself",
                 name.escape_debug().to_string(),
                 GH_TOKEN_HEADERS.join(", ")
             ));
         };
-        if super::remote::bad_header_byte(value) {
-            return Err(format!("remote header {canon} has a control character"));
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b',' | b'-'))
+        {
+            return Err(format!(
+                "remote header {canon} must be a non-empty list of toolset names (a-z, 0-9, _, -, comma)"
+            ));
         }
-        if !seen.insert(canon) {
+        if std::mem::replace(&mut seen, true) {
             return Err(format!("remote header {canon} is set twice"));
         }
-        out.push(format!("{canon}: {}", value.trim()));
+        out.push(format!("{canon}: {value}"));
     }
     Ok(out)
 }
@@ -796,7 +820,7 @@ pub(crate) mod tests {
         assert!(
             check(with(base(), "/credential", json!("gh-token")))
                 .unwrap_err()
-                .contains("remotes[]")
+                .contains("cannot serve a command")
         );
         assert!(
             check(with(
@@ -1189,11 +1213,7 @@ pub(crate) mod tests {
         root["remotes"] = json!([{
             "type": "streamable-http",
             "url": GH_TOKEN_UPSTREAM,
-            "headers": [
-                {"name": "X-MCP-Readonly", "value": "true"},
-                {"name": "x-mcp-toolsets", "value": "repos,issues"},
-                {"name": "X-MCP-Lockdown", "value": "true"},
-            ],
+            "headers": [{"name": "x-mcp-toolsets", "value": "repos,issues"}],
         }]);
         root
     }
@@ -1207,8 +1227,8 @@ pub(crate) mod tests {
             spec.remote_headers,
             [
                 "X-MCP-Readonly: true",
-                "X-MCP-Toolsets: repos,issues",
-                "X-MCP-Lockdown: true"
+                "X-MCP-Lockdown: true",
+                "X-MCP-Toolsets: repos,issues"
             ]
         );
         assert_eq!(spec.timeout_secs, REMOTE_TIMEOUT_DEFAULT);
@@ -1218,10 +1238,12 @@ pub(crate) mod tests {
         r["_meta"][META_KEY]["credential"] = json!("none");
         assert!(check_oauth(&r, true).unwrap_err().contains("not brokered"));
         // Gate off: refused exactly as before this mechanism existed.
-        assert_eq!(
-            check_oauth(&gh_root(), false).unwrap_err(),
-            "remote upstreams are not brokered yet; only a host command"
+        let e = check_oauth(&gh_root(), false).unwrap_err();
+        assert!(
+            e.starts_with("remote upstreams are not brokered yet"),
+            "{e}"
         );
+        assert!(e.contains("CPLT_MCP_REMOTE=1"), "{e}");
     }
 
     #[test]
@@ -1267,10 +1289,17 @@ pub(crate) mod tests {
         refused(&hdr("Cookie", "x"), "not allowed");
         refused(
             &hdr("X-MCP-Toolsets", "a\r\nAuthorization: y"),
-            "control character",
+            "toolset names",
         );
-        refused(&hdr("X-MCP-Toolsets", "a\nb"), "control character");
-        refused(&hdr("X-MCP-Toolsets", "a\u{7f}"), "control character");
+        refused(&hdr("X-MCP-Toolsets", "a\nb"), "toolset names");
+        refused(&hdr("X-MCP-Toolsets", "a\u{7f}"), "toolset names");
+        refused(&hdr("X-MCP-Toolsets", ""), "toolset names");
+        refused(&hdr("X-MCP-Toolsets", " "), "toolset names");
+        refused(&hdr("X-MCP-Toolsets", "Repos"), "toolset names");
+        refused(&hdr("X-MCP-Readonly", "false"), "forces X-MCP-Readonly");
+        refused(&hdr("X-MCP-Readonly", "true"), "not allowed");
+        refused(&hdr("x-mcp-lockdown", "false"), "not allowed");
+        refused(&hdr("X-MCP-Lockdown", " "), "not allowed");
         refused(
             &|r| {
                 r["remotes"][0]["headers"] = json!([
@@ -1283,7 +1312,7 @@ pub(crate) mod tests {
         refused(
             &|r| {
                 r["remotes"][0]["headers"] =
-                    json!([{"name": "X-MCP-Readonly", "value": "true", "isSecret": false}]);
+                    json!([{"name": "X-MCP-Toolsets", "value": "repos", "isSecret": false}]);
             },
             "only",
         );
