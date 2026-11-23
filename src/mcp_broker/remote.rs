@@ -1768,22 +1768,36 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         ep.upstream = url;
         let (reply, log) = serve_on(&ep, "POST", CALL);
         let sent = got.recv().unwrap();
-        assert!(sent.contains("Authorization: Bearer T"), "{sent}");
+        assert!(
+            sent.contains("Authorization: Bearer T"),
+            "unexpected broker output"
+        );
         assert!(sent.contains("X-MCP-Readonly: true") && sent.contains("X-MCP-Lockdown: true"));
         assert!(
             reply.starts_with("HTTP/1.1 200") && reply.contains("\"x\":1"),
-            "{reply}"
+            "unexpected broker output"
         );
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
-        assert!(log.contains("tools/call get_me → ALLOWED "), "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
+        assert!(
+            log.contains("tools/call get_me → ALLOWED "),
+            "unexpected broker output"
+        );
 
         let write = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issue","arguments":{}}}"#;
         let (reply, log) = serve_on(&ep, "POST", write);
-        assert!(reply.contains("\"error\""), "{reply}");
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert!(reply.contains("\"error\""), "unexpected broker output");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
         assert!(
             log.contains("create_issue") && log.contains("DENIED"),
-            "{log}"
+            "unexpected broker output"
         );
         assert!(got.try_recv().is_err(), "the write reached upstream");
     }
@@ -1797,9 +1811,13 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         assert_eq!(
             log.matches("tools/call get_me → FAIL 502 ").count(),
             1,
-            "{log}"
+            "unexpected broker output"
         );
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
     }
 
     #[test]
@@ -1820,9 +1838,13 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         assert_eq!(
             log.matches("tools/call get_me → TIMEOUT ").count(),
             1,
-            "{log}"
+            "unexpected broker output"
         );
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
@@ -1841,8 +1863,15 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             reply.contains("id: 1\nretry: 10\ndata:\n\n"),
             "priming not passed"
         );
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
-        assert!(log.contains("tools/call get_me → FAIL 200 "), "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
+        assert!(
+            log.contains("tools/call get_me → FAIL 200 "),
+            "unexpected broker output"
+        );
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
@@ -1857,7 +1886,11 @@ data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}\n\n",
         let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
         ep.upstream = url;
         let (_, log) = serve_on(&ep, "POST", CALL);
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
@@ -1900,7 +1933,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}\n\n",
             reply.contains("resume (Last-Event-ID) is not supported"),
             "no resume error"
         );
-        assert!(log.contains("FAIL stream resume not supported"), "{log}");
+        assert!(
+            log.contains("FAIL stream resume not supported"),
+            "unexpected broker output"
+        );
         assert!(got.try_recv().is_err(), "upstream reached");
     }
 
