@@ -12455,9 +12455,13 @@ mod agent_stubs {
             .unwrap();
         let h = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(h.join(".config/cplt")).unwrap();
+        // A project directly under HOME is refused as too broad first.
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
         let out = cplt_cmd()
             .args(["exec", "--", "/bin/echo", "ok"])
-            .current_dir(&h)
+            .current_dir(&proj)
             .env("HOME", &h)
             .env("XDG_CONFIG_HOME", h.join(".config"))
             .env("GOCACHE", h.join(".config"))
