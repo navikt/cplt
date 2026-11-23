@@ -61,7 +61,7 @@ run = "sh hack/quiet-test.sh --lib"
 
 [tasks."test:unit"]
 description = "Run unit tests — cross-platform, sandbox-safe"
-run = "sh hack/quiet-test.sh --test unit_tests"
+run = "sh hack/quiet-test.sh --test unit_tests --test github_mcp_spec"
 
 [tasks."test:probe"]
 description = "Run offline probe regression checks (requires Python 3 and Node.js)"

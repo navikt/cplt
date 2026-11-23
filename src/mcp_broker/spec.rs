@@ -75,48 +75,64 @@ impl Rejected {
 /// server and probe read its login and config there, so a session grant
 /// over them (#1061) would let the agent read the login and rewrite the
 /// config. The grant wins and the server is dropped, with a line naming it.
+/// Remote specs (#909) go through the same checks.
 /// Returns the newly rejected, already printed.
 pub fn drop_writable(
     found: &mut Detected,
     home: &Path,
     writable: impl Fn(&Path) -> Option<PathBuf>,
 ) {
-    let mut kept = Vec::new();
-    for spec in std::mem::take(&mut found.specs) {
-        if let Some(tree) = writable(&spec.file) {
-            found.rejected.push(Rejected {
-                file: spec.file.display().to_string(),
-                reason: format!("{} is writable in the sandbox", tree.display()),
-                fix: format!(
-                    "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
-                    tree.display()
-                ),
-            });
-            continue;
+    for remote in [false, true] {
+        let list = if remote {
+            &mut found.remotes
+        } else {
+            &mut found.specs
+        };
+        let mut kept = Vec::new();
+        let before = found.rejected.len();
+        for spec in std::mem::take(list) {
+            if let Some(tree) = writable(&spec.file) {
+                found.rejected.push(Rejected {
+                    file: spec.file.display().to_string(),
+                    reason: format!("{} is writable in the sandbox", tree.display()),
+                    fix: format!(
+                        "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
+                        tree.display()
+                    ),
+                });
+                continue;
+            }
+            let hit = spec
+                .credential
+                .host_write_dirs(home)
+                .into_iter()
+                .find_map(|d| writable(&d).map(|tree| (d, tree)));
+            match hit {
+                None => kept.push(spec),
+                Some((dir, tree)) => found.rejected.push(Rejected {
+                    file: spec.file.display().to_string(),
+                    reason: format!(
+                        "the {} login dir {} is writable in the sandbox (grant: {})",
+                        spec.credential.name,
+                        dir.display(),
+                        tree.display()
+                    ),
+                    fix: format!(
+                        "drop the write grant on {} to use this server; the grant wins and the server is off",
+                        tree.display()
+                    ),
+                }),
+            }
         }
-        let hit = spec
-            .credential
-            .host_write_dirs(home)
-            .into_iter()
-            .find_map(|d| writable(&d).map(|tree| (d, tree)));
-        match hit {
-            None => kept.push(spec),
-            Some((dir, tree)) => found.rejected.push(Rejected {
-                file: spec.file.display().to_string(),
-                reason: format!(
-                    "the {} login dir {} is writable in the sandbox (grant: {})",
-                    spec.credential.name,
-                    dir.display(),
-                    tree.display()
-                ),
-                fix: format!(
-                    "drop the write grant on {} to use this server; the grant wins and the server is off",
-                    tree.display()
-                ),
-            }),
+        *if remote {
+            &mut found.remotes
+        } else {
+            &mut found.specs
+        } = kept;
+        if remote && found.remote_refused.is_none() {
+            found.remote_refused = found.rejected.get(before).cloned();
         }
     }
-    found.specs = kept;
 }
 
 #[derive(Deserialize)]
@@ -660,9 +676,65 @@ pub(crate) fn check_host(host: &str) -> Result<(), String> {
 #[derive(Default)]
 pub struct Detected {
     pub specs: Vec<Spec>,
+    /// Remote gh-token specs (#909), only with the remote gate on.
+    pub remotes: Vec<Spec>,
     pub rejected: Vec<Rejected>,
     /// Skipped by `--no-mcp-broker`.
     pub disabled: Vec<String>,
+    /// A gh-token remote was among `disabled`: GitHub MCP is off (#909).
+    pub remote_disabled: bool,
+    /// A spec that declares (or may declare) a gh-token remote was refused at
+    /// load: its line. GitHub MCP is then off, never the built-in endpoint,
+    /// which would serve the token without that spec's `tools.allow` (#909).
+    pub remote_refused: Option<Rejected>,
+}
+
+impl Detected {
+    /// The GitHub MCP toggles (`sandbox.github_mcp_proxy = false`,
+    /// `--no-github-mcp-proxy`) alias the remote specs' `disabled[]` ids.
+    pub fn disable_remotes(&mut self) {
+        let off = std::mem::take(&mut self.remotes);
+        self.remote_disabled |= !off.is_empty();
+        self.disabled.extend(off.into_iter().map(|s| s.id));
+    }
+}
+
+/// The gh-token spec this launch's GitHub MCP serves (#909). `Ok(None)`: no
+/// spec, so the built-in endpoint serves. `Err(line)`: a spec exists but
+/// cannot serve, so GitHub MCP is off. Disabled means off: never a fallback
+/// to the built-in endpoint, which would serve the token without the spec's
+/// `tools.allow`.
+pub fn github_spec(
+    found: &Detected,
+    home: &Path,
+    writable: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<Option<Spec>, String> {
+    const OFF: &str = "GitHub MCP is off for this session";
+    if let Some(r) = &found.remote_refused {
+        return Err(format!("{OFF}: {}", r.line()));
+    }
+    if found.remote_disabled {
+        return Err(format!(
+            "{OFF}: its gh-token spec is disabled. Drop --no-mcp-broker <id> \
+             (and --no-github-mcp-proxy / sandbox.github_mcp_proxy = false) to turn it on."
+        ));
+    }
+    if found.remotes.len() > 1 {
+        let ids: Vec<&str> = found.remotes.iter().map(|s| s.id.as_str()).collect();
+        return Err(format!(
+            "{OFF}: more than one gh-token spec ({}) is ambiguous. Remove all but one.",
+            ids.join(", ")
+        ));
+    }
+    let mut f = Detected {
+        remotes: found.remotes.clone(),
+        ..Default::default()
+    };
+    drop_writable(&mut f, home, writable);
+    if let Some(r) = f.rejected.first() {
+        return Err(format!("{OFF}: {}", r.line()));
+    }
+    Ok(f.remotes.pop())
 }
 
 /// Load every spec in `dir`. A file in `writable` (a tree the sandbox can
@@ -720,6 +792,7 @@ pub(crate) fn load_with_gate(
             .is_ok_and(|m| m.file_type().is_symlink());
         // (reason, fix): the fix matches the cause; only a bad spec is
         // nav-pilot's to rewrite.
+        let mut snapshot: Option<String> = None;
         let result = if dir_link {
             Err((
                 format!("{} is a symlink", dir.display()),
@@ -750,17 +823,16 @@ pub(crate) fn load_with_gate(
                 format!("nav-pilot mcp enable {id}")
             };
             match crate::untrusted::read_untrusted(&path, SPEC_LIMIT) {
-                Ok(Some(text)) => match validate_gated(&text, &file, &resolve, oauth_gate) {
+                Ok(Some(text)) => match validate_gated(
+                    snapshot.insert(text),
+                    &file,
+                    &resolve,
+                    oauth_gate,
+                ) {
                     Ok(spec) if spec.remote.is_some() && spec.credential.name == "oauth" => Err((
                         "oauth remotes are validated but not served yet (no login in this cplt)"
                             .into(),
                         "remove the spec until cplt supports oauth login".into(),
-                    )),
-                    // ponytail: the gh-token remote leg exists (#909 PR2); no
-                    // client is pointed at it until PR3/PR4.
-                    Ok(spec) if spec.remote.is_some() => Err((
-                        "gh-token remotes are validated but not served to a client yet".into(),
-                        "remove the spec until cplt wires the GitHub MCP broker".into(),
                     )),
                     Ok(spec) => Ok(spec),
                     Err(r) => Err((r, enable())),
@@ -770,22 +842,57 @@ pub(crate) fn load_with_gate(
             }
         };
         match result {
-            Ok(spec) if disabled.contains(&spec.id) => out.disabled.push(spec.id),
+            Ok(spec) if disabled.contains(&spec.id) => {
+                out.remote_disabled |= spec.remote.is_some();
+                out.disabled.push(spec.id);
+            }
             Ok(spec) if !seen.insert(spec.id.clone()) => {}
             Ok(mut spec) => {
                 spec.file.clone_from(&path);
-                out.specs.push(spec);
+                // A remote (only gh-token gets here) is served on the proxy
+                // port, never spawned by the stdio broker.
+                if spec.remote.is_some() {
+                    out.remotes.push(spec);
+                } else {
+                    out.specs.push(spec);
+                }
             }
             Err((reason, fix)) => {
-                out.rejected.push(Rejected {
+                let r = Rejected {
                     file: path.display().to_string(),
                     reason,
                     fix,
-                });
+                };
+                if oauth_gate && out.remote_refused.is_none() && remote_attempt(snapshot.as_deref())
+                {
+                    out.remote_refused = Some(r.clone());
+                }
+                out.rejected.push(r);
             }
         }
     }
     out
+}
+
+/// Whether a refused spec counts as a remote attempt, which turns GitHub MCP
+/// off. Classifies the exact buffer that failed validation, never a reread, so
+/// a swap after validation cannot change the answer. Fails closed: no safe
+/// snapshot (symlink, FIFO, too large, unreadable), not a JSON object, a
+/// `remotes` key of any value, or a credential other than `"oauth"` all count.
+/// Only a stdio spec (a `command`, no `remotes`, not gh-token) or an oauth
+/// one is left alone.
+fn remote_attempt(text: Option<&str>) -> bool {
+    let Some(Value::Object(root)) = text.and_then(|t| serde_json::from_str(t).ok()) else {
+        return true;
+    };
+    let ext = root.get("_meta").and_then(|m| m.get(META_KEY));
+    let cred = ext.and_then(|e| e.get("credential"));
+    let remotes = root.contains_key("remotes");
+    let stdio = !remotes
+        && ext.is_some_and(|e| e.get("command").is_some())
+        && cred.and_then(Value::as_str) != Some("gh-token");
+    let oauth = cred.and_then(Value::as_str) == Some("oauth");
+    !stdio && !oauth && (remotes || cred.is_some())
 }
 
 /// Launch detection: load, print one line per rejected spec. The launch
@@ -1269,6 +1376,103 @@ pub(crate) mod tests {
         );
     }
 
+    /// Load `root` as FILE with the gate on, then ask `github_spec`.
+    fn gh_off(root: &Value, writable: bool, disabled: &[String]) -> Result<Option<Spec>, String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), root.to_string()).unwrap();
+        let w = if writable {
+            vec![dir.path().to_path_buf()]
+        } else {
+            vec![]
+        };
+        let found = load_with_gate(
+            dir.path(),
+            &w,
+            disabled,
+            |n| Some(PathBuf::from("/opt/homebrew/bin").join(n)),
+            true,
+        );
+        github_spec(&found, dir.path(), |_| None)
+    }
+
+    #[test]
+    fn refused_gh_spec_turns_github_mcp_off() {
+        // Loads and serves.
+        assert!(gh_off(&gh_root(), false, &[]).unwrap().is_some());
+        // Under a writable root: refused at load, so off, not the built-in endpoint.
+        let e = gh_off(&gh_root(), true, &[]).unwrap_err();
+        assert!(e.contains("writable in the sandbox"), "{e}");
+        // Disabled and refused at load: still off.
+        let id = FILE.trim_end_matches(".json").replace("__", "/");
+        assert!(gh_off(&gh_root(), true, &[id]).is_err());
+        // Fails validation: off, naming the reason.
+        let mut bad = gh_root();
+        bad["_meta"][META_KEY]["tools"]["alow"] = json!(["get_me"]);
+        let e = gh_off(&bad, false, &[]).unwrap_err();
+        assert!(e.contains("alow"), "{e}");
+        // A refused stdio spec leaves GitHub MCP alone.
+        let mut stdio: Value = serde_json::from_str(&spec_json(base())).unwrap();
+        stdio["_meta"][META_KEY]["credential"] = json!("bogus");
+        assert!(matches!(gh_off(&stdio, false, &[]), Ok(None)));
+        // A credential-only doc with a mistyped credential: off.
+        let mut typo = gh_root();
+        typo.as_object_mut().unwrap().remove("remotes");
+        typo["_meta"][META_KEY]["credential"] = json!("gh-tokn");
+        assert!(gh_off(&typo, false, &[]).is_err());
+    }
+
+    #[test]
+    fn remote_attempt_classifies_the_refused_buffer() {
+        let yes = |v: &Value| remote_attempt(Some(&v.to_string()));
+        // No safe snapshot, or not a JSON object: fail closed.
+        assert!(remote_attempt(None));
+        assert!(remote_attempt(Some("{not json")));
+        assert!(yes(&json!([1])));
+        // gh-token with missing or empty remotes.
+        let mut r = gh_root();
+        r["remotes"] = json!([]);
+        assert!(yes(&r));
+        r.as_object_mut().unwrap().remove("remotes");
+        assert!(yes(&r));
+        // Mistyped or wrong credential on a remote.
+        for c in ["gh-tokn", "none"] {
+            let mut r = gh_root();
+            r["_meta"][META_KEY]["credential"] = json!(c);
+            assert!(yes(&r), "{c}");
+        }
+        // remotes of any value, credential missing.
+        let mut r = gh_root();
+        r["remotes"] = json!("x");
+        r["_meta"][META_KEY]
+            .as_object_mut()
+            .unwrap()
+            .remove("credential");
+        assert!(yes(&r));
+        // oauth remote and a stdio spec refused for another reason: left alone.
+        let mut r = gh_root();
+        r["_meta"][META_KEY]["credential"] = json!("oauth");
+        assert!(!yes(&r));
+        let mut s: Value = serde_json::from_str(&spec_json(base())).unwrap();
+        s["_meta"][META_KEY]["extra"] = json!(1);
+        assert!(!yes(&s));
+        // A command with gh-token is not a stdio spec.
+        s["_meta"][META_KEY]["credential"] = json!("gh-token");
+        assert!(yes(&s));
+    }
+
+    /// The swap race: a file refused as a gh-token remote then replaced by a
+    /// stdio doc. Classification sees only the refused buffer, so it stays a
+    /// remote attempt whatever is on disk afterwards.
+    #[test]
+    fn swap_after_refusal_still_counts_as_remote() {
+        let mut bad = gh_root();
+        bad["_meta"][META_KEY]["tools"]["alow"] = json!(["get_me"]);
+        let refused = bad.to_string();
+        let stdio = spec_json(base());
+        assert!(!remote_attempt(Some(&stdio)));
+        assert!(remote_attempt(Some(&refused)));
+    }
+
     pub(crate) fn gh_root() -> Value {
         let ext = json!({
             "v": 1,
@@ -1426,16 +1630,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn load_does_not_serve_a_gh_token_remote_yet() {
+    fn load_keeps_a_gh_token_remote_apart_from_the_stdio_specs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FILE), gh_root().to_string()).unwrap();
         let found = load_with_gate(dir.path(), &[], &[], |_| None, true);
-        assert!(found.specs.is_empty());
-        assert!(
-            found.rejected[0].reason.contains("gh-token remotes"),
-            "{}",
-            found.rejected[0].reason
-        );
+        assert!(found.specs.is_empty() && found.rejected.is_empty());
+        assert_eq!(found.remotes.len(), 1);
+        // A writable spec dir drops it like any other spec.
+        let mut f = load_with_gate(dir.path(), &[], &[], |_| None, true);
+        drop_writable(&mut f, Path::new("/nohome"), |_| Some(PathBuf::from("/w")));
+        assert!(f.remotes.is_empty() && f.rejected.len() == 1);
+        // --no-mcp-broker <id> turns it off.
+        let id = found.remotes[0].id.clone();
+        let off = load_with_gate(dir.path(), &[], std::slice::from_ref(&id), |_| None, true);
+        assert!(off.remotes.is_empty() && off.disabled == [id.clone()]);
+        // So does the GitHub MCP toggle, as the same disabled id.
+        let mut f = load_with_gate(dir.path(), &[], &[], |_| None, true);
+        f.disable_remotes();
+        assert!(f.remotes.is_empty() && f.disabled == [id]);
         let found = load_with_gate(dir.path(), &[], &[], |_| None, false);
         assert!(found.rejected[0].reason.contains("not brokered yet"));
     }

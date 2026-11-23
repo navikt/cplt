@@ -252,6 +252,30 @@ pub(crate) fn remote_endpoints(
         .collect()
 }
 
+/// The endpoint for a gh-token remote spec (#909), with the token the
+/// launch already looked up: the spec's forced headers, timeout and
+/// `tools.allow`, on the same secret-path seam as the built-in one.
+pub(crate) fn spec_endpoint(
+    spec: &Spec,
+    token: SecretToken,
+    curl: PathBuf,
+    secret: &str,
+) -> Result<Endpoint, String> {
+    struct Held(std::cell::Cell<Option<SecretToken>>);
+    impl CredentialSource for Held {
+        fn bearer(&self) -> Option<SecretToken> {
+            self.0.take()
+        }
+    }
+    for_spec(spec, &Held(Some(token).into()), curl, secret)
+}
+
+/// Serve [`spec_endpoint`] at `/<secret>` on the running proxy.
+pub fn install_spec(spec: &Spec, token: SecretToken, secret: &str) -> Result<(), String> {
+    let curl = crate::git::trusted_binary("curl").ok_or("no curl in the trusted dirs")?;
+    install_endpoint(spec_endpoint(spec, token, curl, secret)?)
+}
+
 /// ponytail: one endpoint per process, which is one cplt session; a
 /// per-proxy field would be needed to serve two.
 static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
@@ -1651,7 +1675,9 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 105\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"},{\"name\":\"delete_repo\"}]}}            ",
         );
         let (reply, log) = through(url.clone(), curl, LIST);
-        let sent = got.recv().unwrap();
+        let sent = got
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
         assert!(sent.contains("Authorization: Bearer T"));
         assert!(sent.contains("X-MCP-Lockdown: true") && !sent.contains("false"));
         assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
@@ -1719,6 +1745,67 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
 
     const CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#;
 
+    /// #909 PR3, under the gate: the spec a launch loads (gh-token, allow
+    /// `get_me`) built into the endpoint OpenCode v2 is pointed at. The
+    /// allowed read tool reaches upstream; a write tool is refused before
+    /// curl runs; each tools/call writes exactly one audit line.
+    #[test]
+    fn gated_gh_token_spec_endpoint_allows_reads_and_refuses_writes() {
+        let Some(curl) = real_curl() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::mcp_broker::spec::tests::gh_root();
+        std::fs::write(
+            dir.path().join(crate::mcp_broker::test_util::FILE),
+            root.to_string(),
+        )
+        .unwrap();
+        let found = crate::mcp_broker::spec::load_with_gate(dir.path(), &[], &[], |_| None, true);
+        let spec = &found.remotes[0];
+        let (url, got) = fake_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":1}}",
+        );
+        let mut ep = spec_endpoint(spec, SecretToken::new("T".into()), curl, "s").unwrap();
+        assert_eq!(ep.path, "/s");
+        assert!(ep.policy.is_some() && ep.tag == spec.id);
+        ep.upstream = url;
+        let (reply, log) = serve_on(&ep, "POST", CALL);
+        let sent = got
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            sent.contains("Authorization: Bearer T"),
+            "unexpected broker output"
+        );
+        assert!(sent.contains("X-MCP-Readonly: true") && sent.contains("X-MCP-Lockdown: true"));
+        assert!(
+            reply.starts_with("HTTP/1.1 200") && reply.contains("\"x\":1"),
+            "unexpected broker output"
+        );
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
+        assert!(
+            log.contains("tools/call get_me → ALLOWED "),
+            "unexpected broker output"
+        );
+
+        let write = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issue","arguments":{}}}"#;
+        let (reply, log) = serve_on(&ep, "POST", write);
+        assert!(reply.contains("\"error\""), "unexpected broker output");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
+        assert!(
+            log.contains("create_issue") && log.contains("DENIED"),
+            "unexpected broker output"
+        );
+        assert!(got.try_recv().is_err(), "the write reached upstream");
+    }
+
     /// A failed call is audited by name, once.
     #[test]
     fn failed_tools_call_logs_the_audit_line_once() {
@@ -1728,9 +1815,13 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         assert_eq!(
             log.matches("tools/call get_me → FAIL 502 ").count(),
             1,
-            "{log}"
+            "unexpected broker output"
         );
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
     }
 
     #[test]
@@ -1751,9 +1842,13 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         assert_eq!(
             log.matches("tools/call get_me → TIMEOUT ").count(),
             1,
-            "{log}"
+            "unexpected broker output"
         );
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
@@ -1772,8 +1867,15 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             reply.contains("id: 1\nretry: 10\ndata:\n\n"),
             "priming not passed"
         );
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
-        assert!(log.contains("tools/call get_me → FAIL 200 "), "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
+        assert!(
+            log.contains("tools/call get_me → FAIL 200 "),
+            "unexpected broker output"
+        );
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
@@ -1788,7 +1890,11 @@ data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}\n\n",
         let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
         ep.upstream = url;
         let (_, log) = serve_on(&ep, "POST", CALL);
-        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("tools/call").count(),
+            1,
+            "unexpected broker output"
+        );
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
@@ -1831,7 +1937,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}\n\n",
             reply.contains("resume (Last-Event-ID) is not supported"),
             "no resume error"
         );
-        assert!(log.contains("FAIL stream resume not supported"), "{log}");
+        assert!(
+            log.contains("FAIL stream resume not supported"),
+            "unexpected broker output"
+        );
         assert!(got.try_recv().is_err(), "upstream reached");
     }
 

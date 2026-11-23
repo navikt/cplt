@@ -97,7 +97,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --no-fail-fast --test unit_tests --lib --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          cargo test --no-fail-fast --test unit_tests --test github_mcp_spec --lib --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       - name: Annotate failing tests
         if: failure()

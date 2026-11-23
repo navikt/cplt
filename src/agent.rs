@@ -1184,7 +1184,8 @@ pub enum KeychainSubstitute {
 pub struct SecretToken(pub(crate) String);
 
 impl SecretToken {
-    pub(crate) fn new(token: String) -> Self {
+    #[doc(hidden)] // public for tests/github_mcp_spec.rs; wrapping a string grants nothing
+    pub fn new(token: String) -> Self {
         Self(token)
     }
 
