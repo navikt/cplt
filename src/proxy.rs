@@ -1225,14 +1225,15 @@ fn handle_connection(
 }
 
 /// A malformed CONNECT target with a path, query or fragment may carry the
-/// MCP endpoint's secret path; log only what precedes it. Other malformed
-/// targets stay in the log (escaped) as evidence.
-fn bad_connect_target(target: &str) -> std::borrow::Cow<'_, str> {
-    // Search after any userinfo: `log_connection` redacts up to the last `@`.
-    let start = target.rfind('@').map_or(0, |i| i + 1);
-    match target[start..].find(['/', '?', '#']) {
-        Some(i) => format!("{}/<redacted>", &target[..start + i]).into(),
-        None => target.into(),
+/// MCP endpoint's secret path anywhere, even before or inside apparent
+/// userinfo; redact the whole target. Other malformed targets stay in the log
+/// (escaped) as evidence.
+fn bad_connect_target(target: &str) -> &str {
+    if target.contains(['/', '\\', '?', '#']) {
+        // The `@` keeps it out of retained host evidence, like other userinfo.
+        "***@<redacted>"
+    } else {
+        target
     }
 }
 
@@ -1599,7 +1600,7 @@ fn handle_connect(
                     state,
                     Some(classification),
                     "CONNECT",
-                    &bad_connect_target(target),
+                    bad_connect_target(target),
                     "BLOCKED",
                 );
                 reject(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -1620,7 +1621,7 @@ fn handle_connect(
             state,
             Some(classification),
             "CONNECT",
-            &bad_connect_target(target),
+            bad_connect_target(target),
             "BLOCKED",
         );
         reject(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -4226,6 +4227,10 @@ mod tests {
             "user:secret@example.invalid:443",
             "alice:secret://user@example.invalid:443",
             "s3cret:x@example.invalid:443",
+            // #1076: secret path before, after or around the last `@`.
+            "host.example:443/@s3cretpath",
+            "host.example:443\\s3cretpath@x",
+            "/s3cretpath@host.example:443",
         ] {
             let _ = proxy_connect(proxy.port, target);
         }
@@ -4234,12 +4239,15 @@ mod tests {
         let snapshot = proxy.finalize_snapshot(LOADED_RUNNER_WAIT);
         let logged = std::fs::read_to_string(log).unwrap();
 
-        assert_eq!(snapshot.recorded_attempts, 3);
-        assert_eq!(snapshot.unretained_observations, 3);
+        assert_eq!(snapshot.recorded_attempts, 6);
+        assert_eq!(snapshot.unretained_observations, 6);
         assert!(snapshot.domains.is_empty());
         assert!(!logged.contains("secret"));
         assert!(!logged.contains("s3cret"));
-        assert_eq!(logged.matches("***@example.invalid:443").count(), 3);
+        assert!(!logged.contains("cretpath"));
+        // The `://` target is redacted whole.
+        assert_eq!(logged.matches("***@example.invalid:443").count(), 2);
+        assert_eq!(logged.matches("***@<redacted>").count(), 4);
         assert!(!format!("{snapshot:?}").contains("secret"));
     }
 
