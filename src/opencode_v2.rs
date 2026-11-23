@@ -491,6 +491,10 @@ fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
 /// sandbox, since OpenCode only sees it then. The token is asked for only
 /// once an entry is found, so other launches pay nothing. `deny.env` naming
 /// `GH_TOKEN` or `OPENCODE_CONFIG_CONTENT` turns it off, like the #695 handover.
+///
+/// `spec`: a gh-token remote broker spec (#909, only with `CPLT_MCP_REMOTE=1`).
+/// The overlay is the same; the endpoint then applies the spec's headers,
+/// timeout and `tools.allow`. `None` is the built-in endpoint, unchanged.
 pub fn github_mcp(
     session: &mut Session,
     home: &Path,
@@ -498,6 +502,7 @@ pub fn github_mcp(
     reaches: impl Fn(&str) -> bool,
     proxy_port: Option<u16>,
     token: impl FnOnce() -> Option<crate::agent::SecretToken>,
+    spec: Option<&crate::mcp_broker::Spec>,
 ) -> bool {
     const VAR: &str = "OPENCODE_CONFIG_CONTENT";
     if deny_env.iter().any(|d| d == "GH_TOKEN" || d == VAR) {
@@ -526,7 +531,10 @@ pub fn github_mcp(
         let url = format!("http://127.0.0.1:{port}/{secret}");
         let value = crate::github_mcp::overlay(existing.as_deref(), &names, &url)
             .ok_or(format!("{VAR} is not a JSON object"))?;
-        crate::github_mcp::install(token, &secret)?;
+        match spec {
+            Some(spec) => crate::mcp_broker::remote::install_spec(spec, token, &secret)?,
+            None => crate::github_mcp::install(token, &secret)?,
+        }
         Ok(value)
     });
     match added {
@@ -1344,7 +1352,8 @@ mod tests {
                 &[],
                 |_| false,
                 Some(1),
-                never
+                never,
+                None
             ));
             // deny.env turns it off, for either variable.
             for d in ["GH_TOKEN", "OPENCODE_CONFIG_CONTENT"] {
@@ -1354,13 +1363,22 @@ mod tests {
                     &deny(&[d]),
                     all,
                     Some(1),
-                    never
+                    never,
+                    None
                 ));
             }
             // No proxy: nothing to serve it on.
-            assert!(!github_mcp(&mut s, tmp.path(), &[], all, None, never));
+            assert!(!github_mcp(&mut s, tmp.path(), &[], all, None, never, None));
             // No gh login.
-            assert!(!github_mcp(&mut s, tmp.path(), &[], all, Some(1), || None));
+            assert!(!github_mcp(
+                &mut s,
+                tmp.path(),
+                &[],
+                all,
+                Some(1),
+                || None,
+                None
+            ));
             // The same from the user config file.
             std::fs::write(oc.join("opencode.json"), entry).unwrap();
             assert!(!github_mcp(
@@ -1369,7 +1387,8 @@ mod tests {
                 &[],
                 |_| false,
                 Some(1),
-                || None
+                || None,
+                None
             ));
             assert_eq!(s.env.len(), n);
         });

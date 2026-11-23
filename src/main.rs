@@ -5433,7 +5433,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &resolved.allow_write,
         Some(&scratch::ScratchDir::base(&home_dir)),
     );
-    let mcp_found = match (mcp_status, resolved.mcp_broker) {
+    let mut mcp_found = match (mcp_status, resolved.mcp_broker) {
         (Some(_), _) => cplt::mcp_broker::load(
             &cplt::mcp_broker::spec_dir(&home_dir),
             &mcp_writable,
@@ -5442,6 +5442,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         (None, true) => cplt::mcp_broker::detect(&home_dir, &mcp_writable, &cli.no_mcp_broker),
         (None, false) => cplt::mcp_broker::Detected::default(),
     };
+    // `sandbox.github_mcp_proxy = false` / `--no-github-mcp-proxy` also turn
+    // off the spec-backed GitHub endpoint (#909): no new knob.
+    if !resolved.github_mcp_proxy {
+        mcp_found.disable_remotes();
+    }
 
     let AssembledSandbox {
         mut prepared,
@@ -5560,6 +5565,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         v2_model = std::mem::replace(&mut session.model, Err(())).ok();
         v2_tui = std::mem::take(&mut session.tui);
+        // A gh-token remote spec the final policy cannot write (#909).
+        let github_spec = {
+            let mut f = cplt::mcp_broker::Detected {
+                remotes: mcp_found.remotes.clone(),
+                ..Default::default()
+            };
+            cplt::mcp_broker::drop_writable(&mut f, &home_dir, |p| {
+                cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree)
+            });
+            for r in &f.rejected {
+                ui::warn(&r.line());
+            }
+            f.remotes.into_iter().next()
+        };
         if resolved.github_mcp_proxy {
             let reaches = |v: &str| {
                 !resolved.deny_env.iter().any(|d| d == v)
@@ -5572,6 +5591,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 reaches,
                 proxy_handle.as_ref().map(|h| h.port),
                 cplt::discover::stored_gh_secret,
+                github_spec.as_ref(),
             );
         }
         // These variables carry the session's isolation; dropping them would

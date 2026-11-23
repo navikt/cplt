@@ -75,48 +75,60 @@ impl Rejected {
 /// server and probe read its login and config there, so a session grant
 /// over them (#1061) would let the agent read the login and rewrite the
 /// config. The grant wins and the server is dropped, with a line naming it.
+/// Remote specs (#909) go through the same checks.
 /// Returns the newly rejected, already printed.
 pub fn drop_writable(
     found: &mut Detected,
     home: &Path,
     writable: impl Fn(&Path) -> Option<PathBuf>,
 ) {
-    let mut kept = Vec::new();
-    for spec in std::mem::take(&mut found.specs) {
-        if let Some(tree) = writable(&spec.file) {
-            found.rejected.push(Rejected {
-                file: spec.file.display().to_string(),
-                reason: format!("{} is writable in the sandbox", tree.display()),
-                fix: format!(
-                    "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
-                    tree.display()
-                ),
-            });
-            continue;
+    for remote in [false, true] {
+        let list = if remote {
+            &mut found.remotes
+        } else {
+            &mut found.specs
+        };
+        let mut kept = Vec::new();
+        for spec in std::mem::take(list) {
+            if let Some(tree) = writable(&spec.file) {
+                found.rejected.push(Rejected {
+                    file: spec.file.display().to_string(),
+                    reason: format!("{} is writable in the sandbox", tree.display()),
+                    fix: format!(
+                        "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
+                        tree.display()
+                    ),
+                });
+                continue;
+            }
+            let hit = spec
+                .credential
+                .host_write_dirs(home)
+                .into_iter()
+                .find_map(|d| writable(&d).map(|tree| (d, tree)));
+            match hit {
+                None => kept.push(spec),
+                Some((dir, tree)) => found.rejected.push(Rejected {
+                    file: spec.file.display().to_string(),
+                    reason: format!(
+                        "the {} login dir {} is writable in the sandbox (grant: {})",
+                        spec.credential.name,
+                        dir.display(),
+                        tree.display()
+                    ),
+                    fix: format!(
+                        "drop the write grant on {} to use this server; the grant wins and the server is off",
+                        tree.display()
+                    ),
+                }),
+            }
         }
-        let hit = spec
-            .credential
-            .host_write_dirs(home)
-            .into_iter()
-            .find_map(|d| writable(&d).map(|tree| (d, tree)));
-        match hit {
-            None => kept.push(spec),
-            Some((dir, tree)) => found.rejected.push(Rejected {
-                file: spec.file.display().to_string(),
-                reason: format!(
-                    "the {} login dir {} is writable in the sandbox (grant: {})",
-                    spec.credential.name,
-                    dir.display(),
-                    tree.display()
-                ),
-                fix: format!(
-                    "drop the write grant on {} to use this server; the grant wins and the server is off",
-                    tree.display()
-                ),
-            }),
-        }
+        *if remote {
+            &mut found.remotes
+        } else {
+            &mut found.specs
+        } = kept;
     }
-    found.specs = kept;
 }
 
 #[derive(Deserialize)]
@@ -660,9 +672,20 @@ pub(crate) fn check_host(host: &str) -> Result<(), String> {
 #[derive(Default)]
 pub struct Detected {
     pub specs: Vec<Spec>,
+    /// Remote gh-token specs (#909), only with the remote gate on.
+    pub remotes: Vec<Spec>,
     pub rejected: Vec<Rejected>,
     /// Skipped by `--no-mcp-broker`.
     pub disabled: Vec<String>,
+}
+
+impl Detected {
+    /// The GitHub MCP toggles (`sandbox.github_mcp_proxy = false`,
+    /// `--no-github-mcp-proxy`) alias the remote specs' `disabled[]` ids.
+    pub fn disable_remotes(&mut self) {
+        let off = std::mem::take(&mut self.remotes);
+        self.disabled.extend(off.into_iter().map(|s| s.id));
+    }
 }
 
 /// Load every spec in `dir`. A file in `writable` (a tree the sandbox can
@@ -756,12 +779,6 @@ pub(crate) fn load_with_gate(
                             .into(),
                         "remove the spec until cplt supports oauth login".into(),
                     )),
-                    // ponytail: the gh-token remote leg exists (#909 PR2); no
-                    // client is pointed at it until PR3/PR4.
-                    Ok(spec) if spec.remote.is_some() => Err((
-                        "gh-token remotes are validated but not served to a client yet".into(),
-                        "remove the spec until cplt wires the GitHub MCP broker".into(),
-                    )),
                     Ok(spec) => Ok(spec),
                     Err(r) => Err((r, enable())),
                 },
@@ -774,7 +791,13 @@ pub(crate) fn load_with_gate(
             Ok(spec) if !seen.insert(spec.id.clone()) => {}
             Ok(mut spec) => {
                 spec.file.clone_from(&path);
-                out.specs.push(spec);
+                // A remote (only gh-token gets here) is served on the proxy
+                // port, never spawned by the stdio broker.
+                if spec.remote.is_some() {
+                    out.remotes.push(spec);
+                } else {
+                    out.specs.push(spec);
+                }
             }
             Err((reason, fix)) => {
                 out.rejected.push(Rejected {
@@ -1426,16 +1449,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn load_does_not_serve_a_gh_token_remote_yet() {
+    fn load_keeps_a_gh_token_remote_apart_from_the_stdio_specs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FILE), gh_root().to_string()).unwrap();
         let found = load_with_gate(dir.path(), &[], &[], |_| None, true);
-        assert!(found.specs.is_empty());
-        assert!(
-            found.rejected[0].reason.contains("gh-token remotes"),
-            "{}",
-            found.rejected[0].reason
-        );
+        assert!(found.specs.is_empty() && found.rejected.is_empty());
+        assert_eq!(found.remotes.len(), 1);
+        // A writable spec dir drops it like any other spec.
+        let mut f = load_with_gate(dir.path(), &[], &[], |_| None, true);
+        drop_writable(&mut f, |_| Some(PathBuf::from("/w")));
+        assert!(f.remotes.is_empty() && f.rejected.len() == 1);
+        // --no-mcp-broker <id> turns it off.
+        let id = found.remotes[0].id.clone();
+        let off = load_with_gate(dir.path(), &[], std::slice::from_ref(&id), |_| None, true);
+        assert!(off.remotes.is_empty() && off.disabled == [id.clone()]);
+        // So does the GitHub MCP toggle, as the same disabled id.
+        let mut f = load_with_gate(dir.path(), &[], &[], |_| None, true);
+        f.disable_remotes();
+        assert!(f.remotes.is_empty() && f.disabled == [id]);
         let found = load_with_gate(dir.path(), &[], &[], |_| None, false);
         assert!(found.rejected[0].reason.contains("not brokered yet"));
     }

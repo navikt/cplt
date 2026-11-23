@@ -24,6 +24,10 @@ pub fn status_json(
     off_reason: Option<&str>,
     clients: &[&str],
 ) -> Value {
+    // Remote specs are served on the proxy port, so the stdio broker's
+    // platform refusal does not reach them.
+    let remote_on = enabled;
+    let enabled = enabled && supported;
     let mut servers: Vec<Value> = found
         .specs
         .iter()
@@ -45,6 +49,31 @@ pub fn status_json(
             })
         })
         .collect();
+    // A gh-token remote (#909) reaches OpenCode v2 only, for now.
+    let remote_clients: Vec<&str> = clients
+        .iter()
+        .copied()
+        .filter(|c| remote_on && *c == "opencode")
+        .collect();
+    servers.extend(found.remotes.iter().map(|s| {
+        let (ok, note) = if probe {
+            credential_ok(s)
+        } else {
+            (None, None)
+        };
+        json!({
+            "id": s.id,
+            "state": if remote_clients.is_empty() { "off" } else { "brokered" },
+            "transport": "http",
+            "mechanism": s.credential.name,
+            "credential": s.credential,
+            "credential_ok": ok,
+            "credential_note": note,
+            "egress_hosts": s.egress_hosts,
+            "tools_allowed": s.allow.len(),
+            "clients": remote_clients,
+        })
+    }));
     servers.extend(found.disabled.iter().map(|id| {
         // Skipped before loading: nothing else is known about it.
         json!({
@@ -82,15 +111,7 @@ pub fn run_status(
     clients: &[&str],
 ) -> ExitCode {
     let supported = refusal.is_none();
-    let status = status_json(
-        found,
-        project,
-        enabled && supported,
-        true,
-        supported,
-        refusal,
-        clients,
-    );
+    let status = status_json(found, project, enabled, true, supported, refusal, clients);
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
@@ -139,5 +160,36 @@ mod tests {
         }
         assert_eq!(row["state"], "off");
         assert_eq!(row["clients"], json!([]));
+    }
+
+    /// #909: a gh-token remote is listed with its mechanism and egress
+    /// host, served to OpenCode only, and the stdio refusal does not hide it.
+    #[test]
+    fn gh_token_remote_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::mcp_broker::spec::tests::gh_root();
+        std::fs::write(
+            dir.path().join(crate::mcp_broker::test_util::FILE),
+            root.to_string(),
+        )
+        .unwrap();
+        let found = crate::mcp_broker::spec::load_with_gate(dir.path(), &[], &[], |_| None, true);
+        let v = status_json(
+            &found,
+            None,
+            true,
+            false,
+            false,
+            Some("no"),
+            &["copilot", "opencode"],
+        );
+        let row = &v["servers"][0];
+        assert_eq!(row["mechanism"], "gh-token");
+        assert_eq!(row["state"], "brokered");
+        assert_eq!(row["transport"], "http");
+        assert_eq!(row["egress_hosts"], json!(["api.githubcopilot.com"]));
+        assert_eq!(row["clients"], json!(["opencode"]));
+        let v = status_json(&found, None, true, false, true, None, &["copilot"]);
+        assert_eq!(v["servers"][0]["state"], "off");
     }
 }

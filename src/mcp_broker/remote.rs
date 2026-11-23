@@ -252,6 +252,30 @@ pub(crate) fn remote_endpoints(
         .collect()
 }
 
+/// The endpoint for a gh-token remote spec (#909), with the token the
+/// launch already looked up: the spec's forced headers, timeout and
+/// `tools.allow`, on the same secret-path seam as the built-in one.
+pub(crate) fn spec_endpoint(
+    spec: &Spec,
+    token: SecretToken,
+    curl: PathBuf,
+    secret: &str,
+) -> Result<Endpoint, String> {
+    struct Held(std::cell::Cell<Option<SecretToken>>);
+    impl CredentialSource for Held {
+        fn bearer(&self) -> Option<SecretToken> {
+            self.0.take()
+        }
+    }
+    for_spec(spec, &Held(Some(token).into()), curl, secret)
+}
+
+/// Serve [`spec_endpoint`] at `/<secret>` on the running proxy.
+pub fn install_spec(spec: &Spec, token: SecretToken, secret: &str) -> Result<(), String> {
+    let curl = crate::git::trusted_binary("curl").ok_or("no curl in the trusted dirs")?;
+    install_endpoint(spec_endpoint(spec, token, curl, secret)?)
+}
+
 /// ponytail: one endpoint per process, which is one cplt session; a
 /// per-proxy field would be needed to serve two.
 static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
@@ -1718,6 +1742,51 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
     }
 
     const CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#;
+
+    /// #909 PR3, under the gate: the spec a launch loads (gh-token, allow
+    /// `get_me`) built into the endpoint OpenCode v2 is pointed at. The
+    /// allowed read tool reaches upstream; a write tool is refused before
+    /// curl runs; each tools/call writes exactly one audit line.
+    #[test]
+    fn gated_gh_token_spec_endpoint_allows_reads_and_refuses_writes() {
+        let Some(curl) = real_curl() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::mcp_broker::spec::tests::gh_root();
+        std::fs::write(
+            dir.path().join(crate::mcp_broker::test_util::FILE),
+            root.to_string(),
+        )
+        .unwrap();
+        let found = crate::mcp_broker::spec::load_with_gate(dir.path(), &[], &[], |_| None, true);
+        let spec = &found.remotes[0];
+        let (url, got) = fake_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":1}}",
+        );
+        let mut ep = spec_endpoint(spec, SecretToken::new("T".into()), curl, "s").unwrap();
+        assert_eq!(ep.path, "/s");
+        assert!(ep.policy.is_some() && ep.tag == spec.id);
+        ep.upstream = url;
+        let (reply, log) = serve_on(&ep, "POST", CALL);
+        let sent = got.recv().unwrap();
+        assert!(sent.contains("Authorization: Bearer T"), "{sent}");
+        assert!(sent.contains("X-MCP-Readonly: true") && sent.contains("X-MCP-Lockdown: true"));
+        assert!(
+            reply.starts_with("HTTP/1.1 200") && reply.contains("\"x\":1"),
+            "{reply}"
+        );
+        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert!(log.contains("tools/call get_me → ALLOWED "), "{log}");
+
+        let write = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issue","arguments":{}}}"#;
+        let (reply, log) = serve_on(&ep, "POST", write);
+        assert!(reply.contains("\"error\""), "{reply}");
+        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert!(
+            log.contains("create_issue") && log.contains("DENIED"),
+            "{log}"
+        );
+        assert!(got.try_recv().is_err(), "the write reached upstream");
+    }
 
     /// A failed call is audited by name, once.
     #[test]
