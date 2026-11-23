@@ -1216,15 +1216,23 @@ fn handle_connection(
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
         classification.complete(None);
-        // An origin-form path may be a near miss of the MCP endpoint's secret
-        // path (`/<secret>?x=1`); never write it to a log.
-        let logged = if target.starts_with('/') {
-            "/<redacted>"
-        } else {
-            target
-        };
-        log_connection(state, None, method, logged, "UNSUPPORTED");
+        // Any request form can carry the MCP endpoint's secret path
+        // (origin-form `/<secret>`, absolute-form `http://host/<secret>`);
+        // never write an unsupported target to a log.
+        log_connection(state, None, method, "<redacted>", "UNSUPPORTED");
         reject(&mut client, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+    }
+}
+
+/// A malformed CONNECT target with a path, query or fragment may carry the
+/// MCP endpoint's secret path; log only what precedes it. Other malformed
+/// targets stay in the log (escaped) as evidence.
+fn bad_connect_target(target: &str) -> std::borrow::Cow<'_, str> {
+    // Search after any userinfo: `log_connection` redacts up to the last `@`.
+    let start = target.rfind('@').map_or(0, |i| i + 1);
+    match target[start..].find(['/', '?', '#']) {
+        Some(i) => format!("{}/<redacted>", &target[..start + i]).into(),
+        None => target.into(),
     }
 }
 
@@ -1587,7 +1595,13 @@ fn handle_connect(
                 (h, port)
             }
             _ => {
-                log_connection(state, Some(classification), "CONNECT", target, "BLOCKED");
+                log_connection(
+                    state,
+                    Some(classification),
+                    "CONNECT",
+                    &bad_connect_target(target),
+                    "BLOCKED",
+                );
                 reject(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n");
                 return;
             }
@@ -1602,7 +1616,13 @@ fn handle_connect(
         || host.contains(['@', '/', '\\', '?', '#'])
         || host.chars().any(char::is_control)
     {
-        log_connection(state, Some(classification), "CONNECT", target, "BLOCKED");
+        log_connection(
+            state,
+            Some(classification),
+            "CONNECT",
+            &bad_connect_target(target),
+            "BLOCKED",
+        );
         reject(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n");
         return;
     }
@@ -4648,6 +4668,64 @@ mod tests {
     /// Without the escaping, `\x1b[2K\r` in a CONNECT target reaches the
     /// user's terminal intact and erases the BLOCKED lines they are watching —
     /// including the one this very request produces.
+    /// Unsupported requests and malformed CONNECT targets must never write a
+    /// path to the audit log, whatever the request form.
+    #[test]
+    fn proxy_log_redacts_unsupported_and_bad_connect_paths() {
+        require_localhost_tcp!();
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        let resolver: ResolverFn = Arc::new(|_h: &str, _p: u16| None);
+        let proxy = start(ProxyOptions {
+            port: 0,
+            blocked_file: None,
+            allowed_ports: vec![443, 80],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
+            default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
+            cli_private_domains: Vec::new(),
+            config_private_domains: Vec::new(),
+            repo_private_domains: Vec::new(),
+            config_file: None,
+            log_file: Some(log.clone()),
+            log_level: ProxyLogLevel::All,
+            timeout: Duration::from_secs(5),
+            upstream: None,
+            upstream_no_proxy: Vec::new(),
+            resolver: Some(resolver),
+        })
+        .expect("proxy start failed");
+
+        let lines = [
+            "GET /s3cretpath?x=1 HTTP/1.1",
+            "GET http://127.0.0.1:8080/s3cretpath?x=1 HTTP/1.1",
+            "OPTIONS * HTTP/1.1",
+            "CONNECT /s3cretpath HTTP/1.1",
+            "CONNECT host.example:443/s3cretpath HTTP/1.1",
+        ];
+        for line in lines {
+            let mut conn =
+                std::net::TcpStream::connect(format!("127.0.0.1:{}", proxy.port)).unwrap();
+            let _ = conn.write_all(format!("{line}\r\nHost: x\r\n\r\n").as_bytes());
+            let mut drain = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut conn, &mut drain);
+        }
+        proxy.shutdown();
+
+        let text = std::fs::read_to_string(&log).expect("audit log must exist");
+        assert_eq!(text.lines().count(), lines.len(), "one line each: {text:?}");
+        assert!(
+            !text.contains("s3cretpath"),
+            "path reached the log: {text:?}"
+        );
+    }
+
     #[test]
     fn proxy_log_sinks_escape_control_characters() {
         require_localhost_tcp!();
