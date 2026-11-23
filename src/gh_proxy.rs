@@ -111,7 +111,12 @@ fn github_token_allowed_for(
         || host_pin.is_some_and(|h| foreign(h) || not_github(h))
         // Any named host but github.com: GHES never needs this token, and
         // localhost or a `*.ghe.com` tenant would receive it (#1049).
-        || requested_hostname(args).is_some_and(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
+        // Every named host counts, not just the one gh keeps; and a `gh auth`
+        // argv the scan cannot read gets no token either.
+        || {
+            let (named, ambiguous) = scan_hostnames(args);
+            ambiguous || named.iter().any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
+        }
     {
         return false;
     }
@@ -3353,32 +3358,105 @@ pub fn check_merge_protection(
 
 /// Every `--hostname` value, in order. gh (pflag) keeps the LAST one.
 ///
-/// Under `gh auth` the shorthand `-h` is `--hostname` too (elsewhere it is
-/// help), alone, as `-h=x`/`-hx`, or at the end of a bool cluster like `-ah`.
-/// Missing it let `gh auth status -h x.ghe.com` past the host checks with the
-/// github.com token (#1049).
+/// Under `gh auth <subcommand>` the shorthand `-h` is `--hostname` too
+/// (elsewhere, and for the bare `gh auth -h` group, it is help): alone, as
+/// `-h=x`/`-hx`, or at the end of a bool cluster like `-ah`. Missing it let
+/// `gh auth status -h x.ghe.com` past the host checks with the github.com token
+/// (#1049).
 fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
-    // Every `gh auth` subcommand but `git-credential` binds `-h` to `--hostname`.
-    let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
-    let auth = positional.next() == Some("auth") && positional.next() != Some("git-credential");
+    scan_hostnames(args).0
+}
+
+/// [`requested_hostnames`], plus whether the scan met a `gh auth` flag it does
+/// not know, so it cannot tell a value from a flag. The token check withholds
+/// the token then; the gate does not refuse on it alone.
+///
+/// The `gh auth` flag tables are the union over `gh auth <cmd> --help` for
+/// login, logout, refresh, setup-git, status, switch and token. No letter means
+/// one thing in one subcommand and another elsewhere. A value-taking flag eats
+/// the rest of its cluster or the next argument, so `--jq '-length'` or
+/// `-uother` is never read as `-h`. pflag stops at `--`, and so does this.
+fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
+    const AUTH_SUBCOMMANDS: &[&str] = &[
+        "login",
+        "logout",
+        "refresh",
+        "setup-git",
+        "status",
+        "switch",
+        "token",
+    ];
+    const AUTH_SHORT_VALUE: &str = "hprsu";
+    const AUTH_SHORT_BOOL: &str = "acftw";
+    const AUTH_LONG_VALUE: &[&str] = &[
+        "hostname",
+        "git-protocol",
+        "scopes",
+        "remove-scopes",
+        "user",
+        "jq",
+        "json",
+        "template",
+    ];
+    const AUTH_LONG_BOOL: &[&str] = &[
+        "clipboard",
+        "expiring",
+        "insecure-storage",
+        "skip-ssh-key",
+        "web",
+        "with-token",
+        "reset-scopes",
+        "force",
+        "active",
+        "no-refresh",
+        "show-token",
+        "help",
+    ];
+    // `gh auth git-credential` and the bare group are not `-h`-is-hostname.
+    let auth =
+        args.first() == Some(&"auth") && args.get(1).is_some_and(|s| AUTH_SUBCOMMANDS.contains(s));
     let mut found = Vec::new();
-    for (index, arg) in args.iter().enumerate() {
-        let next = || args.get(index + 1).copied().unwrap_or("");
-        if let Some(hostname) = arg.strip_prefix("--hostname=") {
-            found.push(hostname);
-        } else if *arg == "--hostname" {
-            found.push(next());
-        } else if auth
-            && !arg.starts_with("--")
-            && let Some(cluster) = arg.strip_prefix('-')
-            && let Some(pos) = cluster.find('h')
-        {
-            let value = &cluster[pos + 1..];
-            let value = value.strip_prefix('=').unwrap_or(value);
-            found.push(if value.is_empty() { next() } else { value });
+    let mut ambiguous = false;
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            if name == "hostname" {
+                found.push(inline.unwrap_or_else(|| iter.next().unwrap_or("")));
+            } else if auth && AUTH_LONG_VALUE.contains(&name) {
+                if inline.is_none() {
+                    iter.next();
+                }
+            } else if auth && !AUTH_LONG_BOOL.contains(&name) {
+                ambiguous = true;
+            }
+        } else if auth && let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
+            for (pos, c) in cluster.char_indices() {
+                if AUTH_SHORT_VALUE.contains(c) {
+                    let value = &cluster[pos + 1..];
+                    let value = value.strip_prefix('=').unwrap_or(value);
+                    let value = if value.is_empty() {
+                        iter.next().unwrap_or("")
+                    } else {
+                        value
+                    };
+                    if c == 'h' {
+                        found.push(value);
+                    }
+                    break;
+                } else if !AUTH_SHORT_BOOL.contains(c) {
+                    ambiguous = true;
+                    break;
+                }
+            }
         }
     }
-    found
+    (found, ambiguous)
 }
 
 /// The `--hostname` gh will use: the last one, as pflag reads it. The gate
@@ -12031,5 +12109,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(refusal.headline.contains("evil.ghe.com"), "{refusal}");
+    }
+
+    /// Review of #1070: option values are not flag clusters, `gh auth -h` is
+    /// group help, `--` ends flags, and every named host counts.
+    #[test]
+    fn auth_hostname_scan_reads_values_and_stops_at_dashdash() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        let policy = GatePolicy {
+            scope_check: true,
+            ..GatePolicy::default()
+        };
+        // Not refused over a hostname (other policy, like block_auth_token, may still apply).
+        let host_ok = |args: &[&str]| {
+            gate_with_repo_scope(args, &policy, &["o/r".to_string()], None)
+                .err()
+                .is_none_or(|r| !r.headline.contains("host") && !r.headline.contains("''"))
+        };
+
+        // Values of value-taking flags are not `-h` clusters.
+        let jq = ["auth", "status", "--json", "hosts", "--jq", "-length"];
+        assert!(requested_hostnames(&jq).is_empty());
+        assert!(host_ok(&jq));
+        assert!(ok(&jq));
+        let user = ["auth", "token", "-hgithub.com", "-uother"];
+        assert_eq!(requested_hostnames(&user), vec!["github.com"]);
+        assert_eq!(
+            requested_hostnames(&["auth", "logout", "-u", "-h"]),
+            Vec::<&str>::new()
+        );
+
+        // `gh auth -h` is group help, as on main.
+        assert!(requested_hostnames(&["auth", "-h"]).is_empty());
+        assert!(host_ok(&["auth", "-h"]));
+
+        // pflag stops at `--`; withhold if any named host is not github.com.
+        let dashdash = [
+            "auth",
+            "status",
+            "-h",
+            "evil.ghe.com",
+            "--",
+            "--hostname",
+            "github.com",
+        ];
+        assert_eq!(requested_hostnames(&dashdash), vec!["evil.ghe.com"]);
+        assert!(!ok(&dashdash));
+        assert!(!ok(&[
+            "auth",
+            "status",
+            "-h",
+            "evil.ghe.com",
+            "--hostname",
+            "github.com"
+        ]));
+
+        // An unknown `gh auth` flag is ambiguous: no token, but no refusal.
+        let unknown = ["auth", "status", "-zh", "evil.ghe.com"];
+        assert!(!ok(&unknown));
+        assert!(!ok(&["auth", "status", "--bogus", "-h", "evil.ghe.com"]));
     }
 }
