@@ -5544,6 +5544,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
             ui::warn(&w);
         }
+        if let Some(w) = cplt::doctor::opencode_v2_auth_content_note(&resolved.pass_env) {
+            ui::warn(w);
+        }
     }
 
     // #732: a repository nobody approved does not get to configure OpenCode.
@@ -10235,21 +10238,37 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // ── settings and auth: the launch's own Keychain/token decision ──
     println!(
         "settings:    {}",
-        doctor::settings_line(&resolved, active_agent, configured_quiet)
+        doctor::settings_line(
+            &resolved,
+            active_agent,
+            configured_quiet,
+            cfg!(target_os = "linux")
+        )
     );
     let macos = cfg!(target_os = "macos");
-    // Copilot's token variables are in ENV_ALLOWLIST; Claude's reaches the
-    // agent only through the Keychain trade, which `keychain_substitute` covers.
-    let token_vars: &[&str] = if active_agent == agent::Agent::Copilot {
-        active_agent.keychain_substitute_env_vars()
-    } else {
-        &[]
+    // Copilot's token variables are in ENV_ALLOWLIST; another agent gets a
+    // token variable only through --pass-env (or --inherit-env) (#1066).
+    let passed = |v: &str| {
+        active_agent == agent::Agent::Copilot
+            || resolved.inherit_env
+            || resolved.pass_env.iter().any(|p| p == v)
     };
-    let env_token = token_vars
+    let env_token = active_agent
+        .keychain_substitute_env_vars()
         .iter()
+        .chain(&["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"])
         .copied()
-        .filter(|v| !resolved.deny_env.iter().any(|d| d == v))
+        .filter(|v| passed(v) && !resolved.deny_env.iter().any(|d| d == v))
         .find(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()));
+    let trusted_gh = cplt::git::trusted_binary("gh").is_some();
+    let opencode_v2 = active_agent == agent::Agent::OpenCode
+        && agent_bin_result
+            .as_ref()
+            .is_ok_and(|bin| agent::is_opencode_v2(bin, &home_dir) != Some(false));
+    if opencode_v2 && let Some(note) = doctor::opencode_v2_auth_content_note(&resolved.pass_env) {
+        findings.push(Finding::warning(note, None));
+    }
+    let denied = |v: &str| resolved.deny_env.iter().any(|d| d == v);
     let claude_nudge = cplt::sandbox::claude_keychain_nudge(
         active_agent,
         resolved.keychain_substitute,
@@ -10275,6 +10294,20 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             env_token,
             gh_login: auth.gh_cli_auth,
             other_login: !auth.keytar_nodes.is_empty(),
+            gh_handover_blocked: (!macos && active_agent == agent::Agent::Copilot)
+                .then(|| doctor::gh_handover_blocked(&resolved, trusted_gh))
+                .flatten(),
+            // Same conditions as the launch's `opencode_handover_applies`.
+            opencode_handover: active_agent == agent::Agent::OpenCode
+                && !opencode_v2
+                && auth.gh_cli_auth
+                && env_token.is_none()
+                && resolved.gh_guard.enabled
+                && resolved.scratch_dir
+                && trusted_gh
+                && !denied("GH_TOKEN")
+                && !denied("OPENCODE_AUTH_CONTENT")
+                && !passed("OPENCODE_AUTH_CONTENT"),
         },
         &home_dir,
     );

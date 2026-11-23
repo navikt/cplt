@@ -538,6 +538,26 @@ thread_local! {
     static FAKE_GH_TOKEN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Sets [`FAKE_GH_TOKEN`] and clears it on drop, so a failing test cannot
+/// leave it set for the next test on the same thread.
+#[cfg(test)]
+struct FakeGhToken;
+
+#[cfg(test)]
+impl FakeGhToken {
+    fn set(token: &str) -> Self {
+        FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some(token.into()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakeGhToken {
+    fn drop(&mut self) {
+        FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
+    }
+}
+
 /// Whether the child will already have a usable GitHub token in its own
 /// environment, making extraction unnecessary.
 ///
@@ -3063,7 +3083,7 @@ echo "failed to read keyring" >&2; exit 1"#,
                 ("COPILOT_GITHUB_TOKEN", None),
             ],
             || {
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                let _fake = FakeGhToken::set("ghp_fake");
                 let ss = crate::agent::KeychainSubstitute::SecretService(
                     crate::agent::SecretToken::new("t".into()),
                 );
@@ -3076,7 +3096,6 @@ echo "failed to read keyring" >&2; exit 1"#,
                     child_env_has_gh_token(&cmd, &[], false),
                     "control: injected"
                 );
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
             },
         );
     }
@@ -3097,7 +3116,7 @@ echo "failed to read keyring" >&2; exit 1"#,
                 ("COPILOT_GITHUB_TOKEN", None),
             ],
             || {
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                let _fake = FakeGhToken::set("ghp_fake");
                 for (preset, want) in [(true, false), (false, true)] {
                     let scratch = tempfile::tempdir().unwrap();
                     let mut cmd = Command::new("true");
@@ -3121,7 +3140,6 @@ echo "failed to read keyring" >&2; exit 1"#,
                         "preset={preset}"
                     );
                 }
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
             },
         );
     }
@@ -3479,7 +3497,8 @@ mod keychain_substitute_tests {
         });
     }
 
-    /// OpenCode v2: a user-passed OPENCODE_AUTH_CONTENT is kept (SECURITY.md).
+    /// A user-passed OPENCODE_AUTH_CONTENT is kept on OpenCode 1.x and removed
+    /// on v2, which never reads it (#716/#729).
     #[test]
     fn session_env_keeps_user_opencode_auth_content_on_v1_only() {
         let mut v1 = Command::new("true");
