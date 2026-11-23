@@ -1797,8 +1797,11 @@ fn handle_connect(
                 target,
                 refusal.status(),
             );
-            if refusal == Refusal::ResolvedPrivate && state.log_level.should_log(refusal.status()) {
-                eprintln!("{}", private_resolved_hint(&host));
+            if refusal == Refusal::ResolvedPrivate
+                && state.log_level.should_log(refusal.status())
+                && first_hint_for(&host)
+            {
+                eprintln!("{}", private_resolved_hint(&host, &resolved));
             }
             reject(&mut client, refusal.response());
         }
@@ -2503,22 +2506,53 @@ impl Refusal {
     }
 }
 
-/// The terminal line printed after a `BLOCKED-PRIVATE-RESOLVED` verdict: the
-/// exact command that waives the guard for this host. A hint only, it grants
-/// nothing. `host` is agent-controlled, so the copy-pasteable command is only
-/// shown for a plain DNS name; anything else gets the generic advice.
-pub(crate) fn private_resolved_hint(host: &str) -> String {
-    let plain = !host.is_empty()
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
-    if plain {
-        format!(
-            "[proxy] {host} resolved to a private IP. If it is a trusted internal host, allow it (and its subdomains) with:\n  cplt config set proxy.allow_private_domains {host}\n  or for this run only: cplt --allow-private-domain {host}"
-        )
-    } else {
-        "[proxy] Resolved to a private IP. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain).".to_string()
+/// A syntactically valid DNS name: dotted, labels 1-63 of `[a-z0-9-]` not
+/// starting or ending with `-`, first char alphanumeric, total <= 253. Rules out
+/// option-shaped input such as `--unset` before it reaches a pasted command.
+fn is_plain_dns_name(host: &str) -> bool {
+    host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(|l| {
+            (1..=63).contains(&l.len())
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// The terminal line printed after a `BLOCKED-PRIVATE-RESOLVED` verdict. A hint
+/// only, it grants nothing. `host` is agent-controlled, and the waiver also
+/// lifts loopback and link-local (cloud metadata), so a paste-ready command is
+/// shown only for a valid DNS name whose every resolved address is RFC 1918 /
+/// unique-local; that address is named so the user sees what they are allowing.
+pub(crate) fn private_resolved_hint(host: &str, resolved: &[std::net::SocketAddr]) -> String {
+    use std::net::IpAddr;
+    let generic = "[proxy] Resolved to a private IP. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain). Applies to the next launch.".to_string();
+    let ordinary = |ip: IpAddr| match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    };
+    if !is_plain_dns_name(host) || resolved.is_empty() || !resolved.iter().all(|a| ordinary(a.ip()))
+    {
+        return generic;
     }
+    let ip = resolved[0].ip().to_canonical();
+    format!(
+        "[proxy] {host} resolved to private address {ip}. If it is a trusted internal host, allow it (and its subdomains, and any address it resolves to) with:\n  cplt config set proxy.allow_private_domains {host}   (applies to the next launch)\n  or for this run only: cplt --allow-private-domain {host}"
+    )
+}
+
+/// True the first time `host` is hinted in this process, so a retry loop does
+/// not flood the terminal.
+fn first_hint_for(host: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.len() < 1024 && seen.insert(host.to_string())
 }
 
 /// What to do with a CONNECT target once DNS has answered.
@@ -2865,16 +2899,64 @@ mod tests {
     /// `classify_resolved`. A repository URL written as `https://10.20.30.40/...`
     /// therefore has no remedy short of giving the host a DNS name.
     #[test]
-    fn private_resolved_hint_names_host_and_exact_fix() {
-        let hint = private_resolved_hint("svc.intern.example.com");
+    fn private_resolved_hint_names_host_ip_and_exact_fix() {
+        let ip = ["10.1.2.3:443".parse().unwrap()];
+        let hint = private_resolved_hint("svc.intern.example.com", &ip);
         assert!(
             hint.contains("cplt config set proxy.allow_private_domains svc.intern.example.com")
         );
         assert!(hint.contains("cplt --allow-private-domain svc.intern.example.com"));
-        // Agent-controlled junk never lands in a copy-pasteable command.
-        let odd = private_resolved_hint("evil.com;rm -rf ~");
+        assert!(hint.contains("10.1.2.3"));
+        assert!(hint.contains("next launch"));
+        let odd = private_resolved_hint("evil.com;rm -rf ~", &ip);
         assert!(!odd.contains("rm -rf"));
         assert!(!odd.contains("cplt config set"));
+    }
+
+    #[test]
+    fn private_resolved_hint_rejects_option_shaped_and_malformed_hosts() {
+        let ip = ["10.1.2.3:443".parse().unwrap()];
+        for bad in [
+            "--unset",
+            "-x.example",
+            ".example",
+            "--inherit-env.evil.com",
+            "nodot",
+            "a..b",
+            "x-.example",
+            &format!("{}.example", "a".repeat(64)),
+        ] {
+            assert!(
+                !private_resolved_hint(bad, &ip).contains("cplt config set"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_resolved_hint_gives_no_command_for_loopback_or_link_local() {
+        for a in [
+            "127.0.0.1:443",
+            "169.254.169.254:443",
+            "[::1]:443",
+            "[fe80::1]:443",
+        ] {
+            let r = [a.parse().unwrap()];
+            let h = private_resolved_hint("svc.intern.example.com", &r);
+            assert!(!h.contains("cplt config set"), "{a}");
+        }
+        // One bad address among good ones is enough to withhold the command.
+        let mixed = [
+            "10.0.0.1:443".parse().unwrap(),
+            "169.254.169.254:443".parse().unwrap(),
+        ];
+        assert!(!private_resolved_hint("svc.example.com", &mixed).contains("cplt config set"));
+    }
+
+    #[test]
+    fn private_hint_prints_once_per_host() {
+        assert!(first_hint_for("dedupe-test.example.com"));
+        assert!(!first_hint_for("dedupe-test.example.com"));
     }
 
     #[test]
