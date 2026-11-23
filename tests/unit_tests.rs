@@ -11657,6 +11657,23 @@ fn profile_denies_write_to_cplt_config_dir() {
     );
 }
 
+/// #1058: the brokered MCP child's temp dir lives under
+/// `~/.config/cplt/mcp-tmp`; every agent profile must deny it, read and write,
+/// with no allow rule naming it.
+#[test]
+fn profile_denies_mcp_child_temp_dir() {
+    let p = generate_profile(&base_profile_options(), &[]);
+    for op in ["file-read*", "file-write*"] {
+        assert!(
+            p.contains(&format!(
+                "(deny {op} (subpath \"/Users/test/.config/cplt\"))"
+            )),
+            "{op} on ~/.config/cplt/mcp-tmp must be denied"
+        );
+    }
+    assert!(!p.contains("mcp-tmp"), "no rule may name mcp-tmp: {p}");
+}
+
 // ============================================================
 // build_sandbox_env — JVM proxy system properties (JAVA_TOOL_OPTIONS)
 // ============================================================
