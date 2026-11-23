@@ -85,7 +85,8 @@ pub fn gh_hosts() -> &'static [String] {
 /// non-github.com pin or a `--hostname` naming one. `auth git-credential`, whose
 /// host arrives on stdin, is decided strictly by
 /// [`credential_stdin_allows_github_token`], so this helper fails closed for it.
-/// With `gh_guard.hosts` unset every other exec gets the token, as before.
+/// A `--hostname` (or `-h` under `gh auth`) naming any host but github.com
+/// gets no token, whatever `gh_guard.hosts` says.
 #[must_use]
 pub fn github_token_allowed(args: &[&str], pin: Option<&str>, host_pin: Option<&str>) -> bool {
     github_token_allowed_for(args, pin, host_pin, gh_hosts())
@@ -108,7 +109,9 @@ fn github_token_allowed_for(
     let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
     if pin.and_then(foreign_pin_host).is_some_and(foreign)
         || host_pin.is_some_and(|h| foreign(h) || not_github(h))
-        || requested_hostname(args).is_some_and(foreign)
+        // Any named host but github.com: GHES never needs this token, and
+        // localhost or a `*.ghe.com` tenant would receive it (#1049).
+        || requested_hostname(args).is_some_and(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
     {
         return false;
     }
@@ -1922,10 +1925,41 @@ pub fn repos_match(left: &str, right: &str) -> bool {
 /// block the policy would otherwise imply (#440). It lived only in `main.rs`,
 /// so the library surface could not see it — the same shape as the other four
 /// cases where `check exec` answered from fewer inputs than the launch has.
+///
+/// The cached token is the github.com token of the active account, so only the
+/// argv that asks for exactly that qualifies: `auth token`, optionally with
+/// `--hostname github.com` and `--no-refresh`. `--user`, another host, `--help`
+/// or anything unknown falls through to the gate, which refuses it, so the
+/// one-time cache is never spent on (or handed to) a different request (#1047).
 #[must_use]
 pub fn is_auth_token_request(args: &[&str]) -> bool {
-    let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
-    positional.next() == Some("auth") && positional.next() == Some("token")
+    let [first, second, rest @ ..] = args else {
+        return false;
+    };
+    if *first != "auth" || *second != "token" {
+        return false;
+    }
+    let github = |h: &str| h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
+    let mut rest = rest.iter().copied();
+    while let Some(arg) = rest.next() {
+        let ok = match arg {
+            "--no-refresh" => true,
+            "--hostname" | "-h" => rest.next().is_some_and(github),
+            _ => {
+                arg.strip_prefix("--no-refresh=")
+                    .is_some_and(|v| parse_pflag_bool(v).is_some())
+                    || arg
+                        .strip_prefix("--hostname=")
+                        .or_else(|| arg.strip_prefix("-h="))
+                        .or_else(|| arg.strip_prefix("-h"))
+                        .is_some_and(github)
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 fn parse_pflag_bool(val: &str) -> Option<bool> {
@@ -2699,8 +2733,15 @@ fn gate_with_scope_resolver_for(
     {
         return Err(Refusal {
             headline: "revealing the GitHub token is not allowed in this environment.".to_string(),
-            guidance: "Reason: token exfiltration prevention. Allowed gh commands already authenticate through the gh guard."
-                .to_string(),
+            guidance: if cmd.subcommand.as_deref() == Some("token") {
+                "Reason: token exfiltration prevention. Only plain 'gh auth token' (github.com, \
+                 active account) is served, once, from the token cplt cached at launch; \
+                 --user, another --hostname and --help are refused. Allowed gh commands \
+                 already authenticate through the gh guard."
+            } else {
+                "Reason: token exfiltration prevention. Allowed gh commands already authenticate through the gh guard."
+            }
+            .to_string(),
             agent_note: &[
                 "This operation is restricted by the cplt sandbox to prevent credential leaks.",
                 NOTE,
@@ -3311,13 +3352,30 @@ pub fn check_merge_protection(
 }
 
 /// Every `--hostname` value, in order. gh (pflag) keeps the LAST one.
+///
+/// Under `gh auth` the shorthand `-h` is `--hostname` too (elsewhere it is
+/// help), alone, as `-h=x`/`-hx`, or at the end of a bool cluster like `-ah`.
+/// Missing it let `gh auth status -h x.ghe.com` past the host checks with the
+/// github.com token (#1049).
 fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
+    // Every `gh auth` subcommand but `git-credential` binds `-h` to `--hostname`.
+    let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
+    let auth = positional.next() == Some("auth") && positional.next() != Some("git-credential");
     let mut found = Vec::new();
     for (index, arg) in args.iter().enumerate() {
+        let next = || args.get(index + 1).copied().unwrap_or("");
         if let Some(hostname) = arg.strip_prefix("--hostname=") {
             found.push(hostname);
         } else if *arg == "--hostname" {
-            found.push(args.get(index + 1).copied().unwrap_or(""));
+            found.push(next());
+        } else if auth
+            && !arg.starts_with("--")
+            && let Some(cluster) = arg.strip_prefix('-')
+            && let Some(pos) = cluster.find('h')
+        {
+            let value = &cluster[pos + 1..];
+            let value = value.strip_prefix('=').unwrap_or(value);
+            found.push(if value.is_empty() { next() } else { value });
         }
     }
     found
@@ -6876,9 +6934,10 @@ mod tests {
         ));
         // Its host arrives on stdin: without stdin this check fails closed.
         assert!(!ok(&["auth", "git-credential", "get"], None));
-        // Default list: unchanged, every other exec gets the token.
+        // Default list: a named non-github.com host still gets no token; a
+        // `*.ghe.com` tenant would receive it (#1049).
         let github = vec!["github.com".to_string()];
-        assert!(github_token_allowed_for(
+        assert!(!github_token_allowed_for(
             &["api", "--hostname", "example.ghe.com", "user"],
             None,
             None,
@@ -11888,5 +11947,89 @@ mod tests {
         );
         assert!(facts.default_branches.is_empty());
         assert!(facts.git_common_dir.is_empty());
+    }
+
+    /// #1047: only a request for the active account's github.com token may
+    /// spend the cache; every other `gh auth token` form is refused.
+    #[test]
+    fn auth_token_serves_only_the_github_com_active_account() {
+        for args in [
+            &["auth", "token"][..],
+            &["auth", "token", "--hostname", "github.com"],
+            &["auth", "token", "-h", "GitHub.com"],
+            &["auth", "token", "--hostname=github.com"],
+            &["auth", "token", "-hgithub.com"],
+            &["auth", "token", "--no-refresh"],
+            &["auth", "token", "--no-refresh=false"],
+        ] {
+            assert!(is_auth_token_request(args), "{args:?}");
+        }
+        for args in [
+            &["auth", "token", "--hostname", "corp.ghe.com"][..],
+            &["auth", "token", "-h", "x"],
+            &["auth", "token", "--hostname=localhost"],
+            &["auth", "token", "-h=evil.ghe.com"],
+            &["auth", "token", "-u", "other"],
+            &["auth", "token", "--user=x"],
+            &["auth", "token", "--user", "x"],
+            &["auth", "token", "--help"],
+            &["auth", "token", "-h"],
+            &["auth", "token", "--hostname"],
+            &["auth", "token", "extra"],
+            &["auth", "token", "--no-refresh=maybe"],
+            &["-R", "o/r", "auth", "token"],
+            &["auth", "status"],
+        ] {
+            assert!(!is_auth_token_request(args), "{args:?}");
+            // Not served, so the gate decides, and it refuses.
+            let dir = std::env::temp_dir();
+            if args.contains(&"token") {
+                let refusal = gate(args, &dir, &GatePolicy::default()).unwrap_err();
+                assert!(
+                    refusal.guidance.contains("Only plain 'gh auth token'"),
+                    "{refusal}"
+                );
+            }
+        }
+    }
+
+    /// #1049: under `gh auth`, `-h` is `--hostname`; the github.com token must
+    /// not go to any other named host, configured or not, localhost included.
+    #[test]
+    fn auth_shorthand_hostname_withholds_github_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        for args in [
+            &["auth", "status", "-h", "evil.ghe.com"][..],
+            &["auth", "status", "-hevil.ghe.com"],
+            &["auth", "status", "-h=evil.ghe.com"],
+            &["auth", "status", "-ah", "evil.ghe.com"],
+            &["auth", "status", "--hostname", "evil.ghe.com"],
+            &["api", "--hostname", "localhost", "user"],
+            &["api", "--hostname", "ghes.corp.example", "user"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        assert!(ok(&["auth", "status"]));
+        assert!(ok(&["auth", "status", "-h", "github.com"]));
+        // Outside `gh auth`, -h is help, not a host.
+        assert!(ok(&["pr", "list", "-h"]));
+        assert_eq!(
+            requested_hostname(&["auth", "status", "-h", "evil.ghe.com"]),
+            Some("evil.ghe.com")
+        );
+        // And the scope check sees the shorthand host.
+        let policy = GatePolicy {
+            scope_check: true,
+            ..GatePolicy::default()
+        };
+        let refusal = gate_with_repo_scope(
+            &["auth", "status", "-h", "evil.ghe.com"],
+            &policy,
+            &["o/r".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(refusal.headline.contains("evil.ghe.com"), "{refusal}");
     }
 }

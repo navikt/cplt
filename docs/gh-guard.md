@@ -292,6 +292,12 @@ without exposing it to subprocesses:
    cached token, then **immediately deletes the file**
 4. Any subsequent call by tools or MCP servers gets "no cached token available"
 
+Only plain `gh auth token` is served: optionally `--hostname github.com` and
+`--no-refresh`. `--user`, any other `--hostname`/`-h`, `--help` and unknown
+arguments are refused without touching the cache, because the cached token is
+the github.com token of the active account and must not be handed out as
+anything else.
+
 A `GH_TOKEN` environment variable would be inherited by every tool, MCP server,
 and subprocess the agent spawns. The file gives it to the first reader only,
 which is Copilot at startup. Copilot then caches it in memory, so one read is
