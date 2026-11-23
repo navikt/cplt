@@ -5747,6 +5747,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     {
         copilot_args.extend(cplt::mcp_broker::copilot_launch_args(&home_dir, broker));
     }
+    if active_agent == agent::Agent::Claude
+        && let Some(scratch) = prepared.scratch_dir()
+        && let Err(e) = brief::claude_brief_args(&mut copilot_args, scratch)
+    {
+        ui::warn(&e);
+    }
 
     // Run agent inside sandbox, wrapped in the post-session audit lifecycle.
     // The audit is on by default and suppressed by --no-audit or --quiet. The

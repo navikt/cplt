@@ -732,6 +732,45 @@ pub fn delivery_env(
     }
 }
 
+/// Load the brief into Claude Code with `--append-system-prompt-file` (#972).
+///
+/// Claude Code honours one append source only: a second
+/// `--append-system-prompt[-file]` replaces the first (checked against 2.1.330).
+/// So a user's own append flag wins and cplt skips its own with an `Err` the
+/// caller warns about, rather than silently dropping either. `--system-prompt*`
+/// composes with the append and is left alone. Prepended, so it sits before
+/// any `--` and cannot be read as a value of the variadic `--add-dir`.
+///
+/// The file is the scratch `CPLT_BRIEF.md`. The agent can write there, but only
+/// once it runs: Claude reads the file at startup, before any tool call, and
+/// cplt itself never reads it back. `Ok` with nothing added when the brief was
+/// not written (`sandbox.brief` off).
+pub fn claude_brief_args(args: &mut Vec<String>, scratch_dir: &Path) -> Result<(), String> {
+    let brief = scratch_dir.join(BRIEF_MD);
+    if !brief.is_file() {
+        return Ok(());
+    }
+    let user_append = args.iter().take_while(|a| *a != "--").find(|a| {
+        let flag = a.split('=').next().unwrap_or(a);
+        flag == "--append-system-prompt" || flag == "--append-system-prompt-file"
+    });
+    if let Some(flag) = user_append {
+        let flag = flag.split('=').next().unwrap_or(flag);
+        return Err(format!(
+            "{flag} is set and Claude Code takes only one: the agent is not pointed at \
+             the sandbox brief ($CPLT_BRIEF)."
+        ));
+    }
+    args.splice(
+        0..0,
+        [
+            "--append-system-prompt-file".to_string(),
+            brief.display().to_string(),
+        ],
+    );
+    Ok(())
+}
+
 /// The persistent managed block content for AGENTS.md.
 ///
 /// Deliberately generic and factual: what cplt is, how an agent can tell
@@ -2229,5 +2268,58 @@ mod tests {
         assert!(delivery_env(Agent::OpenCode, scratch, bad).is_err());
 
         assert_eq!(delivery_env(Agent::Claude, scratch, none), Ok(None));
+    }
+
+    /// #972: Claude gets `--append-system-prompt-file <scratch brief>` up
+    /// front, never in place of the user's own append flag, and only when the
+    /// brief was written.
+    #[test]
+    fn claude_brief_args_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path();
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        let mut args = s(&["--model", "sonnet"]);
+        assert_eq!(claude_brief_args(&mut args, scratch), Ok(()));
+        assert_eq!(args, s(&["--model", "sonnet"]), "brief off: untouched");
+
+        let facts = BriefFacts::capture(&base_resolved(), Agent::Claude, home(), &[], false);
+        write_session_brief(scratch, &facts).unwrap();
+        let brief = scratch.join(BRIEF_MD).display().to_string();
+
+        let mut args = s(&["--add-dir", "/r", "--", "prompt"]);
+        claude_brief_args(&mut args, scratch).unwrap();
+        assert_eq!(
+            args,
+            s(&[
+                "--append-system-prompt-file",
+                &brief,
+                "--add-dir",
+                "/r",
+                "--",
+                "prompt"
+            ])
+        );
+
+        // After `--` it is the prompt, not a flag.
+        let mut args = s(&["--", "--append-system-prompt"]);
+        claude_brief_args(&mut args, scratch).unwrap();
+        assert_eq!(args[0], "--append-system-prompt-file");
+
+        for user in [
+            &["--append-system-prompt", "mine"][..],
+            &["--append-system-prompt=mine"],
+            &["--append-system-prompt-file", "/mine.md"],
+        ] {
+            let mut args = s(user);
+            let err = claude_brief_args(&mut args, scratch).unwrap_err();
+            assert!(err.contains("--append-system-prompt"), "{err}");
+            assert_eq!(args, s(user), "user's flag kept as given");
+        }
+
+        // `--system-prompt` composes with the append, so it does not block it.
+        let mut args = s(&["--system-prompt", "x"]);
+        claude_brief_args(&mut args, scratch).unwrap();
+        assert_eq!(args[0], "--append-system-prompt-file");
     }
 }

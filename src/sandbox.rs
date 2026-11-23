@@ -447,6 +447,11 @@ impl PreparedSandbox {
         self.keychain_substitute.as_ref()
     }
 
+    /// The per-session scratch dir, when one is in use.
+    pub fn scratch_dir(&self) -> Option<&Path> {
+        self.scratch_dir.as_deref()
+    }
+
     /// Name the managed worktree root to the child as `CPLT_WORKTREE_ROOT`.
     ///
     /// Environment only: the root must already be among the policy's named

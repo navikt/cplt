@@ -12473,6 +12473,62 @@ mod agent_stubs {
         });
     }
 
+    /// #972: with the brief on, the fake `claude` gets
+    /// `--append-system-prompt-file <scratch>/CPLT_BRIEF.md` first and can read
+    /// it; a user's own `--append-system-prompt` is kept and cplt adds none.
+    #[test]
+    fn claude_gets_brief_as_system_prompt_file() {
+        if !sandbox_usable() {
+            return;
+        }
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-stub-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(h.join(".claude")).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let bin = h.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("claude");
+        std::fs::write(&stub, STUB).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launch = |extra: &[&str]| {
+            let mut cmd = cplt_cmd();
+            cmd.env_remove("CLAUDE_CONFIG_DIR");
+            let o = cmd
+                .current_dir(&proj)
+                .env("HOME", &h)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .args(["--yes", "--brief", "--agent", "claude", "--"])
+                .args(extra)
+                .arg("head -1 \"$CPLT_BRIEF\"; exit 7")
+                .output()
+                .expect("cplt should run");
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            assert_eq!(o.status.code(), Some(7), "{out}\n{err}");
+            (out, err)
+        };
+
+        let (out, err) = launch(&[]);
+        let argv = out.lines().find(|l| l.starts_with("ARGV:")).unwrap_or("");
+        let rest = argv
+            .strip_prefix("ARGV:--append-system-prompt-file ")
+            .unwrap_or_else(|| panic!("flag missing: {out}\n{err}"));
+        let path = rest.split(' ').next().unwrap();
+        assert!(path.ends_with("/CPLT_BRIEF.md"), "{argv}");
+        assert!(!path.starts_with(proj.to_str().unwrap()), "{argv}");
+        assert!(out.contains("# "), "brief not readable: {out}");
+
+        let (out, err) = launch(&["--append-system-prompt", "mine"]);
+        assert!(out.contains("ARGV:--append-system-prompt mine "), "{out}");
+        assert!(!out.contains("--append-system-prompt-file"), "{out}");
+        assert!(err.contains("takes only one"), "{err}");
+    }
+
     #[test]
     fn copilot() {
         if !sandbox_usable() {
