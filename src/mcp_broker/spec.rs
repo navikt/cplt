@@ -71,23 +71,49 @@ impl Rejected {
 
 /// Drop every spec whose file, or any entry on the way to it, the final
 /// sandbox policy makes writable (`writable` asks the policy about one
-/// path). Returns the newly rejected, already printed.
-pub fn drop_writable(found: &mut Detected, writable: impl Fn(&Path) -> Option<PathBuf>) {
+/// path). The same for the credential mechanism's own dirs: the host-side
+/// server and probe read its login and config there, so a session grant
+/// over them (#1061) would let the agent read the login and rewrite the
+/// config. The grant wins and the server is dropped, with a line naming it.
+/// Returns the newly rejected, already printed.
+pub fn drop_writable(
+    found: &mut Detected,
+    home: &Path,
+    writable: impl Fn(&Path) -> Option<PathBuf>,
+) {
     let mut kept = Vec::new();
     for spec in std::mem::take(&mut found.specs) {
-        match writable(&spec.file) {
+        if let Some(tree) = writable(&spec.file) {
+            found.rejected.push(Rejected {
+                file: spec.file.display().to_string(),
+                reason: format!("{} is writable in the sandbox", tree.display()),
+                fix: format!(
+                    "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
+                    tree.display()
+                ),
+            });
+            continue;
+        }
+        let hit = spec
+            .credential
+            .host_write_dirs(home)
+            .into_iter()
+            .find_map(|d| writable(&d).map(|tree| (d, tree)));
+        match hit {
             None => kept.push(spec),
-            Some(tree) => {
-                let r = Rejected {
-                    file: spec.file.display().to_string(),
-                    reason: format!("{} is writable in the sandbox", tree.display()),
-                    fix: format!(
-                        "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
-                        tree.display()
-                    ),
-                };
-                found.rejected.push(r);
-            }
+            Some((dir, tree)) => found.rejected.push(Rejected {
+                file: spec.file.display().to_string(),
+                reason: format!(
+                    "the {} login dir {} is writable in the sandbox (grant: {})",
+                    spec.credential.name,
+                    dir.display(),
+                    tree.display()
+                ),
+                fix: format!(
+                    "drop the write grant on {} to use this server; the grant wins and the server is off",
+                    tree.display()
+                ),
+            }),
         }
     }
     found.specs = kept;
@@ -953,9 +979,50 @@ pub(crate) mod tests {
         let mut found = load_test(dir.path(), &[], &[]);
         assert_eq!(found.specs.len(), 1);
         assert_eq!(found.specs[0].file, f);
-        drop_writable(&mut found, |p| (p == f).then(|| PathBuf::from("/grant")));
+        drop_writable(&mut found, Path::new("/nohome"), |p| {
+            (p == f).then(|| PathBuf::from("/grant"))
+        });
         assert!(found.specs.is_empty());
         assert!(found.rejected[0].reason.contains("/grant"));
+    }
+
+    #[test]
+    fn a_write_grant_over_the_login_dir_drops_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), spec_json(base())).unwrap();
+        let home = Path::new("/home/u");
+        let login = super::super::credential::MECHANISMS[0].host_write_dirs(home);
+        // The path the child runtime grants, per platform (#1061).
+        let want = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/nais")
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home.join(".config"))
+                .join("nais")
+        };
+        assert_eq!(login, std::slice::from_ref(&want));
+
+        // An unrelated grant leaves the server alone.
+        let mut found = load_test(dir.path(), &[], &[]);
+        drop_writable(&mut found, home, |p| {
+            (p == Path::new("/elsewhere")).then(|| p.to_path_buf())
+        });
+        assert_eq!(found.specs.len(), 1);
+        assert!(found.rejected.is_empty());
+
+        // A grant over the login dir: the server is off, the line names the grant.
+        let mut found = load_test(dir.path(), &[], &[]);
+        drop_writable(&mut found, home, |p| {
+            p.starts_with(&want).then(|| PathBuf::from("/home/u/grant"))
+        });
+        assert!(found.specs.is_empty());
+        let line = found.rejected[0].line();
+        assert!(
+            line.contains("login dir") && line.contains("/home/u/grant"),
+            "{line}"
+        );
     }
 
     #[test]
