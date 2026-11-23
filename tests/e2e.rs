@@ -12472,6 +12472,86 @@ mod agent_stubs {
         assert!(err.contains("environment variable GOCACHE"), "{err}");
     }
 
+    /// A broad allow.write over the state dir names the layer it came from:
+    /// `cplt config unset allow.write` cannot remove a local or CLI grant.
+    #[test]
+    fn e2e_state_dir_grant_names_its_layer() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-layer-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let cfg = h.join(".config");
+        std::fs::create_dir_all(cfg.join("cplt")).unwrap();
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let cplt = |args: &[&str]| {
+            cplt_cmd()
+                .args(args)
+                .current_dir(&proj)
+                .env("HOME", &h)
+                .env("XDG_CONFIG_HOME", &cfg)
+                .env("CPLT_CONFIG", cfg.join("cplt/config.toml"))
+                .env_remove("GOCACHE")
+                .output()
+                .expect("binary should run")
+        };
+        let launch_err = |pre: &[&str]| {
+            let mut args = pre.to_vec();
+            args.extend(["exec", "--", "/bin/echo", "ok"]);
+            let out = cplt(&args);
+            assert!(!out.status.success());
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+
+        let err = launch_err(&["--allow-write", cfg.to_str().unwrap()]);
+        assert!(err.contains("Drop `--allow-write ~/.config`"), "{err}");
+
+        // `config set --local` refuses ~/.config itself, so narrow then widen
+        // the saved line, as a hand edit would.
+        let narrow = cfg.join("gh");
+        assert!(
+            cplt(&[
+                "config",
+                "set",
+                "--local",
+                "allow.write",
+                narrow.to_str().unwrap()
+            ])
+            .status
+            .success()
+        );
+        let local = std::fs::read_dir(cfg.join("cplt/local"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(&local).unwrap();
+        std::fs::write(
+            &local,
+            text.replace(narrow.to_str().unwrap(), cfg.to_str().unwrap()),
+        )
+        .unwrap();
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset --local allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "--local", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        let out = cplt(&["exec", "--", "/bin/echo", "ok"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     fn run(c: &Case) {
         let dir = tempfile::Builder::new()
             .prefix(".cplt-e2e-stub-")

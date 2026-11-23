@@ -368,6 +368,8 @@ cplt now refuses to launch when a tree the agent can write holds cplt's state di
 | --- | --- |
 | `allow.write ~/.config` (also in `config.toml`, where it fails every launch and `cplt check net`) | Remove the broad grant, then add the subdirectory you need: `cplt config unset allow.write ~/.config`, then `cplt config set allow.write ~/.config/<tool>`. Unset matches both `~/.config` and the expanded path. For a command-line grant, drop `--allow-write ~/.config` |
 | `allow.write $HOME` | Remove the broad grant, then grant the directories you need: `cplt config unset allow.write ~`, then `cplt config set allow.write ~/work`. For a command-line grant, drop `--allow-write ~` |
+| `allow.write ~/.config` in this repository's local config (`cplt config set --local`, or a hand-edited local file) | `cplt config unset --local allow.write ~/.config`, then `cplt config set --local allow.write ~/.config/<tool>` if you need one |
+| `allow.write ~/.config` proposed in an approved `.cplt.toml` | `cplt config unset --repo allow.write ~/.config`, commit `.cplt.toml`, then approve the change with `cplt trust accept --all` |
 | Launching with `~/.config` as the project directory (`$HOME` was already refused as too broad) | Launch from inside the repository, e.g. `cd ~/src/myrepo && cplt` |
 | `HOME` inside the project directory | Point `HOME` outside the project, or launch from a project that does not contain it |
 | A stow-style `~/.config/cplt` symlink into the project or an `allow.write` tree | Move the cplt directory out of that tree: `rm ~/.config/cplt && mv <dotfiles>/cplt ~/.config/cplt` |

@@ -12,7 +12,7 @@ use super::types::{
     CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Preset,
     Resolved, ResolvedPushRule, UnknownCommandPolicy,
 };
-use crate::sandbox::{HardeningCategory, validate_sbpl_path};
+use crate::sandbox::{GrantLayer, HardeningCategory, validate_sbpl_path};
 use crate::ui;
 
 impl Config {
@@ -377,14 +377,24 @@ impl Config {
 
         // Allow-write: merge config + CLI
         let mut allow_write: Vec<PathBuf> = Vec::new();
+        let mut allow_write_layers = Vec::new();
         for s in &self.allow.write {
             match resolve_allow_path(s, config_dir.as_ref()) {
-                Ok(p) => allow_write.push(p),
+                Ok(p) => {
+                    let layer = if local.is_some_and(|l| l.allow.write.contains(s)) {
+                        GrantLayer::Local
+                    } else {
+                        GrantLayer::Global
+                    };
+                    allow_write_layers.push((p.clone(), layer));
+                    allow_write.push(p);
+                }
                 Err(e) => {
                     ui::warn(&format!("Warning: allow.write path {s:?}: {e}"));
                 }
             }
         }
+        allow_write_layers.extend(cli.allow_write.iter().map(|p| (p.clone(), GrantLayer::Cli)));
         allow_write.extend(cli.allow_write);
 
         // Allow-exec: merge config + CLI. Read + execute, never write; the
@@ -685,6 +695,7 @@ impl Config {
             allow_private_domains,
             allow_read,
             allow_write,
+            allow_write_layers,
             tool_roots: Vec::new(),
             allow_write_state: Vec::new(),
             allow_exec,
@@ -1893,6 +1904,8 @@ impl Resolved {
                     continue;
                 };
                 if !self.allow_write.contains(&path) {
+                    self.allow_write_layers
+                        .push((path.clone(), GrantLayer::Repo));
                     self.allow_write.push(path);
                 }
             }

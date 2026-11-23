@@ -1229,7 +1229,13 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
                 && let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, p)
                 && let Some(var) = tool_env_var_for(p, config.home_dir)
             {
-                return Err(state_ancestor_refusal(key, p, &dir, Some(var)));
+                return Err(state_ancestor_refusal(
+                    key,
+                    p,
+                    &dir,
+                    Some(var),
+                    config.home_dir,
+                ));
             }
             validate_grant_path(key, p, config.home_dir)?;
         }
@@ -1241,7 +1247,13 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
 /// that fits where the tree came from: telling someone to narrow `allow.write`
 /// when the tree is their project or an exported `GOCACHE` sends them looking
 /// for a grant they never wrote.
-fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, env_var: Option<&str>) -> String {
+fn state_ancestor_refusal(
+    what: &str,
+    p: &Path,
+    dir: &Path,
+    env_var: Option<&str>,
+    home: &Path,
+) -> String {
     let remedy = if !dir.starts_with(p) {
         // Only a symlink on the way to the state dir puts it inside `p`.
         format!(
@@ -1256,12 +1268,11 @@ fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, env_var: Option<&str
         )
     } else {
         match what {
-            "allow.write" | "the allow.write grant" => format!(
-                "Remove the broad grant, then add the subdirectory you need: \
-                 `cplt config unset allow.write {0}` and `cplt config set allow.write \
-                 {0}/<tool>`. If it came from the command line, drop `--allow-write {0}`.",
-                p.display()
+            "allow.write" => format!(
+                "Grant only the subdirectory you need: `cplt config set allow.write {}/<tool>`.",
+                tilde(p, home)
             ),
+            "the allow.write grant" => layer_remedy(p, home, None),
             "the project directory" | "the named repository" => "Launch cplt from inside \
                 the repository, not from ~/.config, $HOME or a directory that contains them."
                 .to_string(),
@@ -1280,6 +1291,80 @@ fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, env_var: Option<&str
         p.display(),
         dir.display()
     )
+}
+
+/// The config layer an `allow.write` grant came from, so a refusal names the
+/// command that actually removes it: `cplt config unset allow.write` does
+/// nothing to a grant in the local file or an approved `.cplt.toml` (#1095).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantLayer {
+    Global,
+    Local,
+    Repo,
+    Cli,
+}
+
+/// `~/x` for a path under `$HOME`, so an example is short and copy-pasteable.
+fn tilde(p: &Path, home: &Path) -> String {
+    match p.strip_prefix(home) {
+        Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+        Ok(rel) => format!("~/{}", rel.display()),
+        Err(_) => p.display().to_string(),
+    }
+}
+
+fn layer_remedy(p: &Path, home: &Path, layer: Option<GrantLayer>) -> String {
+    let t = tilde(p, home);
+    let narrow = format!("`cplt config set allow.write {t}/<tool>`");
+    match layer {
+        Some(GrantLayer::Global) => format!(
+            "Remove the broad grant with `cplt config unset allow.write {t}`, then add the \
+             subdirectory you need: {narrow}."
+        ),
+        Some(GrantLayer::Local) => format!(
+            "The grant is in this repository's local config. Remove it with \
+             `cplt config unset --local allow.write {t}`, then add the subdirectory you \
+             need: `cplt config set --local allow.write {t}/<tool>`."
+        ),
+        Some(GrantLayer::Repo) => format!(
+            "The grant is proposed by this repository's .cplt.toml. Remove it with \
+             `cplt config unset --repo allow.write {t}`, commit .cplt.toml, and approve \
+             the change with `cplt trust accept --all`."
+        ),
+        Some(GrantLayer::Cli) => {
+            format!("Drop `--allow-write {t}` from the command line (flags go before `exec`).")
+        }
+        None => format!(
+            "Remove the broad grant from wherever it is set (`cplt config unset allow.write \
+             {t}`, `--local`, `--repo`, or `--allow-write {t}`), then add the subdirectory \
+             you need: {narrow}."
+        ),
+    }
+}
+
+/// Refuse an explicit `allow.write` grant over cplt's state directory, naming
+/// the layer it came from. Runs before [`prepare`], whose refusal cannot tell.
+///
+/// # Errors
+/// The refusal text, ready to print.
+pub fn refuse_state_ancestor_layers(
+    layers: &[(PathBuf, GrantLayer)],
+    home: &Path,
+) -> Result<(), String> {
+    for (p, layer) in layers {
+        if let Some(dir) = policy::cplt_state_ancestor_grant(home, p)
+            && dir.starts_with(p)
+            && tool_env_var_for(p, home).is_none()
+        {
+            return Err(format!(
+                "allow.write {} would make cplt's state directory {} writable in the sandbox. {}",
+                p.display(),
+                dir.display(),
+                layer_remedy(p, home, Some(*layer))
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The tool-path variable (`GOCACHE`, `CARGO_HOME`, ...) whose value became the
@@ -1318,7 +1403,7 @@ pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), S
     if key == "allow.write"
         && let Some(dir) = policy::cplt_state_ancestor_grant(home_dir, p)
     {
-        return Err(state_ancestor_refusal(key, p, &dir, None));
+        return Err(state_ancestor_refusal(key, p, &dir, None, home_dir));
     }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
@@ -1446,7 +1531,13 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
             let var = (why == "the allow.write grant")
                 .then(|| tool_env_var_for(&tree, config.home_dir))
                 .flatten();
-            return Err(state_ancestor_refusal(why, &tree, &dir, var));
+            return Err(state_ancestor_refusal(
+                why,
+                &tree,
+                &dir,
+                var,
+                config.home_dir,
+            ));
         }
     }
     let trees: Vec<PathBuf> = canonical_writable_trees(config)
@@ -7272,11 +7363,41 @@ mod tests {
         };
 
         // allow.write at config-set time and at launch.
+        // Nothing is saved at config-set time, so nothing to remove.
         let err = validate_grant_path("allow.write", &cfg, &h).unwrap_err();
         assert!(
-            err.contains(&format!("cplt config unset allow.write {}", cfg.display())),
+            err.contains("`cplt config set allow.write ~/.config/<tool>`"),
             "{err}"
         );
+        assert!(!err.contains("Remove"), "{err}");
+        let err = validate_grant_path("allow.write", &h, &h).unwrap_err();
+        assert!(
+            err.contains("`cplt config set allow.write ~/<tool>`"),
+            "{err}"
+        );
+
+        // Each explicit layer names the command that removes the grant there.
+        for (layer, want) in [
+            (
+                GrantLayer::Global,
+                "`cplt config unset allow.write ~/.config`",
+            ),
+            (
+                GrantLayer::Local,
+                "`cplt config unset --local allow.write ~/.config`",
+            ),
+            (
+                GrantLayer::Repo,
+                "`cplt config unset --repo allow.write ~/.config`",
+            ),
+            (GrantLayer::Cli, "Drop `--allow-write ~/.config`"),
+        ] {
+            let err = temp_env::with_vars_unset(["GOCACHE"], || {
+                refuse_state_ancestor_layers(&[(cfg.clone(), layer)], &h).unwrap_err()
+            });
+            assert!(err.contains(want), "{layer:?}: {err}");
+        }
+        assert!(refuse_state_ancestor_layers(&[(cfg.join("gh"), GrantLayer::Local)], &h).is_ok());
         let writes = [cfg.clone()];
         let mut config = test_config(&h, &[]);
         config.extra_write = &writes;

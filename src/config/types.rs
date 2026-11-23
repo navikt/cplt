@@ -1035,6 +1035,10 @@ pub struct Resolved {
     pub managed: Option<super::managed::ManagedConfig>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    /// Which config layer wrote each explicit `allow_write` entry, so a
+    /// refusal can name the command that removes it (#1095). Env-derived
+    /// tool grants are not listed.
+    pub allow_write_layers: Vec<(PathBuf, crate::sandbox::GrantLayer)>,
     /// Tool roots relocated by parent env (`CARGO_HOME`, ...), set by the host
     /// probe. Kept here so the launch confirmation hash covers them.
     pub tool_roots: Vec<crate::sandbox::ToolRoot>,

@@ -8155,6 +8155,11 @@ fn assemble_sandbox(
     sandbox_config.oauth_port_claimed = mcp_broker
         .as_ref()
         .is_some_and(cplt::mcp_broker::Broker::oauth_port_claimed);
+    // Name the layer a broad allow.write came from; prepare() cannot (#1095).
+    if !opts.inspect_only {
+        sandbox::refuse_state_ancestor_layers(&resolved.allow_write_layers, &probe.home_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =

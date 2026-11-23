@@ -1157,6 +1157,7 @@ mod tests {
             managed: None,
             allow_read: Vec::new(),
             allow_write: Vec::new(),
+            allow_write_layers: Vec::new(),
             tool_roots: Vec::new(),
             allow_write_state: Vec::new(),
             allow_exec: Vec::new(),
