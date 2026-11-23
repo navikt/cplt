@@ -2683,6 +2683,144 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
 ];
 
+/// Toolchain homes a relocated `CARGO_HOME` or `GOPATH` may use outside a
+/// cache, each paired with the only variable that may claim it for write.
+/// Under `~/.cache` their `bin` loses exec, so these are the documented
+/// alternative. Only these two names, never `~/.local/share` itself. Another
+/// writable var (`PIP_CACHE_DIR=~/.local/share/cargo/bin`) must not get write
+/// over the toolchain's binaries.
+pub const ENV_TOOL_HOME_ROOTS: &[(&str, &str)] = &[
+    ("CARGO_HOME", "~/.local/share/cargo"),
+    ("GOPATH", "~/.local/share/go"),
+];
+
+/// Read-only SDK roots an env-named toolchain (`JAVA_HOME`, `DOTNET_ROOT`,
+/// `RUSTUP_HOME`, `NODE_PATH`) may live under, beyond [`HOME_TOOL_DIRS`] and
+/// [`TOOL_READ_DIRS`]. Entries starting with `~/` are home-relative.
+pub const ENV_SDK_READ_ROOTS: &[&str] = &[
+    "/usr/lib/jvm",
+    "/usr/share/dotnet",
+    "/usr/lib/dotnet",
+    "/usr/local/share/dotnet",
+    "/opt/hostedtoolcache",
+    // setup-java/setup-dotnet on macOS runners, and the dotnet-install default.
+    "~/hostedtoolcache",
+    "~/.dotnet",
+    "~/.jdks",
+    "~/.local/share/mise",
+];
+
+/// Whether an env-derived tool dir may be granted: the positive rule (#1067).
+///
+/// `GOCACHE`, `CARGO_HOME`, `JAVA_HOME` and the rest come from the
+/// environment, which a project `.envrc` or mise `[env]` can set, and their
+/// grants are automatic. A deny list cannot name every persistence path
+/// (`~/Library/LaunchAgents`, `~/.zshrc`, `~/.local/bin`, ...), so a grant is
+/// allowed only when `path` (canonical, all hops resolved) is a directory,
+/// is not `$HOME`, and lies at or under a safe root, compared by identity
+/// (dev, ino) so case variants and links match:
+/// - write: a writable [`HOME_TOOL_DIRS`] entry (`~/.cache`,
+///   `~/Library/Caches`, `~/.npm`, `~/.gradle`, the pnpm stores, ...) or one of
+///   `extra` (the project, the session scratch, the system temp dir), or
+///   the [`ENV_TOOL_HOME_ROOTS`] entry paired with `var`;
+/// - read: any of those, any [`HOME_TOOL_DIRS`] entry, [`TOOL_READ_DIRS`] or
+///   [`ENV_SDK_READ_ROOTS`].
+///
+/// `~/Library/Caches` itself and any personal-app cache in it
+/// ([`DENIED_CACHE_PREFIXES`], minus `com.apple.dt.`) is refused: an automatic
+/// grant there would override the deny that protects browser and app state.
+#[must_use]
+pub fn env_tool_dir_allowed(
+    var: &str,
+    path: &Path,
+    home: &Path,
+    write: bool,
+    extra: &[&Path],
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    if !path.is_dir() || id(path).is_none() || id(path) == id(home) {
+        return false;
+    }
+    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    // Lowercased: APFS is case-insensitive, so `com.Google.Chrome` is the same dir.
+    let caches = canon_home.join("Library/Caches");
+    let lower = |p: &Path| p.to_string_lossy().to_ascii_lowercase();
+    if let Some(rel) = lower(path).strip_prefix(&lower(&caches)) {
+        let first = rel.trim_start_matches('/').split('/').next().unwrap_or("");
+        if (rel.is_empty() || rel.starts_with('/'))
+            && (first.is_empty()
+                || (!first.starts_with("com.apple.dt.")
+                    && DENIED_CACHE_PREFIXES
+                        .iter()
+                        .any(|d| first.starts_with(&d.to_ascii_lowercase()))))
+        {
+            return false;
+        }
+    }
+    let mut roots: Vec<PathBuf> = HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.write || !write)
+        .map(|d| home.join(d.path))
+        .chain(extra.iter().map(|p| p.to_path_buf()))
+        .collect();
+    let home_rel = |r: &&str| match r.strip_prefix("~/") {
+        Some(rel) => home.join(rel),
+        None => PathBuf::from(r),
+    };
+    roots.extend(
+        ENV_TOOL_HOME_ROOTS
+            .iter()
+            .filter(|(v, _)| !write || *v == var)
+            .map(|(_, r)| home_rel(r)),
+    );
+    if !write {
+        roots.extend(TOOL_READ_DIRS.iter().map(PathBuf::from));
+        roots.extend(
+            ENV_SDK_READ_ROOTS
+                .iter()
+                .map(|r| match r.strip_prefix("~/") {
+                    Some(rel) => home.join(rel),
+                    None => PathBuf::from(r),
+                }),
+        );
+    }
+    // A home root reached through a symlink is skipped: the agent can plant
+    // `~/.local/share/go -> ~/Library/LaunchAgents` and so turn any target
+    // into a "safe root".
+    let ids: Vec<_> = roots
+        .iter()
+        .filter(|r| match r.strip_prefix(home) {
+            Ok(rel) => std::fs::canonicalize(r).is_ok_and(|c| c == canon_home.join(rel)),
+            Err(_) => true,
+        })
+        .filter_map(|r| id(r))
+        .collect();
+    path.ancestors()
+        .any(|a| id(a).is_some_and(|i| ids.contains(&i)))
+}
+
+/// The system temp roots an env-set tool dir may live under (#1067).
+///
+/// Fixed paths only: `/private/tmp` on macOS, `/tmp` elsewhere. The per-user
+/// temp dir is deliberately absent. `confstr(_CS_DARWIN_USER_TEMP_DIR)` falls
+/// back to `TMPDIR` verbatim when `DIRHELPER_USER_DIR_SUFFIX` is invalid, and a
+/// valid suffix can name a symlink an earlier session planted under `T/`, so
+/// both are steered by a project `.envrc`. A root that is `home` or an
+/// ancestor of it is dropped.
+#[must_use]
+pub fn env_tool_temp_roots(home: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let raw = vec![PathBuf::from("/private/tmp")];
+    #[cfg(not(target_os = "macos"))]
+    let raw = vec![PathBuf::from("/tmp")];
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    raw.into_iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .filter(|r| !home.starts_with(r))
+        .collect()
+}
+
 /// Return the home tool directory list.
 ///
 /// A single unified list covers both macOS and Linux paths. Entries for
@@ -3755,6 +3893,45 @@ pub fn tool_override_path_is_safe(path: &Path, home: &Path) -> bool {
         return false;
     }
     true
+}
+
+/// The protected path an env-derived tool grant on `path` would reach, if any.
+///
+/// `GOCACHE`, `PIP_CACHE_DIR`, `CARGO_HOME` and the rest come from the
+/// environment, which a project `.envrc` or mise `[env]` can set. Their grants
+/// are automatic, not typed by the user, so they must never open a path the
+/// deny lists close: the macOS profile emits them after the denies, and Linux
+/// is grant-only, so either backend would honour them. Refused when `path`
+/// lies in, equals, or contains a [`DENIED_DOTFILES`] dir, a [`DENIED_FILES`]
+/// or [`DENIED_HOME_SUBPATHS`] entry, or a cplt state dir.
+///
+/// Compared by identity (dev, ino), not spelling, so a symlink into a
+/// protected dir or a case variant on case-insensitive APFS still matches.
+/// `path` must exist and be canonical; a missing protected entry is resolved
+/// to its deepest existing ancestor, so a grant above it is still refused.
+#[must_use]
+pub fn env_tool_path_protected(home: &Path, path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let me = id(path)?;
+    let canon = resolver(home);
+    DENIED_DOTFILES
+        .iter()
+        .chain(DENIED_FILES)
+        .chain(DENIED_HOME_SUBPATHS)
+        .map(|rel| home.join(rel))
+        .chain(cplt_state_dirs(home).into_iter().flatten())
+        // `CPLT_CONFIG=~/cplt.toml` makes the config dir `$HOME`: that would
+        // refuse every dir under it with a confusing message, and `$HOME`
+        // itself is never granted by the positive rule anyway.
+        .filter(|d| id(&canon(d)) != id(home))
+        .find(|d| {
+            let real = canon(d);
+            // `path` above or equal to the protected entry.
+            real.ancestors().any(|a| id(a) == Some(me))
+                // `path` inside the protected entry.
+                || id(&real).is_some_and(|did| path.ancestors().any(|a| id(a) == Some(did)))
+        })
 }
 
 /// Validate that a path is safe for interpolation into SBPL profile strings.

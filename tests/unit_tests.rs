@@ -11998,3 +11998,229 @@ fn shim_pointing_outside_every_exec_grant_is_reported() {
         "an ungranted shim is not a shim-target problem"
     );
 }
+
+/// An env-derived tool dir (GOCACHE, PIP_CACHE_DIR, ...) must never be granted
+/// in, above, or through a symlink into a protected path (#1067).
+#[test]
+fn env_tool_path_refused_under_protected_paths() {
+    use cplt::sandbox::{TOOL_PATH_ENV_VARS, env_tool_path_protected, tool_path_env_overrides};
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    let protected = [
+        ".nav-pilot",
+        ".ssh",
+        ".aws/sso",
+        ".kube/cache",
+        ".config/gcloud",
+    ];
+    for p in protected {
+        std::fs::create_dir_all(home.join(p).join("x")).unwrap();
+    }
+    std::fs::create_dir_all(home.join("ok/cache")).unwrap();
+    std::fs::create_dir_all(home.join(".config/other")).unwrap();
+    std::os::unix::fs::symlink(home.join(".ssh"), home.join("link")).unwrap();
+
+    for tv in TOOL_PATH_ENV_VARS {
+        for p in protected {
+            for target in [format!("{p}/x"), p.to_string()] {
+                let env = vec![(tv.name.to_string(), format!("~/{target}"))];
+                for ovr in tool_path_env_overrides(&env, &home) {
+                    let real = std::fs::canonicalize(&ovr.path).unwrap();
+                    assert!(
+                        env_tool_path_protected(&home, &real).is_some(),
+                        "{}={target} must be refused",
+                        tv.name
+                    );
+                }
+            }
+        }
+    }
+    // Above a protected dir.
+    assert!(env_tool_path_protected(&home, &home.join(".config")).is_some());
+    assert!(env_tool_path_protected(&home, &home.join(".aws")).is_some());
+    // Through a symlink: canonicalized at the merge site, so the target is checked.
+    let via_link = std::fs::canonicalize(home.join("link")).unwrap();
+    assert!(env_tool_path_protected(&home, &via_link).is_some());
+    // Unrelated dirs stay grantable.
+    assert!(env_tool_path_protected(&home, &home.join("ok/cache")).is_none());
+    assert!(env_tool_path_protected(&home, &home.join(".config/other")).is_none());
+    // Case variant: on case-insensitive APFS this names the same dir.
+    let upper = home.join(".NAV-PILOT/x");
+    if upper.exists() {
+        assert!(env_tool_path_protected(&home, &upper).is_some());
+    }
+}
+
+/// The positive rule for env-derived tool dirs (#1067): only directories under
+/// a safe root are granted, so no env var can open a persistence path.
+#[test]
+fn env_tool_dir_allowed_only_under_safe_roots() {
+    use cplt::sandbox::env_tool_dir_allowed;
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    let project = home.join("src/proj");
+    let mk = |rel: &str| {
+        let p = home.join(rel);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    };
+    let safe = [
+        ".cache/go-build-x",
+        "Library/Caches/pip",
+        ".npm/x",
+        ".gradle/caches",
+        ".m2/repository",
+        ".cargo/registry",
+        ".local/share/pnpm/store",
+        "src/proj/.cache",
+        "Library/Caches/com.apple.dt.Xcode",
+    ];
+    let unsafe_ = [
+        "Library/LaunchAgents",
+        "Library/Keychains",
+        "Library",
+        ".config/fish",
+        ".config/gh",
+        ".local/bin",
+        ".local/share",
+        ".claude",
+        ".cargo",
+        "go/src/other-repo",
+        // Personal-app caches the profile denies, and their parent.
+        "Library/Caches",
+        "Library/Caches/com.google.Chrome",
+        "Library/Caches/com.google.Chrome/Default",
+        "Library/Caches/Firefox",
+        "Library/Caches/com.apple.Safari",
+        // A toolchain home under another var's name: GOCACHE is not CARGO_HOME.
+        ".local/share/cargo",
+        ".local/share/cargo/bin",
+        ".local/share/go/pkg",
+    ];
+    for rel in safe {
+        assert!(
+            env_tool_dir_allowed("GOCACHE", &mk(rel), &home, true, &[&project]),
+            "{rel} must be granted"
+        );
+    }
+    for rel in unsafe_ {
+        assert!(
+            !env_tool_dir_allowed("GOCACHE", &mk(rel), &home, true, &[&project]),
+            "{rel} must be refused"
+        );
+    }
+    // $HOME itself, and a file value (`~/.zshrc`).
+    assert!(!env_tool_dir_allowed("GOCACHE", &home, &home, true, &[]));
+    assert!(!env_tool_dir_allowed("GOCACHE", &home, &home, false, &[]));
+    std::fs::write(home.join(".zshrc"), "").unwrap();
+    assert!(!env_tool_dir_allowed(
+        "GOCACHE",
+        &home.join(".zshrc"),
+        &home,
+        true,
+        &[]
+    ));
+    std::fs::write(home.join(".cache/f"), "").unwrap();
+    assert!(!env_tool_dir_allowed(
+        "GOCACHE",
+        &home.join(".cache/f"),
+        &home,
+        true,
+        &[]
+    ));
+    // A link from a safe root into an unsafe one is judged by its target.
+    std::os::unix::fs::symlink(home.join("Library/LaunchAgents"), home.join(".cache/la")).unwrap();
+    let via = std::fs::canonicalize(home.join(".cache/la")).unwrap();
+    assert!(!env_tool_dir_allowed("GOCACHE", &via, &home, true, &[]));
+    // A safe root that is itself a link does not make its target safe.
+    let fake = tmp.path().join("h2");
+    std::fs::create_dir_all(fake.join(".local/share")).unwrap();
+    std::fs::create_dir_all(fake.join("Library/LaunchAgents")).unwrap();
+    let fake = std::fs::canonicalize(&fake).unwrap();
+    std::os::unix::fs::symlink(
+        fake.join("Library/LaunchAgents"),
+        fake.join(".local/share/go"),
+    )
+    .unwrap();
+    assert!(!env_tool_dir_allowed(
+        "GOCACHE",
+        &fake.join("Library/LaunchAgents"),
+        &fake,
+        true,
+        &[]
+    ));
+    // Read: SDK roots pass, persistence paths do not.
+    assert!(env_tool_dir_allowed(
+        "GOCACHE",
+        &mk(".sdkman/candidates/java/21"),
+        &home,
+        false,
+        &[]
+    ));
+    assert!(env_tool_dir_allowed(
+        "GOCACHE",
+        &mk(".jdks/temurin-21"),
+        &home,
+        false,
+        &[]
+    ));
+    assert!(!env_tool_dir_allowed(
+        "GOCACHE",
+        &home.join("Library/Keychains"),
+        &home,
+        false,
+        &[]
+    ));
+    assert!(!env_tool_dir_allowed(
+        "GOCACHE",
+        &home.join(".config/gh"),
+        &home,
+        false,
+        &[]
+    ));
+    // Read-only roots never satisfy a write grant.
+    assert!(!env_tool_dir_allowed(
+        "GOCACHE",
+        &home.join(".sdkman"),
+        &home,
+        true,
+        &[]
+    ));
+    // A toolchain home is writable only for its own var (#1104).
+    assert!(env_tool_dir_allowed(
+        "CARGO_HOME",
+        &mk(".local/share/cargo"),
+        &home,
+        true,
+        &[]
+    ));
+    assert!(env_tool_dir_allowed(
+        "GOPATH",
+        &mk(".local/share/go/pkg"),
+        &home,
+        true,
+        &[]
+    ));
+    assert!(!env_tool_dir_allowed(
+        "GOPATH",
+        &mk(".local/share/cargo/bin"),
+        &home,
+        true,
+        &[]
+    ));
+    assert!(!env_tool_dir_allowed(
+        "PIP_CACHE_DIR",
+        &mk(".local/share/cargo/bin"),
+        &home,
+        true,
+        &[]
+    ));
+    // Case variant of a denied cache (APFS is case-insensitive).
+    assert!(!env_tool_dir_allowed(
+        "GOCACHE",
+        &mk("Library/Caches/COM.GOOGLE.x"),
+        &home,
+        false,
+        &[]
+    ));
+}

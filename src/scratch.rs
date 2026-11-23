@@ -125,7 +125,7 @@ impl PnpmShadowDir {
         pnpm: &Path,
         launch_dir: &Path,
     ) -> Result<Option<Self>, String> {
-        ensure_pnpm_package_manager_stores(home_dir)?;
+        ensure_pnpm_package_manager_stores(home_dir, None)?;
         // pnpm 11 puts a `/bin/sh` launcher on PATH that execs the real
         // binary, a symlink into the store. Shadow the binary; `source`
         // stays the PATH entry so direct launches still map to the shadow.
@@ -274,15 +274,47 @@ impl Drop for PnpmShadowDir {
     }
 }
 
-fn ensure_pnpm_package_manager_stores(home_dir: &Path) -> Result<(), String> {
+/// Pre-create `package-manager-store` in each pnpm home the grant side
+/// accepts. `project_dir` matters for a `PNPM_HOME` inside the project.
+pub fn ensure_pnpm_package_manager_stores(
+    home_dir: &Path,
+    project_dir: Option<&Path>,
+) -> Result<(), String> {
     let canonical_home = std::fs::canonicalize(home_dir)
         .map_err(|e| format!("Cannot canonicalize home dir {}: {e}", home_dir.display()))?;
+    // The same roots as the grant side in main.rs: project plus system temp.
+    let temp = crate::sandbox::env_tool_temp_roots(&canonical_home);
+    let extra: Vec<&Path> = project_dir
+        .into_iter()
+        .chain(temp.iter().map(PathBuf::as_path))
+        .collect();
     for root in pnpm_home_roots(home_dir) {
         if !root.is_dir() {
             continue;
         }
         let canonical_root = std::fs::canonicalize(&root)
             .map_err(|e| format!("Cannot resolve pnpm home {}: {e}", root.display()))?;
+        // A `PNPM_HOME` the env-tool-dir rule refuses gets no grant, so
+        // nothing is created under it either (#1067).
+        let from_env = std::env::var_os("PNPM_HOME").is_some_and(|v| {
+            let v = PathBuf::from(v);
+            root == if v.is_absolute() { v } else { home_dir.join(v) }
+        });
+        let default =
+            root == home_dir.join("Library/pnpm") || root == home_dir.join(".local/share/pnpm");
+        if from_env
+            && !default
+            && (!crate::sandbox::env_tool_dir_allowed(
+                "PNPM_HOME",
+                &canonical_root,
+                &canonical_home,
+                true,
+                &extra,
+            ) || crate::sandbox::env_tool_path_protected(&canonical_home, &canonical_root)
+                .is_some())
+        {
+            continue;
+        }
         if let Ok(relative) = root.strip_prefix(home_dir) {
             let expected = canonical_home.join(relative);
             if canonical_root != expected {
@@ -1957,7 +1989,7 @@ mod tests {
         let pnpm_home = home.path().join(".local/share/pnpm");
         std::fs::create_dir_all(&pnpm_home).unwrap();
 
-        ensure_pnpm_package_manager_stores(home.path()).unwrap();
+        ensure_pnpm_package_manager_stores(home.path(), None).unwrap();
 
         assert!(pnpm_home.join("package-manager-store").is_dir());
     }
@@ -1969,8 +2001,8 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".local/share")).unwrap();
         std::os::unix::fs::symlink(target.path(), home.path().join(".local/share/pnpm")).unwrap();
 
-        let error =
-            ensure_pnpm_package_manager_stores(home.path()).expect_err("symlink must be refused");
+        let error = ensure_pnpm_package_manager_stores(home.path(), None)
+            .expect_err("symlink must be refused");
 
         assert!(error.contains("resolves through a symlink"));
         assert!(!target.path().join("package-manager-store").exists());

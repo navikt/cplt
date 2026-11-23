@@ -1240,7 +1240,9 @@ fun main() {
             .prefix(".cplt-e2e-custom-pnpm-home-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
             .expect("create home");
-        let pnpm_home = home.path().join("custom-pnpm");
+        // A custom PNPM_HOME is granted only under a safe root (#1067); the
+        // project is one, an arbitrary dir under HOME is not.
+        let pnpm_home = project.canonical_path().join("custom-pnpm");
         let links = pnpm_home.join("store/v10/links/pnpm-package");
         let pinned_dir = pnpm_home.join("package-manager-store/v10");
         fs::create_dir_all(&links).expect("create pnpm store links");

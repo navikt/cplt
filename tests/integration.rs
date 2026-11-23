@@ -6554,4 +6554,255 @@ except Exception as e:
             "renaming intermediate ancestor of nested named_root must be denied"
         );
     }
+
+    /// An env-relocated tool dir outside the safe roots grants nothing (#1067).
+    /// The child writes to the absolute target, not `$VAR`, because cplt
+    /// rewrites some cache vars to scratch inside the sandbox.
+    /// `env` adds vars whose values are paths relative to the fake home;
+    /// `file` is the name written under the target.
+    fn assert_env_tool_dir_not_granted(var: &str, rel: &str, env: &[(&str, &str)], file: &str) {
+        assert_env_tool_dir_not_granted_raw(var, rel, env, &[], file);
+    }
+
+    /// As above; `raw` vars are passed verbatim, not joined to the fake home.
+    fn assert_env_tool_dir_not_granted_raw(
+        var: &str,
+        rel: &str,
+        env: &[(&str, &str)],
+        raw: &[(&str, &str)],
+        file: &str,
+    ) {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create project");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
+        let target = std::fs::canonicalize(home.path()).unwrap().join(rel);
+        std::fs::create_dir_all(&target).expect("create target dir");
+        let file = target.join(file);
+        // Proves the shell ran, so a launch failure cannot pass as a denial.
+        let marker = project.path().join("ran");
+        let mut cmd = cplt_cmd();
+        cmd.args([
+            "--yes",
+            "--no-validate",
+            "--agent",
+            "shell",
+            "--project-dir",
+            &project.path().to_string_lossy(),
+            "--",
+            "-c",
+            &format!(
+                "touch '{}'; echo pwned > '{}'",
+                marker.display(),
+                file.display()
+            ),
+        ])
+        .env("HOME", home.path())
+        .env(var, &target);
+        for (k, v) in env {
+            cmd.env(k, home.path().join(v));
+        }
+        for (k, v) in raw {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("run cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(marker.exists(), "the sandboxed shell must run: {stderr}");
+        assert!(!file.exists(), "{var}={rel} must not grant write: {stderr}");
+        assert!(
+            stderr.contains(&format!("Ignoring {var}")),
+            "the refusal must be reported: {stderr}"
+        );
+    }
+
+    #[test]
+    fn env_tool_dir_in_protected_path_is_not_granted() {
+        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".nav-pilot/pakker", &[], "m.toml");
+    }
+
+    #[test]
+    fn env_tool_dir_at_persistence_path_is_not_granted() {
+        assert_env_tool_dir_not_granted("GOCACHE", "Library/LaunchAgents", &[], "m.toml");
+        assert_env_tool_dir_not_granted("NPM_CONFIG_CACHE", ".config/fish", &[], "m.toml");
+    }
+
+    /// `~/Library/Caches` is a safe root, but a personal-app cache in it is
+    /// denied by the profile; an env grant must not override that (#1104).
+    #[test]
+    fn env_tool_dir_in_denied_app_cache_is_not_granted() {
+        assert_env_tool_dir_not_granted(
+            "PIP_CACHE_DIR",
+            "Library/Caches/com.google.Chrome",
+            &[],
+            "x",
+        );
+        assert_env_tool_dir_not_granted("GOCACHE", "Library/Caches/Firefox/p", &[], "x");
+    }
+
+    /// A relocated toolchain home is writable only for its own var: another
+    /// var must not get write over its `bin` (#1104).
+    #[test]
+    fn env_tool_dir_toolchain_bin_via_other_var_is_not_granted() {
+        assert_env_tool_dir_not_granted(
+            "PIP_CACHE_DIR",
+            ".local/share/cargo/bin",
+            &[("CARGO_HOME", ".local/share/cargo")],
+            "cargo",
+        );
+    }
+
+    /// An SDK var naming a dir with control bytes is reported escaped, so the
+    /// name cannot rewrite the terminal.
+    #[test]
+    fn env_sdk_dir_refusal_escapes_control_bytes() {
+        require_sandbox!();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let evil = home.path().join("jdk\x1b[31m");
+        std::fs::create_dir_all(&evil).unwrap();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                "true",
+            ])
+            .env("HOME", home.path())
+            .env("JAVA_HOME", &evil)
+            .output()
+            .expect("run cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Ignoring JAVA_HOME") && stderr.contains("jdk\\u{1b}[31m"),
+            "refusal must be reported escaped: {stderr:?}"
+        );
+        assert!(!stderr.contains('\x1b'), "raw ESC leaked: {stderr:?}");
+    }
+
+    /// `TMPDIR` is as attacker-set as `GOCACHE`: pointing it at `$HOME` must
+    /// not make a home persistence path a "temp" safe root.
+    #[test]
+    fn env_tool_dir_tmpdir_at_home_is_not_a_safe_root() {
+        assert_env_tool_dir_not_granted(
+            "GOCACHE",
+            "Library/LaunchAgents",
+            &[("TMPDIR", "")],
+            "m.toml",
+        );
+        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".local/bin", &[("TMPDIR", "")], "m.toml");
+    }
+
+    /// The deny-set second layer on its own: `~/.gradle` passes the positive
+    /// rule (a writable tool dir), but contains the denied
+    /// `gradle.properties`, so the grant is refused rather than re-opening it.
+    #[test]
+    fn env_tool_dir_under_safe_root_but_protected_is_not_granted() {
+        assert_env_tool_dir_not_granted("GOCACHE", ".gradle", &[], "gradle.properties");
+    }
+
+    /// `confstr(_CS_DARWIN_USER_TEMP_DIR)` returns `TMPDIR` verbatim when
+    /// `DIRHELPER_USER_DIR_SUFFIX` is invalid, so the per-user temp dir is not
+    /// a safe root: neither this nor `TMPDIR` alone may open `~/Library`.
+    #[test]
+    fn env_tool_dir_dirhelper_suffix_does_not_steer_temp_root() {
+        assert_env_tool_dir_not_granted_raw(
+            "GOCACHE",
+            "Library/LaunchAgents",
+            &[("TMPDIR", "Library")],
+            &[("DIRHELPER_USER_DIR_SUFFIX", "a/b")],
+            "m.toml",
+        );
+        assert_env_tool_dir_not_granted(
+            "GOCACHE",
+            "Library/LaunchAgents",
+            &[("TMPDIR", "Library")],
+            "m.toml",
+        );
+    }
+
+    /// A valid suffix is appended to the real per-user temp dir, where an
+    /// earlier session can plant `T/<suffix> -> ~/Library`.
+    #[test]
+    fn env_tool_dir_planted_dirhelper_symlink_is_not_a_safe_root() {
+        require_sandbox!();
+        let out = std::process::Command::new("/usr/bin/getconf")
+            .arg("DARWIN_USER_TEMP_DIR")
+            .env_remove("TMPDIR")
+            .env_remove("DIRHELPER_USER_DIR_SUFFIX")
+            .output()
+            .expect("getconf");
+        let user_tmp = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-plant-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let suffix = format!("cplt-plant-{}", std::process::id());
+        let link = user_tmp.join(&suffix);
+        let library = std::fs::canonicalize(home.path()).unwrap().join("Library");
+        std::fs::create_dir_all(library.join("LaunchAgents")).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&library, &link).unwrap();
+        struct Unlink(PathBuf);
+        impl Drop for Unlink {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = Unlink(link);
+        // The helper makes its own home; point it at ours via the abs target.
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let file = library.join("LaunchAgents/m.toml");
+        let marker = project.path().join("ran");
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                &format!(
+                    "touch '{}'; echo pwned > '{}'",
+                    marker.display(),
+                    file.display()
+                ),
+            ])
+            .env("HOME", home.path())
+            .env_remove("TMPDIR")
+            .env("DIRHELPER_USER_DIR_SUFFIX", &suffix)
+            .env("GOCACHE", library.join("LaunchAgents"))
+            .output()
+            .expect("run cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(marker.exists(), "the sandboxed shell must run: {stderr}");
+        assert!(
+            !file.exists(),
+            "planted suffix must not grant write: {stderr}"
+        );
+        assert!(
+            stderr.contains("Ignoring GOCACHE"),
+            "the refusal must be reported: {stderr}"
+        );
+    }
 }

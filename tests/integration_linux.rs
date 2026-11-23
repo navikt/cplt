@@ -5604,4 +5604,103 @@ finally:
         assert!(!main.join(".git/worktrees/wt2").exists());
         assert!(!main.join(".git/wtx").exists());
     }
+
+    /// An env-relocated tool dir outside the safe roots grants nothing (#1067).
+    /// The child writes to the absolute target, not `$VAR`, because cplt
+    /// rewrites some cache vars to scratch inside the sandbox.
+    /// `env` adds vars whose values are paths relative to the fake home;
+    /// `file` is the name written under the target.
+    fn assert_env_tool_dir_not_granted(var: &str, rel: &str, env: &[(&str, &str)], file: &str) {
+        env_tool_dir_case(var, rel, env, file, true);
+    }
+
+    /// `expect_denied: false` checks only the refusal, for targets the default
+    /// policy already makes writable on Linux.
+    fn env_tool_dir_case(
+        var: &str,
+        rel: &str,
+        env: &[(&str, &str)],
+        file: &str,
+        expect_denied: bool,
+    ) {
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create project");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-envdeny-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
+        let target = std::fs::canonicalize(home.path()).unwrap().join(rel);
+        std::fs::create_dir_all(&target).expect("create target dir");
+        let file = target.join(file);
+        // Proves the shell ran, so a launch failure cannot pass as a denial.
+        let marker = project.path().join("ran");
+        let mut cmd = cplt_cmd();
+        cmd.args([
+            "--yes",
+            "--no-validate",
+            "--agent",
+            "shell",
+            "--project-dir",
+            &project.path().to_string_lossy(),
+            "--",
+            "-c",
+            &format!(
+                "touch '{}'; echo pwned > '{}'",
+                marker.display(),
+                file.display()
+            ),
+        ])
+        .env("HOME", home.path())
+        .env(var, &target);
+        for (k, v) in env {
+            cmd.env(k, home.path().join(v));
+        }
+        let output = cmd.output().expect("run cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(marker.exists(), "the sandboxed shell must run: {stderr}");
+        if expect_denied {
+            assert!(!file.exists(), "{var}={rel} must not grant write: {stderr}");
+        }
+        assert!(
+            stderr.contains(&format!("Ignoring {var}")),
+            "the refusal must be reported: {stderr}"
+        );
+    }
+
+    #[test]
+    fn env_tool_dir_in_protected_path_is_not_granted() {
+        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".nav-pilot/pakker", &[], "m.toml");
+    }
+
+    #[test]
+    fn env_tool_dir_at_persistence_path_is_not_granted() {
+        assert_env_tool_dir_not_granted("GOCACHE", "Library/LaunchAgents", &[], "m.toml");
+        assert_env_tool_dir_not_granted("NPM_CONFIG_CACHE", ".config/fish", &[], "m.toml");
+    }
+
+    /// `TMPDIR` is as attacker-set as `GOCACHE`: pointing it at `$HOME` must
+    /// not make a home persistence path a "temp" safe root.
+    #[test]
+    fn env_tool_dir_tmpdir_at_home_is_not_a_safe_root() {
+        assert_env_tool_dir_not_granted(
+            "GOCACHE",
+            "Library/LaunchAgents",
+            &[("TMPDIR", "")],
+            "m.toml",
+        );
+        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".local/bin", &[("TMPDIR", "")], "m.toml");
+    }
+
+    /// The deny-set second layer on its own: `~/.gradle` passes the positive
+    /// rule (a writable tool dir), but contains the denied
+    /// `gradle.properties`, so the grant is refused. Only the refusal is
+    /// checked: Landlock cannot deny `gradle.properties` inside the default
+    /// writable `~/.gradle` (documented gap on `DENIED_HOME_SUBPATHS`), so the
+    /// write succeeds with or without the env grant.
+    #[test]
+    fn env_tool_dir_under_safe_root_but_protected_is_not_granted() {
+        env_tool_dir_case("GOCACHE", ".gradle", &[], "gradle.properties", false);
+    }
 }

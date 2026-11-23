@@ -338,6 +338,28 @@ At launch cplt prints a warning naming both directories, then drops the executab
 
 **Fix:** move the toolchain home outside `~/.cache` (for example `CARGO_HOME=~/.local/share/cargo`), or point the symlinks at separate trees.
 
+## Tool dirs set by env var outside the safe roots (behaviour change)
+
+cplt grants a tool dir named by an env var (`GOCACHE`, `GOPATH`, `CARGO_HOME`,
+`PNPM_HOME`, `PIP_CACHE_DIR`, `JAVA_HOME` and the rest) only when it is a
+directory under a safe root: `~/.cache`, `~/Library/Caches`, another cplt tool
+cache such as `~/.npm` or `~/.gradle`, `~/.local/share/cargo`,
+`~/.local/share/go`, the project, or `/tmp` (`/private/tmp` on macOS). The
+per-user temp dir (`$TMPDIR`, `/var/folders/...` on macOS) does not count.
+SDK vars such as `JAVA_HOME` may also point at a known SDK root (`~/.sdkman`,
+`~/.jdks`, `/usr/lib/jvm`, `/Library/Java`, mise or asdf installs). A project
+`.envrc` can set these variables, so a dir elsewhere is refused with a warning:
+
+```text
+Ignoring GOPATH = /Users/you/work/gopath: an env-set tool dir is granted only when ...
+```
+
+To keep using it, do one of these:
+
+- Move it under `~/.cache`, for example `GOPATH=~/.cache/gopath`.
+- Grant it once: `cplt config set allow.write ~/work/gopath` (or `allow.read`
+  for an SDK).
+
 ## Go builds in a git worktree
 
 A Go build in a git worktree can fail under cplt with:
