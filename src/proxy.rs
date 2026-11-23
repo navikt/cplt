@@ -4306,7 +4306,6 @@ mod tests {
         use std::io::BufRead;
         let up = TcpListener::bind("127.0.0.1:0").unwrap();
         let up_port = up.local_addr().unwrap().port();
-        let up_again = up.try_clone().unwrap();
         let up_zero = up.try_clone().unwrap();
         let upstream = format!("http://127.0.0.1:{up_port}/mcp/readonly");
         assert!(
@@ -4448,35 +4447,8 @@ mod tests {
         assert!(read_status_line(&mut c).starts_with("HTTP/1.1 502"));
         p.shutdown();
 
-        // An ambient proxy variable on the host does not reroute the token.
-        let trap = TcpListener::bind("127.0.0.1:0").unwrap();
-        trap.set_nonblocking(true).unwrap();
-        let trap_url = format!("http://127.0.0.1:{}", trap.local_addr().unwrap().port());
-        // SAFETY: only curl children read these, and they get a cleared env.
-        unsafe {
-            std::env::set_var("http_proxy", &trap_url);
-            std::env::set_var("ALL_PROXY", &trap_url);
-        }
-        std::thread::spawn(move || {
-            let (s, _) = up_again.accept().unwrap();
-            let mut r = std::io::BufReader::new(&s);
-            let mut l = String::new();
-            while r.read_line(&mut l).unwrap() > 2 {
-                l.clear();
-            }
-            let _ = (&s).write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
-        });
-        let p = head_test_proxy(up_port, Duration::from_secs(10), dir.path().join("l3"));
-        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
-        c.write_all(post).unwrap();
-        let status = read_status_line(&mut c);
-        unsafe {
-            std::env::remove_var("http_proxy");
-            std::env::remove_var("ALL_PROXY");
-        }
-        assert!(status.starts_with("HTTP/1.1 204"), "{status}");
-        assert!(trap.accept().is_err(), "the ambient proxy saw the request");
-        p.shutdown();
+        // The ambient-proxy guarantee is covered without touching the process
+        // env: see `github_mcp::tests::curl_runs_with_a_cleared_env_and_bounded_times`.
 
         // A body trickled in under the per-read timeout still meets one deadline.
         let p = head_test_proxy(up_port, Duration::from_secs(2), dir.path().join("l4"));
