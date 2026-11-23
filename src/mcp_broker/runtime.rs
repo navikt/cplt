@@ -59,6 +59,9 @@ impl Log {
     }
 }
 
+#[cfg(test)]
+type TeardownHook = Box<dyn FnOnce(&Server) + Send>;
+
 pub(crate) struct Server {
     spec: Spec,
     /// The live child, if a client is connected. One per server.
@@ -73,6 +76,9 @@ pub(crate) struct Server {
     /// Linux, `keychain` mechanisms: where this server's xdg-dbus-proxy
     /// listens, in the broker's 0700 socket dir.
     bus_socket: PathBuf,
+    /// Runs in connection teardown between the kill and the slot clear.
+    #[cfg(test)]
+    teardown_hook: Mutex<Option<TeardownHook>>,
 }
 
 pub(crate) struct Shared {
@@ -351,6 +357,8 @@ impl Broker {
                 egress_port,
                 egress_socket,
                 bus_socket: dir.path().join(format!("b{n}")),
+                #[cfg(test)]
+                teardown_hook: Mutex::new(None),
             };
             servers.insert(server.spec.id.clone(), server);
         }
@@ -919,18 +927,40 @@ fn remove_tmp_on_exit(pid: u32, tmp: tempfile::TempDir, tmps: &ChildTmps) {
             ev.fflags = libc::NOTE_EXIT;
             let mut out: libc::kevent = std::mem::zeroed();
             // ESRCH on register: already exited. Otherwise block until exit.
-            loop {
+            let exited = loop {
                 let n = libc::kevent(kq, &raw const ev, 1, &raw mut out, 1, std::ptr::null());
-                if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                    break;
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if n >= 0 || errno != Some(libc::EINTR) {
+                    break watcher_saw_exit(n, errno, &out);
                 }
-            }
+            };
             libc::close(kq);
+            // Any other watcher error: the child may still run, so the dir
+            // stays for broker drop, as when kqueue() fails.
+            if !exited {
+                return;
+            }
         }
         if let Ok(mut t) = tmps.lock() {
             t.remove(&key);
         }
     });
+}
+
+/// Whether a `kevent` result proves the child gone: `NOTE_EXIT`, or ESRCH
+/// (already exited) as errno or as an `EV_ERROR` event.
+#[cfg(target_os = "macos")]
+fn watcher_saw_exit(n: i32, errno: Option<i32>, out: &libc::kevent) -> bool {
+    if n < 0 {
+        return errno == Some(libc::ESRCH);
+    }
+    if n == 0 {
+        return false;
+    }
+    if out.flags & libc::EV_ERROR != 0 {
+        return out.data == libc::ESRCH as isize;
+    }
+    out.fflags & libc::NOTE_EXIT != 0
 }
 
 /// What the child's command needs past [`host_env`], and what must live
@@ -1623,12 +1653,18 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     // Client gone (or the socket was closed): end the child.
     done.store(true, Ordering::Release);
     drop(stdin);
+    // Kill before freeing the slot: a broker shutdown in between must still
+    // find the child, and its temp dir must outlive it.
+    kill(&child);
+    #[cfg(test)]
+    if let Some(hook) = server.teardown_hook.lock().unwrap().take() {
+        hook(server);
+    }
     if let Ok(mut slot) = server.child.lock()
         && slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &child))
     {
         *slot = None;
     }
-    kill(&child);
     let _ = out.join();
     let _ = ticker.join();
     let _ = canceller.join();
@@ -2463,6 +2499,59 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Only NOTE_EXIT or ESRCH frees the temp dir; other watcher errors
+    /// keep it for broker drop.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn watcher_errors_keep_the_temp_dir() {
+        // SAFETY: an all-zero kevent is a valid value.
+        let ev = |flags: u16, fflags: u32, data: isize| {
+            let mut e: libc::kevent = unsafe { std::mem::zeroed() };
+            e.flags = flags;
+            e.fflags = fflags;
+            e.data = data;
+            e
+        };
+        let none = ev(0, 0, 0);
+        assert!(watcher_saw_exit(1, None, &ev(0, libc::NOTE_EXIT, 0)));
+        assert!(watcher_saw_exit(
+            1,
+            None,
+            &ev(libc::EV_ERROR, 0, libc::ESRCH as isize)
+        ));
+        assert!(watcher_saw_exit(-1, Some(libc::ESRCH), &none));
+        assert!(!watcher_saw_exit(
+            1,
+            None,
+            &ev(libc::EV_ERROR, 0, libc::EBADF as isize)
+        ));
+        assert!(!watcher_saw_exit(-1, Some(libc::EBADF), &none));
+        assert!(!watcher_saw_exit(-1, Some(libc::ENOMEM), &none));
+        assert!(!watcher_saw_exit(0, None, &none));
+    }
+
+    /// A shutdown racing connection teardown still finds the child: it stays
+    /// in the slot until killed and reaped.
+    #[test]
+    fn teardown_kills_before_freeing_the_slot() {
+        let b = cat_broker();
+        let server = &b.shared.servers["io.github.nais/nais-mcp"];
+        let (tx, rx) = std::sync::mpsc::channel();
+        *server.teardown_hook.lock().unwrap() = Some(Box::new(move |s: &Server| {
+            let slot = s.child.lock().unwrap().clone();
+            let gone = slot.map(|c| !matches!(c.lock().unwrap().try_wait(), Ok(None)));
+            tx.send(gone).unwrap();
+        }));
+        let (mut a, mut ra) = connect(&b);
+        writeln!(a, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+        let mut l = String::new();
+        ra.read_line(&mut l).unwrap();
+        drop((a, ra));
+        let seen = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(seen, Some(true), "slot freed before the child was gone");
+        wait_free(&b);
     }
 
     fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {
