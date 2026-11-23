@@ -1213,6 +1213,10 @@ pub(crate) mod tests {
         );
         assert_eq!(spec.timeout_secs, REMOTE_TIMEOUT_DEFAULT);
         assert!(spec.command.is_empty());
+        // A command mechanism cannot take a remote.
+        let mut r = gh_root();
+        r["_meta"][META_KEY]["credential"] = json!("none");
+        assert!(check_oauth(&r, true).unwrap_err().contains("not brokered"));
         // Gate off: refused exactly as before this mechanism existed.
         assert_eq!(
             check_oauth(&gh_root(), false).unwrap_err(),
