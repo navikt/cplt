@@ -3642,19 +3642,25 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
             .find(|(_, s)| AUTH_SUBCOMMANDS.contains(s))
             .map(|(j, _)| (i, j))
     });
-    // `-h <v>`, `-h<v>`, `-h=<v>` may sit between `auth` and the subcommand,
-    // as parse_command allows; the scan must still see that host.
+    // Hostname flags in any form (`-h <v>`, `-h<v>`, `-h=<v>`, `--hostname <v>`,
+    // `--hostname=<v>`) may sit between `auth` and the subcommand, as
+    // parse_command allows; the scan must still see every host, and they are
+    // not ambiguous. Any other flag there is.
     let auth = auth_sub.is_some_and(|(i, j)| {
         let mut k = i + 1;
-        while k < j && args[k].starts_with("-h") {
-            k += if args[k] == "-h" { 2 } else { 1 };
+        while k < j {
+            k += match args[k] {
+                "-h" | "--hostname" => 2,
+                a if a.starts_with("-h") || a.starts_with("--hostname=") => 1,
+                _ => break,
+            };
         }
         k == j
     });
     let mut found = Vec::new();
     // An unknown root flag may take a value (`gh --x v auth ...`): then any
     // `auth` positional before another command word could be the command.
-    let mut ambiguous = auth_sub.is_some_and(|(i, j)| j != i + 1)
+    let mut ambiguous = (auth_sub.is_some() && !auth)
         || (unknown
             && root.is_some_and(|i| {
                 args[i..]
@@ -6645,6 +6651,59 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Review of #1089: every hostname flag around the auth subcommand counts,
+    /// and a known one before it keeps the token.
+    #[test]
+    fn hostname_flags_before_auth_subcommand_all_count() {
+        let policy = GatePolicy::default();
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        for args in [
+            &[
+                "auth",
+                "--hostname",
+                "github.com",
+                "status",
+                "-h",
+                "evil.ghe.com",
+            ][..],
+            &[
+                "auth",
+                "--hostname=github.com",
+                "status",
+                "--hostname",
+                "evil.ghe.com",
+            ],
+            &["auth", "-h", "github.com", "status", "-hevil.ghe.com"],
+        ] {
+            assert_eq!(requested_hostnames(args).len(), 2, "{args:?}");
+            assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
+            assert!(!ok(args), "{args:?}");
+        }
+        for args in [
+            &["auth", "--hostname", "evil.ghe.com", "status"][..],
+            &["auth", "--hostname=evil.ghe.com", "status"],
+            &["auth", "-h", "evil.ghe.com", "status"],
+        ] {
+            assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
+            assert!(!ok(args), "{args:?}");
+        }
+        for args in [
+            &["auth", "-h", "github.com", "status"][..],
+            &["auth", "--hostname", "github.com", "status"],
+            &["auth", "--hostname=github.com", "status"],
+        ] {
+            assert_eq!(
+                scan_hostnames(args),
+                (vec!["github.com"], false),
+                "{args:?}"
+            );
+            assert!(gate(args, Path::new("."), &policy).is_ok(), "{args:?}");
+            assert!(ok(args), "{args:?}");
+        }
+        assert!(scan_hostnames(&["auth", "--bogus", "status"]).1);
     }
 
     #[test]
