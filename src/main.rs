@@ -9071,6 +9071,14 @@ fn run_check_command(
     if let Some(Err(line)) = apply_managed_layer(&mut resolved, || writable) {
         warn_managed_once(&line);
     }
+    // Read back from `resolved`, so this says what the policy below holds.
+    if let Some(m) = &resolved.managed {
+        ui::info(&format!(
+            "managed config: {} [{}]",
+            m.display_path(),
+            m.tag()
+        ));
+    }
     // An unreadable blocklist file stops the live proxy from starting; say so
     // here too rather than report a policy that never runs.
     let net_policy = match build_net_policy(&resolved, active_agent) {

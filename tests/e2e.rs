@@ -11006,16 +11006,68 @@ paths = [
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            // Either refusal proves the layer was loaded: a CI runner whose HOME
-            // is not the passwd home hits the HOME check before the path check.
-            let refused = format!("CPLT_MANAGED_CONFIG={} ignored: ", planted.display());
+            // cplt_cmd() points HOME at a scratch dir, never the passwd home, so the
+            // HOME check refuses first; the path rule is covered by the unit tests.
+            let refused = format!(
+                "CPLT_MANAGED_CONFIG={} ignored: HOME is not the account's home directory",
+                planted.display()
+            );
             assert!(
-                all.contains(&refused)
-                    && (all.contains("must lie under")
-                        || all.contains("HOME is not the account's home directory")),
+                all.contains(&refused),
                 "{args:?} must load and refuse the planted managed file:\n{all}"
             );
         }
+    }
+
+    /// A trusted managed file reaches the policy `check` builds (#1095). Uses
+    /// the debug-only `CPLT_TEST_ACCOUNT_HOME` seam so the scratch home counts
+    /// as the passwd home; fails if `run_check_command` stops applying the layer
+    /// or `apply_managed_layer` stops writing it into the resolved config.
+    #[test]
+    fn e2e_check_applies_a_trusted_managed_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Under the checkout: /tmp and /var/folders are session-writable.
+        let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let dir = home.join(".config/cplt/managed.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nav.toml");
+        std::fs::write(
+            &file,
+            "managed_by = \"nav-pilot\"\nschema = 1\n[proxy]\nallow_private_domains = [\"intern.nav.no\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let proj = home.join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let output = cplt_cmd()
+            .env("HOME", &home)
+            .env("CPLT_TEST_ACCOUNT_HOME", &home)
+            .env("CPLT_MANAGED_CONFIG", &file)
+            .arg("--project-dir")
+            .arg(&proj)
+            .args([
+                "--agent",
+                "shell",
+                "check",
+                "net",
+                "example.com",
+                "--no-connect",
+            ])
+            .output()
+            .expect("cplt should run");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            all.contains(&format!(
+                "managed config: {} [managed:nav-pilot]",
+                file.display()
+            )),
+            "check must apply the trusted managed file:\n{all}"
+        );
     }
 
     #[test]

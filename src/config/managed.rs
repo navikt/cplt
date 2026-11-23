@@ -109,6 +109,11 @@ fn esc(s: &str) -> String {
 
 /// The account's home directory from the passwd entry, never `$HOME`.
 pub fn account_home() -> Option<PathBuf> {
+    // Test-only seam so e2e can trust a scratch home; absent from release builds.
+    #[cfg(debug_assertions)]
+    if let Some(h) = std::env::var_os("CPLT_TEST_ACCOUNT_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(h));
+    }
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt as _;
     let mut buf = vec![0u8; 16 * 1024];
