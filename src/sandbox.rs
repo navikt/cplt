@@ -1229,13 +1229,64 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path) -> String {
+/// The refusal for a writable tree that holds cplt's state dir, with a remedy
+/// that fits where the tree came from: telling someone to narrow `allow.write`
+/// when the tree is their project or an exported `GOCACHE` sends them looking
+/// for a grant they never wrote.
+fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, env_var: Option<&str>) -> String {
+    let remedy = if !dir.starts_with(p) {
+        // Only a symlink on the way to the state dir puts it inside `p`.
+        format!(
+            "{} is a symlink into that tree (a stow-style dotfiles link). Move the cplt \
+             directory out of it, so the state directory is not reachable through it.",
+            dir.display()
+        )
+    } else if let Some(var) = env_var {
+        format!(
+            "That grant comes from the environment variable {var}. Point {var} at a \
+             directory that does not contain cplt's state directory, or unset it."
+        )
+    } else {
+        match what {
+            "allow.write" | "the allow.write grant" => "Narrow allow.write to the \
+                subdirectory you need, e.g. `cplt config set allow.write ~/.config/<tool>`."
+                .to_string(),
+            "the project directory" | "the named repository" => "Launch cplt from inside \
+                the repository, not from ~/.config, $HOME or a directory that contains them."
+                .to_string(),
+            "the writable agent directory" | "the writable agent file" => "The agent's \
+                directory comes from its environment (XDG_CONFIG_HOME, XDG_DATA_HOME or the \
+                agent's own config-dir variable). Point that variable elsewhere."
+                .to_string(),
+            "the writable tool directory" => "Tool directories follow their environment \
+                variables (XDG_CACHE_HOME and friends). Point that variable elsewhere."
+                .to_string(),
+            _ => "Make sure that tree does not contain cplt's state directory.".to_string(),
+        }
+    };
     format!(
-        "{what} {} would make cplt's state directory {} writable in the sandbox. \
-         Grant a narrower directory that does not contain it.",
+        "{what} {} would make cplt's state directory {} writable in the sandbox. {remedy}",
         p.display(),
         dir.display()
     )
+}
+
+/// The tool-path variable (`GOCACHE`, `CARGO_HOME`, ...) whose value became the
+/// write grant `tree`, so the refusal names it instead of blaming `allow.write`.
+fn tool_env_var_for(tree: &Path, home: &Path) -> Option<&'static str> {
+    let env: Vec<(String, String)> = policy::TOOL_PATH_ENV_VARS
+        .iter()
+        .filter_map(|tv| {
+            std::env::var(tv.name)
+                .ok()
+                .map(|v| (tv.name.to_string(), v))
+        })
+        .collect();
+    let want = std::fs::canonicalize(tree).ok()?;
+    policy::tool_path_env_overrides(&env, home)
+        .into_iter()
+        .find(|o| o.write && std::fs::canonicalize(&o.path).ok().as_deref() == Some(&*want))
+        .map(|o| o.name)
 }
 
 /// Refuse one grant that no launch can honour, with the reason.
@@ -1256,7 +1307,7 @@ pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), S
     if key == "allow.write"
         && let Some(dir) = policy::cplt_state_ancestor_grant(home_dir, p)
     {
-        return Err(state_ancestor_refusal(key, p, &dir));
+        return Err(state_ancestor_refusal(key, p, &dir, None));
     }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
@@ -1381,7 +1432,10 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         .filter(|(_, why)| *why != TEMP_DIR_SOURCE)
     {
         if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, &tree) {
-            return Err(state_ancestor_refusal(why, &tree, &dir));
+            let var = (why == "the allow.write grant")
+                .then(|| tool_env_var_for(&tree, config.home_dir))
+                .flatten();
+            return Err(state_ancestor_refusal(why, &tree, &dir, var));
         }
     }
     let trees: Vec<PathBuf> = canonical_writable_trees(config)
@@ -7189,6 +7243,81 @@ mod tests {
         config.agent_dirs = &agent;
         let err = keep_cplt_state_out_of_grants(&config).unwrap_err();
         assert!(err.contains("cplt's state directory"), "{err}");
+    }
+
+    /// #1095 review: each source of a state-dir ancestor gets its own remedy,
+    /// and the launch-time check refuses project, tool-dir, env and symlink
+    /// sources, not only agent dirs.
+    #[test]
+    fn state_ancestor_refusal_names_a_remedy_per_source() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let cfg = h.join(".config");
+        std::fs::create_dir_all(cfg.join("cplt")).unwrap();
+        let refuse = |config: &SandboxConfig| {
+            temp_env::with_vars_unset(["XDG_CONFIG_HOME", "GOCACHE"], || {
+                keep_cplt_state_out_of_grants(config).unwrap_err()
+            })
+        };
+
+        // allow.write at config-set time and at launch.
+        let err = validate_grant_path("allow.write", &cfg, &h).unwrap_err();
+        assert!(
+            err.contains("cplt config set allow.write ~/.config/<tool>"),
+            "{err}"
+        );
+        let writes = [cfg.clone()];
+        let mut config = test_config(&h, &[]);
+        config.extra_write = &writes;
+        let err = refuse(&config);
+        assert!(err.contains("Narrow allow.write"), "{err}");
+
+        // The same grant derived from GOCACHE names the variable.
+        let err = temp_env::with_vars(
+            [
+                ("GOCACHE", Some(cfg.as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || keep_cplt_state_out_of_grants(&config).unwrap_err(),
+        );
+        assert!(err.contains("environment variable GOCACHE"), "{err}");
+        assert!(!err.contains("Narrow allow.write"), "{err}");
+
+        // Project directory = ~/.config.
+        let mut config = test_config(&h, &[]);
+        config.project_dir = &cfg;
+        let err = refuse(&config);
+        assert!(err.contains("the project directory"), "{err}");
+        assert!(
+            err.contains("Launch cplt from inside the repository"),
+            "{err}"
+        );
+
+        // A writable tool directory at ~/.config.
+        let tools = [policy::ResolvedToolDir {
+            path: cfg.clone(),
+            target: None,
+            dir: policy::HOME_TOOL_DIRS.iter().find(|d| d.write).unwrap(),
+        }];
+        let mut config = test_config(&h, &[]);
+        config.existing_home_tool_dirs = Some(&tools);
+        let err = refuse(&config);
+        assert!(err.contains("the writable tool directory"), "{err}");
+        assert!(err.contains("Point that variable elsewhere"), "{err}");
+        assert!(!err.contains("allow.write"), "{err}");
+
+        // A stow-style ~/.config/cplt link into the project.
+        let home2 = tempfile::tempdir().unwrap();
+        let h2 = std::fs::canonicalize(home2.path()).unwrap();
+        let project = h2.join("dotfiles");
+        std::fs::create_dir_all(project.join("cplt")).unwrap();
+        std::fs::create_dir_all(h2.join(".config")).unwrap();
+        std::os::unix::fs::symlink(project.join("cplt"), h2.join(CPLT_STATE_DIR)).unwrap();
+        let mut config = test_config(&h2, &[]);
+        config.project_dir = &project;
+        let err = refuse(&config);
+        assert!(err.contains("is a symlink into that tree"), "{err}");
+        assert!(err.contains("Move the cplt directory out"), "{err}");
     }
 
     /// #1095: with `$HOME` relocated, the passwd home's state dir is still
