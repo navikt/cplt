@@ -196,7 +196,8 @@ fn parse_element(
             if !removing {
                 refuse_private_domain_ip(key_info, value)?;
             }
-            // A hand-written `~/t` entry must stay removable: match raw.
+            // Removal matches the spelling as typed; the caller tries the
+            // expanded and normalised forms after it.
             if removing {
                 return Ok(toml_edit::value(value).into_value().unwrap());
             }
@@ -292,12 +293,25 @@ pub fn remove_array_element_in_doc(
     key_info: &ConfigKeyInfo,
     value: &str,
 ) -> Result<bool, ConfigError> {
-    let element = parse_element(key_info, value, true)?;
-    // The entry may have been stored normalised: try the spelling typed, then
-    // the normalised one.
-    let alt = is_private_domains_key(key_info)
-        .then(|| parse_element(key_info, &crate::proxy::normalize_hostname(value), true))
-        .transpose()?;
+    // Match order: the exact typed string, the tilde-expanded form (what
+    // `set --append` stores for path keys), then the normalised form (what it
+    // stores for proxy.allow_private_domains). Never validates.
+    let mut candidates = vec![parse_element(key_info, value, true)?];
+    if matches!(key_info.value_type, ConfigValueType::StrArray) {
+        let expanded = expand_tilde(value);
+        candidates.push(parse_element(
+            key_info,
+            expanded.to_string_lossy().as_ref(),
+            true,
+        )?);
+        if is_private_domains_key(key_info) {
+            candidates.push(parse_element(
+                key_info,
+                &crate::proxy::normalize_hostname(value),
+                true,
+            )?);
+        }
+    }
 
     let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) else {
         return Ok(false); // Section doesn't exist — nothing to remove
@@ -314,13 +328,10 @@ pub fn remove_array_element_in_doc(
         )));
     };
 
-    // Find and remove all matching elements (handles manual duplicates)
-    let mut removed = false;
-    while let Some(idx) =
-        array_index_of(arr, &element).or_else(|| alt.as_ref().and_then(|a| array_index_of(arr, a)))
-    {
+    let idx = candidates.iter().find_map(|c| array_index_of(arr, c));
+    let removed = idx.is_some();
+    if let Some(idx) = idx {
         arr.remove(idx);
-        removed = true;
     }
 
     // Clean up empty arrays
@@ -744,6 +755,27 @@ mod tests {
             .parse::<toml_edit::DocumentMut>()
             .unwrap();
         assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
+    }
+
+    #[test]
+    fn removal_match_order_exact_then_expanded_then_normalised() {
+        let info = lookup_key("allow.read").unwrap();
+        let home = expand_tilde("~/t").to_string_lossy().to_string();
+        let parse = |s: &str| s.parse::<toml_edit::DocumentMut>().unwrap();
+        // exact wins over expanded: the literal entry goes, the absolute stays.
+        let mut doc = parse(&format!("[allow]\nread = [\"{home}\", \"~/t\"]\n"));
+        assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
+        assert!(doc.to_string().contains(&home) && !doc.to_string().contains("~/t"));
+        // expanded fallback.
+        let mut doc = parse(&format!("[allow]\nread = [\"{home}\"]\n"));
+        assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
+        // normalised fallback, and exact beats normalised.
+        let info = lookup_key("proxy.allow_private_domains").unwrap();
+        let mut doc = parse("[proxy]\nallow_private_domains = [\"A.no\", \"a.no\"]\n");
+        assert!(remove_array_element_in_doc(&mut doc, info, "A.no").unwrap());
+        assert!(doc.to_string().contains("\"a.no\"") && !doc.to_string().contains("A.no"));
+        let mut doc = parse("[proxy]\nallow_private_domains = [\"a.no\"]\n");
+        assert!(remove_array_element_in_doc(&mut doc, info, "A.no.").unwrap());
     }
 
     #[test]
