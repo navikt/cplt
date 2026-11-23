@@ -75,6 +75,7 @@ fn parse_value_for_key(
             // Comma-separated: "path1,path2" or single "path1"
             let mut arr = toml_edit::Array::new();
             for item in value.split(',') {
+                refuse_private_domain_ip(key_info, item.trim())?;
                 if is_gh_hosts_key(key_info) {
                     super::validation::validate_gh_host(item.trim())?;
                 }
@@ -87,6 +88,21 @@ fn parse_value_for_key(
             key_info.section, key_info.key
         ))),
     }
+}
+
+/// `allow_private_domains` cannot allow an IP target, inet_aton aliases
+/// included (#1102): the proxy blocks those before DNS. Refuse while the user
+/// is at the keyboard instead of storing an entry that does nothing.
+fn refuse_private_domain_ip(key_info: &ConfigKeyInfo, value: &str) -> Result<(), ConfigError> {
+    if (key_info.section, key_info.key) == ("proxy", "allow_private_domains")
+        && crate::proxy::is_ip_alias(value)
+    {
+        return Err(ConfigError::Validation(format!(
+            "{value} is an IP address, not a DNS name. cplt blocks private IP targets \
+             whatever proxy.allow_private_domains says. Give the host a DNS name and allow that."
+        )));
+    }
+    Ok(())
 }
 
 fn is_gh_hosts_key(key_info: &ConfigKeyInfo) -> bool {
@@ -150,6 +166,7 @@ fn parse_element_for_key(
                      covered."
                 )));
             }
+            refuse_private_domain_ip(key_info, value)?;
             // Expand ~ so stored values are always absolute paths.
             // For non-path keys (e.g. pass_env), expand_tilde is a no-op.
             let expanded = expand_tilde(value);
@@ -627,6 +644,24 @@ mod tests {
             let err = on.unwrap_err().to_string();
             assert!(err.contains("macOS-only"), "{err}");
         }
+    }
+
+    /// #1102: an IP literal or inet_aton alias cannot be allowed by name.
+    #[test]
+    fn allow_private_domains_refuses_ip_aliases_at_set() {
+        let info = lookup_key("proxy.allow_private_domains").unwrap();
+        for bad in ["10.1", "0x0a.1.2.3", "012.0.0.1", "167772161", "10.0.0.5"] {
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            let err = set_value_in_doc(&mut doc, info, bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a DNS name"), "{bad}: {err}");
+            let err = parse_element_for_key(info, bad).unwrap_err().to_string();
+            assert!(err.contains("not a DNS name"), "{bad}: {err}");
+        }
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        set_value_in_doc(&mut doc, info, "intern.nav.no").unwrap();
+        parse_element_for_key(info, "1password.com").unwrap();
     }
 
     #[test]

@@ -2510,13 +2510,9 @@ impl Refusal {
 /// starting or ending with `-`, first char alphanumeric, total <= 253. Rules out
 /// option-shaped input such as `--unset` before it reaches a pasted command.
 fn is_plain_dns_name(host: &str) -> bool {
-    // A digit-led last label (`10.1`, `0x0a.1.2.3`) is an inet_aton IP alias, not a name.
     host.len() <= 253
         && host.contains('.')
-        && !host
-            .rsplit('.')
-            .next()
-            .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+        && !is_ip_alias(host)
         && host.split('.').all(|l| {
             (1..=63).contains(&l.len())
                 && !l.starts_with('-')
@@ -2678,12 +2674,27 @@ pub fn classify_resolved(
     }
 }
 
+/// A name whose last label starts with a digit (`10.1`, `0x0a.1.2.3`, `012.1`,
+/// `167772161`). The resolver's inet_aton fallback reads it as an IPv4 address,
+/// so it is an IP literal in disguise, never a DNS name. Trailing dot ignored.
+pub fn is_ip_alias(host: &str) -> bool {
+    host.trim_end_matches('.')
+        .rsplit('.')
+        .next()
+        .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Check hostname patterns that are known to be private (pre-DNS fast path).
 pub fn is_private_hostname(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
     // Check if it's an IP literal first
     if let Ok(ip) = h.parse::<std::net::IpAddr>() {
         return is_private_ip(&ip);
+    }
+    // An inet_aton alias may resolve to any private address and cannot be
+    // allowed by name, so treat it as a private IP literal before DNS (#1102).
+    if is_ip_alias(h) {
+        return true;
     }
     h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local")
 }

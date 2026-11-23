@@ -345,6 +345,17 @@ impl Config {
             .collect();
         allow_private_domains.sort_unstable();
         allow_private_domains.dedup();
+        // An IP literal or inet_aton alias is blocked before DNS whatever this
+        // list says, so the entry would do nothing. Say so and drop it (#1102).
+        allow_private_domains.retain(|d| {
+            let alias = crate::proxy::is_ip_alias(d);
+            if alias {
+                ui::warn(&format!(
+                    "Warning: proxy.allow_private_domains entry {d:?} is an IP address, not a DNS name, and is ignored. Give the host a DNS name and allow that."
+                ));
+            }
+            !alias
+        });
         for domain in &allow_private_domains {
             if domain.trim().is_empty() {
                 return Err(ConfigError::Validation(
@@ -3640,6 +3651,21 @@ validate = false
         );
         assert!(resolved.allow_ports.contains(&8080));
         assert!(resolved.allow_ports.contains(&5432));
+    }
+
+    /// #1102: an IP-alias entry would do nothing, so it is dropped (with a
+    /// warning) rather than kept as an apparent grant.
+    #[test]
+    fn allow_private_domains_drops_ip_aliases_at_load() {
+        let config = Config::parse(
+            "[proxy]\nallow_private_domains = [\"intern.nav.no\", \"10.1\", \"0x0a.1.2.3\"]\n",
+        )
+        .expect("config parses");
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(
+            resolved.allow_private_domains,
+            vec!["intern.nav.no".to_string()]
+        );
     }
 
     #[test]
