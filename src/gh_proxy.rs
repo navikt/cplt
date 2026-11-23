@@ -1361,7 +1361,8 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
 
     // Skip global flags that appear before the command.
     // gh global flags that take a value argument:
-    const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &["--repo", "-R", "--hostname"];
+    // `-h` too: cobra reads a bare `-h` before the command as taking a value.
+    const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &["--repo", "-R", "--hostname", "-h"];
     let mut idx = 0;
     let mut global_repo_flag: Option<String> = None;
     while idx < args.len() && args[idx].starts_with('-') {
@@ -1560,6 +1561,11 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                     i += 2;
                     continue;
                 }
+            }
+            // Before the subcommand cobra reads these as taking the next word (#1075).
+            "-h" | "--hostname" if subcommand.is_none() => {
+                i += 2;
+                continue;
             }
             a if a.starts_with('-') => {
                 // Skip flags
@@ -2771,6 +2777,16 @@ fn gate_with_scope_resolver_for(
     resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
     real_git: Option<&Path>,
 ) -> Result<GateApproval, Refusal> {
+    if let Some(flag) = misplaced_flag(args) {
+        return Err(Refusal {
+            headline: format!("'{flag}' before the gh subcommand is not allowed."),
+            guidance: "gh may read the next word as the flag's value and run another \
+                subcommand than the one the guard checked. Put flags after the subcommand, \
+                for example 'gh auth status --hostname github.com'."
+                .to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
         // These are read-only informational invocations — always allow.
@@ -3496,6 +3512,54 @@ fn root_command(args: &[&str]) -> (Option<usize>, bool) {
         i += 1;
     }
     (None, unknown)
+}
+
+/// A flag before the command or subcommand that cobra may read as taking the
+/// next word as its value, so the guard would check one subcommand while gh
+/// runs another: `gh auth -h git-credential token` runs `auth token` (#1075).
+/// The known value flags (`-R`/`--repo`/`--hostname`/`-h`) and `--help` are
+/// fine; any other flag is returned when a positional follows it. Bare
+/// `gh auth -h` and `gh --help` stay help.
+fn misplaced_flag<'a>(args: &[&'a str]) -> Option<&'a str> {
+    // Commands with no subcommands, whose flags may precede a positional.
+    const LEAF: &[&str] = &[
+        "api",
+        "browse",
+        "co",
+        "completion",
+        "copilot",
+        "stack",
+        "status",
+    ];
+    let (root, unknown) = root_command(args);
+    let root = root?;
+    if unknown {
+        return args[..root].iter().find(|a| a.starts_with('-')).copied();
+    }
+    if !GH_COMMANDS.contains(&args[root]) || LEAF.contains(&args[root]) {
+        return None;
+    }
+    let mut i = root + 1;
+    while let Some(&a) = args.get(i) {
+        if !a.starts_with('-') || a == "-" {
+            return None;
+        }
+        match a {
+            "-R" | "-h" | "--repo" | "--hostname" => i += 1,
+            "--help" => {}
+            _ if a.starts_with("--repo=")
+                || a.starts_with("--hostname=")
+                || (a.starts_with("-R") && !a.starts_with("--")) => {}
+            _ => {
+                return args[i + 1..]
+                    .iter()
+                    .any(|b| !b.starts_with('-'))
+                    .then_some(a);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// [`requested_hostnames`], plus whether the scan met a `gh auth` flag it does
@@ -6457,6 +6521,82 @@ mod tests {
         let policy = GatePolicy::default(); // block_auth_token = true
         assert!(gate(&["auth", "git-credential", "get"], dir, &policy).is_ok());
         assert!(gate(&["auth", "token"], dir, &policy).is_err());
+    }
+
+    /// #1075: the guard must see the subcommand gh runs. Checked against gh
+    /// 2.105: `gh auth -h git-credential token` and `gh -h x auth token` print
+    /// the token; `gh auth -hx token` runs `auth token` for host `x`.
+    #[test]
+    fn group_flags_before_auth_subcommand_match_gh() {
+        for sub in [
+            "token",
+            "status",
+            "logout",
+            "refresh",
+            "setup-git",
+            "switch",
+            "git-credential",
+        ] {
+            for known in [
+                vec!["auth", "-h", "git-credential", sub],
+                vec!["auth", "--hostname", "github.com", sub],
+                vec!["auth", "--hostname=github.com", sub],
+                vec!["-h", "github.com", "auth", sub],
+                vec!["--hostname", "git-credential", "auth", sub],
+            ] {
+                assert_eq!(misplaced_flag(&known), None, "{known:?}");
+                let cmd = parse_command(&known).unwrap();
+                assert_eq!(
+                    (cmd.command.as_str(), cmd.subcommand.as_deref()),
+                    ("auth", Some(sub)),
+                    "{known:?}"
+                );
+            }
+            for unknown in [
+                vec!["auth", "-x", "git-credential", sub],
+                vec!["auth", "--foo", sub],
+                vec!["auth", "--foo=1", sub],
+                vec!["auth", "-hx", sub],
+                vec!["auth", "-t", sub],
+                vec!["auth", "--", sub],
+                vec!["--foo", "auth", sub],
+                vec!["-hx", "auth", sub],
+            ] {
+                assert!(misplaced_flag(&unknown).is_some(), "{unknown:?}");
+                assert!(
+                    gate(&unknown, Path::new("."), &GatePolicy::default()).is_err(),
+                    "{unknown:?}"
+                );
+            }
+        }
+        let policy = GatePolicy::default();
+        let refusal = gate(
+            &["auth", "-x", "git-credential", "token"],
+            Path::new("."),
+            &policy,
+        )
+        .unwrap_err();
+        assert!(refusal.guidance.contains("after the subcommand"));
+        assert!(
+            gate(
+                &["auth", "-h", "git-credential", "token"],
+                Path::new("."),
+                &policy
+            )
+            .is_err()
+        );
+        // Help and flags after the subcommand are untouched.
+        for help in [
+            &["auth", "-h"][..],
+            &["--help"],
+            &["auth", "--help"],
+            &["pr", "--help"],
+        ] {
+            assert_eq!(misplaced_flag(help), None, "{help:?}");
+        }
+        assert_eq!(misplaced_flag(&["pr", "-R", "o/r", "list"]), None);
+        assert_eq!(misplaced_flag(&["pr", "list", "--web"]), None);
+        assert_eq!(misplaced_flag(&["api", "-X", "GET", "user"]), None);
     }
 
     #[test]

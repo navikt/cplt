@@ -387,6 +387,19 @@ fn gh_gate_blocks_auth_token_with_hostname() {
 }
 
 #[test]
+fn gh_gate_reads_group_hostname_flag_like_gh() {
+    // gh 2.105 runs `auth token` here: `-h` eats `git-credential` (#1075).
+    let (_, stderr, ok) = gh_gate(&["auth", "-h", "git-credential", "token", "-h", "github.com"]);
+    assert_refused(&stderr, ok, "revealing the GitHub token");
+}
+
+#[test]
+fn gh_gate_refuses_unknown_flag_before_auth_subcommand() {
+    let (_, stderr, ok) = gh_gate(&["auth", "-x", "git-credential", "token"]);
+    assert_refused(&stderr, ok, "before the gh subcommand");
+}
+
+#[test]
 fn gh_gate_allows_auth_status() {
     let (_, _, ok) = gh_gate(&["auth", "status"]);
     assert!(ok, "gh auth status should be allowed (not exfiltration)");
