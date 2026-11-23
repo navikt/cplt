@@ -60,6 +60,34 @@ const SESSION_MARKER: &str = ".cplt-session";
 
 /// gh token caches cplt writes into the scratch dir (see `sandbox_exec`).
 const GH_TOKEN_FILES: [&str; 2] = [".gh-exec-token", ".gh-token"];
+/// `take_cached_gh_token` renames `.gh-token` to this prefix plus pid and time.
+const GH_TOKEN_CLAIMED_PREFIX: &str = ".gh-token.claimed.";
+
+/// The fixed cache names plus any claimed copy a killed guard left behind.
+/// `symlink_metadata` does not follow links, so only regular files qualify.
+/// The claimed-copy file name is agent-chosen, so escape it before it reaches
+/// the user's terminal.
+fn orphan_token_warning(file: &Path, e: &std::io::Error) -> String {
+    format!(
+        "Warning: cannot remove orphaned GitHub token {}: {e}",
+        crate::audit::escape_path(&file.to_string_lossy())
+    )
+}
+
+fn gh_token_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = GH_TOKEN_FILES.iter().map(|f| dir.join(f)).collect();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        files.extend(entries.flatten().filter_map(|e| {
+            let path = e.path();
+            (e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(GH_TOKEN_CLAIMED_PREFIX))
+                && path.symlink_metadata().is_ok_and(|m| m.is_file()))
+            .then_some(path)
+        }));
+    }
+    files
+}
 
 /// A read-only executable copy of pnpm outside its writable store.
 ///
@@ -1004,8 +1032,21 @@ fn gc_stale_session_dirs(base: &Path) {
         // live sessions of an older cplt: leave them alone.
         let held = session_lock_held(&path);
         if held == Some(false) {
-            for file in GH_TOKEN_FILES {
-                let _ = std::fs::remove_file(path.join(file));
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // The agent may have left its TMPDIR read-only (#1054). Only our
+            // own dirs, opened without following a symlink.
+            if metadata.uid() == unsafe { libc::getuid() }
+                && let Ok(dir) = open_dir_nofollow(&path)
+            {
+                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            for file in gh_token_files(&path) {
+                match std::fs::remove_file(&file) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        ui::warn(&orphan_token_warning(&file, &e));
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -1237,11 +1278,11 @@ impl Drop for ScratchDir {
             .map(|rel| rel.iter().map(ToOwned::to_owned).collect())
             .collect();
         remove_all_except_at(&root, &keep);
-        for file in GH_TOKEN_FILES {
-            if self.path.join(file).symlink_metadata().is_ok() {
+        for file in gh_token_files(&self.path) {
+            if file.symlink_metadata().is_ok() {
                 ui::error(&format!(
                     "cannot delete the gh token cache {}; delete it by hand",
-                    crate::audit::escape_path(&self.path.join(file).to_string_lossy())
+                    crate::audit::escape_path(&file.to_string_lossy())
                 ));
             }
         }
@@ -1953,15 +1994,47 @@ mod tests {
                 std::fs::write(dir.join(f), "x").unwrap();
             }
         }
+        // A guard killed between claim and unlink leaves a claimed copy.
+        let claimed = orphan.join(".gh-token.claimed.123.456");
+        std::fs::write(&claimed, "x").unwrap();
+        // A symlink with that prefix is skipped by gh_token_files (not a regular
+        // file), so it is neither followed nor removed.
+        let target = home.join("victim");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, orphan.join(".gh-token.claimed.9.9")).unwrap();
+        // The agent can leave its TMPDIR read-only (#1054).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o500)).unwrap();
         ScratchDir::gc_stale(&home);
         for f in GH_TOKEN_FILES {
             assert!(live.path().join(f).exists(), "live {f} kept");
             assert!(unmarked.join(f).exists(), "unmarked {f} kept");
             assert!(!orphan.join(f).exists(), "orphan {f} removed");
         }
+        assert!(!claimed.exists(), "orphan claimed token removed");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(
+            orphan
+                .join(".gh-token.claimed.9.9")
+                .symlink_metadata()
+                .is_ok(),
+            "symlink entry left alone"
+        );
         let live_path = live.path().to_path_buf();
         drop(live);
         assert!(!live_path.exists(), "Drop removes the session dir");
+    }
+
+    #[test]
+    fn orphan_token_warning_escapes_control_bytes() {
+        let name = ".gh-token.claimed.\x1b]0;x\x07\nFAKE";
+        let e = std::io::Error::other("boom");
+        let w = orphan_token_warning(Path::new("/s").join(name).as_path(), &e);
+        assert!(w.contains("FAKE"));
+        assert!(
+            !w.contains(['\x1b', '\x07', '\n']),
+            "raw control bytes: {w:?}"
+        );
     }
 
     #[allow(clippy::disallowed_methods)] // test fixture; trusted_git is absolute

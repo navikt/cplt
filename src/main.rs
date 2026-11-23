@@ -6526,7 +6526,7 @@ fn is_gh_auth_token_request(args: &[String]) -> bool {
 }
 
 /// Serve the cached GitHub token from the scratch dir's `.gh-token` file.
-/// Deletes the file after reading so subsequent calls by subprocesses fail.
+/// Only the first caller gets it; see `take_cached_gh_token`.
 /// Returns ExitCode::SUCCESS if token found, FAILURE otherwise.
 fn serve_cached_gh_token() -> ExitCode {
     let Some(tmpdir) = gh_token_cache_dir() else {
@@ -6538,26 +6538,35 @@ fn serve_cached_gh_token() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let token_path = Path::new(&tmpdir).join(".gh-token");
-
-    match cplt::untrusted::read_untrusted(&token_path, 64 * 1024) {
-        Ok(Some(token)) if !token.is_empty() => {
-            // Delete the file immediately after reading — one-time use only.
-            // Copilot caches the token in memory after first read, so subsequent
-            // calls to `gh auth token` by tools/subprocesses will get "not available".
-            let _ = std::fs::remove_file(&token_path);
-            print!("{token}");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!(
-                "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
-                 `gh_guard.block_auth_token = false` would let it print the host token, \
-                 readable by every process in the sandbox; see docs/known-impacts.md."
-            );
-            ExitCode::FAILURE
-        }
+    if let Some(token) = take_cached_gh_token(Path::new(&tmpdir)) {
+        print!("{token}");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
+             `gh_guard.block_auth_token = false` would let it print the host token, \
+             readable by every process in the sandbox; see docs/known-impacts.md."
+        );
+        ExitCode::FAILURE
     }
+}
+
+/// Claim `.gh-token` once. Renaming it to a name unique to this process is
+/// atomic, so of concurrent callers exactly one gets the token (#1054). Read
+/// then unlink let two callers both read before either deleted it.
+/// Copilot keeps the token in memory after the first read, so later
+/// `gh auth token` calls from subprocesses get "not available".
+fn take_cached_gh_token(dir: &Path) -> Option<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let claimed = dir.join(format!(".gh-token.claimed.{}.{nanos}", std::process::id()));
+    std::fs::rename(dir.join(".gh-token"), &claimed).ok()?;
+    // A planted symlink or FIFO was renamed too; read_untrusted refuses both.
+    let token = cplt::untrusted::read_untrusted(&claimed, 64 * 1024);
+    let _ = std::fs::remove_file(&claimed);
+    token.ok().flatten().filter(|t| !t.is_empty())
 }
 
 /// Both caches live in the actual scratch dir, even with --pass-env TMPDIR.
@@ -16737,6 +16746,54 @@ mod tests {
         );
         // The serve-once cache is separate: `gh auth token` never reads this file.
         assert!(!dir.path().join(".gh-token").exists());
+    }
+
+    /// #1054: of many concurrent consumers exactly one gets the token.
+    #[test]
+    fn cached_gh_token_is_served_to_exactly_one_concurrent_caller() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".gh-token"), "gho_once").unwrap();
+            let barrier = std::sync::Barrier::new(16);
+            let won = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            take_cached_gh_token(dir.path())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(won, vec!["gho_once".to_string()]);
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                0,
+                "nothing left"
+            );
+        }
+    }
+
+    /// A planted symlink or FIFO is refused, without blocking, and removed.
+    #[test]
+    fn cached_gh_token_refuses_symlink_and_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "other_tool_token").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join(".gh-token")).unwrap();
+        assert_eq!(take_cached_gh_token(dir.path()), None);
+        assert!(dir.path().join(".gh-token").symlink_metadata().is_err());
+
+        let fifo =
+            std::ffi::CString::new(dir.path().join(".gh-token").as_os_str().as_encoded_bytes())
+                .unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(take_cached_gh_token(dir.path()), None);
     }
 
     #[test]

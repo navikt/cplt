@@ -445,6 +445,7 @@ fn configure_command(
                 gh_guard.block_auth_token,
                 inherit_env,
                 opencode_v2,
+                which_real_gh().is_some(),
             );
         }
         install_command_wrappers(
@@ -729,6 +730,10 @@ fn cache_gh_token_to_file(
     block_auth_token: bool,
     inherit_env: bool,
     opencode_v2: bool,
+    // Both token files are read only by the gh wrapper, which is installed
+    // only when the real gh is on PATH (#1054). Without it they would sit in
+    // the agent's TMPDIR for nobody.
+    gh_wrapper: bool,
 ) {
     // `inject_token` may have just set one in `cmd` (#1051).
     let serve = block_auth_token
@@ -761,11 +766,13 @@ fn cache_gh_token_to_file(
     // Both consumers must locate the producer's scratch dir, not an explicitly
     // passed TMPDIR that may contain another session's stale credential.
     cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
-    if serve {
+    if serve && gh_wrapper {
         write_token_file(&scratch_dir.join(".gh-token"), &token);
     }
     if exec {
-        write_token_file(&scratch_dir.join(".gh-exec-token"), &token);
+        if gh_wrapper {
+            write_token_file(&scratch_dir.join(".gh-exec-token"), &token);
+        }
         // OpenCode: the same token as its GitHub Copilot login, when the user
         // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
         // instead of auth.json, so the real file is never read or rewritten
@@ -2751,7 +2758,7 @@ mod gh_token_extraction_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let gh = gh_stub(
             dir.path(),
-            r#"[ "$*" = 'auth token --hostname github.com' ] || exit 41
+            r#"[ "$*" = 'auth token --hostname github.com --no-refresh' ] || exit 41
 [ -z "${GH_TOKEN+x}${GITHUB_TOKEN+x}${COPILOT_GITHUB_TOKEN+x}" ] || exit 42
 echo gho_stored_fixture"#,
         );
@@ -2767,6 +2774,51 @@ echo gho_stored_fixture"#,
                     Some("gho_stored_fixture".to_string())
                 );
             },
+        );
+    }
+
+    /// #1063: an older gh that rejects `--no-refresh` still hands over its token.
+    #[test]
+    fn an_older_gh_without_no_refresh_still_hands_the_token_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls");
+        let gh = gh_stub(
+            dir.path(),
+            &format!(
+                r#"echo "$*" >> '{}'
+case "$*" in *--no-refresh*) echo "unknown flag: --no-refresh" >&2; exit 1;; esac
+echo gho_old"#,
+                log.display()
+            ),
+        );
+        assert_eq!(
+            gh_auth_token(&gh, Duration::from_secs(10)),
+            Some("gho_old".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "auth token --hostname github.com --no-refresh\nauth token --hostname github.com\n"
+        );
+    }
+
+    /// A denied or locked Keychain read also exits 1. Retrying without
+    /// `--no-refresh` would prompt a second time with refresh back on.
+    #[test]
+    fn a_failing_gh_is_not_retried_without_no_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls");
+        let gh = gh_stub(
+            dir.path(),
+            &format!(
+                r#"echo "$*" >> '{}'
+echo "failed to read keyring" >&2; exit 1"#,
+                log.display()
+            ),
+        );
+        assert_eq!(gh_auth_token(&gh, Duration::from_secs(10)), None);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "auth token --hostname github.com --no-refresh\n"
         );
     }
 
@@ -3043,12 +3095,60 @@ echo gho_stored_fixture"#,
                         true,
                         false,
                         false,
+                        true,
                     );
                     assert_eq!(
                         scratch.path().join(".gh-token").exists(),
                         want,
                         "preset={preset}"
                     );
+                }
+                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
+            },
+        );
+    }
+
+    /// #1054: without the gh wrapper nothing reads the token files, so none is written.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn no_gh_wrapper_writes_no_token_files() {
+        let home = tempfile::tempdir().unwrap();
+        let home_s = home.path().to_str().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/gh")).unwrap();
+        std::fs::write(home.path().join(".config/gh/hosts.yml"), "github.com:\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home_s)),
+                ("GH_CONFIG_DIR", None),
+                ("XDG_CONFIG_HOME", None),
+                ("GH_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                for wrapper in [false, true] {
+                    let scratch = tempfile::tempdir().unwrap();
+                    let mut cmd = Command::new("true");
+                    cache_gh_token_to_file(
+                        &mut cmd,
+                        scratch.path(),
+                        Agent::Copilot,
+                        &[],
+                        None,
+                        true,
+                        false,
+                        false,
+                        wrapper,
+                    );
+                    assert_eq!(
+                        scratch.path().join(".gh-token").exists(),
+                        wrapper,
+                        "wrapper={wrapper}"
+                    );
+                    if !wrapper {
+                        assert!(!scratch.path().join(".gh-exec-token").exists());
+                    }
                 }
                 FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
             },
