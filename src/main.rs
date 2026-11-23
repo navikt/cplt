@@ -585,7 +585,7 @@ actually on screen, then turn it back off."
     no_validate: bool,
 
     /// Write the agent-facing sandbox brief to the scratch dir
-    /// (`CPLT_BRIEF.md`) and point Copilot and OpenCode at it. On in configs
+    /// (`CPLT_BRIEF.md`) and point Copilot, OpenCode and Claude Code at it. On in configs
     /// written by `cplt config init`. Also the gate for --agents-md.
     #[arg(long, conflicts_with = "no_brief")]
     brief: bool,
@@ -5758,6 +5758,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         .filter(|_| active_agent == agent::Agent::Copilot)
     {
         copilot_args.extend(cplt::mcp_broker::copilot_launch_args(&home_dir, broker));
+    }
+    if active_agent == agent::Agent::Claude
+        && let Some(scratch) = prepared.scratch_dir()
+        && let Err(e) = brief::claude_brief_args(&mut copilot_args, scratch)
+    {
+        ui::warn(&e);
     }
 
     // Run agent inside sandbox, wrapped in the post-session audit lifecycle.

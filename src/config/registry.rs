@@ -291,7 +291,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Write the per-session agent-facing sandbox brief (CPLT_BRIEF.md) to the scratch dir and point Copilot and OpenCode at it. On in configs written by `cplt config init`.",
+        description: "Write the per-session agent-facing sandbox brief (CPLT_BRIEF.md) to the scratch dir and point Copilot, OpenCode and Claude Code at it. On in configs written by `cplt config init`.",
     },
     ConfigKeyInfo {
         section: "sandbox",
