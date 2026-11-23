@@ -281,8 +281,18 @@ fn quote(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(b"\"\n");
 }
 
+/// An RFC 9110 token (`tchar`), the only header name forwarded. curl reads a
+/// `header` value starting with `@` as a file of headers, so anything else
+/// could make the host curl read local files or add cplt's own mode headers.
+/// The name always leads the value, so no value can start a curl special form.
+fn header_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// The curl config for one request, or `None` for a header with a control
-/// byte. Upstream, credential and MCP mode come from cplt alone; the client
+/// byte or a name that is not a token. Upstream, credential and MCP mode come from cplt alone; the client
 /// supplies only the method, its other headers and the body.
 fn curl_config(
     upstream: &str,
@@ -293,7 +303,7 @@ fn curl_config(
 ) -> Option<Vec<u8>> {
     if headers
         .iter()
-        .any(|(k, v)| bad_header_byte(k) || bad_header_byte(v))
+        .any(|(k, v)| !header_name(k) || bad_header_byte(v))
     {
         return None;
     }
@@ -319,6 +329,17 @@ fn curl_config(
         opt("data-raw", body);
     }
     Some(c)
+}
+
+/// curl's stderr for the log: the token replaced before truncation, so a cut
+/// can never leave a token prefix behind.
+fn redact_stderr(raw: &[u8], token: &str) -> String {
+    let s = String::from_utf8_lossy(raw).replace(token, "<token>");
+    let mut end = s.len().min(2048);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn reply(stream: &mut TcpStream, status: &str) {
@@ -418,7 +439,7 @@ impl Endpoint {
             std::thread::spawn(move || {
                 let mut e = e;
                 let mut buf = Vec::new();
-                let _ = e.by_ref().take(2048).read_to_end(&mut buf);
+                let _ = e.by_ref().take(64 * 1024).read_to_end(&mut buf);
                 let _ = std::io::copy(&mut e, &mut std::io::sink());
                 buf
             })
@@ -447,7 +468,7 @@ impl Endpoint {
             reply(&mut client, "502 Bad Gateway");
             let err = stderr
                 .and_then(|t| t.join().ok())
-                .map(|b| String::from_utf8_lossy(&b).replace(self.token.expose(), "<token>"))
+                .map(|b| redact_stderr(&b, self.token.expose()))
                 .unwrap_or_default();
             log.line(&method, &format!("FAIL upstream: {}", err.trim()));
         }
@@ -648,5 +669,45 @@ mod tests {
             );
         }
         assert!(curl_config(UPSTREAM, "POST", &hdrs(&[("A", "x\ty")]), b"", "T").is_some());
+    }
+
+    #[test]
+    fn non_token_header_names_are_refused() {
+        for k in [
+            "@/etc/passwd",
+            "@x",
+            "",
+            "X A",
+            "X:A",
+            "X;",
+            "X\"A",
+            "X(A)",
+            "X\u{e9}",
+        ] {
+            assert_eq!(
+                curl_config(UPSTREAM, "POST", &hdrs(&[(k, "v")]), b"", "T"),
+                None,
+                "{k:?}"
+            );
+        }
+        let c = curl_config(
+            UPSTREAM,
+            "POST",
+            &hdrs(&[("X-a!#$%&'*+.^_`|~1", "@v")]),
+            b"",
+            "T",
+        );
+        assert!(c.is_some());
+    }
+
+    #[test]
+    fn stderr_is_redacted_before_truncation() {
+        let token = "ghp_SECRETSECRETSECRET";
+        let mut raw = vec![b'x'; 2040];
+        raw.extend_from_slice(token.as_bytes());
+        let out = redact_stderr(&raw, token);
+        assert!(!out.contains("ghp_"), "{out}");
+        assert!(out.len() <= 2048);
+        assert!(redact_stderr(&[b'a'; 4000], token).len() == 2048);
     }
 }
