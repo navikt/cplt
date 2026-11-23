@@ -679,6 +679,10 @@ pub struct Detected {
     pub disabled: Vec<String>,
     /// A gh-token remote was among `disabled`: GitHub MCP is off (#909).
     pub remote_disabled: bool,
+    /// A spec that declares (or may declare) a gh-token remote was refused at
+    /// load: its line. GitHub MCP is then off, never the built-in endpoint,
+    /// which would serve the token without that spec's `tools.allow` (#909).
+    pub remote_refused: Option<String>,
 }
 
 impl Detected {
@@ -702,6 +706,9 @@ pub fn github_spec(
     writable: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<Option<Spec>, String> {
     const OFF: &str = "GitHub MCP is off for this session";
+    if let Some(line) = &found.remote_refused {
+        return Err(format!("{OFF}: {line}"));
+    }
     if found.remote_disabled {
         return Err(format!(
             "{OFF}: its gh-token spec is disabled. Drop --no-mcp-broker <id> \
@@ -841,15 +848,40 @@ pub(crate) fn load_with_gate(
                 }
             }
             Err((reason, fix)) => {
-                out.rejected.push(Rejected {
+                let r = Rejected {
                     file: path.display().to_string(),
                     reason,
                     fix,
-                });
+                };
+                if oauth_gate && out.remote_refused.is_none() && may_be_gh_remote(&path) {
+                    out.remote_refused = Some(r.line());
+                }
+                out.rejected.push(r);
             }
         }
     }
     out
+}
+
+/// Whether a refused spec file declares a gh-token remote. Fails closed: a
+/// file that cannot be read safely (symlink, FIFO, too large) or parsed counts.
+fn may_be_gh_remote(path: &Path) -> bool {
+    let Ok(Some(text)) = crate::untrusted::read_untrusted(path, SPEC_LIMIT) else {
+        return true;
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        return true;
+    };
+    let remote = root
+        .get("remotes")
+        .is_some_and(|r| r.as_array().is_none_or(|a| !a.is_empty()));
+    let cred = root
+        .pointer(&format!(
+            "/_meta/{}/credential",
+            META_KEY.replace('/', "~1")
+        ))
+        .and_then(Value::as_str);
+    remote && cred.is_none_or(|c| c == "gh-token")
 }
 
 /// Launch detection: load, print one line per rejected spec. The launch
@@ -1331,6 +1363,47 @@ pub(crate) mod tests {
             found.rejected[0].fix,
             "remove the spec until cplt supports oauth login"
         );
+    }
+
+    /// Load `root` as FILE with the gate on, then ask `github_spec`.
+    fn gh_off(root: &Value, writable: bool, disabled: &[String]) -> Result<Option<Spec>, String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), root.to_string()).unwrap();
+        let w = if writable {
+            vec![dir.path().to_path_buf()]
+        } else {
+            vec![]
+        };
+        let found = load_with_gate(
+            dir.path(),
+            &w,
+            disabled,
+            |n| Some(PathBuf::from("/opt/homebrew/bin").join(n)),
+            true,
+        );
+        github_spec(&found, dir.path(), |_| None)
+    }
+
+    #[test]
+    fn refused_gh_spec_turns_github_mcp_off() {
+        // Loads and serves.
+        assert!(gh_off(&gh_root(), false, &[]).unwrap().is_some());
+        // Under a writable root: refused at load, so off, not the built-in endpoint.
+        let e = gh_off(&gh_root(), true, &[]).unwrap_err();
+        assert!(e.contains("writable in the sandbox"), "{e}");
+        // Disabled and refused at load: still off.
+        let id = FILE.trim_end_matches(".json").replace("__", "/");
+        assert!(gh_off(&gh_root(), true, &[id]).is_err());
+        // Fails validation: off, naming the reason.
+        let mut bad = gh_root();
+        bad["_meta"][META_KEY]["tools"]["alow"] = json!(["get_me"]);
+        let e = gh_off(&bad, false, &[]).unwrap_err();
+        assert!(e.contains("alow"), "{e}");
+        // A refused stdio spec leaves GitHub MCP alone.
+        let mut stdio = gh_root();
+        stdio.as_object_mut().unwrap().remove("remotes");
+        stdio["_meta"][META_KEY]["credential"] = json!("bogus");
+        assert!(matches!(gh_off(&stdio, false, &[]), Ok(None)));
     }
 
     pub(crate) fn gh_root() -> Value {
