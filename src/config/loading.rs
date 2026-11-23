@@ -350,9 +350,7 @@ impl Config {
         allow_private_domains.retain(|d| {
             let alias = crate::proxy::is_ip_alias(d);
             if alias {
-                ui::warn(&format!(
-                    "proxy.allow_private_domains entry {d:?} is an IP address, not a DNS name, and is ignored. Give the host a DNS name and allow that."
-                ));
+                ui::warn(&crate::proxy::ip_alias_ignored_msg(d));
             }
             !alias
         });
@@ -1970,6 +1968,13 @@ impl Resolved {
                 // validation rejects "" but not "." or " ", which normalize to
                 // the same nothing. Skip them here so the two paths agree.
                 if domain.is_empty() {
+                    continue;
+                }
+                // `cplt trust accept` refuses an alias, but an approval on file
+                // from before that rule still lists one. Warn and drop it, as the
+                // config path does: the pre-DNS guard blocks it anyway (#1102).
+                if crate::proxy::is_ip_alias(&domain) {
+                    ui::warn(&crate::proxy::ip_alias_ignored_msg(&domain));
                     continue;
                 }
                 if !self.allow_private_domains.contains(&domain) {
@@ -3685,6 +3690,8 @@ validate = false
                         "Intern.NAV.no".to_string(),
                         "mimir.nav.cloud.nais.io.".to_string(),
                         ".".to_string(),
+                        // Legacy approval from before `trust accept` refused aliases (#1102).
+                        "10.1".to_string(),
                     ],
                     ..Default::default()
                 },

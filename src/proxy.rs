@@ -2684,6 +2684,14 @@ pub fn is_ip_alias(host: &str) -> bool {
         .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_digit()))
 }
 
+/// The one line every `allow_private_domains` entry point prints when it drops
+/// an IP alias, so config, `.cplt.toml` and live reload say the same thing.
+pub fn ip_alias_ignored_msg(entry: &str) -> String {
+    format!(
+        "proxy.allow_private_domains entry {entry:?} is an IP address, not a DNS name, and is ignored. Give the host a DNS name and allow that."
+    )
+}
+
 /// Check hostname patterns that are known to be private (pre-DNS fast path).
 pub fn is_private_hostname(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');

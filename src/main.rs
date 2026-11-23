@@ -13519,6 +13519,15 @@ fn trust_accept(
         return ExitCode::FAILURE;
     }
 
+    let aliases = repo_config::ip_alias_private_domains(&loaded.config.propose);
+    if !aliases.is_empty() {
+        ui::error(&format!(
+            "proxy.allow_private_domains entry {:?} is an IP address, not a DNS name, so it cannot be approved. Give the host a DNS name, propose that in .cplt.toml, commit, and run `cplt trust accept` again.",
+            aliases[0]
+        ));
+        return ExitCode::FAILURE;
+    }
+
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
 
     let current_hash = trust::proposal_content_hash(&loaded.config.propose);

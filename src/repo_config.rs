@@ -721,6 +721,20 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// `propose.proxy.allow_private_domains` entries that are IP aliases (#1102).
+/// The pre-DNS guard blocks them whatever the list says, so `cplt trust accept`
+/// refuses them. Not checked in validation: that runs on every load and would
+/// break a repository whose approval predates the rule.
+pub fn ip_alias_private_domains(propose: &ProposeSection) -> Vec<String> {
+    propose
+        .proxy
+        .allow_private_domains
+        .iter()
+        .map(|d| crate::proxy::normalize_hostname(d))
+        .filter(|d| !d.is_empty() && crate::proxy::is_ip_alias(d))
+        .collect()
+}
+
 /// Collect the proposed key names a ProposeSection puts up for approval.
 ///
 /// Returns the keys that would RELAX the sandbox if approved. Tighten-only
@@ -1549,6 +1563,24 @@ allow_network = true
         }
         // The bare form is what works, and must still pass.
         assert!(parse_and_validate("[propose.allow]\ndomains = [\"example.com\"]\n").is_ok());
+    }
+
+    /// #1102: `cplt trust accept` refuses these; validation must not, or a
+    /// repository approved before the rule stops loading.
+    #[test]
+    fn ip_alias_private_domains_finds_aliases_and_validation_accepts_them() {
+        let cfg = parse_and_validate(
+            "[propose.proxy]\nallow_private_domains = [\"intern.nav.no\", \"10.1\", \"0x0a.1.2.3.\"]\n",
+        )
+        .expect("legacy proposal still loads");
+        assert_eq!(
+            ip_alias_private_domains(&cfg.propose),
+            vec!["10.1".to_string(), "0x0a.1.2.3".to_string()]
+        );
+        let ok =
+            parse_and_validate("[propose.proxy]\nallow_private_domains = [\"intern.nav.no\"]\n")
+                .unwrap();
+        assert!(ip_alias_private_domains(&ok.propose).is_empty());
     }
 
     #[test]

@@ -632,6 +632,18 @@ fn parse_private_domains_from_toml(path: &Path) -> Option<Vec<String>> {
             .filter_map(toml::Value::as_str)
             .map(normalize_hostname)
             .filter(|d| !d.is_empty())
+            .filter(|d| {
+                let alias = crate::proxy::is_ip_alias(d);
+                if alias {
+                    eprintln!(
+                        "{}[proxy]{} Warning: {}",
+                        crate::ui::color(crate::ui::YELLOW),
+                        crate::ui::color(crate::ui::RESET),
+                        crate::proxy::ip_alias_ignored_msg(d)
+                    );
+                }
+                !alias
+            })
             .collect(),
     )
 }
@@ -759,7 +771,7 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "[sandbox]\nquiet = true\n\n[proxy]\nallow_private_domains = [\"intern.nav.no\", \"dev.CORP.example.com\"]\nport = 8080\n\n[allow]\nports = [443]\n",
+            "[sandbox]\nquiet = true\n\n[proxy]\nallow_private_domains = [\"intern.nav.no\", \"10.1\", \"dev.CORP.example.com\"]\nport = 8080\n\n[allow]\nports = [443]\n",
         )
         .unwrap();
 
