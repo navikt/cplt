@@ -176,9 +176,13 @@ pub fn load_managed_from(
         return Err(refuse(&format!("it is larger than {LIMIT} bytes")));
     }
     let mut raw = String::new();
-    file.take(LIMIT)
+    // One byte past the cap: a file that grew after the fstat is refused, not truncated.
+    file.take(LIMIT + 1)
         .read_to_string(&mut raw)
         .map_err(|e| refuse(&format!("cannot read it ({})", esc(&e.to_string()))))?;
+    if raw.len() as u64 > LIMIT {
+        return Err(refuse(&format!("it is larger than {LIMIT} bytes")));
+    }
     let (managed_by, allow_private_domains) = parse(&raw).map_err(|e| refuse(&e))?;
     Ok(ManagedConfig {
         path: path.to_path_buf(),
