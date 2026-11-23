@@ -2697,6 +2697,9 @@ pub const ENV_SDK_READ_ROOTS: &[&str] = &[
     "/usr/lib/dotnet",
     "/usr/local/share/dotnet",
     "/opt/hostedtoolcache",
+    // setup-java/setup-dotnet on macOS runners, and the dotnet-install default.
+    "~/hostedtoolcache",
+    "~/.dotnet",
     "~/.jdks",
     "~/.local/share/mise",
 ];

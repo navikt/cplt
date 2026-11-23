@@ -1931,15 +1931,19 @@ fn merge_tool_path_env_overrides(
             .chain(temp.as_deref())
             .collect();
         if !cplt::sandbox::env_tool_dir_allowed(&path, home, ovr.write, &extra) {
-            ui::warn(&format!(
-                "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
+            // `cplt exec` promises clean stderr: quiet hides this, like the
+            // other launch warnings.
+            if !resolved.quiet {
+                ui::warn(&format!(
+                    "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
                  under ~/.cache, ~/Library/Caches, another cplt tool cache, the project or the \
                  temp dir, so no grant is added. Move it under ~/.cache, or grant it with \
                  `allow.{}` if you mean to.",
-                ovr.name,
-                path.display(),
-                if ovr.write { "write" } else { "read" }
-            ));
+                    ovr.name,
+                    path.display(),
+                    if ovr.write { "write" } else { "read" }
+                ));
+            }
             continue;
         }
         // Second layer: never open a protected path.
@@ -7342,19 +7346,19 @@ impl HostProbe {
             // JDK read access when installed outside TOOL_READ_DIRS. Covers
             // sdkman (~/.sdkman/candidates/java/), actions/setup-java
             // (hostedtoolcache), jabba, or any other manager under HOME.
-            java_home: tool_dir_from_env("JAVA_HOME", home_dir),
+            java_home: tool_dir_from_env("JAVA_HOME", home_dir, resolved.quiet),
             // .NET SDK read access when installed outside TOOL_READ_DIRS (e.g.
             // actions/setup-dotnet hostedtoolcache, or dotnet-install.sh into a
             // custom directory under $HOME).
-            dotnet_root: tool_dir_from_env("DOTNET_ROOT", home_dir),
+            dotnet_root: tool_dir_from_env("DOTNET_ROOT", home_dir, resolved.quiet),
         }
     }
 }
 
 /// An env var naming a tool directory, accepted only when it exists and does not
 /// resolve to an unsafe root that would defeat the sandbox.
-fn tool_dir_from_env(var: &str, home_dir: &Path) -> Option<PathBuf> {
-    accept_tool_dir(var, std::env::var(var).ok(), home_dir)
+fn tool_dir_from_env(var: &str, home_dir: &Path, quiet: bool) -> Option<PathBuf> {
+    accept_tool_dir(var, std::env::var(var).ok(), home_dir, quiet)
 }
 
 /// The value half of [`tool_dir_from_env`], separate so it can be tested without
@@ -7366,18 +7370,25 @@ fn tool_dir_from_env(var: &str, home_dir: &Path) -> Option<PathBuf> {
 /// `/`, `/tmp` or `$HOME` because `JAVA_HOME` points there would defeat the
 /// sandbox, so the same `is_unsafe_root` veto that guards the relocatable tool
 /// roots guards these too.
-fn accept_tool_dir(var: &str, value: Option<String>, home_dir: &Path) -> Option<PathBuf> {
+fn accept_tool_dir(
+    var: &str,
+    value: Option<String>,
+    home_dir: &Path,
+    quiet: bool,
+) -> Option<PathBuf> {
     let path = std::fs::canonicalize(value?).ok()?;
     if crate::is_unsafe_root(&path, home_dir) {
         return None;
     }
     if !cplt::sandbox::env_tool_dir_allowed(&path, home_dir, false, &[]) {
-        ui::warn(&format!(
-            "Ignoring {var} = {}: an env-set SDK dir is granted read only under a known SDK or tool \
+        if !quiet {
+            ui::warn(&format!(
+                "Ignoring {var} = {}: an env-set SDK dir is granted read only under a known SDK or tool \
              root (~/.sdkman, ~/.jdks, /usr/lib/jvm, /Library/Java, mise, asdf, ...). Grant it \
              with `allow.read` if you mean to.",
-            path.display()
-        ));
+                path.display()
+            ));
+        }
         return None;
     }
     Some(path)
@@ -17138,9 +17149,9 @@ mod tests {
     #[test]
     fn tool_dir_env_var_that_is_unset_or_missing_grants_nothing() {
         let home = tempfile::env::temp_dir();
-        assert_eq!(accept_tool_dir("JAVA_HOME", None, &home), None);
+        assert_eq!(accept_tool_dir("JAVA_HOME", None, &home, false), None);
         assert_eq!(
-            accept_tool_dir("JAVA_HOME", Some(String::new()), &home),
+            accept_tool_dir("JAVA_HOME", Some(String::new()), &home, false),
             None,
             "an exported-but-empty JAVA_HOME must not resolve to the cwd"
         );
@@ -17148,7 +17159,8 @@ mod tests {
             accept_tool_dir(
                 "JAVA_HOME",
                 Some("/definitely/not/a/jdk".to_string()),
-                &home
+                &home,
+                false
             ),
             None
         );
@@ -17163,12 +17175,13 @@ mod tests {
             accept_tool_dir(
                 "JAVA_HOME",
                 Some(home.to_string_lossy().into_owned()),
-                &home
+                &home,
+                false
             ),
             None
         );
         assert_eq!(
-            accept_tool_dir("JAVA_HOME", Some("/".to_string()), &home),
+            accept_tool_dir("JAVA_HOME", Some("/".to_string()), &home, false),
             None
         );
     }
@@ -17180,7 +17193,12 @@ mod tests {
         let jdk = home.join(".sdkman/candidates/java/21");
         std::fs::create_dir_all(&jdk).unwrap();
         assert_eq!(
-            accept_tool_dir("JAVA_HOME", Some(jdk.to_string_lossy().into_owned()), &home),
+            accept_tool_dir(
+                "JAVA_HOME",
+                Some(jdk.to_string_lossy().into_owned()),
+                &home,
+                false
+            ),
             Some(jdk)
         );
     }
@@ -17196,7 +17214,8 @@ mod tests {
             accept_tool_dir(
                 "JAVA_HOME",
                 Some(keychains.to_string_lossy().into_owned()),
-                &home
+                &home,
+                false
             ),
             None
         );
