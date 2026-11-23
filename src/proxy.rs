@@ -2551,10 +2551,14 @@ pub(crate) fn private_resolved_hint(host: &str, resolved: &[std::net::SocketAddr
 /// True the first time `host` is hinted in this process, so a retry loop does
 /// not flood the terminal.
 fn first_hint_for(host: &str) -> bool {
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    let mut seen = SEEN
-        .get_or_init(Default::default)
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    first_hint_in(SEEN.get_or_init(Default::default), host)
+}
+
+/// [`first_hint_for`] over an explicit cache, so tests do not share state.
+fn first_hint_in(cache: &std::sync::Mutex<std::collections::HashSet<String>>, host: &str) -> bool {
+    let mut seen = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if seen.contains(host) {
@@ -2966,16 +2970,18 @@ mod tests {
 
     #[test]
     fn private_hint_prints_once_per_host() {
-        assert!(first_hint_for("dedupe-test.example.com"));
-        assert!(!first_hint_for("dedupe-test.example.com"));
+        let c = std::sync::Mutex::default();
+        assert!(first_hint_in(&c, "dedupe-test.example.com"));
+        assert!(!first_hint_in(&c, "dedupe-test.example.com"));
     }
 
     #[test]
     fn private_hint_cap_evicts_instead_of_going_silent() {
+        let c = std::sync::Mutex::default();
         for i in 0..1100 {
-            first_hint_for(&format!("flood-{i}.example.com"));
+            first_hint_in(&c, &format!("flood-{i}.example.com"));
         }
-        assert!(first_hint_for("after-the-cap.example.com"));
+        assert!(first_hint_in(&c, "after-the-cap.example.com"));
     }
 
     #[test]
