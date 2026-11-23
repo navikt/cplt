@@ -6,11 +6,14 @@
 //! project `.envrc`, mise `[env]`), and so can `HOME`, `XDG_*` and the agent
 //! config dirs, so nothing derived from the environment decides trust. The
 //! rule is positive: the canonical path (every symlink hop resolved) must lie
-//! under one of [`TRUSTED_DIRS`] in the account's home directory, taken from
-//! the passwd entry. Every agent profile denies both by name on macOS and
-//! Linux (`DENIED_DOTFILES`: `.config/cplt` and `.nav-pilot`). Those denies
-//! are spelled from `$HOME`, so the file is also refused when `$HOME` does not
-//! resolve to the passwd home. As extra refusals, the file is refused when it
+//! under [`TRUSTED_DIR`] in the account's home directory, taken from the
+//! passwd entry. That is inside cplt's own state tree (`.config/cplt`), which
+//! every agent profile denies on macOS and Linux and where every grant,
+//! `allow.write` and env-relocated tool dirs alike, is refused. The file is
+//! opened beneath the trusted dir one component at a time with `O_NOFOLLOW`,
+//! so the file read is the one trust was decided on. The denies are spelled
+//! from `$HOME`, so the file is also refused when `$HOME` does not resolve to
+//! the passwd home. As extra refusals, the file is refused when it
 //! or any hop lies in a tree this session can write; when the last component
 //! is a symlink or not a regular file; when it has more than one hard link;
 //! when the current user does not own it; or when the header, a key or an
@@ -33,9 +36,49 @@ const SCHEMA: i64 = 1;
 /// Size cap: a managed file holds a handful of domain lists.
 const LIMIT: u64 = 64 * 1024;
 
-/// Directories, relative to the passwd home, a managed file may live under.
-/// Both sit inside `DENIED_DOTFILES` entries, so no agent can write them.
-pub const TRUSTED_DIRS: &[&str] = &[".config/cplt/managed.d", ".nav-pilot"];
+/// The directory, relative to the passwd home, a managed file must live under.
+/// It is inside cplt's own state tree, where every grant (`allow.*`, and
+/// env-relocated tool dirs such as `GOCACHE`) is refused, so no agent can
+/// write it.
+pub const TRUSTED_DIR: &str = ".config/cplt/managed.d";
+
+/// Open `rel` beneath the directory `dir`, one component at a time with
+/// `O_NOFOLLOW`, so the file opened is under `dir` whatever happens to the
+/// tree meanwhile. Non-blocking, so a FIFO cannot hang the launch.
+fn open_beneath(dir: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    let open = |at: libc::c_int, name: &OsStr, flags: libc::c_int| {
+        let c = std::ffi::CString::new(name.as_bytes())?;
+        // SAFETY: `c` is NUL-terminated; `at` is AT_FDCWD or an open fd.
+        let fd =
+            unsafe { libc::openat(at, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a fresh fd we now own.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    use std::os::fd::AsRawFd as _;
+    let mut cur = open(
+        libc::AT_FDCWD,
+        dir.as_os_str(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    )?;
+    let parts: Vec<_> = rel.components().collect();
+    for (i, c) in parts.iter().enumerate() {
+        let std::path::Component::Normal(name) = c else {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        };
+        let flags = if i + 1 == parts.len() {
+            libc::O_RDONLY | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY
+        };
+        cur = open(cur.as_raw_fd(), name, flags)?;
+    }
+    Ok(std::fs::File::from(cur))
+}
 
 /// A managed file that passed every check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,14 +137,16 @@ pub fn account_home() -> Option<PathBuf> {
 /// Read the managed file named by `CPLT_MANAGED_CONFIG`. `None` when the
 /// variable is unset or empty; `Some(Err(line))` when the file is refused.
 /// `writable` is every tree this session can write (an extra refusal only).
-pub fn load_managed(writable: &[PathBuf]) -> Option<Result<ManagedConfig, String>> {
+pub fn load_managed(
+    writable: impl FnOnce() -> Vec<PathBuf>,
+) -> Option<Result<ManagedConfig, String>> {
     let value = std::env::var_os(MANAGED_CONFIG_ENV).filter(|v| !v.is_empty())?;
     let env_home = std::env::var_os("HOME").map(PathBuf::from);
     Some(load_managed_from(
         &value,
         account_home().as_deref(),
         env_home.as_deref(),
-        writable,
+        &writable(),
     ))
 }
 
@@ -125,39 +170,36 @@ pub fn load_managed_from(
     let home = account_home
         .and_then(|h| std::fs::canonicalize(h).ok())
         .ok_or_else(|| refuse("cannot find the account's home directory"))?;
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|e| refuse(&format!("cannot resolve it ({})", esc(&e.to_string()))))?;
-    let trusted = TRUSTED_DIRS
-        .iter()
-        .filter_map(|d| std::fs::canonicalize(home.join(d)).ok())
-        .any(|d| canonical.starts_with(&d));
-    if !trusted {
-        return Err(refuse(&format!(
-            "it must lie under ~/{} or ~/{}",
-            TRUSTED_DIRS[0], TRUSTED_DIRS[1]
-        )));
-    }
-    // The sandbox denies the trusted dirs as spelled from `$HOME`.
+    // The sandbox denies the trusted dir as spelled from `$HOME`.
     if env_home
         .and_then(|h| std::fs::canonicalize(h).ok())
         .as_ref()
         != Some(&home)
     {
         return Err(refuse(
-            "HOME is not the account's home directory, so the sandbox would not deny the managed directories",
+            "HOME is not the account's home directory, so the sandbox would not deny the managed directory",
         ));
     }
-    let real = crate::sandbox::resolve_unwritable(path, writable)
+    let under = || refuse(&format!("it must lie under ~/{TRUSTED_DIR}"));
+    let trusted = std::fs::canonicalize(home.join(TRUSTED_DIR)).map_err(|_| under())?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| refuse(&format!("cannot resolve it ({})", esc(&e.to_string()))))?;
+    let rel = canonical.strip_prefix(&trusted).map_err(|_| under())?;
+    crate::sandbox::resolve_unwritable(path, writable)
         .map_err(|()| refuse("it lies in or passes through a tree this session can write"))?;
     // The name itself must not be a link: whoever can re-point it chooses the file.
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(refuse("it is a symlink"));
     }
-    let file = match crate::untrusted::open_untrusted(&real) {
-        Ok(Some(f)) => f,
-        Ok(None) => return Err(refuse("it is not a regular file")),
-        Err(e) => return Err(refuse(&format!("cannot open it ({})", esc(&e.to_string())))),
-    };
+    // Open what is read relative to the trusted dir, never following a link,
+    // so a hop flipped after the canonicalize above cannot swap the file.
+    let file = open_beneath(&trusted, rel).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
+            refuse("a component changed into a symlink while it was opened")
+        } else {
+            refuse(&format!("cannot open it ({})", esc(&e.to_string())))
+        }
+    })?;
     // fstat the open descriptor so nothing can swap the file between check and read.
     let meta = file
         .metadata()
@@ -171,6 +213,9 @@ pub fn load_managed_from(
         if meta.uid() != unsafe { libc::geteuid() } {
             return Err(refuse("it is not owned by the current user"));
         }
+    }
+    if !meta.is_file() {
+        return Err(refuse("it is not a regular file"));
     }
     if meta.len() > LIMIT {
         return Err(refuse(&format!("it is larger than {LIMIT} bytes")));
@@ -323,22 +368,20 @@ mod tests {
         p
     }
 
-    /// A fake account home with both trusted dirs; it stands for the passwd home.
+    /// A fake account home with the trusted dir; it stands for the passwd home.
     struct Home(tempfile::TempDir);
 
     impl Home {
         fn new() -> Self {
             let d = tempfile::tempdir().unwrap();
-            for t in TRUSTED_DIRS {
-                std::fs::create_dir_all(d.path().join(t)).unwrap();
-            }
+            std::fs::create_dir_all(d.path().join(TRUSTED_DIR)).unwrap();
             Self(d)
         }
         fn path(&self) -> &Path {
             self.0.path()
         }
         fn managed_d(&self) -> PathBuf {
-            self.path().join(TRUSTED_DIRS[0])
+            self.path().join(TRUSTED_DIR)
         }
         fn load(&self, value: &OsStr, writable: &[PathBuf]) -> Result<ManagedConfig, String> {
             load_managed_from(value, Some(self.path()), Some(self.path()), writable)
@@ -359,27 +402,43 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_good_file_in_either_trusted_dir_and_normalizes() {
+    fn accepts_a_good_file_in_the_trusted_dir_and_normalizes() {
         let h = Home::new();
-        for dir in [h.managed_d(), h.path().join(".nav-pilot")] {
-            let p = write(&dir, "managed.toml", GOOD);
-            let m = h.load(p.as_os_str(), &[]).unwrap();
-            assert_eq!(m.managed_by, "nav-pilot");
-            assert_eq!(m.allow_private_domains, ["b.nav.no", "intern.nav.no"]);
-            assert_eq!(m.tag(), "managed:nav-pilot");
-        }
+        let p = write(&h.managed_d(), "nav-pilot.toml", GOOD);
+        let m = h.load(p.as_os_str(), &[]).unwrap();
+        assert_eq!(m.managed_by, "nav-pilot");
+        assert_eq!(m.allow_private_domains, ["b.nav.no", "intern.nav.no"]);
+        assert_eq!(m.tag(), "managed:nav-pilot");
     }
 
     #[test]
-    fn every_trusted_dir_is_inside_a_denied_dotfile_dir() {
-        // The deny that keeps agents out of the trusted dirs on both platforms.
-        for t in TRUSTED_DIRS {
+    fn refuses_nav_pilot_state_dir() {
+        // `~/.nav-pilot` can be granted write (an env-relocated tool dir, a
+        // per-file allow.write), so it is not trusted.
+        let h = Home::new();
+        let dir = h.path().join(".nav-pilot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write(&dir, "managed.toml", GOOD);
+        h.refused(p.as_os_str(), &[], "must lie under");
+    }
+
+    #[test]
+    fn no_grant_can_make_the_trusted_dir_writable() {
+        // What keeps agents out on both platforms: every grant into cplt's
+        // state tree is refused, whether `allow.write` or an env-relocated
+        // tool dir such as GOCACHE.
+        let h = Home::new();
+        let home = h.path();
+        for target in [h.managed_d(), h.managed_d().join("nav-pilot.toml")] {
+            assert!(crate::sandbox::validate_grant_path("allow.write", &target, home).is_err());
             assert!(
-                crate::sandbox::DENIED_DOTFILES
-                    .iter()
-                    .any(|d| Path::new(t).starts_with(d)),
-                "{t} must sit under a DENIED_DOTFILES entry"
+                crate::sandbox::grant_is_refused(home, &target),
+                "{target:?}"
             );
+        }
+        let env = vec![("GOCACHE".to_string(), h.managed_d().display().to_string())];
+        for o in crate::sandbox::tool_path_env_overrides(&env, home) {
+            assert!(crate::sandbox::grant_is_refused(home, &o.path), "{o:?}");
         }
     }
 
@@ -417,7 +476,7 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert!(e.contains("must lie under"), "{e}");
+        assert!(e.contains("HOME is not the account's home"), "{e}");
         let e = load_managed_from(
             planted.as_os_str(),
             Some(real.path()),
@@ -445,11 +504,52 @@ mod tests {
 
     #[test]
     fn still_refuses_a_trusted_file_inside_a_writable_tree() {
-        // An `allow.write` inside `~/.nav-pilot` is a legal grant.
+        // Defense in depth: the grant is refused at launch anyway.
         let h = Home::new();
         let p = write(&h.managed_d(), "managed.toml", GOOD);
         h.refused(p.as_os_str(), &[h.managed_d()], "can write");
         h.refused(p.as_os_str(), std::slice::from_ref(&p), "can write");
+    }
+
+    #[test]
+    fn a_symlink_flipped_during_the_load_never_gets_its_target_read() {
+        // `dir` flips between a link into managed.d and a link out of it. The
+        // canonicalize may see the inside target; the open must not follow
+        // the link that is there by then.
+        let h = Home::new();
+        let inside = h.managed_d().join("real");
+        std::fs::create_dir(&inside).unwrap();
+        write(&inside, "m.toml", GOOD);
+        let evil = tempfile::tempdir().unwrap();
+        write(
+            evil.path(),
+            "m.toml",
+            &GOOD.replace("\"nav-pilot\"", "\"evil\""),
+        );
+        let dir = h.managed_d().join("dir");
+        let tmp = h.managed_d().join("dir.tmp");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let (stop, dir, tmp) = (stop.clone(), dir.clone(), tmp.clone());
+            let targets = [inside.clone(), evil.path().to_path_buf()];
+            std::thread::spawn(move || {
+                let mut i = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&tmp);
+                    std::os::unix::fs::symlink(&targets[i % 2], &tmp).unwrap();
+                    std::fs::rename(&tmp, &dir).unwrap();
+                    i += 1;
+                }
+            })
+        };
+        let value = dir.join("m.toml");
+        for _ in 0..3000 {
+            if let Ok(m) = h.load(value.as_os_str(), &[]) {
+                assert_eq!(m.managed_by, "nav-pilot", "read the file outside managed.d");
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flipper.join().unwrap();
     }
 
     #[test]

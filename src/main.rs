@@ -7393,7 +7393,7 @@ fn warn_managed_once(line: &str) {
 
 fn apply_managed_layer(
     resolved: &mut config::Resolved,
-    writable: &[PathBuf],
+    writable: impl FnOnce() -> Vec<PathBuf>,
 ) -> Option<Result<config::ManagedConfig, String>> {
     let loaded = config::load_managed(writable)?;
     if let Ok(m) = &loaded {
@@ -7838,10 +7838,10 @@ fn assemble_sandbox(
     // `exec` and `check` paths deliberately never call.
     // Managed layer (#1095). Trust is the fixed dirs in the passwd home; the
     // writable set, known only now that the agent dirs are, is an extra refusal.
-    if let Some(Err(line)) = apply_managed_layer(
-        resolved,
-        &session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs),
-    ) {
+    let allow_write = resolved.allow_write.clone();
+    if let Some(Err(line)) = apply_managed_layer(resolved, || {
+        session_writable_everywhere(probe, opts.repos.dirs, &allow_write, &agent_dirs)
+    }) {
         warn_managed_once(&line);
     }
     write_session_sandbox_brief(
@@ -9068,7 +9068,7 @@ fn run_check_command(
     // Managed layer (#1095), as the launch applies it.
     let writable =
         managed_layer_writable(&home_dir, &project_dir, &repo_paths, &resolved.allow_write);
-    if let Some(Err(line)) = apply_managed_layer(&mut resolved, &writable) {
+    if let Some(Err(line)) = apply_managed_layer(&mut resolved, || writable) {
         warn_managed_once(&line);
     }
     // An unreadable blocklist file stops the live proxy from starting; say so
@@ -10186,7 +10186,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // Managed layer (#1095) before the network snapshot, so doctor agrees with launch.
     let writable =
         managed_layer_writable(&home_dir, &project_dir, &repo_paths, &resolved.allow_write);
-    match apply_managed_layer(&mut resolved, &writable) {
+    match apply_managed_layer(&mut resolved, || writable) {
         Some(Ok(managed)) => {
             ok.push(format!(
                 "managed config: {} [{}]",
@@ -11255,7 +11255,7 @@ fn show_managed_config(
         _ => Vec::new(),
     };
     println!();
-    match config::load_managed(&writable) {
+    match config::load_managed(|| writable) {
         Some(Ok(m)) => {
             println!("Managed config ({}):", m.display_path());
             for d in &m.allow_private_domains {
@@ -17852,7 +17852,7 @@ mod tests {
     fn managed_private_domain_reaches_proxy_and_check_policy() {
         use std::os::unix::fs::PermissionsExt as _;
         let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join(config::TRUSTED_DIRS[0]);
+        let dir = home.path().join(config::TRUSTED_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("nav.toml");
         std::fs::write(
