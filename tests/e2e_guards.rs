@@ -4272,3 +4272,60 @@ fn gh_gate_planted_credential_helper_on_ghe_host_withholds_token() {
     assert!(log.contains("TOKEN=\nprotocol=https\nhost=tenant.ghe.com"));
     assert!(log.contains("TOKEN=gho_github_token\nprotocol=https\nhost=github.com"));
 }
+
+/// A bare `gh auth status` run with the cached exec token gets
+/// `--hostname github.com`, so real gh never sends `GH_TOKEN` to another host
+/// in hosts.yml (#1070). A named host is left alone; without a token nothing
+/// is pinned.
+#[test]
+fn gh_gate_pins_auth_hostname_when_token_rides_along() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"${GH_TOKEN:+set}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let token_dir = tempfile::tempdir().unwrap();
+    let repo = temp_repo("navikt/cplt");
+
+    let run = |args: &[&str], with_token: bool| {
+        let cache = token_dir.path().join(".gh-exec-token");
+        if with_token {
+            std::fs::write(&cache, "gho_cached\n").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&cache);
+        }
+        let output = cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--real-git")
+            .arg(binary_in_path("git"))
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--")
+            .args(args)
+            .current_dir(repo.path())
+            .env("__CPLT_GH_TOKEN_DIR", token_dir.path())
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .output()
+            .expect("cplt gh-gate should run");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    assert_eq!(
+        run(&["auth", "status"], true),
+        "auth status --hostname github.com|set"
+    );
+    assert_eq!(
+        run(&["auth", "status", "-h", "github.com"], true),
+        "auth status -h github.com|set"
+    );
+    assert_eq!(run(&["auth", "status"], false), "auth status|");
+}

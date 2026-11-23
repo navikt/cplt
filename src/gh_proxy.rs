@@ -85,7 +85,8 @@ pub fn gh_hosts() -> &'static [String] {
 /// non-github.com pin or a `--hostname` naming one. `auth git-credential`, whose
 /// host arrives on stdin, is decided strictly by
 /// [`credential_stdin_allows_github_token`], so this helper fails closed for it.
-/// With `gh_guard.hosts` unset every other exec gets the token, as before.
+/// A `--hostname` (or `-h` under `gh auth`) naming any host but github.com
+/// gets no token, whatever `gh_guard.hosts` says.
 #[must_use]
 pub fn github_token_allowed(args: &[&str], pin: Option<&str>, host_pin: Option<&str>) -> bool {
     github_token_allowed_for(args, pin, host_pin, gh_hosts())
@@ -101,43 +102,108 @@ fn github_token_allowed_for(
         return false;
     }
     let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
-    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
-    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
-    // `*.ghe.com` destination can therefore receive the github.com token by
-    // mistake. A URL in a body or notes on any other host is just text.
-    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
-    if pin.and_then(foreign_pin_host).is_some_and(foreign)
-        || host_pin.is_some_and(|h| foreign(h) || not_github(h))
-        || requested_hostname(args).is_some_and(foreign)
-    {
-        return false;
+    // A GH_TOKEN pin naming a tenant, or any argv element naming one, withholds
+    // the token: see [`names_token_tenant`].
+    !(pin.and_then(foreign_pin_host).is_some_and(foreign)
+        || pin.is_some_and(names_token_tenant)
+        || host_pin.is_some_and(|h| foreign(h) || names_token_tenant(h))
+        // Any named host but github.com: GHES never needs this token, and a
+        // tenant would receive it (#1049). Every named host counts, not just
+        // the one gh keeps; and a `gh auth` argv the scan cannot read gets no
+        // token either.
+        || {
+            let (named, ambiguous) = scan_hostnames(args);
+            ambiguous || named.iter().any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
+        }
+        || args.iter().any(|a| names_token_tenant(a))
+        // These iterate every host in hosts.yml without `--hostname`, tenants
+        // included; `exec_real` adds `--hostname github.com` via
+        // [`pin_auth_hostname`] so the token can ride along.
+        || (auth_host_subcommand(args).is_some() && scan_hostnames(args).0.is_empty()))
+}
+
+/// Index of a `gh auth` subcommand that, with no `--hostname`, acts on every
+/// host in hosts.yml (gh 2.105 `--help`: all of them take `-h/--hostname`).
+fn auth_host_subcommand(args: &[&str]) -> Option<usize> {
+    const SUBS: &[&str] = &[
+        "status",
+        "refresh",
+        "setup-git",
+        "switch",
+        "logout",
+        "token",
+    ];
+    let (root, _) = root_command(args);
+    let i = root.filter(|&i| args[i] == "auth")? + 1;
+    args.get(i).filter(|s| SUBS.contains(s)).map(|_| i)
+}
+
+/// `args` with `--hostname github.com` after the `gh auth` subcommand, when it
+/// names no host and would otherwise send `GH_TOKEN` to every host (#1070).
+#[must_use]
+pub fn pin_auth_hostname(args: &[&str]) -> Option<Vec<String>> {
+    let i = auth_host_subcommand(args)?;
+    let (named, ambiguous) = scan_hostnames(args);
+    if !named.is_empty() || ambiguous {
+        return None;
     }
-    // gh honours an explicit selector over `GH_REPO`: a host-qualified `-R`
-    // or a URL argument decides where the request goes, so a destination off
-    // github.com gets no github.com token, whatever was pinned.
-    // Go's url.Parse lowercases the scheme, so `HTTPS://` is a URL too.
-    fn http_rest(arg: &str) -> Option<&str> {
-        let (scheme, rest) = arg.split_once("://")?;
-        (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
-            .then_some(rest)
+    let mut out: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    out.insert(i + 1, DEFAULT_GH_HOST.into());
+    out.insert(i + 1, "--hostname".into());
+    Some(out)
+}
+
+/// Whether `s` mentions `github.localhost` or `ghe.com` anywhere.
+///
+/// go-gh `auth.TokenForHost` sends `GH_TOKEN` to github.com, `*.ghe.com`
+/// tenants and `github.localhost`/`*.github.localhost`; every other host
+/// (bare `localhost` included) is GHES and reads `GH_ENTERPRISE_TOKEN`. So
+/// only a tenant can receive the token by mistake. Finding which argument gh
+/// reads as a host failed review five times (#1070: attached short flags,
+/// bool clusters, re-encoding), so this is a plain substring match with no
+/// boundary checks. A title or body that mentions either string also withholds
+/// the token; that is the safe direction, and `--body-file` avoids it.
+fn names_token_tenant(s: &str) -> bool {
+    // gh and Go's url package may percent-decode more than once (`%25C4` ->
+    // `%C4` -> byte), so decode until stable. Still changing after 4 rounds:
+    // fail closed rather than guess how many rounds gh applies.
+    let mut decoded = s.to_string();
+    let mut stable = false;
+    for _ in 0..4 {
+        let next = percent_decode(&decoded);
+        if next == decoded {
+            stable = true;
+            break;
+        }
+        decoded = next;
     }
-    // The host part: before the first `/`, after the last `@`, before a `:`. Covers
-    // URL authorities, `HOST/owner/repo` and scp `git@HOST:owner/repo`; a
-    // bare `owner/repo` yields `owner`, which is never a `*.ghe.com` host.
-    let host_of = |rest: &str| -> String {
-        let head = rest.split('/').next().unwrap_or(rest);
-        let head = head.rsplit('@').next().unwrap_or(head);
-        head.split(':').next().unwrap_or(head).to_string()
-    };
-    if let Some(r) = parse_command(args).and_then(|cmd| cmd.repo_flag) {
-        let rest = r.split_once("://").map_or(r.as_str(), |(_, rest)| rest);
-        if not_github(&host_of(rest)) {
-            return false;
+    if !stable {
+        return true;
+    }
+    // Unicode lowercase as Go's strings.ToLower, which maps U+0130 `İ` to `i`
+    // where Rust yields `i` plus a combining dot.
+    let decoded = decoded.replace('\u{130}', "i").to_lowercase();
+    decoded.contains("github.localhost") || decoded.contains("ghe.com")
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
         }
     }
-    !args
-        .iter()
-        .any(|arg| http_rest(arg).is_some_and(|rest| not_github(&host_of(rest))))
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn host_allowed(host: &str, hosts: &[String]) -> bool {
@@ -1922,10 +1988,41 @@ pub fn repos_match(left: &str, right: &str) -> bool {
 /// block the policy would otherwise imply (#440). It lived only in `main.rs`,
 /// so the library surface could not see it — the same shape as the other four
 /// cases where `check exec` answered from fewer inputs than the launch has.
+///
+/// The cached token is the github.com token of the active account, so only the
+/// argv that asks for exactly that qualifies: `auth token`, optionally with
+/// `--hostname github.com` and `--no-refresh`. `--user`, another host, `--help`
+/// or anything unknown falls through to the gate, which refuses it, so the
+/// one-time cache is never spent on (or handed to) a different request (#1047).
 #[must_use]
 pub fn is_auth_token_request(args: &[&str]) -> bool {
-    let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
-    positional.next() == Some("auth") && positional.next() == Some("token")
+    let [first, second, rest @ ..] = args else {
+        return false;
+    };
+    if *first != "auth" || *second != "token" {
+        return false;
+    }
+    let github = |h: &str| h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
+    let mut rest = rest.iter().copied();
+    while let Some(arg) = rest.next() {
+        let ok = match arg {
+            "--no-refresh" => true,
+            "--hostname" | "-h" => rest.next().is_some_and(github),
+            _ => {
+                arg.strip_prefix("--no-refresh=")
+                    .is_some_and(|v| parse_pflag_bool(v).is_some())
+                    || arg
+                        .strip_prefix("--hostname=")
+                        .or_else(|| arg.strip_prefix("-h="))
+                        .or_else(|| arg.strip_prefix("-h"))
+                        .is_some_and(github)
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 fn parse_pflag_bool(val: &str) -> Option<bool> {
@@ -2699,8 +2796,15 @@ fn gate_with_scope_resolver_for(
     {
         return Err(Refusal {
             headline: "revealing the GitHub token is not allowed in this environment.".to_string(),
-            guidance: "Reason: token exfiltration prevention. Allowed gh commands already authenticate through the gh guard."
-                .to_string(),
+            guidance: if cmd.subcommand.as_deref() == Some("token") {
+                "Reason: token exfiltration prevention. Only plain 'gh auth token' (github.com, \
+                 active account) is served, once, from the token cplt cached at launch; \
+                 --user, another --hostname and --help are refused. Allowed gh commands \
+                 already authenticate through the gh guard."
+            } else {
+                "Reason: token exfiltration prevention. Allowed gh commands already authenticate through the gh guard."
+            }
+            .to_string(),
             agent_note: &[
                 "This operation is restricted by the cplt sandbox to prevent credential leaks.",
                 NOTE,
@@ -3311,16 +3415,208 @@ pub fn check_merge_protection(
 }
 
 /// Every `--hostname` value, in order. gh (pflag) keeps the LAST one.
+///
+/// Under `gh auth <subcommand>` the shorthand `-h` is `--hostname` too
+/// (elsewhere, and for the bare `gh auth -h` group, it is help): alone, as
+/// `-h=x`/`-hx`, or at the end of a bool cluster like `-ah`. Missing it let
+/// `gh auth status -h x.ghe.com` past the host checks with the github.com token
+/// (#1049).
 fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
+    scan_hostnames(args).0
+}
+
+/// gh's top-level command words, from `gh --help`.
+const GH_COMMANDS: &[&str] = &[
+    "agent-task",
+    "alias",
+    "api",
+    "attestation",
+    "auth",
+    "browse",
+    "cache",
+    "co",
+    "codespace",
+    "completion",
+    "config",
+    "copilot",
+    "discussion",
+    "extension",
+    "gist",
+    "gpg-key",
+    "issue",
+    "label",
+    "org",
+    "pr",
+    "preview",
+    "project",
+    "release",
+    "repo",
+    "ruleset",
+    "run",
+    "search",
+    "secret",
+    "skill",
+    "ssh-key",
+    "stack",
+    "status",
+    "variable",
+    "workflow",
+];
+
+/// Index of the first root-level positional, skipping the values of known
+/// value flags (`-R`/`--repo`/`--hostname`), and whether a root flag before it
+/// was unknown, so its value could have been mistaken for the command.
+fn root_command(args: &[&str]) -> (Option<usize>, bool) {
+    let mut unknown = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            return (Some(i + 1).filter(|&j| j < args.len()), unknown);
+        }
+        if !a.starts_with('-') || a == "-" {
+            return (Some(i), unknown);
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            match long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)))
+            {
+                ("repo" | "hostname", None) => i += 1,
+                ("repo" | "hostname" | "help" | "version", _) => {}
+                _ => unknown = true,
+            }
+        } else if a == "-R" || a == "-h" {
+            // gh reads a root `-h` as `--hostname` under `gh auth`, so it takes a value.
+            i += 1;
+        } else if !a.starts_with("-R") {
+            // `-hX`, `-ah`: not a flag gh knows at the root.
+            unknown = true;
+        }
+        i += 1;
+    }
+    (None, unknown)
+}
+
+/// [`requested_hostnames`], plus whether the scan met a `gh auth` flag it does
+/// not know, so it cannot tell a value from a flag. The token check withholds
+/// the token then; the gate does not refuse on it alone.
+///
+/// The `gh auth` flag tables are the union over `gh auth <cmd> --help` for
+/// login, logout, refresh, setup-git, status, switch and token. No letter means
+/// one thing in one subcommand and another elsewhere. A value-taking flag eats
+/// the rest of its cluster or the next argument, so `--jq '-length'` or
+/// `-uother` is never read as `-h`. Under `gh auth`, `--` ends the scan as it
+/// ends pflag's; elsewhere a `--` may be a flag value, so the scan goes on.
+fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
+    const AUTH_SUBCOMMANDS: &[&str] = &[
+        "login",
+        "logout",
+        "refresh",
+        "setup-git",
+        "status",
+        "switch",
+        "token",
+    ];
+    const AUTH_SHORT_VALUE: &str = "hprsu";
+    const AUTH_SHORT_BOOL: &str = "acftw";
+    const AUTH_LONG_VALUE: &[&str] = &[
+        "hostname",
+        "git-protocol",
+        "scopes",
+        "remove-scopes",
+        "user",
+        "jq",
+        "json",
+        "template",
+    ];
+    const AUTH_LONG_BOOL: &[&str] = &[
+        "clipboard",
+        "expiring",
+        "insecure-storage",
+        "skip-ssh-key",
+        "web",
+        "with-token",
+        "reset-scopes",
+        "force",
+        "active",
+        "no-refresh",
+        "show-token",
+        "help",
+    ];
+    // `gh auth git-credential` and the bare group are not `-h`-is-hostname.
+    // A flag before the subcommand (`gh -hX auth status`, `gh auth -hX status`)
+    // could be a value or a host, so it is ambiguous; bare `gh auth -h` is help.
+    // A flag value can look positional, so any later subcommand name counts.
+    let (root, unknown) = root_command(args);
+    let auth_at = root.filter(|&i| args[i] == "auth");
+    let auth_sub = auth_at.and_then(|i| {
+        args.iter()
+            .enumerate()
+            .skip(i + 1)
+            .filter(|(_, a)| !a.starts_with('-'))
+            .find(|(_, s)| AUTH_SUBCOMMANDS.contains(s))
+            .map(|(j, _)| (i, j))
+    });
+    let auth = auth_sub.is_some_and(|(i, j)| j == i + 1);
     let mut found = Vec::new();
-    for (index, arg) in args.iter().enumerate() {
-        if let Some(hostname) = arg.strip_prefix("--hostname=") {
-            found.push(hostname);
-        } else if *arg == "--hostname" {
-            found.push(args.get(index + 1).copied().unwrap_or(""));
+    // An unknown root flag may take a value (`gh --x v auth ...`): then any
+    // `auth` positional before another command word could be the command.
+    let mut ambiguous = auth_sub.is_some_and(|(i, j)| j != i + 1)
+        || (unknown
+            && root.is_some_and(|i| {
+                args[i..]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .find(|a| **a == "auth" || GH_COMMANDS.contains(a))
+                    == Some(&"auth")
+            }));
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        // pflag stops at `--` only when it is not a flag's value. The flag
+        // tables are known only under `gh auth`, so elsewhere keep scanning:
+        // `gh api --jq -- --hostname x` must still see the host.
+        if auth && arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            if name == "hostname" {
+                found.push(inline.unwrap_or_else(|| iter.next().unwrap_or("")));
+            } else if auth && AUTH_LONG_VALUE.contains(&name) {
+                if inline.is_none() {
+                    iter.next();
+                }
+            } else if auth && !AUTH_LONG_BOOL.contains(&name) {
+                ambiguous = true;
+            }
+        } else if auth && let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
+            for (pos, c) in cluster.char_indices() {
+                if AUTH_SHORT_VALUE.contains(c) {
+                    let value = &cluster[pos + 1..];
+                    let value = value.strip_prefix('=').unwrap_or(value);
+                    let value = if value.is_empty() {
+                        iter.next().unwrap_or("")
+                    } else {
+                        value
+                    };
+                    if c == 'h' {
+                        found.push(value);
+                    }
+                    break;
+                } else if !AUTH_SHORT_BOOL.contains(c) {
+                    ambiguous = true;
+                    break;
+                } else if cluster[pos + c.len_utf8()..].starts_with('=') {
+                    // pflag: `-a=false` gives the rest of the cluster to `a`.
+                    break;
+                }
+            }
         }
     }
-    found
+    (found, ambiguous)
 }
 
 /// The `--hostname` gh will use: the last one, as pflag reads it. The gate
@@ -6876,9 +7172,10 @@ mod tests {
         ));
         // Its host arrives on stdin: without stdin this check fails closed.
         assert!(!ok(&["auth", "git-credential", "get"], None));
-        // Default list: unchanged, every other exec gets the token.
+        // Default list: a named non-github.com host still gets no token; a
+        // `*.ghe.com` tenant would receive it (#1049).
         let github = vec!["github.com".to_string()];
-        assert!(github_token_allowed_for(
+        assert!(!github_token_allowed_for(
             &["api", "--hostname", "example.ghe.com", "user"],
             None,
             None,
@@ -11888,5 +12185,348 @@ mod tests {
         );
         assert!(facts.default_branches.is_empty());
         assert!(facts.git_common_dir.is_empty());
+    }
+
+    /// #1047: only a request for the active account's github.com token may
+    /// spend the cache; every other `gh auth token` form is refused.
+    #[test]
+    fn auth_token_serves_only_the_github_com_active_account() {
+        for args in [
+            &["auth", "token"][..],
+            &["auth", "token", "--hostname", "github.com"],
+            &["auth", "token", "-h", "GitHub.com"],
+            &["auth", "token", "--hostname=github.com"],
+            &["auth", "token", "-hgithub.com"],
+            &["auth", "token", "--no-refresh"],
+            &["auth", "token", "--no-refresh=false"],
+        ] {
+            assert!(is_auth_token_request(args), "{args:?}");
+        }
+        for args in [
+            &["auth", "token", "--hostname", "corp.ghe.com"][..],
+            &["auth", "token", "-h", "x"],
+            &["auth", "token", "--hostname=localhost"],
+            &["auth", "token", "-h=evil.ghe.com"],
+            &["auth", "token", "-u", "other"],
+            &["auth", "token", "--user=x"],
+            &["auth", "token", "--user", "x"],
+            &["auth", "token", "--help"],
+            &["auth", "token", "-h"],
+            &["auth", "token", "--hostname"],
+            &["auth", "token", "extra"],
+            &["auth", "token", "--no-refresh=maybe"],
+            &["-R", "o/r", "auth", "token"],
+            &["auth", "status"],
+        ] {
+            assert!(!is_auth_token_request(args), "{args:?}");
+            // Not served, so the gate decides, and it refuses.
+            let dir = std::env::temp_dir();
+            if args.contains(&"token") {
+                let refusal = gate(args, &dir, &GatePolicy::default()).unwrap_err();
+                assert!(
+                    refusal.guidance.contains("Only plain 'gh auth token'"),
+                    "{refusal}"
+                );
+            }
+        }
+    }
+
+    /// #1049: under `gh auth`, `-h` is `--hostname`; the github.com token must
+    /// not go to any other named host, configured or not, localhost included.
+    #[test]
+    fn auth_shorthand_hostname_withholds_github_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        for args in [
+            &["auth", "status", "-h", "evil.ghe.com"][..],
+            &["auth", "status", "-hevil.ghe.com"],
+            &["auth", "status", "-h=evil.ghe.com"],
+            &["auth", "status", "-ah", "evil.ghe.com"],
+            &["auth", "status", "--hostname", "evil.ghe.com"],
+            &["api", "--hostname", "localhost", "user"],
+            &["api", "--hostname", "ghes.corp.example", "user"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        // No host: gh would iterate hosts.yml, tenants included (#1070).
+        assert!(!ok(&["auth", "status"]));
+        let pinned = pin_auth_hostname(&["auth", "status", "--", "x"]).unwrap();
+        assert_eq!(
+            pinned,
+            ["auth", "status", "--hostname", "github.com", "--", "x"]
+        );
+        let refs: Vec<&str> = pinned.iter().map(String::as_str).collect();
+        assert!(ok(&refs));
+        for sub in [
+            "status",
+            "refresh",
+            "setup-git",
+            "switch",
+            "logout",
+            "token",
+        ] {
+            assert!(!ok(&["auth", sub]), "{sub}");
+            assert_eq!(
+                pin_auth_hostname(&["auth", sub, "--", "x"]).unwrap(),
+                ["auth", sub, "--hostname", "github.com", "--", "x"],
+                "{sub}"
+            );
+        }
+        // pflag gives `-a=false` its value; `-h=` still names a host.
+        assert!(ok(&[
+            "auth",
+            "status",
+            "--hostname",
+            "github.com",
+            "-a=false"
+        ]));
+        assert!(!ok(&["auth", "status", "-a=false", "-h=evil.ghe.com"]));
+        // Attached short-flag values and `=` forms name a tenant too.
+        for args in [
+            &["pr", "list", "-Rgithub.localhost/o/r"][..],
+            &["pr", "list", "-Rx.ghe.com/o/r"],
+            &["pr", "list", "--repo=github.localhost/o/r"],
+            &["pr", "list", "-R=github.localhost/o/r"],
+            // gh decodes again: double and triple encoding of `İ`.
+            &["repo", "clone", "https://g%25C4%25B0thub.localhost/o/r"],
+            &["repo", "clone", "https://g%2525C4%2525B0thub.localhost/o/r"],
+            // Bool flags clustered ahead of an attached `-R` value.
+            &["pr", "list", "-dRgithub.localhost/o/r"],
+            &["pr", "view", "-cRgithub.localhost/o/r"],
+            &["run", "list", "-aRgithub.localhost"],
+            &["pr", "list", "-wRx.ghe.com/o/r"],
+            // Still changing after 4 decode rounds: fail closed.
+            &["pr", "list", "-R", "x.ghe%252525252Ecom/o/r"],
+            &["pr", "list", "-R", "%2525252525"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        assert_eq!(
+            pin_auth_hostname(&["auth", "status", "-h", "github.com"]),
+            None
+        );
+        assert_eq!(pin_auth_hostname(&["pr", "status"]), None);
+        assert!(ok(&["auth", "status", "-h", "github.com"]));
+        // Root `-h` takes a value, so `auth` is still the command.
+        assert!(ok(&["-h", "github.com", "auth", "status"]));
+        for args in [
+            &["repo", "view", "g\u{130}thub.localhost/o/r"][..],
+            &["repo", "view", "-R", "g\u{130}thub.localhost/o/r"],
+            &["repo", "view", "--repo=g\u{130}thub.localhost/o/r"],
+            &["repo", "clone", "https://g\u{130}thub.localhost/o/r"],
+            &["repo", "clone", "git@g\u{130}thub.localhost:o/r"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        for args in [
+            &["pr", "list"][..],
+            &["pr", "list", "-R", "o/r"],
+            &["repo", "view", "navikt/cplt"],
+            &["pr", "view", "https://github.com/o/r/pull/1"],
+        ] {
+            assert!(ok(args), "{args:?}");
+        }
+        assert!(!github_token_allowed_for(
+            &["pr", "list"],
+            Some("x.g%252525252Ehe.com/o/r"),
+            None,
+            &hosts
+        ));
+        // Outside `gh auth`, -h is help, not a host.
+        assert!(ok(&["pr", "list", "-h"]));
+        assert_eq!(
+            requested_hostname(&["auth", "status", "-h", "evil.ghe.com"]),
+            Some("evil.ghe.com")
+        );
+        // And the scope check sees the shorthand host.
+        let policy = GatePolicy {
+            scope_check: true,
+            ..GatePolicy::default()
+        };
+        let refusal = gate_with_repo_scope(
+            &["auth", "status", "-h", "evil.ghe.com"],
+            &policy,
+            &["o/r".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(refusal.headline.contains("evil.ghe.com"), "{refusal}");
+    }
+
+    /// Review of #1070: option values are not flag clusters, `gh auth -h` is
+    /// group help, `--` ends flags, and every named host counts.
+    #[test]
+    fn auth_hostname_scan_reads_values_and_stops_at_dashdash() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        let policy = GatePolicy {
+            scope_check: true,
+            ..GatePolicy::default()
+        };
+        // Not refused over a hostname (other policy, like block_auth_token, may still apply).
+        let host_ok = |args: &[&str]| {
+            gate_with_repo_scope(args, &policy, &["o/r".to_string()], None)
+                .err()
+                .is_none_or(|r| !r.headline.contains("host") && !r.headline.contains("''"))
+        };
+
+        // Values of value-taking flags are not `-h` clusters.
+        let jq = ["auth", "status", "--json", "hosts", "--jq", "-length"];
+        assert!(requested_hostnames(&jq).is_empty());
+        assert!(host_ok(&jq));
+        let pinned = pin_auth_hostname(&jq).unwrap();
+        assert!(ok(&pinned.iter().map(String::as_str).collect::<Vec<_>>()));
+        let user = ["auth", "token", "-hgithub.com", "-uother"];
+        assert_eq!(requested_hostnames(&user), vec!["github.com"]);
+        assert_eq!(
+            requested_hostnames(&["auth", "logout", "-u", "-h"]),
+            Vec::<&str>::new()
+        );
+
+        // `gh auth -h` is group help, as on main.
+        assert!(requested_hostnames(&["auth", "-h"]).is_empty());
+        assert!(host_ok(&["auth", "-h"]));
+
+        // pflag stops at `--`; withhold if any named host is not github.com.
+        let dashdash = [
+            "auth",
+            "status",
+            "-h",
+            "evil.ghe.com",
+            "--",
+            "--hostname",
+            "github.com",
+        ];
+        assert_eq!(requested_hostnames(&dashdash), vec!["evil.ghe.com"]);
+        assert!(!ok(&dashdash));
+        assert!(!ok(&[
+            "auth",
+            "status",
+            "-h",
+            "evil.ghe.com",
+            "--hostname",
+            "github.com"
+        ]));
+
+        // An unknown `gh auth` flag is ambiguous: no token, but no refusal.
+        let unknown = ["auth", "status", "-zh", "evil.ghe.com"];
+        assert!(!ok(&unknown));
+        assert!(!ok(&["auth", "status", "--bogus", "-h", "evil.ghe.com"]));
+    }
+
+    /// Review of #1070 at 5c70fade: outside `gh auth` a `--` can be a flag
+    /// value, and a flag before the auth subcommand hides where `-h` binds.
+    #[test]
+    fn hostname_scan_past_dashdash_value_and_flag_before_auth_subcommand() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        for flag in ["--jq", "-p", "-t", "-q"] {
+            let args = ["api", flag, "--", "--hostname", "evil.ghe.com", "repos/o/r"];
+            assert!(!ok(&args), "{args:?}");
+        }
+        for args in [
+            &["auth", "-hevil.ghe.com", "status"][..],
+            &["-hevil.ghe.com", "auth", "status"],
+            &["auth", "-h", "evil.ghe.com", "status"],
+            &["--bogus", "auth", "status"],
+            &[
+                "--hostname",
+                "github.com",
+                "auth",
+                "status",
+                "-h",
+                "evil.ghe.com",
+            ],
+            &[
+                "--hostname",
+                "github.com",
+                "auth",
+                "status",
+                "-hevil.ghe.com",
+            ],
+            &[
+                "--hostname",
+                "github.com",
+                "auth",
+                "status",
+                "-ah",
+                "evil.ghe.com",
+            ],
+            &[
+                "--hostname=github.com",
+                "auth",
+                "status",
+                "-h",
+                "evil.ghe.com",
+            ],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        assert!(ok(&["auth", "status", "--hostname", "github.com"]));
+        assert!(requested_hostnames(&["auth", "-h"]).is_empty());
+    }
+
+    /// Review of #1070 at 8623d4fc: a positional `HOST/OWNER/REPO` picks the
+    /// host like `-R` does.
+    #[test]
+    fn positional_host_repo_withholds_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        for sub in ["view", "clone", "fork", "edit", "delete", "archive"] {
+            assert!(!ok(&["repo", sub, "evil.ghe.com/o/r"]), "{sub}");
+            assert!(ok(&["repo", sub, "o/r"]), "{sub}");
+            assert!(ok(&["repo", sub, "github.com/o/r"]), "{sub}");
+        }
+        assert!(!ok(&["repo", "clone", "git@evil.ghe.com:o/r"]));
+        // Bare localhost is GHES: gh sends it no GH_TOKEN.
+        assert!(ok(&["repo", "view", "localhost/o/r"]));
+        // Free text naming a tenant over-withholds, by design.
+        assert!(!ok(&["pr", "create", "--title", "see x.ghe.com/o/r"]));
+        for args in [
+            &["pr", "view", "-c", "https://evil.ghe.com/o/r/pull/1"][..],
+            &["issue", "view", "-c", "https://evil.ghe.com/o/r/issues/1"],
+            &["repo", "view", "ssh://git@evil.ghe.com/o/r"],
+            &["repo", "view", "git://evil.ghe.com/o/r"],
+            &["repo", "view", "git+ssh://git@EVIL.GHE.COM./o/r"],
+            &["repo", "view", "evil.ghe.com:443/o/r"],
+            &["repo", "view", "https://evil%2eghe.com/o/r"],
+            &["repo", "view", "github.localhost/o/r"],
+            &["repo", "view", "a.github.localhost/o/r"],
+            &["pr", "view", "http://github.localhost/o/r/pull/1"],
+            &["pr", "list", "-R", "github.localhost/o/r"],
+            &["pr", "list", "--repo=evil.ghe.com/o/r"],
+            &["-h", "evil.ghe.com", "auth", "status"],
+            &["-h", "ghes.example", "auth", "status"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        assert!(ok(&["repo", "view", "o/r"]));
+        assert!(ok(&["pr", "view", "https://github.com/o/r/pull/1"]));
+        assert!(!github_token_allowed_for(
+            &["pr", "list"],
+            Some("github.localhost/o/r"),
+            None,
+            &hosts
+        ));
+    }
+
+    /// Review of #1070 at 527ed6ee: `auth` as free text after a root `-R` is
+    /// not the command, so the token stays.
+    #[test]
+    fn root_repo_flag_with_auth_text_keeps_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        assert!(ok(&[
+            "-R",
+            "o/r",
+            "pr",
+            "create",
+            "--title",
+            "fix auth bug"
+        ]));
+        assert!(ok(&["-R", "o/r", "issue", "list", "--search", "auth"]));
+        assert!(ok(&["--repo=o/r", "issue", "list", "--search", "auth"]));
+        assert!(!ok(&["-hevil.ghe.com", "auth", "status"]));
+        assert!(!ok(&["-ah", "evil.ghe.com", "auth", "status"]));
     }
 }

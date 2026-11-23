@@ -36,7 +36,9 @@ Both guards take a `mode`. `block` prints the message and exits non-zero.
 `warn` prints the same message behind `⚠️  WARNING (would block):` and runs the
 command anyway. `audit` prints it behind `[audit] gh-gate: would block:` (or
 `git-gate`) and runs it. Use `warn` or `audit` to find out what a rollout would
-break before you enforce it.
+break before you enforce it. In `warn` or `audit` mode, when the cached
+github.com token is passed to gh, a bare `gh auth logout` or `gh auth switch`
+acts on github.com, where gh would otherwise prompt for a host.
 
 For per-repo enforcement, committed to version control:
 
@@ -291,6 +293,30 @@ without exposing it to subprocesses:
 3. On Copilot's first call to `gh auth token`, the wrapper reads and returns the
    cached token, then **immediately deletes the file**
 4. Any subsequent call by tools or MCP servers gets "no cached token available"
+
+Only plain `gh auth token` is served: optionally `--hostname github.com` and
+`--no-refresh`. `--user`, any other `--hostname`/`-h`, `--help` and unknown
+arguments are refused without touching the cache, because the cached token is
+the github.com token of the active account and must not be handed out as
+anything else.
+
+The same holds for every other `gh` command: one that names a host other than
+`github.com` (with `--hostname`, or `-h` under `gh auth`) never gets the
+github.com token. For a GitHub Enterprise Server host, `gh` reads
+`GH_ENTERPRISE_TOKEN` instead; pass it with `--pass-env GH_ENTERPRISE_TOKEN`.
+A `*.ghe.com` tenant is not GHES: `gh` reads `GH_TOKEN` for it, so set
+`GH_TOKEN` to the tenant's token and pass it with `--pass-env GH_TOKEN`.
+`gh` then sends that tenant token to `github.com` as well, and a passed
+`GH_TOKEN` turns off the exec-token cache described above.
+
+`gh` also sends `GH_TOKEN` to `github.localhost` and `*.github.localhost`
+(bare `localhost` is treated as GHES). So any argument, `GH_REPO` or `GH_HOST`
+that mentions the text `ghe.com` or `github.localhost` anywhere, even
+percent-encoded, withholds the github.com token. A title or body that mentions
+either string therefore runs without the token; pass the text
+with `--body-file` instead. A `gh auth` command that names no host, such as
+plain `gh auth status`, runs as `--hostname github.com` when it gets the token,
+since gh would otherwise send the token to every host it is logged in to.
 
 A `GH_TOKEN` environment variable would be inherited by every tool, MCP server,
 and subprocess the agent spawns. The file gives it to the first reader only,
