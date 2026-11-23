@@ -721,9 +721,10 @@ impl ProxyHandle {
                 &std::net::SocketAddr::from(([127, 0, 0, 1], self.port)),
                 Duration::from_secs(1),
             );
+            // After the flag: a curl spawned from here on sees it and dies
+            // itself. Only once, like the wake-up: the port may be reused.
+            crate::github_mcp::kill_children(self.port);
         }
-        // After the flag: a curl spawned from here on sees it and dies itself.
-        crate::github_mcp::kill_children(self.port);
     }
 
     /// Test reader for the live collector before snapshot finalization.

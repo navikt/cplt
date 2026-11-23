@@ -61,7 +61,8 @@ pub(crate) fn kill_children(port: u16) {
 /// Read exactly `buf.len()` bytes, all within `limit` in total: a per-read
 /// timeout alone lets a client trickle a 4 MiB body one byte at a time (#1059).
 fn read_body(client: &mut TcpStream, buf: &mut [u8], limit: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + limit;
+    // `proxy.timeout` is any u64 of seconds: cap it so the sum cannot overflow.
+    let deadline = std::time::Instant::now() + limit.min(std::time::Duration::from_secs(86_400));
     let mut done = 0;
     while done < buf.len() {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -865,6 +866,15 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
         assert_eq!(reply.matches("HTTP/1.1").count(), 1, "{reply}");
         assert!(!ran.exists(), "curl ran after shutdown");
+    }
+
+    #[test]
+    fn huge_body_limit_does_not_overflow() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut server, _) = l.accept().unwrap();
+        c.write_all(b"x").unwrap();
+        assert!(read_body(&mut server, &mut [0], std::time::Duration::MAX));
     }
 
     #[test]
