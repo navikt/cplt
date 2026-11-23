@@ -10977,6 +10977,42 @@ paths = [
         );
     }
 
+    /// `check net` and `doctor` load the managed layer (#1095) the way a
+    /// launch does: a file the agent could plant in the project is refused,
+    /// not silently skipped and not applied.
+    #[test]
+    fn e2e_check_net_and_doctor_apply_the_managed_layer() {
+        let proj = check_project();
+        let planted = proj.path().join("managed.toml");
+        std::fs::write(
+            &planted,
+            "managed_by = \"x\"\nschema = 1\n[proxy]\nallow_private_domains = [\"a.nav.no\"]\n",
+        )
+        .unwrap();
+        for args in [
+            &["check", "net", "example.com", "--no-connect"][..],
+            &["doctor"][..],
+        ] {
+            let output = cplt_cmd()
+                .arg("--project-dir")
+                .arg(proj.path())
+                .args(["--agent", "shell"])
+                .args(args)
+                .env("CPLT_MANAGED_CONFIG", &planted)
+                .output()
+                .expect("cplt should run");
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                all.contains("CPLT_MANAGED_CONFIG=") && all.contains("must lie under"),
+                "{args:?} must load and refuse the planted managed file:\n{all}"
+            );
+        }
+    }
+
     #[test]
     fn e2e_check_net_default_allowed() {
         let proj = check_project();
