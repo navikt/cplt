@@ -538,6 +538,26 @@ thread_local! {
     static FAKE_GH_TOKEN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Sets [`FAKE_GH_TOKEN`] and clears it on drop, so a failing test cannot
+/// leave it set for the next test on the same thread.
+#[cfg(test)]
+struct FakeGhToken;
+
+#[cfg(test)]
+impl FakeGhToken {
+    fn set(token: &str) -> Self {
+        FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some(token.into()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakeGhToken {
+    fn drop(&mut self) {
+        FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
+    }
+}
+
 /// Whether the child will already have a usable GitHub token in its own
 /// environment, making extraction unnecessary.
 ///
@@ -787,8 +807,12 @@ fn cache_gh_token_to_file(
         // for this; the value carries the user's other providers too. Skipped
         // when v2 ignores it, deny.env strips it, or the user passed their
         // own, which must not be overwritten (#1056).
-        if opencode_handover_applies(cmd, agent, deny_env, inherit_env, opencode_v2)
-            && let Some(home) = std::env::var_os("HOME")
+        if opencode_handover_applies(
+            &|k| child_env_value(cmd, k, inherit_env),
+            agent,
+            deny_env,
+            opencode_v2,
+        ) && let Some(home) = std::env::var_os("HOME")
             && let Some(auth) = crate::agent::opencode_host_login(Path::new(&home), &token)
         {
             cmd.env("OPENCODE_AUTH_CONTENT", auth);
@@ -796,17 +820,41 @@ fn cache_gh_token_to_file(
     }
 }
 
+/// `env` is the child's value for a variable before the deny sweep:
+/// [`child_env_value`] at launch, doctor's view of the same env.
 fn opencode_handover_applies(
-    cmd: &Command,
+    env: &dyn Fn(&str) -> Option<String>,
     agent: Agent,
     deny_env: &[String],
-    inherit_env: bool,
     opencode_v2: bool,
 ) -> bool {
     agent == Agent::OpenCode
         && !opencode_v2
         && !deny_env.iter().any(|d| d == "OPENCODE_AUTH_CONTENT")
-        && child_env_value(cmd, "OPENCODE_AUTH_CONTENT", inherit_env).is_none()
+        && env("OPENCODE_AUTH_CONTENT").is_none()
+}
+
+/// Whether [`cache_gh_token_to_file`] would pass OpenCode the stored gh token
+/// as `OPENCODE_AUTH_CONTENT`, given a stored token and a usable `auth.json`.
+/// Doctor calls this so its auth line cannot drift from the launch (#1092).
+pub fn opencode_handover_planned(
+    env: &dyn Fn(&str) -> Option<String>,
+    agent: Agent,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+    opencode_v2: bool,
+) -> bool {
+    let gh_token = ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|k| !deny_env.iter().any(|d| d == k) && env(k).is_some_and(|v| !v.trim().is_empty()));
+    !gh_token
+        && should_cache_exec_token(
+            agent,
+            deny_env,
+            substitute,
+            gh_hosts_yml().is_some_and(|p| is_regular_file(&p)),
+        )
+        && opencode_handover_applies(env, agent, deny_env, opencode_v2)
 }
 
 /// Points gh at the token dir only when every file was written (#1078).
@@ -3114,7 +3162,7 @@ echo "failed to read keyring" >&2; exit 1"#,
                 ("COPILOT_GITHUB_TOKEN", None),
             ],
             || {
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                let _fake = FakeGhToken::set("ghp_fake");
                 let ss = crate::agent::KeychainSubstitute::SecretService(
                     crate::agent::SecretToken::new("t".into()),
                 );
@@ -3127,7 +3175,6 @@ echo "failed to read keyring" >&2; exit 1"#,
                     child_env_has_gh_token(&cmd, &[], false),
                     "control: injected"
                 );
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
             },
         );
     }
@@ -3148,7 +3195,7 @@ echo "failed to read keyring" >&2; exit 1"#,
                 ("COPILOT_GITHUB_TOKEN", None),
             ],
             || {
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                let _fake = FakeGhToken::set("ghp_fake");
                 for (preset, want) in [(true, false), (false, true)] {
                     let scratch = tempfile::tempdir().unwrap();
                     let mut cmd = Command::new("true");
@@ -3172,7 +3219,6 @@ echo "failed to read keyring" >&2; exit 1"#,
                         "preset={preset}"
                     );
                 }
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
             },
         );
     }
@@ -3233,47 +3279,41 @@ echo "failed to read keyring" >&2; exit 1"#,
             let cmd = Command::new("true");
             let deny = vec!["OPENCODE_AUTH_CONTENT".to_string()];
             assert!(opencode_handover_applies(
-                &cmd,
+                &|k| child_env_value(&cmd, k, false),
                 Agent::OpenCode,
                 &[],
-                false,
                 false
             ));
             assert!(!opencode_handover_applies(
-                &cmd,
+                &|k| child_env_value(&cmd, k, true),
                 Agent::OpenCode,
                 &[],
-                true,
                 false
             ));
             assert!(!opencode_handover_applies(
-                &cmd,
+                &|k| child_env_value(&cmd, k, false),
                 Agent::OpenCode,
                 &[],
-                false,
                 true
             ));
             assert!(!opencode_handover_applies(
-                &cmd,
+                &|k| child_env_value(&cmd, k, false),
                 Agent::OpenCode,
                 &deny,
-                false,
                 false
             ));
             assert!(!opencode_handover_applies(
-                &cmd,
+                &|k| child_env_value(&cmd, k, false),
                 Agent::Copilot,
                 &[],
-                false,
                 false
             ));
             let mut passed = Command::new("true");
             passed.env("OPENCODE_AUTH_CONTENT", "{}");
             assert!(!opencode_handover_applies(
-                &passed,
+                &|k| child_env_value(&passed, k, false),
                 Agent::OpenCode,
                 &[],
-                false,
                 false
             ));
         });
@@ -3447,6 +3487,41 @@ echo "failed to read keyring" >&2; exit 1"#,
         );
     }
 
+    /// Doctor's OpenCode handover line uses the launch's predicate with its
+    /// own view of the child env (#1092): a `--pass-env` of an unset var does
+    /// not stop it, COPILOT_GITHUB_TOKEN does not either, GH_TOKEN does.
+    #[test]
+    fn opencode_handover_planned_follows_the_child_env() {
+        let gh = tempfile::tempdir().unwrap();
+        std::fs::write(gh.path().join("hosts.yml"), "github.com:\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("GH_CONFIG_DIR", Some(gh.path().to_str().unwrap())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || {
+                let planned = |env: &dyn Fn(&str) -> Option<String>| {
+                    opencode_handover_planned(env, Agent::OpenCode, &[], None, false)
+                };
+                assert!(planned(&|_| None), "passed but unset");
+                assert!(planned(
+                    &|k| (k == "COPILOT_GITHUB_TOKEN").then(|| "t".into())
+                ));
+                assert!(!planned(&|k| (k == "GH_TOKEN").then(|| "t".into())));
+                assert!(!planned(
+                    &|k| (k == "OPENCODE_AUTH_CONTENT").then(|| "{}".into())
+                ));
+                assert!(!opencode_handover_planned(
+                    &|_| None,
+                    Agent::OpenCode,
+                    &[],
+                    None,
+                    true
+                ));
+            },
+        );
+    }
+
     #[test]
     fn gh_hosts_yml_honours_gh_config_dir() {
         temp_env::with_vars(
@@ -3530,7 +3605,8 @@ mod keychain_substitute_tests {
         });
     }
 
-    /// OpenCode v2: a user-passed OPENCODE_AUTH_CONTENT is kept (SECURITY.md).
+    /// A user-passed OPENCODE_AUTH_CONTENT is kept on OpenCode 1.x and removed
+    /// on v2, which never reads it (#716/#729).
     #[test]
     fn session_env_keeps_user_opencode_auth_content_on_v1_only() {
         let mut v1 = Command::new("true");

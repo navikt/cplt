@@ -442,7 +442,7 @@ fn opencode_auth_overlay(auth_json: Option<&str>, token: &str) -> Option<String>
 }
 
 /// [`opencode_auth_overlay`] for the store in `home`.
-pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
+pub fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
     let path = opencode_auth_json(home)?;
     if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         crate::ui::warn(&format!(

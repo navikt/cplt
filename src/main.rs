@@ -2499,6 +2499,22 @@ fn linux_login_hint(
     })
 }
 
+/// The agent's own login variable that reaches the child, for doctor's
+/// `auth:` line. Only the agent's own: GH_TOKEN is not Claude's login, and
+/// OpenCode's gh vars feed `OPENCODE_AUTH_CONTENT` instead (#1092).
+fn doctor_env_token(
+    agent: agent::Agent,
+    deny_env: &[String],
+    child_env: &dyn Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    agent
+        .keychain_substitute_env_vars()
+        .iter()
+        .copied()
+        .filter(|v| !deny_env.iter().any(|d| d == v))
+        .find(|v| child_env(v).is_some_and(|t| !t.trim().is_empty()))
+}
+
 /// [`linux_login_hint`] as a doctor warning (#933).
 fn doctor_login_finding(hint: Option<String>) -> Option<cplt::doctor::Finding> {
     hint.map(|message| cplt::doctor::Finding::warning(message, None))
@@ -2507,23 +2523,70 @@ fn doctor_login_finding(hint: Option<String>) -> Option<cplt::doctor::Finding> {
 /// gh holds a github.com token cplt may read: the one predicate launch and
 /// doctor share (#1055). A GHE-only or stale `hosts.yml` does not count.
 /// Every consumer needs Copilot with gh_guard and scratch on, so other
-/// launches skip the `gh auth token` probe.
-fn host_gh_token_stored(resolved: &config::Resolved, agent: agent::Agent) -> bool {
-    agent == agent::Agent::Copilot
-        && resolved.gh_guard.enabled
-        && resolved.scratch_dir
-        && cplt::sandbox::gh_configured()
-        && discover::stored_gh_token_available()
+/// launches skip the `gh auth token` probe. `Err` says why not, for doctor.
+fn host_gh_token_stored(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+) -> Result<(), &'static str> {
+    host_gh_token_stored_with(resolved, agent, cplt::sandbox::gh_configured, &|| {
+        cplt::git::trusted_binary("gh").is_some()
+    })
 }
 
+/// [`host_gh_token_stored`] with the host lookups injected, so tests control
+/// "gh configured" and "trusted gh present" and can check the ranking.
+fn host_gh_token_stored_with(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    gh_configured: fn() -> bool,
+    trusted_gh: &dyn Fn() -> bool,
+) -> Result<(), &'static str> {
+    use cplt::doctor::{GH_GUARD_OFF, GH_NO_LOGIN, NO_TRUSTED_GH, SCRATCH_OFF};
+    if agent != agent::Agent::Copilot || !gh_configured() {
+        Err(GH_NO_LOGIN)
+    } else if !resolved.gh_guard.enabled {
+        Err(GH_GUARD_OFF)
+    } else if !resolved.scratch_dir {
+        Err(SCRATCH_OFF)
+    } else if !trusted_gh() {
+        Err(NO_TRUSTED_GH)
+    } else if !discover::stored_gh_token_available() {
+        Err(GH_NO_LOGIN)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the launch hands Copilot the stored gh token (gh wrapper or
+/// `inject_token`), and if not, why. Launch and doctor both call this (#1092).
 fn copilot_stored_token_handover(
     resolved: &config::Resolved,
     substitute: Option<&agent::KeychainSubstitute>,
-    stored_token: bool,
+    stored_token: Result<(), &'static str>,
     native_copilot_login: bool,
-) -> bool {
-    if !stored_token || !resolved.gh_guard.enabled || !resolved.scratch_dir {
-        return false;
+) -> Result<(), &'static str> {
+    use cplt::doctor::{GH_GUARD_OFF, NATIVE_LOGIN, SCRATCH_OFF};
+    stored_token?;
+    if !resolved.gh_guard.enabled {
+        return Err(GH_GUARD_OFF);
+    }
+    if !resolved.scratch_dir {
+        return Err(SCRATCH_OFF);
+    }
+    if resolved.gh_guard.inject_token
+        && !cfg!(target_os = "macos")
+        && agent::Agent::Copilot
+            .keychain_substitute_env_vars()
+            .iter()
+            .any(|v| !resolved.deny_env.iter().any(|d| d == v))
+    {
+        return Ok(());
+    }
+    if native_copilot_login {
+        return Err(NATIVE_LOGIN);
+    }
+    if !resolved.gh_guard.block_auth_token {
+        return Err(cplt::doctor::BLOCK_AUTH_TOKEN_OFF);
     }
     let (serve, _) = discover::gh_token_cache_eligibility(
         agent::Agent::Copilot,
@@ -2533,16 +2596,22 @@ fn copilot_stored_token_handover(
         false,
         true,
     );
-    (!native_copilot_login
-        && resolved.gh_guard.block_auth_token
-        && serve
-        && discover::gh_wrapper_available())
-        || (resolved.gh_guard.inject_token
-            && !cfg!(target_os = "macos")
-            && agent::Agent::Copilot
-                .keychain_substitute_env_vars()
-                .iter()
-                .any(|v| !resolved.deny_env.iter().any(|d| d == v)))
+    if !serve {
+        return Err(match substitute {
+            _ if resolved.deny_env.iter().any(|d| d == "GH_TOKEN") => "deny.env strips GH_TOKEN",
+            Some(agent::KeychainSubstitute::SecretService(_)) => {
+                "Copilot's keyring login is passed instead"
+            }
+            Some(agent::KeychainSubstitute::GhToken { .. }) => {
+                "the token is passed as a variable instead"
+            }
+            _ => "an exported token variable is used instead",
+        });
+    }
+    if !discover::gh_wrapper_available() {
+        return Err("gh is not on PATH, so no gh wrapper serves the token");
+    }
+    Ok(())
 }
 
 /// Notes `cplt check` prints for weaker auth paths that have a replacement (#695).
@@ -5544,6 +5613,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
             ui::warn(&w);
         }
+        if let Some(w) = cplt::doctor::opencode_v2_auth_content_note(
+            &cli.pass_env,
+            &resolved.pass_env,
+            resolved.inherit_env,
+            std::env::var_os("OPENCODE_AUTH_CONTENT").is_some(),
+        ) {
+            ui::warn(&w);
+        }
     }
 
     // #732: a repository nobody approved does not get to configure OpenCode.
@@ -7678,12 +7755,20 @@ fn assemble_sandbox(
     );
     // Doctor's suppression: a token handed over another way makes the keyring moot.
     let gh_token_stored = host_gh_token_stored(resolved, active_agent);
+    if !resolved.quiet && gh_token_stored == Err(cplt::doctor::NO_TRUSTED_GH) {
+        ui::warn(&format!(
+            "gh's stored token was not read: no gh in {}",
+            cplt::git::TRUSTED_BIN_DIRS.join(", ")
+        ));
+    }
     let keyring_moot = copilot_stored_token_handover(
         resolved,
         keychain_substitute.as_ref(),
         gh_token_stored,
         cplt::sandbox::copilot_has_native_login(home_dir),
-    );
+    )
+    .is_ok();
+    let gh_token_stored = gh_token_stored.is_ok();
     if !resolved.quiet
         && !keyring_moot
         && cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed)
@@ -10241,21 +10326,58 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // ── settings and auth: the launch's own Keychain/token decision ──
     println!(
         "settings:    {}",
-        doctor::settings_line(&resolved, active_agent, configured_quiet)
+        doctor::settings_line(
+            &resolved,
+            active_agent,
+            configured_quiet,
+            cfg!(target_os = "linux")
+        )
     );
     let macos = cfg!(target_os = "macos");
-    // Copilot's token variables are in ENV_ALLOWLIST; Claude's reaches the
-    // agent only through the Keychain trade, which `keychain_substitute` covers.
-    let token_vars: &[&str] = if active_agent == agent::Agent::Copilot {
-        active_agent.keychain_substitute_env_vars()
-    } else {
-        &[]
+    // The value a variable will have in the child, as the launch's
+    // `child_env_value` sees it: the launch's own env builder, so
+    // --pass-env, --inherit-env and per-agent suppression match (#1092).
+    let parent_env: Vec<(String, String)> = std::env::vars().collect();
+    let sandbox_env = cplt::sandbox::build_sandbox_env(
+        &parent_env,
+        &resolved.pass_env,
+        resolved.inherit_env,
+        &[],
+        None,
+        None,
+        active_agent,
+    );
+    let child_env = |k: &str| {
+        if let Some((_, v)) = sandbox_env.vars.iter().rev().find(|(n, _)| n == k) {
+            Some(v.clone())
+        } else if sandbox_env.clear_first || sandbox_env.remove.iter().any(|n| n == k) {
+            None
+        } else {
+            std::env::var(k).ok()
+        }
     };
-    let env_token = token_vars
-        .iter()
-        .copied()
-        .filter(|v| !resolved.deny_env.iter().any(|d| d == v))
-        .find(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()));
+    let env_token = doctor_env_token(active_agent, &resolved.deny_env, &child_env);
+    let opencode_v2 = active_agent == agent::Agent::OpenCode
+        && agent_bin_result
+            .as_ref()
+            .is_ok_and(|bin| agent::is_opencode_v2(bin, &home_dir) != Some(false));
+    if opencode_v2
+        && let Some(note) = doctor::opencode_v2_auth_content_note(
+            &cli.pass_env,
+            &resolved.pass_env,
+            resolved.inherit_env,
+            std::env::var_os("OPENCODE_AUTH_CONTENT").is_some(),
+        )
+    {
+        findings.push(Finding::warning(note, None));
+    }
+    // The launch's own decision, reason included (#1092).
+    let copilot_handover = copilot_stored_token_handover(
+        &resolved,
+        keychain_substitute.as_ref(),
+        host_gh_token_stored(&resolved, active_agent),
+        cplt::sandbox::copilot_has_native_login(&home_dir),
+    );
     let claude_nudge = cplt::sandbox::claude_keychain_nudge(
         active_agent,
         resolved.keychain_substitute,
@@ -10280,7 +10402,21 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             macos,
             env_token,
             gh_login: auth.gh_cli_auth,
-            other_login: !auth.keytar_nodes.is_empty(),
+            other_login: !auth.keytar_nodes.is_empty()
+                || cplt::sandbox::copilot_has_native_login(&home_dir),
+            gh_handover: (!macos && active_agent == agent::Agent::Copilot)
+                .then_some(copilot_handover),
+            opencode_handover: auth.gh_cli_auth
+                && resolved.gh_guard.enabled
+                && resolved.scratch_dir
+                && cplt::sandbox::opencode_handover_planned(
+                    &child_env,
+                    active_agent,
+                    &resolved.deny_env,
+                    keychain_substitute.as_ref(),
+                    opencode_v2,
+                )
+                && cplt::agent::opencode_host_login(&home_dir, "probe").is_some(),
         },
         &home_dir,
     );
@@ -10325,12 +10461,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                 keychain_substitute,
                 Some(agent::KeychainSubstitute::SecretService(_))
             ),
-        copilot_stored_token_handover(
-            &resolved,
-            keychain_substitute.as_ref(),
-            auth.gh_cli_auth,
-            cplt::sandbox::copilot_has_native_login(&home_dir),
-        ),
+        copilot_handover.is_ok(),
         &cplt::sandbox::secret_service_skip_reason(
             resolved.keychain_substitute,
             &resolved.deny_env,
@@ -10345,13 +10476,8 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             &home_dir,
             cfg!(target_os = "linux"),
             keychain_substitute.is_some() || env_token.is_some(),
-            copilot_stored_token_handover(
-                &resolved,
-                keychain_substitute.as_ref(),
-                host_gh_token_stored(&resolved, active_agent),
-                cplt::sandbox::copilot_has_native_login(&home_dir),
-            ) && host_gh_token_stored(&resolved, active_agent),
-            host_gh_token_stored(&resolved, active_agent),
+            copilot_handover.is_ok(),
+            host_gh_token_stored(&resolved, active_agent).is_ok(),
             cplt::sandbox::SECRET_SERVICE_SKIP
                 .get()
                 .map(|s| s.reason(&home_dir)),
@@ -18016,6 +18142,156 @@ mod tests {
         );
     }
 
+    /// Doctor names only the agent's own login variable (#1092).
+    #[test]
+    fn doctor_env_token_is_the_agents_own_login() {
+        let all = |_: &str| Some("t".to_string());
+        for a in [
+            agent::Agent::Claude,
+            agent::Agent::Shell,
+            agent::Agent::Pi,
+            agent::Agent::OpenCode,
+        ] {
+            let want = (a == agent::Agent::Claude).then_some("CLAUDE_CODE_OAUTH_TOKEN");
+            assert_eq!(doctor_env_token(a, &[], &all), want, "{a:?}");
+        }
+        let gh_only = |k: &str| (k == "GH_TOKEN").then(|| "t".to_string());
+        assert_eq!(doctor_env_token(agent::Agent::Claude, &[], &gh_only), None);
+        assert_eq!(
+            doctor_env_token(agent::Agent::Copilot, &[], &gh_only),
+            Some("GH_TOKEN")
+        );
+        assert_eq!(
+            doctor_env_token(agent::Agent::Copilot, &["GH_TOKEN".into()], &gh_only),
+            None
+        );
+    }
+
+    /// Doctor's auth line and blocking finding come from the launch's own
+    /// handover decision (#1092): each case runs the shared predicate and
+    /// feeds that exact result to the report.
+    #[test]
+    fn doctor_auth_report_matches_launch_handover() {
+        use cplt::doctor::{AuthDecision, GH_GUARD_OFF, NATIVE_LOGIN, auth_report};
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                let report = |handover: Result<(), &'static str>, other_login: bool| {
+                    auth_report(
+                        &AuthDecision {
+                            agent: agent::Agent::Copilot,
+                            substitute: None,
+                            setting: None,
+                            kept_reason: None,
+                            macos: false,
+                            env_token: None,
+                            gh_login: true,
+                            other_login,
+                            gh_handover: Some(handover),
+                            opencode_handover: false,
+                        },
+                        Path::new("/home/u"),
+                    )
+                };
+                let base = || {
+                    let mut r = config::Config::default()
+                        .merge(config::CliFlags::default())
+                        .unwrap();
+                    r.gh_guard.enabled = true;
+                    r.scratch_dir = true;
+                    r
+                };
+                // 1. inject_token with GH_TOKEN denied: launch injects GITHUB_TOKEN.
+                let mut r = base();
+                r.gh_guard.inject_token = true;
+                r.deny_env = vec!["GH_TOKEN".into()];
+                let h = copilot_stored_token_handover(&r, None, Ok(()), false);
+                assert_eq!(h.is_ok(), !cfg!(target_os = "macos"));
+                if h.is_ok() {
+                    let (_, auth, f) = report(h, false);
+                    assert!(!auth.contains("not handed over"), "{auth}");
+                    assert!(f.is_none());
+                }
+                // A refusal the user can fix blocks, and names it.
+                r.gh_guard.inject_token = false;
+                let h = copilot_stored_token_handover(&r, None, Ok(()), false);
+                assert_eq!(h, Err("deny.env strips GH_TOKEN"));
+                let f = report(h, false).2.expect("blocking");
+                assert!(
+                    f.message.contains("deny.env strips GH_TOKEN"),
+                    "{}",
+                    f.message
+                );
+                // 2. Copilot's own login: refused, but no blocking finding.
+                let h = copilot_stored_token_handover(&base(), None, Ok(()), true);
+                assert_eq!(h, Err(NATIVE_LOGIN));
+                assert!(report(h, true).2.is_none());
+                // 3. gh_guard off: hedged, not blocking.
+                let mut r = base();
+                r.gh_guard.enabled = false;
+                let h = copilot_stored_token_handover(&r, None, Ok(()), false);
+                assert_eq!(h, Err(GH_GUARD_OFF));
+                let (_, auth, f) = report(h, false);
+                assert!(auth.contains("may still use gh's own login"), "{auth}");
+                assert!(f.is_none());
+                // 4. scratch off, 5. block_auth_token off: Copilot may still run
+                // real `gh auth token`, so hedged like gh_guard off.
+                let mut scratch_off = base();
+                scratch_off.scratch_dir = false;
+                let mut unblocked = base();
+                unblocked.gh_guard.block_auth_token = false;
+                for (r, why) in [
+                    (scratch_off, cplt::doctor::SCRATCH_OFF),
+                    (unblocked, cplt::doctor::BLOCK_AUTH_TOKEN_OFF),
+                ] {
+                    let h = copilot_stored_token_handover(&r, None, Ok(()), false);
+                    assert_eq!(h, Err(why));
+                    let (_, auth, f) = report(h, false);
+                    assert!(auth.contains("may still use gh's own login"), "{auth}");
+                    assert!(f.is_none(), "{why}");
+                }
+                // gh_guard off and scratch off outrank a missing trusted gh
+                // (mise-only gh), and a logged-in user gets no blocking finding.
+                let no_gh = || false;
+                let stored = |r: &config::Resolved| {
+                    host_gh_token_stored_with(r, agent::Agent::Copilot, || true, &no_gh)
+                };
+                assert_eq!(stored(&base()), Err(cplt::doctor::NO_TRUSTED_GH));
+                let mut guard_off = base();
+                guard_off.gh_guard.enabled = false;
+                let mut scratch_off = base();
+                scratch_off.scratch_dir = false;
+                for (r, why) in [
+                    (guard_off, GH_GUARD_OFF),
+                    (scratch_off, cplt::doctor::SCRATCH_OFF),
+                ] {
+                    let h = stored(&r);
+                    assert_eq!(h, Err(why));
+                    let h = copilot_stored_token_handover(&r, None, h, false);
+                    let d = AuthDecision {
+                        agent: agent::Agent::Copilot,
+                        substitute: None,
+                        setting: None,
+                        kept_reason: None,
+                        macos: false,
+                        env_token: None,
+                        gh_login: false,
+                        other_login: false,
+                        gh_handover: Some(h),
+                        opencode_handover: false,
+                    };
+                    let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
+                    assert!(auth.contains("may still use gh's own login"), "{auth}");
+                    assert!(f.is_none(), "{why}: {f:?}");
+                }
+            },
+        );
+    }
+
     /// Each doctor config finding fires on its condition and only then, and
     /// names variables, never values.
     #[test]
@@ -18066,11 +18342,11 @@ mod tests {
                     .is_empty()
                 );
                 assert!(
-                    copilot_stored_token_handover(&r, None, true, false),
+                    copilot_stored_token_handover(&r, None, Ok(()), false).is_ok(),
                     "default one-shot route without native Copilot login"
                 );
                 assert!(
-                    !copilot_stored_token_handover(&r, None, true, true),
+                    copilot_stored_token_handover(&r, None, Ok(()), true).is_err(),
                     "native Copilot login attempts Secret Service before gh auth token"
                 );
                 assert!(
@@ -18079,13 +18355,13 @@ mod tests {
                         true,
                         true,
                         false,
-                        copilot_stored_token_handover(&r, None, true, true),
+                        copilot_stored_token_handover(&r, None, Ok(()), true).is_ok(),
                         ""
                     )
                     .is_some()
                 );
                 temp_env::with_var("PATH", Some("/synthetic/no-gh"), || {
-                    let handover = copilot_stored_token_handover(&r, None, true, false);
+                    let handover = copilot_stored_token_handover(&r, None, Ok(()), false).is_ok();
                     assert!(
                         !handover,
                         "stored retrieval success does not install a PATH wrapper"
@@ -18104,8 +18380,14 @@ mod tests {
                     r.gh_guard.inject_token = true;
                     // A no-op on macOS (#877), so no handover there.
                     let linux = !cfg!(target_os = "macos");
-                    assert_eq!(copilot_stored_token_handover(&r, None, true, false), linux);
-                    assert_eq!(copilot_stored_token_handover(&r, None, true, true), linux);
+                    assert_eq!(
+                        copilot_stored_token_handover(&r, None, Ok(()), false).is_ok(),
+                        linux
+                    );
+                    assert_eq!(
+                        copilot_stored_token_handover(&r, None, Ok(()), true).is_ok(),
+                        linux
+                    );
                     r.gh_guard.inject_token = false;
                 });
                 assert!(
@@ -18114,22 +18396,22 @@ mod tests {
                         true,
                         true,
                         false,
-                        copilot_stored_token_handover(&r, None, true, false),
+                        copilot_stored_token_handover(&r, None, Ok(()), false).is_ok(),
                         ""
                     )
                     .is_none()
                 );
-                assert!(!copilot_stored_token_handover(&r, None, false, false));
+                assert!(copilot_stored_token_handover(&r, None, Err("none"), false).is_err());
                 r.scratch_dir = false;
                 assert!(!replacement(&r, true, true));
-                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                assert!(copilot_stored_token_handover(&r, None, Ok(()), false).is_err());
                 assert!(
                     cplt::doctor::linux_keyring_finding(
                         agent::Agent::Copilot,
                         true,
                         true,
                         false,
-                        copilot_stored_token_handover(&r, None, true, false),
+                        copilot_stored_token_handover(&r, None, Ok(()), false).is_ok(),
                         ""
                     )
                     .is_some()
@@ -18137,28 +18419,34 @@ mod tests {
                 r.scratch_dir = true;
                 r.gh_guard.enabled = false;
                 assert!(!replacement(&r, true, true));
-                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                assert!(copilot_stored_token_handover(&r, None, Ok(()), false).is_err());
                 r.gh_guard.enabled = true;
                 r.gh_guard.block_auth_token = false;
-                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                assert!(copilot_stored_token_handover(&r, None, Ok(()), false).is_err());
                 r.gh_guard.inject_token = true;
                 let linux = !cfg!(target_os = "macos");
-                assert_eq!(copilot_stored_token_handover(&r, None, true, false), linux);
-                assert_eq!(copilot_stored_token_handover(&r, None, true, true), linux);
+                assert_eq!(
+                    copilot_stored_token_handover(&r, None, Ok(()), false).is_ok(),
+                    linux
+                );
+                assert_eq!(
+                    copilot_stored_token_handover(&r, None, Ok(()), true).is_ok(),
+                    linux
+                );
                 r.deny_env = vec!["GH_TOKEN".into()];
                 assert!(!replacement(&r, true, true));
                 assert_eq!(
-                    copilot_stored_token_handover(&r, None, true, false),
+                    copilot_stored_token_handover(&r, None, Ok(()), false).is_ok(),
                     linux,
                     "injection can use GITHUB_TOKEN"
                 );
                 r.gh_guard.inject_token = false;
                 r.gh_guard.block_auth_token = true;
-                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                assert!(copilot_stored_token_handover(&r, None, Ok(()), false).is_err());
                 r.deny_env.clear();
                 let sub = agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN");
-                assert!(copilot_stored_token_handover(&r, Some(&sub), true, false));
-                assert!(!copilot_stored_token_handover(&r, Some(&sub), true, true));
+                assert!(copilot_stored_token_handover(&r, Some(&sub), Ok(()), false).is_ok());
+                assert!(copilot_stored_token_handover(&r, Some(&sub), Ok(()), true).is_err());
                 r.inherit_env = true;
                 assert!(!replacement(&r, true, true));
             },
