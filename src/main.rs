@@ -5442,7 +5442,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             opencode_v2
         };
         let mut found = mcp_found;
-        cplt::mcp_broker::drop_writable(&mut found, |p| {
+        cplt::mcp_broker::drop_writable(&mut found, &home_dir, |p| {
             cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree)
         });
         return Ok(cplt::mcp_broker::run_status(
@@ -7779,7 +7779,7 @@ fn assemble_sandbox(
             specs: found.specs.clone(),
             ..Default::default()
         };
-        cplt::mcp_broker::drop_writable(&mut found, |p| {
+        cplt::mcp_broker::drop_writable(&mut found, home_dir, |p| {
             cplt::check::writable_tree_on_path(&policy, home_dir, p).map(|(_, tree)| tree)
         });
         for r in &found.rejected {

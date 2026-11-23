@@ -121,6 +121,23 @@ impl CredentialSource for GhToken {
 }
 
 impl Credential {
+    /// This platform's host dirs the brokered server writes and reads its
+    /// login and config from (`write_dirs` on macOS, `linux_write_dirs`
+    /// under `XDG_CONFIG_HOME` elsewhere), as the child runtime resolves them.
+    pub fn host_write_dirs(&self, home: &std::path::Path) -> Vec<std::path::PathBuf> {
+        if cfg!(target_os = "macos") {
+            return self.write_dirs.iter().map(|d| home.join(d)).collect();
+        }
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| home.join(".config"));
+        self.linux_write_dirs
+            .iter()
+            .map(|d| config_home.join(d))
+            .collect()
+    }
+
     pub(crate) fn parse(name: &str) -> Result<&'static Self, String> {
         if name == "gh-token" {
             return Err(
