@@ -2643,7 +2643,15 @@ mod e2e_tests {
         );
         let zshenv = std::fs::read_to_string(home.path().join(".zshenv")).unwrap();
         assert!(zshenv.contains(".local/share/cplt/bin"), "{zshenv}");
+        // A project of its own: one containing HOME is refused, since it would
+        // make cplt's state dir writable (#1095).
+        let proj = tempfile::Builder::new()
+            .prefix(".cplt-e2e-proj-")
+            .tempdir_in(project_dir())
+            .unwrap();
         let out = cplt_cmd()
+            .arg("--project-dir")
+            .arg(proj.path())
             .args(["--no-validate", "exec", "--", "/bin/zsh", "-c"])
             .arg("command -v copilot")
             .env("HOME", home.path())
@@ -2655,7 +2663,7 @@ mod e2e_tests {
                     fake.path().display()
                 ),
             )
-            .current_dir(project_dir())
+            .current_dir(proj.path())
             .output()
             .expect("cplt exec should run");
         let stdout = String::from_utf8_lossy(&out.stdout);
