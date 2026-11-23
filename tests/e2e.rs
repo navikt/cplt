@@ -11006,8 +11006,13 @@ paths = [
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            // Either refusal proves the layer was loaded: a CI runner whose HOME
+            // is not the passwd home hits the HOME check before the path check.
+            let refused = format!("CPLT_MANAGED_CONFIG={} ignored: ", planted.display());
             assert!(
-                all.contains("CPLT_MANAGED_CONFIG=") && all.contains("must lie under"),
+                all.contains(&refused)
+                    && (all.contains("must lie under")
+                        || all.contains("HOME is not the account's home directory")),
                 "{args:?} must load and refuse the planted managed file:\n{all}"
             );
         }
