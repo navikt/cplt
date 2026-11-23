@@ -255,33 +255,29 @@ pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<
     let Some(dir) = crate::sandbox::gh_config_dir(home) else {
         return Err("GH_CONFIG_DIR or XDG_CONFIG_HOME is a relative path".into());
     };
-    let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-    if crate::sandbox::hosts_agent_writable(&dir, &real, writable) {
-        return Err(format!(
+    let writable_err = || {
+        format!(
             "gh's config dir {} is writable from the sandbox",
             dir.display()
-        ));
-    }
-    let hosts = dir.join("hosts.yml");
-    match std::fs::symlink_metadata(&hosts) {
-        Err(_) => {}
-        Ok(m) if m.is_file() => {}
-        Ok(m) if m.file_type().is_symlink() => {
-            let target = std::fs::canonicalize(&hosts);
-            let ok = target.as_ref().is_ok_and(|t| {
-                std::fs::metadata(t).is_ok_and(|m| m.is_file())
-                    && !crate::sandbox::hosts_agent_writable(&hosts, t, writable)
-            });
-            if !ok {
-                return Err(format!(
-                    "{} links to a file the sandbox can write or that is not a regular file",
-                    hosts.display()
-                ));
-            }
+        )
+    };
+    let real = crate::sandbox::resolve_unwritable(&dir, writable).map_err(|()| writable_err())?;
+    // The named and the resolved hosts.yml both count: a file-only grant
+    // (`allow.write = [".../gh/hosts.yml"]`) passes the dir check.
+    for hosts in [dir.join("hosts.yml"), real.join("hosts.yml")] {
+        let Ok(target) = crate::sandbox::resolve_unwritable(&hosts, writable) else {
+            return Err(format!(
+                "{} is writable from the sandbox, or links through a path that is",
+                hosts.display()
+            ));
+        };
+        match std::fs::symlink_metadata(&target) {
+            Err(_) => {}
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Err(format!("{} is not a regular file", hosts.display())),
         }
-        Ok(_) => return Err(format!("{} is not a regular file", hosts.display())),
     }
-    Ok(dir)
+    Ok(real)
 }
 
 /// `config_dir` pins gh to the dir that was checked, so the lookup reads it.
@@ -2078,6 +2074,34 @@ mod tests {
         std::os::unix::fs::symlink(root.join("dotfiles.yml"), safe.join("hosts.yml")).unwrap();
         with(safe.to_str().unwrap(), &|| {
             assert!(check().is_ok(), "dotfile-manager link");
+        });
+        // hosts.yml through a hop that lives in the writable tree.
+        std::fs::remove_file(safe.join("hosts.yml")).unwrap();
+        std::os::unix::fs::symlink(root.join("dotfiles.yml"), rw.join("hop")).unwrap();
+        std::os::unix::fs::symlink(rw.join("hop"), safe.join("hosts.yml")).unwrap();
+        with(safe.to_str().unwrap(), &|| {
+            assert!(check().is_err(), "hosts.yml hop in writable");
+        });
+        // The config dir through a hop in the writable tree.
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&other, rw.join("dirhop")).unwrap();
+        std::os::unix::fs::symlink(rw.join("dirhop"), root.join("cfg")).unwrap();
+        with(root.join("cfg").to_str().unwrap(), &|| {
+            assert!(check().is_err(), "config dir hop in writable");
+        });
+        // A file-only grant on hosts.yml.
+        let file_grant = vec![other.join("hosts.yml")];
+        with(other.to_str().unwrap(), &|| {
+            assert!(
+                gh_lookup_config_dir(&root, &file_grant).is_err(),
+                "file grant"
+            );
+        });
+        // A missing dir under an alias of a writable tree.
+        std::os::unix::fs::symlink(&rw, root.join("alias")).unwrap();
+        with(root.join("alias/missing/gh").to_str().unwrap(), &|| {
+            assert!(check().is_err(), "missing dir via alias");
         });
     }
 

@@ -2506,8 +2506,14 @@ fn doctor_login_finding(hint: Option<String>) -> Option<cplt::doctor::Finding> {
 
 /// gh holds a github.com token cplt may read: the one predicate launch and
 /// doctor share (#1055). A GHE-only or stale `hosts.yml` does not count.
-fn host_gh_token_stored() -> bool {
-    cplt::sandbox::gh_configured() && discover::stored_gh_token_available()
+/// Every consumer needs Copilot with gh_guard and scratch on, so other
+/// launches skip the `gh auth token` probe.
+fn host_gh_token_stored(resolved: &config::Resolved, agent: agent::Agent) -> bool {
+    agent == agent::Agent::Copilot
+        && resolved.gh_guard.enabled
+        && resolved.scratch_dir
+        && cplt::sandbox::gh_configured()
+        && discover::stored_gh_token_available()
 }
 
 fn copilot_stored_token_handover(
@@ -7653,7 +7659,7 @@ fn assemble_sandbox(
         &session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs),
     );
     // Doctor's suppression: a token handed over another way makes the keyring moot.
-    let gh_token_stored = host_gh_token_stored();
+    let gh_token_stored = host_gh_token_stored(resolved, active_agent);
     let keyring_moot = copilot_stored_token_handover(
         resolved,
         keychain_substitute.as_ref(),
@@ -10324,10 +10330,10 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             copilot_stored_token_handover(
                 &resolved,
                 keychain_substitute.as_ref(),
-                host_gh_token_stored(),
+                host_gh_token_stored(&resolved, active_agent),
                 cplt::sandbox::copilot_has_native_login(&home_dir),
-            ) && host_gh_token_stored(),
-            host_gh_token_stored(),
+            ) && host_gh_token_stored(&resolved, active_agent),
+            host_gh_token_stored(&resolved, active_agent),
             cplt::sandbox::SECRET_SERVICE_SKIP
                 .get()
                 .map(|s| s.reason(&home_dir)),

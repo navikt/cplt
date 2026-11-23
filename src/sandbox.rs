@@ -2252,14 +2252,59 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
 /// refusal; a path that does not resolve gives no login (fail closed). The
 /// path is resolved once, and the check and the read both use that result.
 fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Result<Option<String>, ()> {
-    let Ok(real) = std::fs::canonicalize(hosts) else {
-        return Ok(None);
-    };
-    if hosts_agent_writable(hosts, &real, writable) {
-        return Err(());
-    }
+    let real = resolve_unwritable(hosts, writable)?;
     let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT);
     Ok(text.ok().flatten().as_deref().and_then(gh_login))
+}
+
+/// Resolve `path` one symlink hop at a time. `Err` when any path on the way
+/// (the name, every ancestor, every hop and the hop's parent) lies in a tree
+/// in `writable`, or the chain exceeds 40 links. Checking only the name and
+/// the final target misses `/safe -> <writable>/hop -> /other`: the agent
+/// re-points the hop to another account's config or a FIFO (#1080 review).
+/// A missing tail is appended lexically, after its existing prefix resolved.
+pub(crate) fn resolve_unwritable(path: &Path, writable: &[PathBuf]) -> Result<PathBuf, ()> {
+    use std::path::Component;
+    let inside = |p: &Path| hosts_agent_writable(p, p, writable);
+    let mut todo: std::collections::VecDeque<std::ffi::OsString> =
+        path.iter().map(ToOwned::to_owned).collect();
+    let mut cur = PathBuf::new();
+    let mut hops = 0;
+    let mut missing = false;
+    while let Some(part) = todo.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir | Component::Prefix(_)) => cur = PathBuf::from(&part),
+            Some(Component::ParentDir) => {
+                cur.pop();
+            }
+            Some(Component::Normal(_)) => {
+                let next = cur.join(&part);
+                if inside(&next) {
+                    return Err(());
+                }
+                if !missing {
+                    match std::fs::symlink_metadata(&next) {
+                        Ok(m) if m.file_type().is_symlink() => {
+                            hops += 1;
+                            let target = std::fs::read_link(&next).map_err(|_| ())?;
+                            if hops > 40 {
+                                return Err(());
+                            }
+                            for c in target.iter().rev() {
+                                todo.push_front(c.to_owned());
+                            }
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(_) => missing = true,
+                    }
+                }
+                cur = next;
+            }
+            _ => {}
+        }
+    }
+    if inside(&cur) { Err(()) } else { Ok(cur) }
 }
 
 /// The agent could have written `hosts`: the path as named (a link the agent
@@ -2326,7 +2371,7 @@ fn copilot_keychain_acct() -> Result<Option<String>, String> {
     let mut cmd = std::process::Command::new("/usr/bin/security");
     cmd.arg("dump-keychain");
     let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))
-        .ok_or("the Keychain did not answer within 1 s")?;
+        .ok_or("`security dump-keychain` failed or did not answer within 1 s")?;
     copilot_keychain_accts(&String::from_utf8_lossy(&out))
 }
 
@@ -2336,10 +2381,26 @@ fn copilot_keychain_accts(out: &str) -> Result<Option<String>, String> {
     for item in out.split("keychain: ").skip(1) {
         let svce = item
             .lines()
-            .any(|l| l.trim() == "\"svce\"<blob>=\"copilot-cli\"");
-        if let (true, Some(a)) = (svce, keychain_acct(item))
-            && !accts.contains(&a)
-        {
+            .map(str::trim)
+            .filter(|l| l.starts_with("\"svce\""));
+        let mut matched = false;
+        for l in svce {
+            match l.strip_prefix("\"svce\"<blob>=\"") {
+                Some(v) => matched |= v == "copilot-cli\"",
+                // A hex or otherwise encoded service could be Copilot's: ambiguous.
+                None if l != "\"svce\"<blob>=<NULL>" => {
+                    return Err("the Keychain lists an item cplt cannot parse".into());
+                }
+                None => {}
+            }
+        }
+        if !matched {
+            continue;
+        }
+        let Some(a) = keychain_acct(item) else {
+            return Err("the Keychain lists a Copilot item whose account cplt cannot parse".into());
+        };
+        if !accts.contains(&a) {
             accts.push(a);
         }
     }
@@ -7828,6 +7889,15 @@ mod account_tests {
         assert_eq!(copilot_keychain_accts(&item("x", "other")), Ok(None));
         let two = item("alice", "copilot-cli") + &item("alice-work", "copilot-cli");
         assert!(copilot_keychain_accts(&two).is_err());
+        // An unparsable account or service on a possible Copilot item is ambiguous.
+        let hex_acct = "keychain: \"/k\"\n    \"acct\"<blob>=0x68747470  \"https\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
+        assert!(copilot_keychain_accts(&(item("alice", "copilot-cli") + hex_acct)).is_err());
+        let no_acct = "keychain: \"/k\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
+        assert!(copilot_keychain_accts(no_acct).is_err());
+        let hex_svce = "keychain: \"/k\"\n    \"acct\"<blob>=\"x\"\n    \"svce\"<blob>=0x636F70\n";
+        assert!(copilot_keychain_accts(hex_svce).is_err());
+        let null_svce = "keychain: \"/k\"\n    \"svce\"<blob>=<NULL>\n";
+        assert_eq!(copilot_keychain_accts(null_svce), Ok(None));
     }
 
     #[test]
@@ -8068,6 +8138,16 @@ mod account_tests {
         let dangling = ro.join("dangling.yml");
         std::os::unix::fs::symlink(ro.join("gone.yml"), &dangling).unwrap();
         assert_eq!(anchored_gh_login(&dangling, &writable), Ok(None));
+        // An intermediate hop inside the writable tree: the agent can re-point it.
+        let hop = rw.join("hop");
+        std::os::unix::fs::symlink(&good, &hop).unwrap();
+        let chain = ro.join("chain.yml");
+        std::os::unix::fs::symlink(&hop, &chain).unwrap();
+        assert_eq!(anchored_gh_login(&chain, &writable), Err(()));
+        // A loop is refused, not followed forever.
+        let lp = ro.join("loop.yml");
+        std::os::unix::fs::symlink(&lp, &lp).unwrap();
+        assert_eq!(anchored_gh_login(&lp, &writable), Err(()));
         // The check runs on the real path it is given, not a fresh resolution.
         assert!(hosts_agent_writable(&good, &planted, &writable));
         assert!(!hosts_agent_writable(&good, &good, &writable));
