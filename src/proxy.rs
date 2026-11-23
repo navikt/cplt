@@ -1216,7 +1216,14 @@ fn handle_connection(
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
         classification.complete(None);
-        log_connection(state, None, method, target, "UNSUPPORTED");
+        // An origin-form path may be a near miss of the MCP endpoint's secret
+        // path (`/<secret>?x=1`); never write it to a log.
+        let logged = if target.starts_with('/') {
+            "/<redacted>"
+        } else {
+            target
+        };
+        log_connection(state, None, method, logged, "UNSUPPORTED");
         reject(&mut client, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
     }
 }
@@ -4261,6 +4268,11 @@ mod tests {
         let mut bad = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
         bad.write_all(b"GET /s3cr3u HTTP/1.1\r\n\r\n").unwrap();
         assert!(read_status_line(&mut bad).starts_with("HTTP/1.1 405"));
+        let mut near = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        near.write_all(b"GET /s3cr3t?x=1 HTTP/1.1\r\n\r\n").unwrap();
+        assert!(read_status_line(&mut near).starts_with("HTTP/1.1 405"));
+        let logged = std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+        assert!(!logged.contains("s3cr3"), "secret path logged: {logged}");
 
         let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
         c.write_all(
