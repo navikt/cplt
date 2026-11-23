@@ -270,7 +270,7 @@ impl UpstreamProxy {
     /// proxy. An IPv6 literal host (stored without brackets) is wrapped back in
     /// brackets so the result is a valid socket address (`[::1]:3128`); names
     /// and IPv4 addresses are used verbatim.
-    fn socket_addr(&self) -> String {
+    pub(crate) fn socket_addr(&self) -> String {
         if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -704,6 +704,7 @@ enum AcceptLoopOutcome {
 
 impl ProxyHandle {
     pub fn shutdown(&self) {
+        crate::github_mcp::kill_children();
         // The accept loop blocks in accept(); one connection of our own wakes
         // it to see the flag. Only the first call connects: once the loop has
         // stopped the port is closed and may belong to someone else. A failed
@@ -1206,12 +1207,41 @@ fn handle_connection(
         // OpenCode's GitHub MCP entry (#797): served on this port so the
         // sandbox needs no new one. The head was read under this proxy's size
         // cap and deadline, and the connection counts against its limit.
-        classification.complete(None);
+        // The token leaves only for the endpoint's pinned upstream, under the
+        // same domain policy and upstream proxy as a CONNECT to it: the request
+        // path is agent-chosen, so skipping the gates would bypass the user's
+        // blocklist and allowlist for this host.
+        let (host, port) = endpoint.authority();
+        let target = format!("{host}:{port}");
+        let verdict = classify_connect(&state.net_policy(), &host, port);
+        if verdict != NetVerdict::Allowed {
+            log_connection(
+                state,
+                Some(&mut classification),
+                "CONNECT",
+                &target,
+                verdict.status(),
+            );
+            reject(
+                &mut client,
+                b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n",
+            );
+            return;
+        }
+        let via = state
+            .upstream
+            .as_ref()
+            .filter(|_| !host_matches_no_proxy(&host, &state.upstream_no_proxy));
+        let route = match via {
+            Some(u) => format!("CONNECTED (github-mcp via {})", u.socket_addr()),
+            None => "CONNECTED (github-mcp)".to_string(),
+        };
+        log_connection(state, Some(&mut classification), "CONNECT", &target, &route);
         let log = crate::github_mcp::Log {
             level: state.log_level,
             file: state.log_file.clone(),
         };
-        endpoint.serve(client, &head, &log);
+        endpoint.serve(client, &head, &log, via, state.timeout);
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
@@ -4258,10 +4288,9 @@ mod tests {
     fn github_mcp_endpoint_forwards_through_curl() {
         use std::io::BufRead;
         let up = TcpListener::bind("127.0.0.1:0").unwrap();
-        let upstream = format!(
-            "http://127.0.0.1:{}/mcp/readonly",
-            up.local_addr().unwrap().port()
-        );
+        let up_port = up.local_addr().unwrap().port();
+        let up_again = up.try_clone().unwrap();
+        let upstream = format!("http://127.0.0.1:{up_port}/mcp/readonly");
         assert!(
             crate::github_mcp::install_for_test(&upstream, "TOKEN", "s3cr3t").is_some(),
             "no curl in the trusted dirs: this test cannot run without it"
@@ -4291,7 +4320,7 @@ mod tests {
             s.write_all(b"7\r\ndata:2\n\r\n0\r\n\r\n").unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
-        let p = head_test_proxy(1, Duration::from_secs(10), dir.path().join("log"));
+        let p = head_test_proxy(up_port, Duration::from_secs(10), dir.path().join("log"));
 
         let mut bad = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
         bad.write_all(b"GET /s3cr3u HTTP/1.1\r\n\r\n").unwrap();
@@ -4346,6 +4375,107 @@ mod tests {
         big.write_all(b"POST /s3cr3t HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n")
             .unwrap();
         assert!(read_status_line(&mut big).starts_with("HTTP/1.1 413"));
+        p.shutdown();
+
+        // The endpoint is process-global, so the routing cases share it here.
+        let post = b"POST /s3cr3t HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+
+        // A blocklist naming the upstream host refuses before curl runs.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "127.0.0.1\n").unwrap();
+        let log = dir.path().join("log-blocked");
+        let p = routed_test_proxy(
+            up_port,
+            Duration::from_secs(10),
+            log.clone(),
+            Some(blocked),
+            None,
+        );
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(post).unwrap();
+        assert!(read_status_line(&mut c).starts_with("HTTP/1.1 403"));
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains(&format!("CONNECT 127.0.0.1:{up_port} BLOCKED")),
+            "{logged}"
+        );
+        p.shutdown();
+
+        // proxy.upstream carries the request, as a tunnel to the pinned host.
+        let corp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let corp_port = corp.local_addr().unwrap().port();
+        let (ctx, crx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (s, _) = corp.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&s).read_line(&mut line).unwrap();
+            ctx.send(line).unwrap();
+            let _ = (&s).write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        });
+        let via = UpstreamProxy::parse(&format!("http://127.0.0.1:{corp_port}")).unwrap();
+        let p = routed_test_proxy(
+            up_port,
+            Duration::from_secs(10),
+            dir.path().join("l2"),
+            None,
+            Some(via),
+        );
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(post).unwrap();
+        let line = crx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            line.starts_with(&format!("CONNECT 127.0.0.1:{up_port} ")),
+            "{line}"
+        );
+        assert!(read_status_line(&mut c).starts_with("HTTP/1.1 502"));
+        p.shutdown();
+
+        // An ambient proxy variable on the host does not reroute the token.
+        let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+        trap.set_nonblocking(true).unwrap();
+        let trap_url = format!("http://127.0.0.1:{}", trap.local_addr().unwrap().port());
+        // SAFETY: only curl children read these, and they get a cleared env.
+        unsafe {
+            std::env::set_var("http_proxy", &trap_url);
+            std::env::set_var("ALL_PROXY", &trap_url);
+        }
+        std::thread::spawn(move || {
+            let (s, _) = up_again.accept().unwrap();
+            let mut r = std::io::BufReader::new(&s);
+            let mut l = String::new();
+            while r.read_line(&mut l).unwrap() > 2 {
+                l.clear();
+            }
+            let _ = (&s).write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        });
+        let p = head_test_proxy(up_port, Duration::from_secs(10), dir.path().join("l3"));
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(post).unwrap();
+        let status = read_status_line(&mut c);
+        unsafe {
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("ALL_PROXY");
+        }
+        assert!(status.starts_with("HTTP/1.1 204"), "{status}");
+        assert!(trap.accept().is_err(), "the ambient proxy saw the request");
+        p.shutdown();
+
+        // A body trickled in under the per-read timeout still meets one deadline.
+        let p = head_test_proxy(up_port, Duration::from_secs(2), dir.path().join("l4"));
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(b"POST /s3cr3t HTTP/1.1\r\nContent-Length: 40\r\n\r\n")
+            .unwrap();
+        let mut w = c.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(300));
+                if w.write_all(b" ").is_err() {
+                    break;
+                }
+            }
+        });
+        c.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        assert!(read_status_line(&mut c).starts_with("HTTP/1.1 400"));
         p.shutdown();
     }
 
@@ -4431,12 +4561,22 @@ mod tests {
 
     /// Proxy that lets CONNECT reach `origin_port` on IPv4 loopback directly.
     fn head_test_proxy(origin_port: u16, timeout: Duration, log: PathBuf) -> ProxyHandle {
+        routed_test_proxy(origin_port, timeout, log, None, None)
+    }
+
+    fn routed_test_proxy(
+        origin_port: u16,
+        timeout: Duration,
+        log: PathBuf,
+        blocked_file: Option<PathBuf>,
+        upstream: Option<UpstreamProxy>,
+    ) -> ProxyHandle {
         let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let resolver: ResolverFn =
             Arc::new(move |_h: &str, p: u16| Some(std::net::SocketAddr::new(loopback, p)));
         start(ProxyOptions {
             port: 0,
-            blocked_file: None,
+            blocked_file,
             subscription_blocklist: Vec::new(),
             allowed_ports: vec![443],
             allow_localhost_ports: vec![origin_port],
@@ -4452,7 +4592,7 @@ mod tests {
             log_file: Some(log),
             log_level: ProxyLogLevel::None,
             timeout,
-            upstream: None,
+            upstream,
             upstream_no_proxy: Vec::new(),
             resolver: Some(resolver),
         })

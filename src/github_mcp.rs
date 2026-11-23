@@ -28,12 +28,52 @@ use crate::agent::SecretToken;
 
 use serde_json::{Map, Value};
 
-use crate::proxy::ProxyLogLevel;
+use crate::proxy::{ProxyLogLevel, UpstreamProxy};
 
 /// The only place requests go, whatever URL the user's entry names.
 pub const UPSTREAM: &str = "https://api.githubcopilot.com/mcp/readonly";
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const CONFIG_LIMIT: u64 = 1024 * 1024;
+/// curl's limit on reaching the upstream (or the upstream proxy).
+const CONNECT_TIMEOUT_SECS: &str = "10";
+/// curl's limit on one whole request, an event stream included, so a stalled
+/// upstream cannot hold a proxy connection slot for ever (#1059).
+const MAX_TIME_SECS: &str = "600";
+
+/// PIDs of running curl children, so proxy shutdown can kill them (#1059).
+/// A PID leaves the set before it is reaped, so it is never a reused PID.
+static CHILDREN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Kill every running curl child. Called when the proxy shuts down.
+pub(crate) fn kill_children() {
+    let pids = CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for &pid in pids.iter() {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // SAFETY: plain syscall; the PID is unreaped (see CHILDREN).
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Read exactly `buf.len()` bytes, all within `limit` in total: a per-read
+/// timeout alone lets a client trickle a 4 MiB body one byte at a time (#1059).
+fn read_body(client: &mut TcpStream, buf: &mut [u8], limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    let mut done = 0;
+    while done < buf.len() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || client.set_read_timeout(Some(left)).is_err() {
+            return false;
+        }
+        match client.read(&mut buf[done..]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => done += n,
+        }
+    }
+    true
+}
 
 /// Does `url` name GitHub's remote MCP server (full or read-only endpoint)?
 pub fn is_github_mcp_url(url: &str) -> bool {
@@ -296,6 +336,7 @@ fn header_name(s: &str) -> bool {
 /// supplies only the method, its other headers and the body.
 fn curl_config(
     upstream: &str,
+    via: Option<&UpstreamProxy>,
     method: &str,
     headers: &[(String, String)],
     body: &[u8],
@@ -314,6 +355,21 @@ fn curl_config(
         quote(&mut c, value);
     };
     opt("url", upstream.as_bytes());
+    // The route is set here, never left to curl's env: the token goes direct
+    // or through the user's `proxy.upstream`, nowhere else.
+    match via {
+        Some(u) => {
+            opt("proxy", format!("http://{}", u.socket_addr()).as_bytes());
+            opt("noproxy", b"");
+            if let Some(auth) = &u.proxy_authorization {
+                opt(
+                    "proxy-header",
+                    format!("Proxy-Authorization: Basic {auth}").as_bytes(),
+                );
+            }
+        }
+        None => opt("noproxy", b"*"),
+    }
     opt("request", method.as_bytes());
     for (k, v) in headers.iter().filter(|(k, _)| forwarded(k)) {
         opt("header", format!("{k}: {v}").as_bytes());
@@ -327,6 +383,10 @@ fn curl_config(
     opt("header", b"Expect:");
     if !body.is_empty() {
         opt("data-raw", body);
+    }
+    if via.is_some() {
+        // A bare boolean: curl's config parser refuses a value here.
+        c.extend_from_slice(b"proxytunnel\n");
     }
     Some(c)
 }
@@ -353,7 +413,24 @@ impl Endpoint {
     /// One request, whose head the proxy has read (its size cap, deadline and
     /// connection limit apply); the body is still in `client`. Runs curl and
     /// streams its answer back.
-    pub(crate) fn serve(&self, mut client: TcpStream, head: &[u8], log: &Log) {
+    /// Host and port of the pinned upstream, for the proxy's domain policy.
+    pub(crate) fn authority(&self) -> (String, u16) {
+        let (scheme, rest) = self.upstream.split_once("://").unwrap_or(("https", ""));
+        let auth = rest.split('/').next().unwrap_or_default();
+        match auth.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap_or(443)),
+            _ => (auth.to_string(), if scheme == "http" { 80 } else { 443 }),
+        }
+    }
+
+    pub(crate) fn serve(
+        &self,
+        mut client: TcpStream,
+        head: &[u8],
+        log: &Log,
+        via: Option<&UpstreamProxy>,
+        body_limit: std::time::Duration,
+    ) {
         let head = String::from_utf8_lossy(head);
         let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
         let method = lines
@@ -392,12 +469,13 @@ impl Endpoint {
             }
         };
         let mut body = vec![0; len];
-        if client.read_exact(&mut body).is_err() || body.contains(&0) {
+        if !read_body(&mut client, &mut body, body_limit) || body.contains(&0) {
             reply(&mut client, "400 Bad Request");
             return log.line(&method, "FAIL bad body");
         }
         let Some(config) = curl_config(
             &self.upstream,
+            via,
             &method,
             &headers,
             &body,
@@ -418,13 +496,24 @@ impl Endpoint {
             "--suppress-connect-headers",
             "--max-redirs",
             "0",
+            "--connect-timeout",
+            CONNECT_TIMEOUT_SECS,
+            "--max-time",
+            MAX_TIME_SECS,
             "-K",
             "-",
         ]);
         if self.upstream.starts_with("https://") {
             cmd.args(["--proto", "=https"]);
         }
-        cmd.env_remove("SSLKEYLOGFILE");
+        // A cleared env: HTTPS_PROXY, ALL_PROXY, NO_PROXY and CURL_* on the host
+        // must not decide where the token goes. Only CA locations pass.
+        cmd.env_clear();
+        for var in ["SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"] {
+            if let Some(v) = std::env::var_os(var) {
+                cmd.env(var, v);
+            }
+        }
         let Ok(mut child) = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -434,6 +523,10 @@ impl Endpoint {
             reply(&mut client, "502 Bad Gateway");
             return log.line(&method, "FAIL curl did not start");
         };
+        CHILDREN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(child.id());
         // Bounded, and drained so curl never blocks on a full pipe.
         let stderr = child.stderr.take().map(|e| {
             std::thread::spawn(move || {
@@ -452,6 +545,10 @@ impl Endpoint {
             Some(out) if wrote => relay(out, &mut client),
             _ => None,
         };
+        CHILDREN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&p| p != child.id());
         let _ = child.kill();
         let _ = child.wait();
         if let Some(code) = status {
@@ -632,7 +729,7 @@ mod tests {
             ("Mcp-Session-Id", "s\"1\\"),
         ]);
         let c = String::from_utf8(
-            curl_config(UPSTREAM, "POST", &headers, b"{\"a\":\n1}", "T").unwrap(),
+            curl_config(UPSTREAM, None, "POST", &headers, b"{\"a\":\n1}", "T").unwrap(),
         )
         .unwrap();
         let lines: Vec<&str> = c.lines().collect();
@@ -650,6 +747,7 @@ mod tests {
             assert!(c.contains(&format!("header = \"{h}\"")), "{h}: {c}");
         }
         assert!(c.contains(r#"data-raw = "{\"a\":\n1}""#));
+        assert!(c.contains("noproxy = \"*\""), "{c}");
     }
 
     #[test]
@@ -663,12 +761,12 @@ mod tests {
             ("X-A\r", "v"),
         ] {
             assert_eq!(
-                curl_config(UPSTREAM, "POST", &hdrs(&[(k, v)]), b"", "T"),
+                curl_config(UPSTREAM, None, "POST", &hdrs(&[(k, v)]), b"", "T"),
                 None,
                 "{k:?}: {v:?}"
             );
         }
-        assert!(curl_config(UPSTREAM, "POST", &hdrs(&[("A", "x\ty")]), b"", "T").is_some());
+        assert!(curl_config(UPSTREAM, None, "POST", &hdrs(&[("A", "x\ty")]), b"", "T").is_some());
     }
 
     #[test]
