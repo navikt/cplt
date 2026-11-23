@@ -36,7 +36,8 @@ Both guards take a `mode`. `block` prints the message and exits non-zero.
 `warn` prints the same message behind `⚠️  WARNING (would block):` and runs the
 command anyway. `audit` prints it behind `[audit] gh-gate: would block:` (or
 `git-gate`) and runs it. Use `warn` or `audit` to find out what a rollout would
-break before you enforce it.
+break before you enforce it. In `warn` or `audit` mode a bare `gh auth logout` or `gh auth switch` acts on
+github.com, where gh would otherwise prompt for a host.
 
 For per-repo enforcement, committed to version control:
 

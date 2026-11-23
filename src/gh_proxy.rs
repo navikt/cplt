@@ -148,7 +148,8 @@ pub fn pin_auth_hostname(args: &[&str]) -> Option<Vec<String>> {
         return None;
     }
     let mut out: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-    out.splice(i + 1..=i, ["--hostname".into(), DEFAULT_GH_HOST.into()]);
+    out.insert(i + 1, DEFAULT_GH_HOST.into());
+    out.insert(i + 1, "--hostname".into());
     Some(out)
 }
 
