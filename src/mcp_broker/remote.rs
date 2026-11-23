@@ -1768,7 +1768,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
         ep.upstream = url;
         let (reply, log) = serve_on(&ep, "POST", CALL);
-        assert!(reply.contains("id: 1\nretry: 10\ndata:\n\n"), "{reply}");
+        assert!(
+            reply.contains("id: 1\nretry: 10\ndata:\n\n"),
+            "priming not passed"
+        );
         assert_eq!(log.matches("tools/call").count(), 1, "{log}");
         assert!(log.contains("tools/call get_me → FAIL 200 "), "{log}");
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
@@ -1823,10 +1826,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}\n\n",
         let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
         ep.upstream = url;
         let (reply, log) = serve_with(&ep, "GET", "", "Last-Event-ID: 1\r\n");
-        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+        assert!(reply.starts_with("HTTP/1.1 400"), "not refused");
         assert!(
             reply.contains("resume (Last-Event-ID) is not supported"),
-            "{reply}"
+            "no resume error"
         );
         assert!(log.contains("FAIL stream resume not supported"), "{log}");
         assert!(got.try_recv().is_err(), "upstream reached");
