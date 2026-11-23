@@ -2748,7 +2748,18 @@ pub fn env_tool_dir_allowed(path: &Path, home: &Path, write: bool, extra: &[&Pat
                 }),
         );
     }
-    let ids: Vec<_> = roots.iter().filter_map(|r| id(r)).collect();
+    // A home root reached through a symlink is skipped: the agent can plant
+    // `~/.local/share/go -> ~/Library/LaunchAgents` and so turn any target
+    // into a "safe root".
+    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let ids: Vec<_> = roots
+        .iter()
+        .filter(|r| match r.strip_prefix(home) {
+            Ok(rel) => std::fs::canonicalize(r).is_ok_and(|c| c == canon_home.join(rel)),
+            Err(_) => true,
+        })
+        .filter_map(|r| id(r))
+        .collect();
     path.ancestors()
         .any(|a| id(a).is_some_and(|i| ids.contains(&i)))
 }

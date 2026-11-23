@@ -12121,6 +12121,22 @@ fn env_tool_dir_allowed_only_under_safe_roots() {
     std::os::unix::fs::symlink(home.join("Library/LaunchAgents"), home.join(".cache/la")).unwrap();
     let via = std::fs::canonicalize(home.join(".cache/la")).unwrap();
     assert!(!env_tool_dir_allowed(&via, &home, true, &[]));
+    // A safe root that is itself a link does not make its target safe.
+    let fake = tmp.path().join("h2");
+    std::fs::create_dir_all(fake.join(".local/share")).unwrap();
+    std::fs::create_dir_all(fake.join("Library/LaunchAgents")).unwrap();
+    let fake = std::fs::canonicalize(&fake).unwrap();
+    std::os::unix::fs::symlink(
+        fake.join("Library/LaunchAgents"),
+        fake.join(".local/share/go"),
+    )
+    .unwrap();
+    assert!(!env_tool_dir_allowed(
+        &fake.join("Library/LaunchAgents"),
+        &fake,
+        true,
+        &[]
+    ));
     // Read: SDK roots pass, persistence paths do not.
     assert!(env_tool_dir_allowed(
         &mk(".sdkman/candidates/java/21"),
