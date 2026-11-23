@@ -328,10 +328,13 @@ pub fn remove_array_element_in_doc(
         )));
     };
 
-    let idx = candidates.iter().find_map(|c| array_index_of(arr, c));
-    let removed = idx.is_some();
-    if let Some(idx) = idx {
-        arr.remove(idx);
+    // Only the first spelling that matches; its manual duplicates all go.
+    let mut removed = false;
+    if let Some(c) = candidates.iter().find(|c| array_index_of(arr, c).is_some()) {
+        while let Some(idx) = array_index_of(arr, c) {
+            arr.remove(idx);
+            removed = true;
+        }
     }
 
     // Clean up empty arrays
