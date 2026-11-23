@@ -12523,10 +12523,17 @@ mod agent_stubs {
         assert!(!path.starts_with(proj.to_str().unwrap()), "{argv}");
         assert!(out.contains("# "), "brief not readable: {out}");
 
-        let (out, err) = launch(&["--append-system-prompt", "mine"]);
-        assert!(out.contains("ARGV:--append-system-prompt mine "), "{out}");
-        assert!(!out.contains("--append-system-prompt-file"), "{out}");
-        assert!(err.contains("takes only one"), "{err}");
+        let (out, _) = launch(&["--append-system-prompt", "mine"]);
+        assert!(out.contains("ARGV:--append-system-prompt-file "), "{out}");
+        assert!(out.contains(" --append-system-prompt mine "), "{out}");
+
+        let (out, err) = launch(&["--append-system-prompt-file", "/mine.md"]);
+        assert!(
+            out.contains("ARGV:--append-system-prompt-file /mine.md "),
+            "{out}"
+        );
+        assert!(!out.contains("CPLT_BRIEF.md"), "{out}");
+        assert!(err.contains("keeps only one"), "{err}");
     }
 
     #[test]

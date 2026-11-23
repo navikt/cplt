@@ -732,14 +732,92 @@ pub fn delivery_env(
     }
 }
 
+/// Claude Code options that take a value, from `claude --help` 2.1.330. The
+/// value is consumed even when it starts with `-` (Commander semantics), so it
+/// is never read as a flag or as the `--` terminator.
+const CLAUDE_VALUE_OPTS: &[&str] = &[
+    "--agent",
+    "--agents",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--autocompact",
+    "--debug-file",
+    "--effort",
+    "--environment",
+    "--fallback-model",
+    "--input-format",
+    "--json-schema",
+    "--max-budget-usd",
+    "--model",
+    "-n",
+    "--name",
+    "--output-format",
+    "--permission-mode",
+    "--permission-prompts",
+    "--plugin-dir",
+    "--plugin-url",
+    "--remote-control-session-name-prefix",
+    "--session-id",
+    "--setting-sources",
+    "--settings",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--system-prompt-snapshot",
+];
+/// Variadic options: the first value is always consumed, later ones until an
+/// argument that starts with `-`.
+const CLAUDE_VARIADIC_OPTS: &[&str] = &[
+    "--add-dir",
+    "--allowedTools",
+    "--allowed-tools",
+    "--betas",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--file",
+    "--mcp-config",
+    "--tools",
+];
+
+/// The option names in `args` (before `=`), skipping option values and
+/// stopping at the `--` terminator.
+fn user_flags(args: &[String]) -> impl Iterator<Item = &str> {
+    let mut out = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            break;
+        }
+        if !a.starts_with('-') {
+            continue;
+        }
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, _)) => (f, true),
+            None => (a.as_str(), false),
+        };
+        out.push(flag);
+        if inline {
+            continue;
+        }
+        if CLAUDE_VALUE_OPTS.contains(&flag) {
+            it.next();
+        } else if CLAUDE_VARIADIC_OPTS.contains(&flag) {
+            it.next();
+            while it.next_if(|v| !v.starts_with('-')).is_some() {}
+        }
+    }
+    out.into_iter()
+}
+
 /// Load the brief into Claude Code with `--append-system-prompt-file` (#972).
 ///
-/// Claude Code honours one append source only: a second
-/// `--append-system-prompt[-file]` replaces the first (checked against 2.1.330).
-/// So a user's own append flag wins and cplt skips its own with an `Err` the
-/// caller warns about, rather than silently dropping either. `--system-prompt*`
-/// composes with the append and is left alone. Prepended, so it sits before
-/// any `--` and cannot be read as a value of the variadic `--add-dir`.
+/// Claude Code sends an inline `--append-system-prompt` and an
+/// `--append-system-prompt-file` together, but a second
+/// `--append-system-prompt-file` replaces the first (checked against 2.1.330).
+/// So only a user's own `--append-system-prompt-file` makes cplt skip its own,
+/// with an `Err` the caller warns about, rather than silently dropping either.
+/// `--system-prompt*` composes with the append and is left alone. Prepended,
+/// so it sits before any `--` and cannot be read as a value of the variadic
+/// `--add-dir`.
 ///
 /// The file is the scratch `CPLT_BRIEF.md`. The agent can write there, but only
 /// once it runs: Claude reads the file at startup, before any tool call, and
@@ -750,16 +828,12 @@ pub fn claude_brief_args(args: &mut Vec<String>, scratch_dir: &Path) -> Result<(
     if !brief.is_file() {
         return Ok(());
     }
-    let user_append = args.iter().take_while(|a| *a != "--").find(|a| {
-        let flag = a.split('=').next().unwrap_or(a);
-        flag == "--append-system-prompt" || flag == "--append-system-prompt-file"
-    });
-    if let Some(flag) = user_append {
-        let flag = flag.split('=').next().unwrap_or(flag);
-        return Err(format!(
-            "{flag} is set and Claude Code takes only one: the agent is not pointed at \
-             the sandbox brief ($CPLT_BRIEF)."
-        ));
+    if user_flags(args).any(|f| f == "--append-system-prompt-file") {
+        return Err(
+            "--append-system-prompt-file is set and Claude Code keeps only one: the agent \
+             is not pointed at the sandbox brief ($CPLT_BRIEF)."
+                .to_string(),
+        );
     }
     args.splice(
         0..0,
@@ -2306,10 +2380,33 @@ mod tests {
         claude_brief_args(&mut args, scratch).unwrap();
         assert_eq!(args[0], "--append-system-prompt-file");
 
+        // An inline append is sent alongside the file, so the brief is added.
+        let mut args = s(&["--append-system-prompt", "mine"]);
+        claude_brief_args(&mut args, scratch).unwrap();
+        assert_eq!(args[0], "--append-system-prompt-file");
+
+        // Option values are not flags, and a `--` value is not the terminator.
         for user in [
-            &["--append-system-prompt", "mine"][..],
-            &["--append-system-prompt=mine"],
-            &["--append-system-prompt-file", "/mine.md"],
+            &["--system-prompt", "--append-system-prompt-file=x"][..],
+            &["--append-system-prompt", "--append-system-prompt-file"],
+            &["--model", "--", "--x"],
+            &["--add-dir", "--append-system-prompt-file", "/b", "--print"],
+        ] {
+            let mut args = s(user);
+            claude_brief_args(&mut args, scratch).unwrap();
+            assert_eq!(args[0], "--append-system-prompt-file", "{user:?}");
+            assert_eq!(&args[2..], &s(user)[..], "{user:?}");
+        }
+        let mut args = s(&["--model", "--", "--append-system-prompt-file", "f"]);
+        assert!(
+            claude_brief_args(&mut args, scratch).is_err(),
+            "`--` was a value"
+        );
+
+        for user in [
+            &["--append-system-prompt-file", "/mine.md"][..],
+            &["--append-system-prompt-file=/mine.md"],
+            &["--add-dir", "/a", "/b", "--append-system-prompt-file", "/m"],
         ] {
             let mut args = s(user);
             let err = claude_brief_args(&mut args, scratch).unwrap_err();

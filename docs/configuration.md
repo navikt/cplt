@@ -1385,7 +1385,7 @@ your own or nav-pilot's settings stay.
 | --- | --- |
 | Copilot | `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` gets the scratch dir's `cplt-instructions/`, which holds a copy at `.github/instructions/cplt-sandbox.instructions.md` |
 | OpenCode (v1 and v2) | `OPENCODE_CONFIG_CONTENT` gets `CPLT_BRIEF.md` added to its `instructions` list |
-| Claude Code | `--append-system-prompt-file` pointing at `CPLT_BRIEF.md` is added to the arguments. Claude Code honours only one append flag, so if you pass your own `--append-system-prompt` or `--append-system-prompt-file`, yours is kept and cplt warns that the brief is not loaded. `--system-prompt` is unaffected |
+| Claude Code | `--append-system-prompt-file` pointing at `CPLT_BRIEF.md` is added to the arguments. Your own `--append-system-prompt` is kept and sent alongside it. Claude Code keeps only one `--append-system-prompt-file`, so if you pass your own, yours is kept and cplt warns that the brief is not loaded. `--system-prompt` is unaffected |
 | Antigravity, Pi, Goose, dsh, shell | **Gap:** not loaded. cplt knows no channel it can extend without rewriting your arguments or files. The agent sees `$CPLT_BRIEF` only if something tells it to read it, for example a line in your own `AGENTS.md` |
 
 If `deny.env` names the variable, or an existing `OPENCODE_CONFIG_CONTENT` is

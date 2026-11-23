@@ -585,7 +585,7 @@ actually on screen, then turn it back off."
     no_validate: bool,
 
     /// Write the agent-facing sandbox brief to the scratch dir
-    /// (`CPLT_BRIEF.md`) and point Copilot and OpenCode at it. On in configs
+    /// (`CPLT_BRIEF.md`) and point Copilot, OpenCode and Claude Code at it. On in configs
     /// written by `cplt config init`. Also the gate for --agents-md.
     #[arg(long, conflicts_with = "no_brief")]
     brief: bool,
