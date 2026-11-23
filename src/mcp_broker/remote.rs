@@ -584,6 +584,17 @@ impl Endpoint {
             session: header("mcp-session-id").unwrap_or_default().to_string(),
             resumable: false,
         });
+        // A session-less `initialize` creates a session, so two of them
+        // never share ids: each gets a namespace no header value can name.
+        if let Some(f) = &mut filter
+            && f.session.is_empty()
+            && serde_json::from_slice::<serde_json::Value>(&body)
+                .is_ok_and(|v| v.get("method").and_then(|m| m.as_str()) == Some("initialize"))
+        {
+            static INIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = INIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            f.session = format!("\ninitialize {n}");
+        }
         // Only a POST body is checked, so no other method may carry one.
         if self.policy.is_some() && method != "POST" && !body.is_empty() {
             reply(&mut client, "400 Bad Request");
@@ -1778,6 +1789,57 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"}
             1,
             "{log}"
         );
+        assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
+    }
+
+    /// Two session-less `initialize` calls with the same id are separate
+    /// sessions, not duplicates.
+    #[test]
+    fn concurrent_initializations_with_one_id_both_pass() {
+        let Some(curl) = real_curl() else { return };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", l.local_addr().unwrap());
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let (mut c, _) = l.accept().unwrap();
+                let (mut got, mut buf) = (Vec::new(), [0; 4096]);
+                while !got.ends_with(b"}}") {
+                    match c.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = seen_tx.send(());
+                held.push(c);
+            }
+            let b = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+            for mut c in held {
+                let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).as_bytes());
+            }
+        });
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        let ep = std::sync::Arc::new(ep);
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
+        let t = std::time::Duration::from_secs(10);
+        let hs: Vec<_> = (0..2)
+            .map(|_| {
+                let ep = ep.clone();
+                std::thread::spawn(move || serve_on(&ep, "POST", init))
+            })
+            .collect();
+        seen.recv_timeout(t)
+            .expect("first initialize not forwarded");
+        seen.recv_timeout(t)
+            .expect("second initialize refused as a duplicate");
+        for h in hs {
+            assert!(
+                h.join().unwrap().0.contains(r#""result""#),
+                "reply assertion"
+            );
+        }
         assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
     }
 
