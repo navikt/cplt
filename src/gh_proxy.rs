@@ -3375,7 +3375,8 @@ fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
 /// login, logout, refresh, setup-git, status, switch and token. No letter means
 /// one thing in one subcommand and another elsewhere. A value-taking flag eats
 /// the rest of its cluster or the next argument, so `--jq '-length'` or
-/// `-uother` is never read as `-h`. pflag stops at `--`, and so does this.
+/// `-uother` is never read as `-h`. Under `gh auth`, `--` ends the scan as it
+/// ends pflag's; elsewhere a `--` may be a flag value, so the scan goes on.
 fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
     const AUTH_SUBCOMMANDS: &[&str] = &[
         "login",
@@ -3413,13 +3414,25 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
         "help",
     ];
     // `gh auth git-credential` and the bare group are not `-h`-is-hostname.
-    let auth =
-        args.first() == Some(&"auth") && args.get(1).is_some_and(|s| AUTH_SUBCOMMANDS.contains(s));
+    // A flag before the subcommand (`gh -hX auth status`, `gh auth -hX status`)
+    // could be a value or a host, so it is ambiguous; bare `gh auth -h` is help.
+    // A flag value can look positional, so any later subcommand name counts.
+    let mut positionals = args.iter().enumerate().filter(|(_, a)| !a.starts_with('-'));
+    let auth_sub = match positionals.next() {
+        Some((_, &"auth")) => positionals
+            .find(|(_, s)| AUTH_SUBCOMMANDS.contains(s))
+            .map(|(j, _)| j),
+        _ => None,
+    };
+    let auth = auth_sub == Some(1);
     let mut found = Vec::new();
-    let mut ambiguous = false;
+    let mut ambiguous = auth_sub.is_some_and(|j| j != 1);
     let mut iter = args.iter().copied();
     while let Some(arg) = iter.next() {
-        if arg == "--" {
+        // pflag stops at `--` only when it is not a flag's value. The flag
+        // tables are known only under `gh auth`, so elsewhere keep scanning:
+        // `gh api --jq -- --hostname x` must still see the host.
+        if auth && arg == "--" {
             break;
         }
         if let Some(long) = arg.strip_prefix("--") {
@@ -12169,5 +12182,27 @@ mod tests {
         let unknown = ["auth", "status", "-zh", "evil.ghe.com"];
         assert!(!ok(&unknown));
         assert!(!ok(&["auth", "status", "--bogus", "-h", "evil.ghe.com"]));
+    }
+
+    /// Review of #1070 at 5c70fade: outside `gh auth` a `--` can be a flag
+    /// value, and a flag before the auth subcommand hides where `-h` binds.
+    #[test]
+    fn hostname_scan_past_dashdash_value_and_flag_before_auth_subcommand() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let ok = |args: &[&str]| github_token_allowed_for(args, None, None, &hosts);
+        for flag in ["--jq", "-p", "-t", "-q"] {
+            let args = ["api", flag, "--", "--hostname", "evil.ghe.com", "repos/o/r"];
+            assert!(!ok(&args), "{args:?}");
+        }
+        for args in [
+            &["auth", "-hevil.ghe.com", "status"][..],
+            &["-hevil.ghe.com", "auth", "status"],
+            &["auth", "-h", "evil.ghe.com", "status"],
+            &["--bogus", "auth", "status"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
+        assert!(ok(&["auth", "status"]));
+        assert!(requested_hostnames(&["auth", "-h"]).is_empty());
     }
 }

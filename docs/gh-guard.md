@@ -302,6 +302,8 @@ The same holds for every other `gh` command: one that names a host other than
 `github.com` (with `--hostname`, or `-h` under `gh auth`) never gets the
 github.com token. For a GitHub Enterprise Server host, `gh` reads
 `GH_ENTERPRISE_TOKEN` instead; pass it with `--pass-env GH_ENTERPRISE_TOKEN`.
+A `*.ghe.com` tenant is not GHES: `gh` reads `GH_TOKEN` for it, so set
+`GH_TOKEN` to the tenant's token and pass it with `--pass-env GH_TOKEN`.
 
 A `GH_TOKEN` environment variable would be inherited by every tool, MCP server,
 and subprocess the agent spawns. The file gives it to the first reader only,
