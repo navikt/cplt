@@ -792,6 +792,7 @@ pub(crate) fn load_with_gate(
             .is_ok_and(|m| m.file_type().is_symlink());
         // (reason, fix): the fix matches the cause; only a bad spec is
         // nav-pilot's to rewrite.
+        let mut snapshot: Option<String> = None;
         let result = if dir_link {
             Err((
                 format!("{} is a symlink", dir.display()),
@@ -822,7 +823,12 @@ pub(crate) fn load_with_gate(
                 format!("nav-pilot mcp enable {id}")
             };
             match crate::untrusted::read_untrusted(&path, SPEC_LIMIT) {
-                Ok(Some(text)) => match validate_gated(&text, &file, &resolve, oauth_gate) {
+                Ok(Some(text)) => match validate_gated(
+                    snapshot.insert(text),
+                    &file,
+                    &resolve,
+                    oauth_gate,
+                ) {
                     Ok(spec) if spec.remote.is_some() && spec.credential.name == "oauth" => Err((
                         "oauth remotes are validated but not served yet (no login in this cplt)"
                             .into(),
@@ -857,7 +863,8 @@ pub(crate) fn load_with_gate(
                     reason,
                     fix,
                 };
-                if oauth_gate && out.remote_refused.is_none() && may_be_gh_remote(&path) {
+                if oauth_gate && out.remote_refused.is_none() && remote_attempt(snapshot.as_deref())
+                {
                     out.remote_refused = Some(r.clone());
                 }
                 out.rejected.push(r);
@@ -867,25 +874,25 @@ pub(crate) fn load_with_gate(
     out
 }
 
-/// Whether a refused spec file declares a gh-token remote. Fails closed: a
-/// file that cannot be read safely (symlink, FIFO, too large) or parsed counts.
-fn may_be_gh_remote(path: &Path) -> bool {
-    let Ok(Some(text)) = crate::untrusted::read_untrusted(path, SPEC_LIMIT) else {
+/// Whether a refused spec counts as a remote attempt, which turns GitHub MCP
+/// off. Classifies the exact buffer that failed validation, never a reread, so
+/// a swap after validation cannot change the answer. Fails closed: no safe
+/// snapshot (symlink, FIFO, too large, unreadable), not a JSON object, a
+/// `remotes` key of any value, or a credential other than `"oauth"` all count.
+/// Only a stdio spec (a `command`, no `remotes`, not gh-token) or an oauth
+/// one is left alone.
+fn remote_attempt(text: Option<&str>) -> bool {
+    let Some(Value::Object(root)) = text.and_then(|t| serde_json::from_str(t).ok()) else {
         return true;
     };
-    let Ok(root) = serde_json::from_str::<Value>(&text) else {
-        return true;
-    };
-    let remote = root
-        .get("remotes")
-        .is_some_and(|r| r.as_array().is_none_or(|a| !a.is_empty()));
-    let cred = root
-        .pointer(&format!(
-            "/_meta/{}/credential",
-            META_KEY.replace('/', "~1")
-        ))
-        .and_then(Value::as_str);
-    remote && cred.is_none_or(|c| c == "gh-token")
+    let ext = root.get("_meta").and_then(|m| m.get(META_KEY));
+    let cred = ext.and_then(|e| e.get("credential"));
+    let remotes = root.contains_key("remotes");
+    let stdio = !remotes
+        && ext.is_some_and(|e| e.get("command").is_some())
+        && cred.and_then(Value::as_str) != Some("gh-token");
+    let oauth = cred.and_then(Value::as_str) == Some("oauth");
+    !stdio && !oauth && (remotes || cred.is_some())
 }
 
 /// Launch detection: load, print one line per rejected spec. The launch
@@ -1404,10 +1411,66 @@ pub(crate) mod tests {
         let e = gh_off(&bad, false, &[]).unwrap_err();
         assert!(e.contains("alow"), "{e}");
         // A refused stdio spec leaves GitHub MCP alone.
-        let mut stdio = gh_root();
-        stdio.as_object_mut().unwrap().remove("remotes");
+        let mut stdio: Value = serde_json::from_str(&spec_json(base())).unwrap();
         stdio["_meta"][META_KEY]["credential"] = json!("bogus");
         assert!(matches!(gh_off(&stdio, false, &[]), Ok(None)));
+        // A credential-only doc with a mistyped credential: off.
+        let mut typo = gh_root();
+        typo.as_object_mut().unwrap().remove("remotes");
+        typo["_meta"][META_KEY]["credential"] = json!("gh-tokn");
+        assert!(gh_off(&typo, false, &[]).is_err());
+    }
+
+    #[test]
+    fn remote_attempt_classifies_the_refused_buffer() {
+        let yes = |v: &Value| remote_attempt(Some(&v.to_string()));
+        // No safe snapshot, or not a JSON object: fail closed.
+        assert!(remote_attempt(None));
+        assert!(remote_attempt(Some("{not json")));
+        assert!(yes(&json!([1])));
+        // gh-token with missing or empty remotes.
+        let mut r = gh_root();
+        r["remotes"] = json!([]);
+        assert!(yes(&r));
+        r.as_object_mut().unwrap().remove("remotes");
+        assert!(yes(&r));
+        // Mistyped or wrong credential on a remote.
+        for c in ["gh-tokn", "none"] {
+            let mut r = gh_root();
+            r["_meta"][META_KEY]["credential"] = json!(c);
+            assert!(yes(&r), "{c}");
+        }
+        // remotes of any value, credential missing.
+        let mut r = gh_root();
+        r["remotes"] = json!("x");
+        r["_meta"][META_KEY]
+            .as_object_mut()
+            .unwrap()
+            .remove("credential");
+        assert!(yes(&r));
+        // oauth remote and a stdio spec refused for another reason: left alone.
+        let mut r = gh_root();
+        r["_meta"][META_KEY]["credential"] = json!("oauth");
+        assert!(!yes(&r));
+        let mut s: Value = serde_json::from_str(&spec_json(base())).unwrap();
+        s["_meta"][META_KEY]["extra"] = json!(1);
+        assert!(!yes(&s));
+        // A command with gh-token is not a stdio spec.
+        s["_meta"][META_KEY]["credential"] = json!("gh-token");
+        assert!(yes(&s));
+    }
+
+    /// The swap race: a file refused as a gh-token remote then replaced by a
+    /// stdio doc. Classification sees only the refused buffer, so it stays a
+    /// remote attempt whatever is on disk afterwards.
+    #[test]
+    fn swap_after_refusal_still_counts_as_remote() {
+        let mut bad = gh_root();
+        bad["_meta"][META_KEY]["tools"]["alow"] = json!(["get_me"]);
+        let refused = bad.to_string();
+        let stdio = spec_json(base());
+        assert!(!remote_attempt(Some(&stdio)));
+        assert!(remote_attempt(Some(&refused)));
     }
 
     pub(crate) fn gh_root() -> Value {
