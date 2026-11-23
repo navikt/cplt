@@ -1183,43 +1183,48 @@ pub struct AuthDecision<'a> {
     /// Copilot's keytar module is installed. Whether it holds a login is not
     /// checked; kept so a Linux keytar user gets no false blocking finding.
     pub other_login: bool,
-    /// Copilot on Linux: why the stored gh token would not reach the agent,
-    /// from [`gh_handover_blocked`].
-    pub gh_handover_blocked: Option<&'static str>,
-    /// OpenCode 1.x gets the stored gh token as `OPENCODE_AUTH_CONTENT`.
+    /// Copilot on Linux: the launch's own handover decision
+    /// (`copilot_stored_token_handover`), with the reason when it is refused.
+    pub gh_handover: Option<Result<(), &'static str>>,
+    /// The launch would pass the stored gh token to OpenCode 1.x as
+    /// `OPENCODE_AUTH_CONTENT` (`sandbox::opencode_handover_planned`).
     pub opencode_handover: bool,
 }
 
-/// Why the launch would not hand Copilot (Linux) the stored gh token through
-/// the gh wrapper's token file, or `None` when nothing in the config stops it.
-/// Mirrors the conditions in `sandbox_exec::cache_gh_token_to_file` (#1066).
-#[must_use]
-pub fn gh_handover_blocked(r: &crate::config::Resolved, trusted_gh: bool) -> Option<&'static str> {
-    if !r.gh_guard.enabled {
-        Some("gh_guard is off")
-    } else if !r.scratch_dir {
-        Some("the scratch dir is off")
-    } else if !trusted_gh {
-        Some("no trusted gh found")
-    } else if r.deny_env.iter().any(|d| d == "GH_TOKEN") {
-        Some("deny.env strips GH_TOKEN")
-    } else {
-        None
-    }
-}
+/// gh has no github.com token cplt can read: nothing to hand over.
+pub const GH_NO_LOGIN: &str = "gh holds no github.com token cplt can read";
+/// gh_guard off: cplt hands nothing over, but Copilot may still run gh itself.
+pub const GH_GUARD_OFF: &str = "gh_guard is off";
+pub const SCRATCH_OFF: &str = "the scratch dir is off";
+pub const NO_TRUSTED_GH: &str = "no trusted gh found";
+/// Copilot has its own login (keytar or `~/.copilot/config.json`).
+pub const NATIVE_LOGIN: &str = "Copilot has its own login";
 
 /// OpenCode v2 never reads `OPENCODE_AUTH_CONTENT`, and the launch removes it,
-/// so a `--pass-env` for it does nothing (#716/#729). Said instead of dropped.
+/// so passing it does nothing (#716/#729). Said instead of dropped; names
+/// where the value came from.
 #[must_use]
-pub fn opencode_v2_auth_content_note(pass_env: &[String]) -> Option<&'static str> {
-    pass_env
-        .iter()
-        .any(|v| v == "OPENCODE_AUTH_CONTENT")
-        .then_some(
-            "--pass-env OPENCODE_AUTH_CONTENT has no effect: OpenCode v2 does not read it.\n\
-             cplt removes it from the agent's environment.\n\
-             Sign in inside OpenCode instead, or use OpenCode 1.x.",
-        )
+pub fn opencode_v2_auth_content_note(
+    cli_pass_env: &[String],
+    pass_env: &[String],
+    inherit_env: bool,
+    exported: bool,
+) -> Option<String> {
+    let has = |l: &[String]| l.iter().any(|v| v == "OPENCODE_AUTH_CONTENT");
+    let source = if has(cli_pass_env) {
+        "--pass-env OPENCODE_AUTH_CONTENT"
+    } else if has(pass_env) {
+        "sandbox.pass_env = [\"OPENCODE_AUTH_CONTENT\"]"
+    } else if inherit_env && exported {
+        "--inherit-env with OPENCODE_AUTH_CONTENT exported"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{source} has no effect: OpenCode v2 does not read it.\n\
+         cplt removes it from the agent's environment.\n\
+         Sign in inside OpenCode instead, or use OpenCode 1.x."
+    ))
 }
 
 /// The Keychain grant (macOS agents that use the Keychain only), the
@@ -1248,10 +1253,20 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
             None if d.macos && d.agent.needs_keychain() => {
                 format!("left to {name}: Keychain access granted, stored login not checked")
             }
-            None if d.agent == Agent::Copilot && d.gh_login && d.gh_handover_blocked.is_some() => {
+            None if d.agent == Agent::Copilot && d.gh_handover == Some(Ok(())) => {
+                "stored gh token for github.com (handed over, validity not checked)".to_string()
+            }
+            None if d.agent == Agent::Copilot && d.gh_handover == Some(Err(GH_GUARD_OFF)) => {
+                "not handed over by cplt: gh_guard is off; Copilot may still use gh's own \
+                 login if the sandbox can read gh's hosts.yml"
+                    .to_string()
+            }
+            None if d.agent == Agent::Copilot
+                && matches!(d.gh_handover, Some(Err(w)) if w != GH_NO_LOGIN) =>
+            {
                 format!(
-                    "stored gh token for github.com found, not handed over: {}",
-                    d.gh_handover_blocked.unwrap_or_default()
+                    "gh login found, not handed over: {}",
+                    d.gh_handover.and_then(Result::err).unwrap_or_default()
                 )
             }
             None if d.agent == Agent::OpenCode && d.opencode_handover => {
@@ -1284,6 +1299,28 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
                     .to_string(),
             ),
         )),
+        // The launch refuses the handover for a reason the user can fix, and
+        // nothing else gives Copilot a login. gh_guard off is hedged in the
+        // auth line instead: Copilot may still run gh itself.
+        None if d.agent == Agent::Copilot
+            && d.env_token.is_none()
+            && !d.other_login
+            && matches!(d.gh_handover, Some(Err(w))
+                if ![GH_NO_LOGIN, GH_GUARD_OFF, NATIVE_LOGIN].contains(&w)) =>
+        {
+            let why = d.gh_handover.and_then(Result::err).unwrap_or_default();
+            Some(Finding::blocking(
+                format!(
+                    "Copilot will not get your gh login: {why}, so the stored token is not \
+                     handed over and no token variable reaches the sandbox."
+                ),
+                format!(
+                    "turn gh_guard and the scratch dir on, install gh in one of {}, and keep \
+                     GH_TOKEN out of deny.env; or export COPILOT_GITHUB_TOKEN",
+                    crate::git::TRUSTED_BIN_DIRS.join(", ")
+                ),
+            ))
+        }
         None if d.agent == Agent::Copilot
             && d.env_token.is_none()
             && !d.gh_login
@@ -1297,18 +1334,6 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
                 "clear COPILOT_GITHUB_TOKEN, GH_TOKEN and GITHUB_TOKEN in a subshell, then run \
                  `gh auth login --hostname github.com --web` on the host",
             ))
-        }
-        None if d.agent == Agent::Copilot && d.env_token.is_none() && d.gh_login => {
-            d.gh_handover_blocked.map(|why| {
-                Finding::blocking(
-                    format!(
-                        "Copilot will not get your gh login: {why}, so the stored token is \
-                         not handed over and no token variable reaches the sandbox."
-                    ),
-                    "turn gh_guard and the scratch dir on, install gh where cplt trusts it, \
-                     and keep GH_TOKEN out of deny.env; or export COPILOT_GITHUB_TOKEN",
-                )
-            })
         }
         _ => None,
     };
@@ -2157,7 +2182,7 @@ mod tests {
             env_token: None,
             gh_login: false,
             other_login: false,
-            gh_handover_blocked: None,
+            gh_handover: None,
             opencode_handover: false,
         }
     }
@@ -2400,53 +2425,74 @@ mod tests {
     }
 
     #[test]
-    fn gh_handover_blocked_names_each_cause() {
-        use crate::config::{CliFlags, Config};
-        let fresh = || Config::default().merge(CliFlags::default()).unwrap();
-        let base = fresh();
-        assert_eq!(gh_handover_blocked(&base, true), None);
-        assert_eq!(
-            gh_handover_blocked(&base, false),
-            Some("no trusted gh found")
-        );
-        let mut r = fresh();
-        r.gh_guard.enabled = false;
-        assert_eq!(gh_handover_blocked(&r, true), Some("gh_guard is off"));
-        let mut r = fresh();
-        r.scratch_dir = false;
-        assert_eq!(
-            gh_handover_blocked(&r, true),
-            Some("the scratch dir is off")
-        );
-        let mut r = fresh();
-        r.deny_env = vec!["GH_TOKEN".into()];
-        assert_eq!(
-            gh_handover_blocked(&r, true),
-            Some("deny.env strips GH_TOKEN")
-        );
-    }
-
-    #[test]
     fn auth_copilot_linux_blocked_handover_is_blocking() {
         let d = AuthDecision {
             gh_login: true,
-            gh_handover_blocked: Some("gh_guard is off"),
+            gh_handover: Some(Err(NO_TRUSTED_GH)),
             ..decision(Agent::Copilot, false)
+        };
+        let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
+        assert_eq!(auth, "gh login found, not handed over: no trusted gh found");
+        let f = f.expect("a refused handover with no other source blocks");
+        assert_eq!(f.level, Level::Blocking);
+        assert!(f.message.contains(NO_TRUSTED_GH), "{}", f.message);
+        assert!(
+            f.fix.as_deref().unwrap().contains("/opt/homebrew/bin"),
+            "{:?}",
+            f.fix
+        );
+        // Reachable without gh_login: a mise-only gh fails the trusted lookup.
+        let d = AuthDecision {
+            gh_login: false,
+            ..d
+        };
+        assert!(auth_report(&d, Path::new("/home/u")).2.is_some());
+        // An exported token or Copilot's own login: no finding.
+        for d in [
+            AuthDecision {
+                env_token: Some("GH_TOKEN"),
+                ..d
+            },
+            AuthDecision {
+                other_login: true,
+                ..d
+            },
+        ] {
+            assert!(auth_report(&d, Path::new("/home/u")).2.is_none());
+        }
+    }
+
+    #[test]
+    fn auth_copilot_gh_guard_off_is_hedged_not_blocking() {
+        let d = AuthDecision {
+            gh_login: true,
+            gh_handover: Some(Err(GH_GUARD_OFF)),
+            ..decision(Agent::Copilot, false)
+        };
+        let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
+        assert!(
+            auth.contains("Copilot may still use gh's own login"),
+            "{auth}"
+        );
+        assert!(f.is_none());
+        for why in [NATIVE_LOGIN, GH_NO_LOGIN] {
+            let d = AuthDecision {
+                gh_handover: Some(Err(why)),
+                other_login: why == NATIVE_LOGIN,
+                ..d
+            };
+            assert!(auth_report(&d, Path::new("/home/u")).2.is_none(), "{why}");
+        }
+        let d = AuthDecision {
+            gh_handover: Some(Ok(())),
+            ..d
         };
         let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
         assert_eq!(
             auth,
-            "stored gh token for github.com found, not handed over: gh_guard is off"
+            "stored gh token for github.com (handed over, validity not checked)"
         );
-        let f = f.expect("a blocked handover with no other source blocks");
-        assert_eq!(f.level, Level::Blocking);
-        assert!(f.message.contains("gh_guard is off"), "{}", f.message);
-        // An exported token still reaches the agent: no finding.
-        let d = AuthDecision {
-            env_token: Some("GH_TOKEN"),
-            ..d
-        };
-        assert!(auth_report(&d, Path::new("/home/u")).2.is_none());
+        assert!(f.is_none());
     }
 
     #[test]
@@ -2467,11 +2513,23 @@ mod tests {
     }
 
     #[test]
-    fn opencode_v2_auth_content_note_only_for_that_var() {
-        assert!(opencode_v2_auth_content_note(&["GH_TOKEN".into()]).is_none());
-        let n = opencode_v2_auth_content_note(&["OPENCODE_AUTH_CONTENT".into()]).unwrap();
+    fn opencode_v2_auth_content_note_names_the_source() {
+        let var = || vec!["OPENCODE_AUTH_CONTENT".to_string()];
+        assert!(opencode_v2_auth_content_note(&["GH_TOKEN".into()], &[], false, true).is_none());
+        assert!(opencode_v2_auth_content_note(&[], &[], true, false).is_none());
+        let n = opencode_v2_auth_content_note(&var(), &var(), false, false).unwrap();
         assert_eq!(n.lines().count(), 3, "{n}");
-        assert!(n.contains("OpenCode v2 does not read it"), "{n}");
+        assert!(
+            n.starts_with("--pass-env OPENCODE_AUTH_CONTENT has no effect"),
+            "{n}"
+        );
+        let n = opencode_v2_auth_content_note(&[], &var(), false, false).unwrap();
+        assert!(n.starts_with("sandbox.pass_env"), "{n}");
+        let n = opencode_v2_auth_content_note(&[], &[], true, true).unwrap();
+        assert!(
+            n.starts_with("--inherit-env with OPENCODE_AUTH_CONTENT exported"),
+            "{n}"
+        );
     }
 
     #[test]
