@@ -93,14 +93,45 @@ pub fn github_token_allowed(args: &[&str], pin: Option<&str>, host_pin: Option<&
 }
 
 /// Why [`github_token_allowed`] said no, for the notice `exec_real` prints.
+/// Takes the same inputs and checks in the same order of cause, so the text
+/// names the real reason rather than guessing from argv alone.
 #[must_use]
-pub fn token_withheld_reason(args: &[&str]) -> &'static str {
+pub fn token_withheld_reason(
+    args: &[&str],
+    pin: Option<&str>,
+    host_pin: Option<&str>,
+) -> &'static str {
+    token_withheld_reason_for(args, pin, host_pin, gh_hosts())
+}
+
+fn token_withheld_reason_for(
+    args: &[&str],
+    pin: Option<&str>,
+    host_pin: Option<&str>,
+    hosts: &[String],
+) -> &'static str {
+    let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
+    let (named, ambiguous) = scan_hostnames(args);
     if is_auth_git_credential_request(args) {
         "GitHub token withheld: `gh auth git-credential` never gets it."
-    } else if scan_hostnames(args).1 {
+    } else if pin.and_then(foreign_pin_host).is_some_and(foreign)
+        || host_pin.is_some_and(|h| foreign(h) || names_token_tenant(h))
+        || pin.is_some_and(names_token_tenant)
+    {
+        "GitHub token withheld: this repository is pinned to a non-github.com GitHub host."
+    } else if ambiguous {
         "GitHub token withheld: cplt could not read the host in these `gh auth` arguments."
-    } else {
+    } else if named
+        .iter()
+        .any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
+    {
+        "GitHub token withheld: --hostname names a non-github.com host."
+    } else if args.iter().any(|a| decode_stable(a).is_none()) {
+        "GitHub token withheld: cplt could not decode an argument (failing closed)."
+    } else if args.iter().any(|a| names_token_tenant(a)) {
         "GitHub token withheld: an argument mentions a non-github.com GitHub host (ghe.com / github.localhost). Use --body-file for text that names one."
+    } else {
+        "GitHub token withheld: this command could reach a non-github.com GitHub host."
     }
 }
 
@@ -176,26 +207,28 @@ pub fn pin_auth_hostname(args: &[&str]) -> Option<Vec<String>> {
 /// boundary checks. A title or body that mentions either string also withholds
 /// the token; that is the safe direction, and `--body-file` avoids it.
 fn names_token_tenant(s: &str) -> bool {
-    // gh and Go's url package may percent-decode more than once (`%25C4` ->
-    // `%C4` -> byte), so decode until stable. Still changing after 4 rounds:
-    // fail closed rather than guess how many rounds gh applies.
-    let mut decoded = s.to_string();
-    let mut stable = false;
-    for _ in 0..4 {
-        let next = percent_decode(&decoded);
-        if next == decoded {
-            stable = true;
-            break;
-        }
-        decoded = next;
-    }
-    if !stable {
+    // Undecodable: fail closed rather than guess how many rounds gh applies.
+    let Some(decoded) = decode_stable(s) else {
         return true;
-    }
+    };
     // Unicode lowercase as Go's strings.ToLower, which maps U+0130 `İ` to `i`
     // where Rust yields `i` plus a combining dot.
     let decoded = decoded.replace('\u{130}', "i").to_lowercase();
     decoded.contains("github.localhost") || decoded.contains("ghe.com")
+}
+
+/// Percent-decode until stable. gh and Go's url package may decode more than
+/// once (`%25C4` -> `%C4` -> byte). `None`: still changing after 4 rounds.
+fn decode_stable(s: &str) -> Option<String> {
+    let mut decoded = s.to_string();
+    for _ in 0..4 {
+        let next = percent_decode(&decoded);
+        if next == decoded {
+            return Some(decoded);
+        }
+        decoded = next;
+    }
+    None
 }
 
 fn percent_decode(s: &str) -> String {
@@ -7382,6 +7415,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(refusal.guidance.contains("not on github.com"), "{refusal}");
+    }
+
+    #[test]
+    fn token_withheld_reason_is_accurate() {
+        let hosts = ghe_hosts();
+        let r = |args: &[&str], pin, hp| token_withheld_reason_for(args, pin, hp, &hosts);
+        assert!(r(&["auth", "git-credential", "get"], None, None).contains("git-credential"));
+        assert!(r(&["pr", "list"], None, Some("example.ghe.com")).contains("pinned"));
+        assert!(r(&["pr", "list"], Some("example.ghe.com/o/r"), None).contains("pinned"));
+        assert!(r(&["api", "--hostname", "ghes.corp", "user"], None, None).contains("--hostname"));
+        assert!(r(&["auth", "status", "-Z"], None, None).contains("could not read"));
+        assert!(r(&["pr", "create", "--body", "%2525252567he.com"], None, None).contains("decode"));
+        assert!(
+            r(&["pr", "create", "--body", "see x.ghe.com"], None, None).contains("--body-file")
+        );
+        assert!(r(&["pr", "list"], None, None).contains("could reach"));
     }
 
     #[test]

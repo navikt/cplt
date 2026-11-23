@@ -196,6 +196,10 @@ fn parse_element(
             if !removing {
                 refuse_private_domain_ip(key_info, value)?;
             }
+            // A hand-written `~/t` entry must stay removable: match raw.
+            if removing {
+                return Ok(toml_edit::value(value).into_value().unwrap());
+            }
             // Expand ~ so stored values are always absolute paths.
             // For non-path keys (e.g. pass_env), expand_tilde is a no-op.
             let expanded = expand_tilde(value);
@@ -289,6 +293,11 @@ pub fn remove_array_element_in_doc(
     value: &str,
 ) -> Result<bool, ConfigError> {
     let element = parse_element(key_info, value, true)?;
+    // The entry may have been stored normalised: try the spelling typed, then
+    // the normalised one.
+    let alt = is_private_domains_key(key_info)
+        .then(|| parse_element(key_info, &crate::proxy::normalize_hostname(value), true))
+        .transpose()?;
 
     let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) else {
         return Ok(false); // Section doesn't exist — nothing to remove
@@ -307,7 +316,9 @@ pub fn remove_array_element_in_doc(
 
     // Find and remove all matching elements (handles manual duplicates)
     let mut removed = false;
-    while let Some(idx) = array_index_of(arr, &element) {
+    while let Some(idx) =
+        array_index_of(arr, &element).or_else(|| alt.as_ref().and_then(|a| array_index_of(arr, a)))
+    {
         arr.remove(idx);
         removed = true;
     }
@@ -706,6 +717,33 @@ mod tests {
             .unwrap();
         assert!(remove_array_element_in_doc(&mut doc, info, "10.1").unwrap());
         assert!(!doc.to_string().contains("10.1"), "{doc}");
+        // set stores the normalised form.
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        set_value_in_doc(&mut doc, info, " Intern.NAV.no. ").unwrap();
+        assert!(
+            doc.to_string()
+                .contains("allow_private_domains = [\"intern.nav.no\"]"),
+            "{doc}"
+        );
+        // unset finds a normalised entry by its mixed-case spelling.
+        assert!(remove_array_element_in_doc(&mut doc, info, "Intern.NAV.no").unwrap());
+        assert!(!doc.to_string().contains("intern"), "{doc}");
+        // an empty entry does not block removing others.
+        let mut doc = "[proxy]\nallow_private_domains = [\"\", \"a.no\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(remove_array_element_in_doc(&mut doc, info, "A.no").unwrap());
+        assert!(doc.to_string().contains("\"\""), "{doc}");
+        assert!(!doc.to_string().contains("a.no"), "{doc}");
+    }
+
+    #[test]
+    fn removal_does_not_expand_tilde() {
+        let info = lookup_key("allow.read").unwrap();
+        let mut doc = "[allow]\nread = [\"~/t\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
     }
 
     #[test]

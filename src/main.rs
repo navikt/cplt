@@ -6354,7 +6354,10 @@ fn exec_real(
             command.args(token_args);
         } else {
             // No silent grants: say why gh runs without the token (#1088).
-            eprintln!("[cplt] {}", gh_proxy::token_withheld_reason(token_args));
+            eprintln!(
+                "[cplt] {}",
+                gh_proxy::token_withheld_reason(token_args, repo_scope, host_pin)
+            );
             command.args(args);
         }
     } else {
