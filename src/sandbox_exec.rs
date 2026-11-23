@@ -770,14 +770,17 @@ fn cache_gh_token_to_file(
     let token = crate::token_inject::mask(&token);
     // Both consumers must locate the producer's scratch dir, not an explicitly
     // passed TMPDIR that may contain another session's stale credential.
-    cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
+    let mut files = Vec::new();
     if serve && gh_wrapper {
-        write_token_file(&scratch_dir.join(".gh-token"), &token);
+        files.push(".gh-token");
     }
+    if exec && gh_wrapper {
+        files.push(".gh-exec-token");
+    }
+    // No silent grants (#1078): a token file that could not be written in full
+    // must not leave gh pointed at an empty or truncated credential.
+    apply_token_files(cmd, scratch_dir, &files, &token, serve);
     if exec {
-        if gh_wrapper {
-            write_token_file(&scratch_dir.join(".gh-exec-token"), &token);
-        }
         // OpenCode: the same token as its GitHub Copilot login, when the user
         // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
         // instead of auth.json, so the real file is never read or rewritten
@@ -806,20 +809,68 @@ fn opencode_handover_applies(
         && child_env_value(cmd, "OPENCODE_AUTH_CONTENT", inherit_env).is_none()
 }
 
-fn write_token_file(token_path: &Path, token: &str) {
-    // Write token to file, creating it with 0600 from the start to avoid a
-    // permissions window where the file is world-readable.
+/// Points gh at the token dir only when every file was written (#1078).
+fn apply_token_files(cmd: &mut Command, dir: &Path, files: &[&str], token: &str, serve: bool) {
+    match write_token_files(dir, files, token) {
+        Ok(()) => {
+            cmd.env(GH_TOKEN_DIR_ENV, dir);
+        }
+        Err(e) => {
+            let lost = if serve {
+                "; Copilot's login handover is lost too"
+            } else {
+                ""
+            };
+            eprintln!(
+                "cplt: could not write the gh token cache ({e}); gh in the sandbox will not be authenticated{lost}"
+            );
+        }
+    }
+}
+
+/// Write every token file in `names` under `dir`, or none: on any error every
+/// requested name and its temp file is removed, including caches left by an
+/// earlier setup in the same scratch dir (the bubblewrap fallback configures
+/// twice), so gh never reads a partial or stale set.
+fn write_token_files(dir: &Path, names: &[&str], token: &str) -> std::io::Result<()> {
+    for name in names {
+        if let Err(e) = write_token_file(&dir.join(name), token) {
+            for n in names {
+                let _ = std::fs::remove_file(dir.join(n));
+                let _ = std::fs::remove_file(dir.join(token_tmp_name(n)));
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+fn token_tmp_name(name: &str) -> String {
+    format!("{name}.tmp.{}", std::process::id())
+}
+
+/// Write the token to a temp name in the same dir, fsync, then rename, so the
+/// final path holds the whole token or nothing. Created 0600 from the start to
+/// avoid a window where the file is world-readable.
+fn write_token_file(token_path: &Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(token_path)
-    else {
-        return;
-    };
-    let _ = file.write_all(token.as_bytes());
+    let name = token_path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = token_path.with_file_name(token_tmp_name(&name));
+    let res = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, token_path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Install gh and git wrapper scripts into the scratch dir and prepend to PATH.
@@ -3997,5 +4048,90 @@ mod which_real_gh_tests {
             which_real_gh_in(&only_real, |_| panic!("not a shim")),
             Some(real)
         );
+    }
+}
+
+#[cfg(test)]
+mod token_file_tests {
+    use super::{GH_TOKEN_DIR_ENV, apply_token_files, write_token_files};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn dir_env(cmd: &std::process::Command) -> Option<std::ffi::OsString> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == GH_TOKEN_DIR_ENV)
+            .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn token_dir_env_only_set_when_write_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = std::process::Command::new("true");
+        apply_token_files(&mut cmd, dir.path(), &[".gh-token"], "tok", true);
+        assert_eq!(dir_env(&cmd), Some(dir.path().as_os_str().to_owned()));
+
+        std::fs::create_dir_all(dir.path().join(".gh-exec-token/x")).unwrap();
+        let mut cmd = std::process::Command::new("true");
+        apply_token_files(&mut cmd, dir.path(), &[".gh-exec-token"], "tok", true);
+        assert_eq!(dir_env(&cmd), None);
+    }
+
+    #[test]
+    fn writes_all_token_files_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        write_token_files(dir.path(), &[".gh-token", ".gh-exec-token"], "tok").unwrap();
+        for n in [".gh-token", ".gh-exec-token"] {
+            let p = dir.path().join(n);
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "tok");
+            assert_eq!(p.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "no temp left"
+        );
+    }
+
+    /// #1078: an injected failure on the second file must fail the call and
+    /// leave no token file and no temp file behind.
+    #[test]
+    fn write_error_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory at the final name makes the rename fail.
+        std::fs::create_dir_all(dir.path().join(".gh-exec-token/x")).unwrap();
+        assert!(write_token_files(dir.path(), &[".gh-token", ".gh-exec-token"], "tok").is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(".gh-exec-token")]);
+    }
+
+    /// The bubblewrap fallback configures twice with one scratch dir: a failed
+    /// second setup must remove the caches the first one wrote, and unset the env.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn failed_rewrite_removes_earlier_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [".gh-token", ".gh-exec-token"];
+        for n in names {
+            std::fs::write(dir.path().join(n), "old").unwrap();
+        }
+        // A taken temp name makes the first write fail.
+        std::fs::write(dir.path().join(super::token_tmp_name(names[0])), "").unwrap();
+        let mut cmd = std::process::Command::new("true");
+        apply_token_files(&mut cmd, dir.path(), &names, "tok", true);
+        assert_eq!(dir_env(&cmd), None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A successful second setup replaces the first cleanly.
+        for n in names {
+            std::fs::write(dir.path().join(n), "old").unwrap();
+        }
+        write_token_files(dir.path(), &names, "tok").unwrap();
+        for n in names {
+            assert_eq!(std::fs::read_to_string(dir.path().join(n)).unwrap(), "tok");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 }
