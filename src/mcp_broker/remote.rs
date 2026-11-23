@@ -1675,7 +1675,9 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 105\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"},{\"name\":\"delete_repo\"}]}}            ",
         );
         let (reply, log) = through(url.clone(), curl, LIST);
-        let sent = got.recv().unwrap();
+        let sent = got
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
         assert!(sent.contains("Authorization: Bearer T"));
         assert!(sent.contains("X-MCP-Lockdown: true") && !sent.contains("false"));
         assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
@@ -1767,7 +1769,9 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         assert!(ep.policy.is_some() && ep.tag == spec.id);
         ep.upstream = url;
         let (reply, log) = serve_on(&ep, "POST", CALL);
-        let sent = got.recv().unwrap();
+        let sent = got
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
         assert!(
             sent.contains("Authorization: Bearer T"),
             "unexpected broker output"

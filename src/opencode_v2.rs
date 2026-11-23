@@ -496,10 +496,12 @@ fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
 /// The overlay is the same; the endpoint then applies the spec's headers,
 /// timeout and `tools.allow`. `None` is the built-in endpoint, unchanged.
 /// Why [`github_mcp`] would leave GitHub MCP alone, for `cplt mcp status`
-/// (#909). Ignores the host `OPENCODE_CONFIG_CONTENT`.
+/// (#909). `reaches` as for [`github_mcp`], so a passed-through
+/// `OPENCODE_CONFIG_CONTENT` counts the same way.
 pub fn github_mcp_inactive(
     home: &Path,
     deny_env: &[String],
+    reaches: impl Fn(&str) -> bool,
     proxy_on: bool,
 ) -> Option<&'static str> {
     if deny_env.iter().any(|d| d == "GH_TOKEN") {
@@ -511,7 +513,12 @@ pub fn github_mcp_inactive(
     if !proxy_on {
         return Some("cplt's proxy is off");
     }
-    if crate::github_mcp::configured_servers(&user_config_dirs(home), None, None).is_empty() {
+    let existing = reaches("OPENCODE_CONFIG_CONTENT")
+        .then(|| std::env::var("OPENCODE_CONFIG_CONTENT").ok())
+        .flatten();
+    if crate::github_mcp::configured_servers(&user_config_dirs(home), None, existing.as_deref())
+        .is_empty()
+    {
         return Some("no GitHub MCP entry in the OpenCode config");
     }
     None

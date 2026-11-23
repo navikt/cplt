@@ -169,7 +169,6 @@ fn gh_token_spec_filters_opencode_github_mcp() {
     );
     up.set_nonblocking(true).unwrap();
     assert!(up.accept().is_err(), "a denied call reached upstream");
-    up.set_nonblocking(false).unwrap();
 
     // Allowed: curl tunnels to the pinned upstream through the fake proxy.
     let call = std::thread::spawn(move || {
@@ -179,7 +178,20 @@ fn gh_token_spec_filters_opencode_github_mcp() {
             r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#,
         )
     });
-    let (s, _) = up.accept().unwrap();
+    // Timed waits: a regression fails here instead of hanging CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let s = loop {
+        match up.accept() {
+            Ok((s, _)) => break s,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("upstream never received the call: {e}"),
+        }
+    };
+    s.set_nonblocking(false).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).unwrap();
     assert!(

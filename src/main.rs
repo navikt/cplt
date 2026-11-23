@@ -5522,9 +5522,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             cplt::mcp_broker::github_spec(&mcp_found, &home_dir, writable)
                 .err()
                 .or_else(|| {
+                    let reaches = |v: &str| {
+                        !resolved.deny_env.iter().any(|d| d == v)
+                            && (resolved.inherit_env || resolved.pass_env.iter().any(|p| p == v))
+                    };
                     cplt::opencode_v2::github_mcp_inactive(
                         &home_dir,
                         &resolved.deny_env,
+                        reaches,
                         proxy_handle.is_some(),
                     )
                     .map(str::to_string)

@@ -82,6 +82,20 @@ pub fn status_json(
             "clients": remote_clients,
         })
     }));
+    // A refused gh-token spec keeps GitHub MCP off (#909): show why.
+    servers.extend(found.remote_refused.iter().map(|r| {
+        json!({
+            "id": r.file,
+            "state": "inactive",
+            "reason": remote_off.unwrap_or(&r.reason),
+            "transport": "http",
+            "credential": null,
+            "credential_ok": null,
+            "credential_note": null,
+            "tools_allowed": null,
+            "clients": [],
+        })
+    }));
     servers.extend(found.disabled.iter().map(|id| {
         // Skipped before loading: nothing else is known about it.
         json!({
@@ -139,6 +153,9 @@ pub fn run_status(
             s["state"].as_str().unwrap_or(""),
             s["credential_ok"]
         );
+        if let Some(why) = s["reason"].as_str() {
+            println!("    {}", why.escape_debug());
+        }
     }
     for r in &found.rejected {
         println!("  {}", r.line());
@@ -149,6 +166,34 @@ pub fn run_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_gh_spec_row_is_inactive_with_reason() {
+        let r = crate::mcp_broker::spec::Rejected {
+            file: "/x/gh.json".into(),
+            reason: "/x is writable in the sandbox".into(),
+            fix: "f".into(),
+        };
+        let found = Detected {
+            remote_refused: Some(r.clone()),
+            rejected: vec![r],
+            ..Default::default()
+        };
+        let v = status_json(
+            &found,
+            None,
+            true,
+            false,
+            true,
+            None,
+            &["opencode"],
+            Some("off: why"),
+        );
+        let row = &v["servers"][0];
+        assert_eq!(row["id"], "/x/gh.json");
+        assert_eq!(row["state"], "inactive");
+        assert_eq!(row["reason"], "off: why");
+    }
 
     #[test]
     fn disabled_rows_carry_every_field() {

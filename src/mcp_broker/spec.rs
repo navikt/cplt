@@ -89,6 +89,7 @@ pub fn drop_writable(
             &mut found.specs
         };
         let mut kept = Vec::new();
+        let before = found.rejected.len();
         for spec in std::mem::take(list) {
             if let Some(tree) = writable(&spec.file) {
                 found.rejected.push(Rejected {
@@ -128,6 +129,9 @@ pub fn drop_writable(
         } else {
             &mut found.specs
         } = kept;
+        if remote && found.remote_refused.is_none() {
+            found.remote_refused = found.rejected.get(before).cloned();
+        }
     }
 }
 
@@ -682,7 +686,7 @@ pub struct Detected {
     /// A spec that declares (or may declare) a gh-token remote was refused at
     /// load: its line. GitHub MCP is then off, never the built-in endpoint,
     /// which would serve the token without that spec's `tools.allow` (#909).
-    pub remote_refused: Option<String>,
+    pub remote_refused: Option<Rejected>,
 }
 
 impl Detected {
@@ -706,8 +710,8 @@ pub fn github_spec(
     writable: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<Option<Spec>, String> {
     const OFF: &str = "GitHub MCP is off for this session";
-    if let Some(line) = &found.remote_refused {
-        return Err(format!("{OFF}: {line}"));
+    if let Some(r) = &found.remote_refused {
+        return Err(format!("{OFF}: {}", r.line()));
     }
     if found.remote_disabled {
         return Err(format!(
@@ -854,7 +858,7 @@ pub(crate) fn load_with_gate(
                     fix,
                 };
                 if oauth_gate && out.remote_refused.is_none() && may_be_gh_remote(&path) {
-                    out.remote_refused = Some(r.line());
+                    out.remote_refused = Some(r.clone());
                 }
                 out.rejected.push(r);
             }
