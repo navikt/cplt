@@ -2510,8 +2510,13 @@ impl Refusal {
 /// starting or ending with `-`, first char alphanumeric, total <= 253. Rules out
 /// option-shaped input such as `--unset` before it reaches a pasted command.
 fn is_plain_dns_name(host: &str) -> bool {
+    // A digit-led last label (`10.1`, `0x0a.1.2.3`) is an inet_aton IP alias, not a name.
     host.len() <= 253
         && host.contains('.')
+        && !host
+            .rsplit('.')
+            .next()
+            .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_digit()))
         && host.split('.').all(|l| {
             (1..=63).contains(&l.len())
                 && !l.starts_with('-')
@@ -2528,7 +2533,7 @@ fn is_plain_dns_name(host: &str) -> bool {
 /// unique-local; that address is named so the user sees what they are allowing.
 pub(crate) fn private_resolved_hint(host: &str, resolved: &[std::net::SocketAddr]) -> String {
     use std::net::IpAddr;
-    let generic = "[proxy] Resolved to a private IP. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain). Applies to the next launch.".to_string();
+    let generic = "[proxy] Resolved to a private IP. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain). A config change applies within a few seconds when this session reads a config file, otherwise on the next launch.".to_string();
     let ordinary = |ip: IpAddr| match ip.to_canonical() {
         IpAddr::V4(v4) => v4.is_private(),
         IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
@@ -2539,7 +2544,7 @@ pub(crate) fn private_resolved_hint(host: &str, resolved: &[std::net::SocketAddr
     }
     let ip = resolved[0].ip().to_canonical();
     format!(
-        "[proxy] {host} resolved to private address {ip}. If it is a trusted internal host, allow it (and its subdomains, and any address it resolves to) with:\n  cplt config set proxy.allow_private_domains {host}   (applies to the next launch)\n  or for this run only: cplt --allow-private-domain {host}"
+        "[proxy] {host} resolved to private address {ip}. If it is a trusted internal host, allow it (and its subdomains, and any address it resolves to) with:\n  cplt config set proxy.allow_private_domains {host}\n(applies within a few seconds when this session reads a config file, otherwise on the next launch). Or for the next run only:\n  cplt --allow-private-domain {host}"
     )
 }
 
@@ -2552,7 +2557,14 @@ fn first_hint_for(host: &str) -> bool {
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    seen.len() < 1024 && seen.insert(host.to_string())
+    if seen.contains(host) {
+        return false;
+    }
+    // Bounded: past the cap, start over rather than going silent for new hosts.
+    if seen.len() >= 1024 {
+        seen.clear();
+    }
+    seen.insert(host.to_string())
 }
 
 /// What to do with a CONNECT target once DNS has answered.
@@ -2891,13 +2903,6 @@ mod tests {
         );
     }
 
-    /// An IP-literal target cannot be rescued by `allow_private_domains`, and the
-    /// documentation says so (`docs/known-impacts.md`, "Internal Maven/Gradle
-    /// repositories on private IPs"). This pins the reason: the private check for
-    /// a literal is the PRE-DNS gate in `classify_connect`, which never consults
-    /// the private-domain list — that list is only read by the post-DNS guard in
-    /// `classify_resolved`. A repository URL written as `https://10.20.30.40/...`
-    /// therefore has no remedy short of giving the host a DNS name.
     #[test]
     fn private_resolved_hint_names_host_ip_and_exact_fix() {
         let ip = ["10.1.2.3:443".parse().unwrap()];
@@ -2908,6 +2913,12 @@ mod tests {
         assert!(hint.contains("cplt --allow-private-domain svc.intern.example.com"));
         assert!(hint.contains("10.1.2.3"));
         assert!(hint.contains("next launch"));
+        // Each command is alone on its own line, so it pastes cleanly.
+        let lines: Vec<&str> = hint.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(&"cplt config set proxy.allow_private_domains svc.intern.example.com")
+        );
+        assert!(lines.contains(&"cplt --allow-private-domain svc.intern.example.com"));
         let odd = private_resolved_hint("evil.com;rm -rf ~", &ip);
         assert!(!odd.contains("rm -rf"));
         assert!(!odd.contains("cplt config set"));
@@ -2959,6 +2970,32 @@ mod tests {
         assert!(!first_hint_for("dedupe-test.example.com"));
     }
 
+    #[test]
+    fn private_hint_cap_evicts_instead_of_going_silent() {
+        for i in 0..1100 {
+            first_hint_for(&format!("flood-{i}.example.com"));
+        }
+        assert!(first_hint_for("after-the-cap.example.com"));
+    }
+
+    #[test]
+    fn inet_aton_style_names_get_generic_advice() {
+        let ip = ["10.1.2.3:443".parse().unwrap()];
+        for bad in ["10.1", "0x0a.1.2.3", "svc.0x7f", "a.1"] {
+            assert!(
+                !private_resolved_hint(bad, &ip).contains("cplt config set"),
+                "{bad}"
+            );
+        }
+    }
+
+    /// An IP-literal target cannot be rescued by `allow_private_domains`, and the
+    /// documentation says so (`docs/known-impacts.md`, "Internal Maven/Gradle
+    /// repositories on private IPs"). This pins the reason: the private check for
+    /// a literal is the PRE-DNS gate in `classify_connect`, which never consults
+    /// the private-domain list — that list is only read by the post-DNS guard in
+    /// `classify_resolved`. A repository URL written as `https://10.20.30.40/...`
+    /// therefore has no remedy short of giving the host a DNS name.
     #[test]
     fn ip_literal_stays_private_blocked_even_when_listed_as_a_private_domain() {
         let mut policy = np(&[], &[], &[443]);
