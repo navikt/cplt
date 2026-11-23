@@ -1945,8 +1945,8 @@ fn merge_tool_path_env_overrides(
             if !resolved.quiet && !covered {
                 ui::warn(&format!(
                     "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
-                 under ~/.cache, ~/Library/Caches, another cplt tool cache, the project or the \
-                 temp dir, so no grant is added. Move it under ~/.cache, or grant it with \
+                 under ~/.cache, ~/Library/Caches, another cplt tool cache, the project or \
+                 /tmp, so no grant is added. Move it under ~/.cache, or grant it with \
                  `allow.{}` if you mean to.",
                     ovr.name,
                     path.to_string_lossy().escape_debug(),
@@ -16942,7 +16942,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         // Under the project (here also home): a temp CARGO_HOME is not a safe
-        // root when TMPDIR is not the confstr user temp dir, as on CI runners.
+        // root: the per-user temp dir never is.
         let cargo = home.join("cargo");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cargo).unwrap();

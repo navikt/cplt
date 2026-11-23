@@ -582,7 +582,11 @@ all links resolved and compared by identity (dev, ino), must be a directory,
 must not be `$HOME`, and must lie under a safe root: a writable `HOME_TOOL_DIRS`
 entry (`~/.cache`, `~/Library/Caches`, `~/.npm`, `~/.gradle`, `~/.m2`,
 `~/.cargo/registry`, the pnpm stores), `~/.local/share/cargo`, `~/.local/share/go`,
-the project, or the system temp dir. A
+the project, or the fixed system temp dir (`/private/tmp` on macOS, `/tmp` on
+Linux). The per-user temp dir (`/var/folders/.../T`, `TMPDIR`) is not a safe
+root: `confstr(_CS_DARWIN_USER_TEMP_DIR)` falls back to `TMPDIR` when
+`DIRHELPER_USER_DIR_SUFFIX` is invalid, and a valid suffix can name a symlink an
+earlier session planted there, so both are steered by a project `.envrc`. A
 target that is the default dir reached through a link counts as the default.
 Read-only SDK vars (`JAVA_HOME`, `DOTNET_ROOT`, `RUSTUP_HOME`, `NODE_PATH`) may
 also lie under any `HOME_TOOL_DIRS` entry, `TOOL_READ_DIRS` or

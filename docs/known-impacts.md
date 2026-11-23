@@ -344,7 +344,8 @@ cplt grants a tool dir named by an env var (`GOCACHE`, `GOPATH`, `CARGO_HOME`,
 `PNPM_HOME`, `PIP_CACHE_DIR`, `JAVA_HOME` and the rest) only when it is a
 directory under a safe root: `~/.cache`, `~/Library/Caches`, another cplt tool
 cache such as `~/.npm` or `~/.gradle`, `~/.local/share/cargo`,
-`~/.local/share/go`, the project, or the system temp dir.
+`~/.local/share/go`, the project, or `/tmp` (`/private/tmp` on macOS). The
+per-user temp dir (`$TMPDIR`, `/var/folders/...` on macOS) does not count.
 SDK vars such as `JAVA_HOME` may also point at a known SDK root (`~/.sdkman`,
 `~/.jdks`, `/usr/lib/jvm`, `/Library/Java`, mise or asdf installs). A project
 `.envrc` can set these variables, so a dir elsewhere is refused with a warning:
