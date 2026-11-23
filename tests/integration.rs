@@ -6558,8 +6558,9 @@ except Exception as e:
     /// An env-relocated tool dir outside the safe roots grants nothing (#1067).
     /// The child writes to the absolute target, not `$VAR`, because cplt
     /// rewrites some cache vars to scratch inside the sandbox.
-    /// `env` adds vars whose values are paths relative to the fake home.
-    fn assert_env_tool_dir_not_granted(var: &str, rel: &str, env: &[(&str, &str)]) {
+    /// `env` adds vars whose values are paths relative to the fake home;
+    /// `file` is the name written under the target.
+    fn assert_env_tool_dir_not_granted(var: &str, rel: &str, env: &[(&str, &str)], file: &str) {
         require_sandbox!();
         let project = tempfile::Builder::new()
             .prefix(".cplt-envdeny-project-")
@@ -6571,7 +6572,7 @@ except Exception as e:
             .expect("create fake home");
         let target = std::fs::canonicalize(home.path()).unwrap().join(rel);
         std::fs::create_dir_all(&target).expect("create target dir");
-        let file = target.join("m.toml");
+        let file = target.join(file);
         let mut cmd = cplt_cmd();
         cmd.args([
             "--yes",
@@ -6600,31 +6601,33 @@ except Exception as e:
 
     #[test]
     fn env_tool_dir_in_protected_path_is_not_granted() {
-        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".nav-pilot/pakker", &[]);
+        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".nav-pilot/pakker", &[], "m.toml");
     }
 
     #[test]
     fn env_tool_dir_at_persistence_path_is_not_granted() {
-        assert_env_tool_dir_not_granted("GOCACHE", "Library/LaunchAgents", &[]);
-        assert_env_tool_dir_not_granted("NPM_CONFIG_CACHE", ".config/fish", &[]);
+        assert_env_tool_dir_not_granted("GOCACHE", "Library/LaunchAgents", &[], "m.toml");
+        assert_env_tool_dir_not_granted("NPM_CONFIG_CACHE", ".config/fish", &[], "m.toml");
     }
 
     /// `TMPDIR` is as attacker-set as `GOCACHE`: pointing it at `$HOME` must
     /// not make a home persistence path a "temp" safe root.
     #[test]
     fn env_tool_dir_tmpdir_at_home_is_not_a_safe_root() {
-        assert_env_tool_dir_not_granted("GOCACHE", "Library/LaunchAgents", &[("TMPDIR", "")]);
-        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".local/bin", &[("TMPDIR", "")]);
-    }
-
-    /// The deny-set second layer on its own: the target sits under
-    /// `~/.cache`, which the positive rule accepts, but is the cplt config dir.
-    #[test]
-    fn env_tool_dir_under_safe_root_but_protected_is_not_granted() {
         assert_env_tool_dir_not_granted(
             "GOCACHE",
-            ".cache/cpltcfg",
-            &[("CPLT_CONFIG", ".cache/cpltcfg/config.toml")],
+            "Library/LaunchAgents",
+            &[("TMPDIR", "")],
+            "m.toml",
         );
+        assert_env_tool_dir_not_granted("PIP_CACHE_DIR", ".local/bin", &[("TMPDIR", "")], "m.toml");
+    }
+
+    /// The deny-set second layer on its own: `~/.gradle` passes the positive
+    /// rule (a writable tool dir), but contains the denied
+    /// `gradle.properties`, so the grant is refused rather than re-opening it.
+    #[test]
+    fn env_tool_dir_under_safe_root_but_protected_is_not_granted() {
+        assert_env_tool_dir_not_granted("GOCACHE", ".gradle", &[], "gradle.properties");
     }
 }
