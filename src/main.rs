@@ -1910,7 +1910,7 @@ fn merge_tool_path_env_overrides(
                 ui::warn(&format!(
                     "Ignoring {} = {}: resolves to an unsafe root or HOME and would defeat the sandbox",
                     ovr.name,
-                    path.display()
+                    path.to_string_lossy().escape_debug()
                 ));
             }
             continue;
@@ -1949,7 +1949,7 @@ fn merge_tool_path_env_overrides(
                  temp dir, so no grant is added. Move it under ~/.cache, or grant it with \
                  `allow.{}` if you mean to.",
                     ovr.name,
-                    path.display(),
+                    path.to_string_lossy().escape_debug(),
                     if ovr.write { "write" } else { "read" }
                 ));
             }
@@ -1962,8 +1962,8 @@ fn merge_tool_path_env_overrides(
                     "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
                  added and writes there stay denied. Point {} at a directory outside it.",
                     ovr.name,
-                    path.display(),
-                    prot.display(),
+                    path.to_string_lossy().escape_debug(),
+                    prot.to_string_lossy().escape_debug(),
                     ovr.name
                 ));
             }

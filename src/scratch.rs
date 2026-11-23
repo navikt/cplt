@@ -304,7 +304,13 @@ pub fn ensure_pnpm_package_manager_stores(
             root == home_dir.join("Library/pnpm") || root == home_dir.join(".local/share/pnpm");
         if from_env
             && !default
-            && !crate::sandbox::env_tool_dir_allowed(&canonical_root, &canonical_home, true, &extra)
+            && (!crate::sandbox::env_tool_dir_allowed(
+                &canonical_root,
+                &canonical_home,
+                true,
+                &extra,
+            ) || crate::sandbox::env_tool_path_protected(&canonical_home, &canonical_root)
+                .is_some())
         {
             continue;
         }

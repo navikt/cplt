@@ -5622,6 +5622,8 @@ finally:
         let target = std::fs::canonicalize(home.path()).unwrap().join(rel);
         std::fs::create_dir_all(&target).expect("create target dir");
         let file = target.join(file);
+        // Proves the shell ran, so a launch failure cannot pass as a denial.
+        let marker = project.path().join("ran");
         let mut cmd = cplt_cmd();
         cmd.args([
             "--yes",
@@ -5632,7 +5634,11 @@ finally:
             &project.path().to_string_lossy(),
             "--",
             "-c",
-            &format!("echo pwned > '{}'", file.display()),
+            &format!(
+                "touch '{}'; echo pwned > '{}'",
+                marker.display(),
+                file.display()
+            ),
         ])
         .env("HOME", home.path())
         .env(var, &target);
@@ -5641,6 +5647,7 @@ finally:
         }
         let output = cmd.output().expect("run cplt");
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(marker.exists(), "the sandboxed shell must run: {stderr}");
         assert!(!file.exists(), "{var}={rel} must not grant write: {stderr}");
         assert!(
             stderr.contains(&format!("Ignoring {var}")),
