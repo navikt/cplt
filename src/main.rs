@@ -1906,11 +1906,13 @@ fn merge_tool_path_env_overrides(
         // so this is the single choke point where the effective grant is vetted.
         // Applies to read grants too (read access to `/` or `$HOME` over-grants).
         if !cplt::sandbox::tool_override_path_is_safe(&path, home) {
-            ui::warn(&format!(
-                "Ignoring {} = {}: resolves to an unsafe root or HOME and would defeat the sandbox",
-                ovr.name,
-                path.display()
-            ));
+            if !resolved.quiet {
+                ui::warn(&format!(
+                    "Ignoring {} = {}: resolves to an unsafe root or HOME and would defeat the sandbox",
+                    ovr.name,
+                    path.display()
+                ));
+            }
             continue;
         }
         // The same tree as the default, reached through a link
@@ -1926,14 +1928,21 @@ fn merge_tool_path_env_overrides(
         // Positive rule: an env-derived grant is automatic, and a project
         // `.envrc` or mise `[env]` can set it, so it is granted only under a
         // known safe root, never at an arbitrary persistence path.
-        let temp = std::fs::canonicalize(std::env::temp_dir()).ok();
+        let temp = cplt::sandbox::env_tool_temp_roots(home);
         let extra: Vec<&Path> = std::iter::once(project_dir)
-            .chain(temp.as_deref())
+            .chain(temp.iter().map(PathBuf::as_path))
             .collect();
         if !cplt::sandbox::env_tool_dir_allowed(&path, home, ovr.write, &extra) {
+            // An explicit `allow.*` grant already covers it: nothing to report.
+            let reads: &[PathBuf] = if ovr.write { &[] } else { &resolved.allow_read };
+            let covered = resolved
+                .allow_write
+                .iter()
+                .chain(reads)
+                .any(|g| std::fs::canonicalize(g).is_ok_and(|g| path.starts_with(g)));
             // `cplt exec` promises clean stderr: quiet hides this, like the
             // other launch warnings.
-            if !resolved.quiet {
+            if !resolved.quiet && !covered {
                 ui::warn(&format!(
                     "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
                  under ~/.cache, ~/Library/Caches, another cplt tool cache, the project or the \
@@ -1948,14 +1957,16 @@ fn merge_tool_path_env_overrides(
         }
         // Second layer: never open a protected path.
         if let Some(prot) = cplt::sandbox::env_tool_path_protected(home, &path) {
-            ui::warn(&format!(
-                "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
+            if !resolved.quiet {
+                ui::warn(&format!(
+                    "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
                  added and writes there stay denied. Point {} at a directory outside it.",
-                ovr.name,
-                path.display(),
-                prot.display(),
-                ovr.name
-            ));
+                    ovr.name,
+                    path.display(),
+                    prot.display(),
+                    ovr.name
+                ));
+            }
             continue;
         }
         // One root per default tree: a second segment of a list var
@@ -7560,6 +7571,7 @@ fn assemble_sandbox(
                 || std::env::current_dir().unwrap_or_else(|_| probe.project_dir.clone()),
                 Path::to_path_buf,
             );
+            scratch::ensure_pnpm_package_manager_stores(home_dir, Some(&probe.project_dir))?;
             scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm, &launch_dir)
         })
         .transpose()

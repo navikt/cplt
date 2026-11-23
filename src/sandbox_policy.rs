@@ -2753,6 +2753,39 @@ pub fn env_tool_dir_allowed(path: &Path, home: &Path, write: bool, extra: &[&Pat
         .any(|a| id(a).is_some_and(|i| ids.contains(&i)))
 }
 
+/// The system temp roots an env-set tool dir may live under (#1067).
+///
+/// Never derived from `TMPDIR`: a project `.envrc` sets that as easily as
+/// `GOCACHE`, so `TMPDIR=$HOME` would turn any home path into a "temp" grant.
+/// macOS uses `confstr(_CS_DARWIN_USER_TEMP_DIR)` plus `/private/tmp`; Linux
+/// uses `/tmp`. A root that is `home` or an ancestor of it is dropped.
+#[must_use]
+pub fn env_tool_temp_roots(home: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let raw = {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = [0 as libc::c_char; 1024];
+        // SAFETY: buf is valid for buf.len() bytes; confstr NUL-terminates.
+        let n =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+        let user = (n > 0 && n <= buf.len()).then(|| {
+            // SAFETY: confstr wrote a NUL-terminated string into buf.
+            let c = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+            PathBuf::from(std::ffi::OsStr::from_bytes(c.to_bytes()))
+        });
+        user.into_iter()
+            .chain([PathBuf::from("/private/tmp")])
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let raw = vec![PathBuf::from("/tmp")];
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    raw.into_iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .filter(|r| !home.starts_with(r))
+        .collect()
+}
+
 /// Return the home tool directory list.
 ///
 /// A single unified list covers both macOS and Linux paths. Entries for

@@ -131,7 +131,7 @@ pub use policy::{
     copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_dir, cplt_state_file,
     credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
     cypress_runtime_intent, dir_overlaps_credentials, env_tool_dir_allowed,
-    env_tool_path_protected, exec_write_conflicts, first_party_read_target,
+    env_tool_path_protected, env_tool_temp_roots, exec_write_conflicts, first_party_read_target,
     home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
     linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
     no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
