@@ -121,9 +121,17 @@ fn apply_puppeteer_cache(
     }
 }
 
-fn apply_session_env(cmd: &mut Command, extra_env: &[(String, String)], deny_env: &[String]) {
-    // No v2 strip here: cplt never sets the #695 handover under v2
-    // (`opencode_handover_applies`), so only a user-passed value remains.
+fn apply_session_env(
+    cmd: &mut Command,
+    opencode_v2: bool,
+    extra_env: &[(String, String)],
+    deny_env: &[String],
+) {
+    // v2 ignores the #695 handover: a credential there, even a user-passed
+    // one, is only exposure (#716/#729).
+    if opencode_v2 {
+        cmd.env_remove("OPENCODE_AUTH_CONTENT");
+    }
     cmd.envs(
         extra_env
             .iter()
@@ -1726,7 +1734,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, &sandbox.extra_env, deny_env);
+    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
@@ -1878,7 +1886,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, &sandbox.extra_env, deny_env);
+    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
@@ -2123,7 +2131,7 @@ fn exec_bwrap(
         sandbox.opencode_v2,
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, &sandbox.extra_env, deny_env);
+    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
@@ -3355,15 +3363,21 @@ mod keychain_substitute_tests {
 
     /// OpenCode v2: a user-passed OPENCODE_AUTH_CONTENT is kept (SECURITY.md).
     #[test]
-    fn session_env_keeps_user_opencode_auth_content() {
-        let mut cmd = Command::new("true");
-        cmd.env("OPENCODE_AUTH_CONTENT", "{}");
-        apply_session_env(&mut cmd, &[], &[]);
-        let set: Vec<_> = cmd.get_envs().collect();
+    fn session_env_keeps_user_opencode_auth_content_on_v1_only() {
+        let mut v1 = Command::new("true");
+        v1.env("OPENCODE_AUTH_CONTENT", "{}");
+        apply_session_env(&mut v1, false, &[], &[]);
+        let set: Vec<_> = v1.get_envs().collect();
         assert_eq!(
             set,
             vec![("OPENCODE_AUTH_CONTENT".as_ref(), Some("{}".as_ref()))]
         );
+
+        let mut v2 = Command::new("true");
+        v2.env("OPENCODE_AUTH_CONTENT", "{}");
+        apply_session_env(&mut v2, true, &[], &[]);
+        let set: Vec<_> = v2.get_envs().collect();
+        assert_eq!(set, vec![("OPENCODE_AUTH_CONTENT".as_ref(), None)]);
     }
 
     #[test]
@@ -3373,7 +3387,7 @@ mod keychain_substitute_tests {
             ("OPENAI_API_KEY".to_string(), "x".to_string()),
             ("KEEP".to_string(), "y".to_string()),
         ];
-        apply_session_env(&mut cmd, &extra, &["OPENAI_API_KEY".to_string()]);
+        apply_session_env(&mut cmd, false, &extra, &["OPENAI_API_KEY".to_string()]);
         let set: Vec<_> = cmd.get_envs().collect();
         assert_eq!(set, vec![("KEEP".as_ref(), Some("y".as_ref()))]);
     }
