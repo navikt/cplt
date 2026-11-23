@@ -48,12 +48,15 @@ pub fn is_github_mcp_url(url: &str) -> bool {
 /// legacy `mcp.<name>` that v2 still reads; the name).
 pub type Entry = (bool, String);
 
-/// The entries in `config` that point at GitHub's MCP.
+/// The entries in `config` that point at GitHub's MCP, skipping any the user
+/// turned off with `"enabled": false`: no proxy for those, and the entry stays
+/// as written (#1062).
 pub fn github_servers(config: &Value) -> Vec<Entry> {
     let is_github = |s: &Value| {
-        s.get("url")
-            .and_then(Value::as_str)
-            .is_some_and(is_github_mcp_url)
+        s.get("enabled").and_then(Value::as_bool) != Some(false)
+            && s.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(is_github_mcp_url)
     };
     let mut out = Vec::new();
     for (v2, map) in [
@@ -77,7 +80,8 @@ pub fn github_servers(config: &Value) -> Vec<Entry> {
 pub fn overlay(existing: Option<&str>, entries: &[Entry], proxy_url: &str) -> Option<String> {
     let mut root = match existing.map(str::trim).filter(|s| !s.is_empty()) {
         None => Map::new(),
-        Some(s) => match serde_json::from_str(s).ok()? {
+        // JSONC, as OpenCode and `user_configs` read it (#1062).
+        Some(s) => match serde_json::from_str(&crate::agent::strip_jsonc(s)).ok()? {
             Value::Object(m) => m,
             _ => return None,
         },
@@ -234,6 +238,13 @@ mod tests {
         assert_eq!(configured_servers(&[], None, None), []);
     }
 
+    /// #1062: a disabled entry gets no proxy and is left as written.
+    #[test]
+    fn disabled_entries_are_not_routed() {
+        let c: Value = serde_json::from_str(r#"{"mcp":{"servers":{"off":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"},"on":{"enabled":true,"url":"https://api.githubcopilot.com/mcp"}},"legacy":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"}}}"#).unwrap();
+        assert_eq!(github_servers(&c), [(true, "on".to_string())]);
+    }
+
     #[test]
     fn overlay_keeps_the_users_keys() {
         let existing = r#"{"model":"x","mcp":{"servers":{"gh":{"enabled":true,"headers":{"a":"b"}},"o":{"url":"u"}}}}"#;
@@ -262,6 +273,17 @@ mod tests {
                 old["mcp"].get("servers")
             ),
             (Some(false), None)
+        );
+        // #1062: OPENCODE_CONFIG_CONTENT in JSONC is still rewritten.
+        let jsonc = "{\n // c\n \"model\": \"x\",\n}";
+        let v: Value =
+            serde_json::from_str(&overlay(Some(jsonc), &gh, "http://p").unwrap()).unwrap();
+        assert_eq!(
+            (
+                v["model"].as_str(),
+                v["mcp"]["servers"]["gh"]["url"].as_str()
+            ),
+            (Some("x"), Some("http://p"))
         );
         assert_eq!(overlay(Some("[1]"), &gh, "http://p"), None);
         assert_eq!(overlay(Some("{\"mcp\":1}"), &gh, "http://p"), None);
