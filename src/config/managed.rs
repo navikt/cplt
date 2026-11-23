@@ -8,8 +8,11 @@
 //! rule is positive: the canonical path (every symlink hop resolved) must lie
 //! under [`TRUSTED_DIR`] in the account's home directory, taken from the
 //! passwd entry. That is inside cplt's own state tree (`.config/cplt`), which
-//! every agent profile denies on macOS and Linux and where every grant,
-//! `allow.write` and env-relocated tool dirs alike, is refused. The file is
+//! every agent profile denies on macOS and Linux, both as spelled from `$HOME`
+//! and in the passwd home. Refused there: any grant (`allow.*`, env-relocated
+//! tool dirs) inside the tree, and any writable tree (`allow.write`, the
+//! project, named repos, agent and tool dirs) that is the tree or an ancestor
+//! of it, such as `~/.config` or `$HOME`. The file is
 //! opened beneath the trusted dir one component at a time with `O_NOFOLLOW`,
 //! so the file read is the one trust was decided on. The denies are spelled
 //! from `$HOME`, so the file is also refused when `$HOME` does not resolve to
@@ -37,9 +40,8 @@ const SCHEMA: i64 = 1;
 const LIMIT: u64 = 64 * 1024;
 
 /// The directory, relative to the passwd home, a managed file must live under.
-/// It is inside cplt's own state tree, where every grant (`allow.*`, and
-/// env-relocated tool dirs such as `GOCACHE`) is refused, so no agent can
-/// write it.
+/// It is inside cplt's own state tree: grants inside it, and writable trees
+/// that contain it, are refused (see the module docs), so no agent can write it.
 pub const TRUSTED_DIR: &str = ".config/cplt/managed.d";
 
 /// Open `rel` beneath the directory `dir`, one component at a time with
