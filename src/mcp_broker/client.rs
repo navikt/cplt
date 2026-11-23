@@ -49,7 +49,8 @@ pub fn opencode_overlay(
 ) -> Option<String> {
     let mut root = match existing.map(str::trim).filter(|s| !s.is_empty()) {
         None => Map::new(),
-        Some(s) => match serde_json::from_str(s).ok()? {
+        // JSONC, as OpenCode and `user_configs` read it (#1062).
+        Some(s) => match serde_json::from_str(&crate::agent::strip_jsonc(s)).ok()? {
             Value::Object(m) => m,
             _ => return None,
         },
@@ -257,6 +258,12 @@ mod tests {
         let out: Value =
             serde_json::from_str(&opencode_overlay(Some(r#"{"a":1}"#), &[], &[&s], sock).unwrap())
                 .unwrap();
+        assert_eq!(out["a"], 1);
+        // #1062: JSONC is read, not dropped.
+        let out: Value = serde_json::from_str(
+            &opencode_overlay(Some("{\"a\":1, // c\n}"), &[], &[&s], sock).unwrap(),
+        )
+        .unwrap();
         assert_eq!(out["a"], 1);
         assert_eq!(out["mcp"]["servers"]["nais-mcp"]["type"], "local");
         assert!(opencode_overlay(Some("[]"), &[], &[&s], sock).is_none());

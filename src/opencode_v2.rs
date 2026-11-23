@@ -541,16 +541,15 @@ pub fn github_mcp(
     }
 }
 
-/// The user's OpenCode config dirs: `$XDG_CONFIG_HOME/opencode`, then an
-/// absolute `OPENCODE_CONFIG_DIR`. Never a project dir.
+/// The user's OpenCode config dir: an absolute `OPENCODE_CONFIG_DIR`, which
+/// replaces `$XDG_CONFIG_HOME/opencode` as in OpenCode 2.3.2. Never a project dir.
 pub(crate) fn user_config_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode")];
-    dirs.extend(
+    vec![
         std::env::var_os("OPENCODE_CONFIG_DIR")
             .map(PathBuf::from)
-            .filter(|p| p.is_absolute()),
-    );
-    dirs
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode")),
+    ]
 }
 
 /// `overlay` = a link per entry of `user`, except `opencode`, which becomes a

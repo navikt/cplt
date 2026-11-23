@@ -48,12 +48,17 @@ pub fn is_github_mcp_url(url: &str) -> bool {
 /// legacy `mcp.<name>` that v2 still reads; the name).
 pub type Entry = (bool, String);
 
-/// The entries in `config` that point at GitHub's MCP.
+/// The entries in `config` that point at GitHub's MCP, skipping any the user
+/// turned off with `"enabled": false` (legacy) or `"disabled": true` (v2's own
+/// form, which OpenCode 2.3.2 rewrites `enabled: false` into): no proxy for
+/// those, and the entry stays as written (#1062).
 pub fn github_servers(config: &Value) -> Vec<Entry> {
     let is_github = |s: &Value| {
-        s.get("url")
-            .and_then(Value::as_str)
-            .is_some_and(is_github_mcp_url)
+        s.get("enabled").and_then(Value::as_bool) != Some(false)
+            && s.get("disabled").and_then(Value::as_bool) != Some(true)
+            && s.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(is_github_mcp_url)
     };
     let mut out = Vec::new();
     for (v2, map) in [
@@ -77,7 +82,8 @@ pub fn github_servers(config: &Value) -> Vec<Entry> {
 pub fn overlay(existing: Option<&str>, entries: &[Entry], proxy_url: &str) -> Option<String> {
     let mut root = match existing.map(str::trim).filter(|s| !s.is_empty()) {
         None => Map::new(),
-        Some(s) => match serde_json::from_str(s).ok()? {
+        // JSONC, as OpenCode and `user_configs` read it (#1062).
+        Some(s) => match serde_json::from_str(&crate::agent::strip_jsonc(s)).ok()? {
             Value::Object(m) => m,
             _ => return None,
         },
@@ -102,7 +108,7 @@ fn object_at<'a>(map: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut M
 }
 
 /// The GitHub MCP entries in the config files the user controls: the config
-/// dirs (`$XDG_CONFIG_HOME/opencode`, `OPENCODE_CONFIG_DIR`), `OPENCODE_CONFIG`
+/// dir (`OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`), `OPENCODE_CONFIG`
 /// and `OPENCODE_CONFIG_CONTENT`. Project files are agent-writable and never
 /// count: an agent must not be able to switch on spending the user's token.
 /// `nav-pilot mcp enable --client opencode` writes the user config dir.
@@ -111,17 +117,35 @@ pub fn configured_servers(
     config_file: Option<&Path>,
     content: Option<&str>,
 ) -> Vec<Entry> {
-    let mut names: Vec<Entry> = user_configs(dirs, config_file, content)
-        .iter()
-        .flat_map(github_servers)
-        .collect();
+    // cplt deep-merges these in order and judges each entry as merged, so a
+    // URL in one file and an off switch in a later one counts as off. OpenCode
+    // 2.3.2 instead drops an entry lacking `type`/`url` from its document, so
+    // the two may disagree; that only ever leaves cplt not proxying (fail safe).
+    let mut merged = Value::Object(Map::new());
+    for c in user_configs(dirs, config_file, content) {
+        deep_merge(&mut merged, c);
+    }
+    let mut names = github_servers(&merged);
     names.sort();
     names.dedup();
     names
 }
 
-/// The user's OpenCode configs, parsed: `config.json`, `opencode.json` and
-/// `opencode.jsonc` in each of `dirs`, then `config_file`, then `content`.
+/// `over` merged into `base`, objects key by key, anything else replaced:
+/// OpenCode's merge of its config layers.
+fn deep_merge(base: &mut Value, over: Value) {
+    match (base, over) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                deep_merge(b.entry(k).or_insert(Value::Null), v);
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
+/// The user's OpenCode configs, parsed: `opencode.json` and `opencode.jsonc`
+/// in each of `dirs` (OpenCode 2.3.2 never loads `config.json`), then `config_file`, then `content`.
 /// Read as untrusted (no symlinks, size cap); unreadable or invalid ones are
 /// skipped. Project config is never among them.
 pub fn user_configs(
@@ -131,7 +155,7 @@ pub fn user_configs(
 ) -> Vec<Value> {
     let mut files: Vec<PathBuf> = dirs
         .iter()
-        .flat_map(|d| ["config.json", "opencode.json", "opencode.jsonc"].map(|f| d.join(f)))
+        .flat_map(|d| ["opencode.json", "opencode.jsonc"].map(|f| d.join(f)))
         .collect();
     files.extend(config_file.map(Path::to_path_buf));
     let mut texts: Vec<String> = files
@@ -182,6 +206,30 @@ pub(crate) fn install_for_test(upstream: &str, token: &str, secret: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fable/Copilot on #1083: `enabled` is judged on the merged config.
+    #[test]
+    fn enabled_is_judged_after_merging_the_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = r#"{"mcp":{"gh":{"url":"https://api.githubcopilot.com/mcp"}}}"#;
+        std::fs::write(dir.path().join("opencode.json"), url).unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        let off = r#"{"mcp":{"gh":{"enabled":false}}}"#;
+        assert!(configured_servers(&dirs, None, Some(off)).is_empty());
+        let on = r#"{"mcp":{"gh":{"enabled":true}}}"#;
+        assert_eq!(
+            configured_servers(&dirs, None, Some(on)),
+            [(false, "gh".to_string())]
+        );
+        // A disabled, B enabled: on, since the merged entry has the URL.
+        let a = r#"{"mcp":{"gh":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"}}}"#;
+        std::fs::write(dir.path().join("opencode.json"), a).unwrap();
+        assert_eq!(
+            configured_servers(&dirs, None, Some(on)),
+            [(false, "gh".to_string())]
+        );
+        assert!(configured_servers(&dirs, None, None).is_empty());
+    }
 
     #[test]
     fn url_detection() {
@@ -234,6 +282,25 @@ mod tests {
         assert_eq!(configured_servers(&[], None, None), []);
     }
 
+    /// #1062: a disabled entry gets no proxy and is left as written.
+    #[test]
+    fn disabled_entries_are_not_routed() {
+        let c: Value = serde_json::from_str(r#"{"mcp":{"servers":{"off":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"},"on":{"enabled":true,"url":"https://api.githubcopilot.com/mcp"}},"legacy":{"enabled":false,"url":"https://api.githubcopilot.com/mcp"}}}"#).unwrap();
+        assert_eq!(github_servers(&c), [(true, "on".to_string())]);
+    }
+
+    /// OpenCode v2's own off switch, `"disabled": true`, also means no proxy,
+    /// including when a later file adds it to an earlier file's entry.
+    #[test]
+    fn v2_disabled_entries_are_not_routed() {
+        let c: Value = serde_json::from_str(r#"{"mcp":{"servers":{"off":{"disabled":true,"url":"https://api.githubcopilot.com/mcp"},"on":{"disabled":false,"url":"https://api.githubcopilot.com/mcp"}},"legacy":{"disabled":true,"url":"https://api.githubcopilot.com/mcp"}}}"#).unwrap();
+        assert_eq!(github_servers(&c), [(true, "on".to_string())]);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), r#"{"mcp":{"servers":{"gh":{"type":"remote","url":"https://api.githubcopilot.com/mcp"}}}}"#).unwrap();
+        let later = r#"{"mcp":{"servers":{"gh":{"disabled":true}}}}"#;
+        assert!(configured_servers(&[], Some(file.path()), Some(later)).is_empty());
+    }
+
     #[test]
     fn overlay_keeps_the_users_keys() {
         let existing = r#"{"model":"x","mcp":{"servers":{"gh":{"enabled":true,"headers":{"a":"b"}},"o":{"url":"u"}}}}"#;
@@ -262,6 +329,17 @@ mod tests {
                 old["mcp"].get("servers")
             ),
             (Some(false), None)
+        );
+        // #1062: OPENCODE_CONFIG_CONTENT in JSONC is still rewritten.
+        let jsonc = "{\n // c\n \"model\": \"x\",\n}";
+        let v: Value =
+            serde_json::from_str(&overlay(Some(jsonc), &gh, "http://p").unwrap()).unwrap();
+        assert_eq!(
+            (
+                v["model"].as_str(),
+                v["mcp"]["servers"]["gh"]["url"].as_str()
+            ),
+            (Some("x"), Some("http://p"))
         );
         assert_eq!(overlay(Some("[1]"), &gh, "http://p"), None);
         assert_eq!(overlay(Some("{\"mcp\":1}"), &gh, "http://p"), None);
