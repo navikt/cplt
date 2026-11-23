@@ -777,18 +777,18 @@ mod tests {
         let info = lookup_key("allow.read").unwrap();
         let home = expand_tilde("~/t").to_string_lossy().to_string();
         let parse = |s: &str| s.parse::<toml_edit::DocumentMut>().unwrap();
-        // exact wins over expanded: the literal entry goes, the absolute stays.
+        // every spelling of the same path goes: literal and expanded.
         let mut doc = parse(&format!("[allow]\nread = [\"{home}\", \"~/t\"]\n"));
         assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
-        assert!(doc.to_string().contains(&home) && !doc.to_string().contains("~/t"));
+        assert!(!doc.to_string().contains(&home) && !doc.to_string().contains("~/t"));
         // expanded fallback.
         let mut doc = parse(&format!("[allow]\nread = [\"{home}\"]\n"));
         assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
-        // normalised fallback, and exact beats normalised.
+        // normalised fallback.
         let info = lookup_key("proxy.allow_private_domains").unwrap();
         let mut doc = parse("[proxy]\nallow_private_domains = [\"A.no\", \"a.no\"]\n");
         assert!(remove_array_element_in_doc(&mut doc, info, "A.no").unwrap());
-        assert!(doc.to_string().contains("\"a.no\"") && !doc.to_string().contains("A.no"));
+        assert!(!doc.to_string().to_lowercase().contains("a.no"), "{doc}");
         let mut doc = parse("[proxy]\nallow_private_domains = [\"a.no\"]\n");
         assert!(remove_array_element_in_doc(&mut doc, info, "A.no.").unwrap());
         // every spelling goes, whichever rule matches it.
