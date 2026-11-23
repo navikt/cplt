@@ -387,6 +387,19 @@ fn gh_gate_blocks_auth_token_with_hostname() {
 }
 
 #[test]
+fn gh_gate_reads_group_hostname_flag_like_gh() {
+    // gh 2.105 runs `auth token` here: `-h` eats `git-credential` (#1075).
+    let (_, stderr, ok) = gh_gate(&["auth", "-h", "git-credential", "token", "-h", "github.com"]);
+    assert_refused(&stderr, ok, "revealing the GitHub token");
+}
+
+#[test]
+fn gh_gate_refuses_unknown_flag_before_auth_subcommand() {
+    let (_, stderr, ok) = gh_gate(&["auth", "-x", "git-credential", "token"]);
+    assert_refused(&stderr, ok, "before the gh subcommand");
+}
+
+#[test]
 fn gh_gate_allows_auth_status() {
     let (_, _, ok) = gh_gate(&["auth", "status"]);
     assert!(ok, "gh auth status should be allowed (not exfiltration)");
@@ -1374,6 +1387,25 @@ fn gh_gate_default_still_blocks_api_post() {
         ok,
         "gh api with input flags implies write operation",
     );
+}
+
+#[test]
+fn gh_gate_refuses_lone_dash_before_subcommand() {
+    for args in [
+        &["gist", "-", "-d", "view", "create"][..],
+        &["ssh-key", "-", "-t", "list", "add"],
+        &["pr", "-", "--body", "view", "merge"],
+        &["-", "gist", "-d", "view", "create"],
+        &["-", "pr", "--body", "view", "merge"],
+        &["-", "--body", "-R", "pr", "--body", "-R", "merge"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert!(!ok, "{args:?} should be refused");
+        assert!(
+            stderr.contains("'-' before the gh subcommand"),
+            "{args:?}: {stderr}"
+        );
+    }
 }
 
 #[test]

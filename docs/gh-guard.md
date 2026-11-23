@@ -158,6 +158,8 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 5. If allowed, `exec()` replaces the process with the real `gh`, so there is no runtime overhead
 6. If blocked, it prints an error explaining why and exits non-zero
 
+A flag before the subcommand, other than `-R`/`--repo`, `--hostname`/`-h` or `--help`, is refused: gh may read the next word as that flag's value and run a different subcommand than the one checked, so put flags after the subcommand.
+
 > **Note:** Wrappers require the scratch directory. If you run with `--no-scratch-dir`,
 > the gh/git guards will be inactive. `cplt doctor` then shows `push main` and
 > `pr merge` as ALLOWED on its `guard:` lines.
