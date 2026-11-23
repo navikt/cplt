@@ -1555,7 +1555,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
                 }
                 let action = match pending.lock() {
                     Ok(mut p) => {
-                        let a = on_server(&line, &spec, &mut p);
+                        let a = on_server(&line, &spec, "", &mut p);
                         if let Some(text) = p.1.take() {
                             log.line(&spec.id, &text);
                         }
@@ -1625,7 +1625,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     while let Some(line) = read_line(&mut reader, MAX_MESSAGE) {
         let action = match pending.lock() {
             Ok(mut p) => {
-                let a = on_client(&line, spec, &mut p);
+                let a = on_client(&line, spec, "", &mut p);
                 if let Some(text) = p.1.take() {
                     shared.log.line(&spec.id, &text);
                 }

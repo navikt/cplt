@@ -145,16 +145,16 @@ struct Filter<'a> {
     audit: Option<String>,
     /// This exchange's `Mcp-Session-Id` ("" if none): ids are per session.
     session: String,
+    /// An event with an `id:` passed, so the client may resume the stream
+    /// with `Last-Event-ID` and get the response there.
+    resumable: bool,
 }
 
 impl<'a> Filter<'a> {
     fn lock(&self) -> std::sync::MutexGuard<'a, Pending> {
-        let mut p = self
-            .pending
+        self.pending
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        p.2.clone_from(&self.session);
-        p
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -162,14 +162,48 @@ impl<'a> Filter<'a> {
 /// not a response for it came back (upstream error, curl failure): else
 /// every such failure would hold an in-flight slot until the timeout.
 /// The `Instant` makes sure a later request reusing the id is left alone.
-struct OwnId<'a>(&'a Mutex<Pending>, String, String, std::time::Instant);
+/// A `tools/call` still unanswered here gets its audit line from here, so
+/// every call is logged exactly once: by the response, a cancel, eviction,
+/// or this.
+struct OwnId<'a> {
+    ep: &'a Endpoint,
+    log: &'a Log,
+    session: String,
+    id: String,
+    sent: std::time::Instant,
+    /// The upstream status, or why there was none.
+    outcome: String,
+    /// A resumable stream: leave the id for the resumed GET or eviction.
+    keep: bool,
+}
 
 impl Drop for OwnId<'_> {
     fn drop(&mut self) {
-        self.0
+        if self.keep {
+            return;
+        }
+        let freed = self
+            .ep
+            .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.1, &self.2, self.3);
+            .remove(&self.session, &self.id, self.sent);
+        if let Some(tool) = freed {
+            let ms = self.sent.elapsed().as_millis();
+            // curl's --max-time is the timeout, so a call this old timed out.
+            let outcome = if ms >= u128::from(self.ep.timeout_secs) * 1000 {
+                "TIMEOUT".to_string()
+            } else {
+                format!("FAIL {}", self.outcome)
+            };
+            self.log.line(
+                &self.ep.tag,
+                &self.ep.upstream,
+                true,
+                "POST",
+                &format!("tools/call {tool} → {outcome} {ms}ms"),
+            );
+        }
     }
 }
 
@@ -526,6 +560,21 @@ impl Endpoint {
                 "FAIL bad body",
             );
         }
+        // Ids are keyed by session, so the session must be unambiguous.
+        let sessions = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+            .count();
+        if self.policy.is_some() && sessions > 1 {
+            reply(&mut client, "400 Bad Request");
+            return log.line(
+                &self.tag,
+                &self.upstream,
+                true,
+                method,
+                "FAIL more than one Mcp-Session-Id",
+            );
+        }
         // The spec's tool policy, as for a stdio server: one JSON-RPC
         // message per POST (batches refused), checked and re-serialised.
         let mut filter = self.policy.as_ref().map(|spec| Filter {
@@ -533,6 +582,7 @@ impl Endpoint {
             pending: &self.pending,
             audit: None,
             session: header("mcp-session-id").unwrap_or_default().to_string(),
+            resumable: false,
         });
         // Only a POST body is checked, so no other method may carry one.
         if self.policy.is_some() && method != "POST" && !body.is_empty() {
@@ -545,36 +595,38 @@ impl Endpoint {
                 "FAIL body on non-POST",
             );
         }
-        let mut _own = None;
+        let mut own = None;
         if let Some(f) = &mut filter
             && method == "POST"
         {
-            let action = {
+            let (action, evicted) = {
                 let mut p = f.lock();
                 // curl gives up at the same deadline, so nothing is left to cancel.
                 let evicted = p.evict(std::time::Duration::from_secs(self.timeout_secs));
-                for audit in evicted.into_iter().filter_map(|(_, _, a)| a) {
-                    log.line(
-                        &self.tag,
-                        &self.upstream,
-                        self.policy.is_some(),
-                        method,
-                        &audit,
-                    );
-                }
-                let action = on_client(&String::from_utf8_lossy(&body), f.spec, &mut p);
+                let action = on_client(&String::from_utf8_lossy(&body), f.spec, &f.session, &mut p);
                 f.audit = p.1.take();
                 if let Action::Forward(line) = &action {
                     let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
                     let id = v.get("id").filter(|_| v.get("method").is_some());
-                    _own = id.and_then(|id| {
+                    own = id.and_then(|id| {
                         let id = id.to_string();
                         let sent = p.sent(&f.session, &id)?;
-                        Some(OwnId(&self.pending, f.session.clone(), id, sent))
+                        Some(OwnId {
+                            ep: self,
+                            log,
+                            session: f.session.clone(),
+                            id,
+                            sent,
+                            outcome: "upstream not reached".into(),
+                            keep: false,
+                        })
                     });
                 }
-                action
+                (action, evicted)
             };
+            for audit in evicted.into_iter().filter_map(|(_, _, a)| a) {
+                log.line(&self.tag, &self.upstream, true, method, &audit);
+            }
             match action {
                 Action::Forward(line) => body = line.into_bytes(),
                 Action::Reply(line, why) => {
@@ -678,6 +730,12 @@ impl Endpoint {
             .retain(|&(_, p)| p != child.id());
         let _ = child.kill();
         let _ = child.wait();
+        if let Some(own) = &mut own {
+            let code = status.as_ref().map(|(c, _)| c.as_str());
+            own.outcome = code.unwrap_or("upstream").to_string();
+            own.keep = code.is_some_and(|c| c.starts_with('2'))
+                && filter.as_ref().is_some_and(|f| f.resumable);
+        }
         if let Some(audit) = filter.and_then(|f| f.audit) {
             log.line(
                 &self.tag,
@@ -841,7 +899,7 @@ fn filter_message(data: &[u8], f: &mut Filter) -> Result<String, &'static str> {
     serde_json::from_str::<serde_json::Value>(text).map_err(|_| "unparsable message")?;
     let action = {
         let mut p = f.lock();
-        let action = on_server(text, f.spec, &mut p);
+        let action = on_server(text, f.spec, &f.session, &mut p);
         if let Some(a) = p.1.take() {
             f.audit = Some(a);
         }
@@ -904,6 +962,7 @@ fn filter_events(
                 return Err("unknown event field");
             }
         }
+        f.resumable |= fields.lines().any(|l| l.starts_with("id:"));
         let event = if data.is_empty() {
             fields + "\n"
         } else if data.iter().all(String::is_empty) {
@@ -1333,35 +1392,42 @@ mod tests {
 
     /// A one-shot local upstream answering `answer`; sends back what it got.
     fn fake_upstream(answer: &'static [u8]) -> (String, std::sync::mpsc::Receiver<String>) {
+        fake_upstreams(vec![answer])
+    }
+
+    /// One answer per connection, in order.
+    fn fake_upstreams(answers: Vec<&'static [u8]>) -> (String, std::sync::mpsc::Receiver<String>) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", l.local_addr().unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let (mut s, _) = l.accept().unwrap();
-            let mut got = Vec::new();
-            let mut buf = [0; 4096];
-            while let Ok(n) = s.read(&mut buf) {
-                got.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&got);
-                if let Some(end) = text.find("\r\n\r\n") {
-                    let len = text
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if got.len() >= end + 4 + len {
+            for answer in answers {
+                let (mut s, _) = l.accept().unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0; 4096];
+                while let Ok(n) = s.read(&mut buf) {
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if got.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    if n == 0 {
                         break;
                     }
                 }
-                if n == 0 {
-                    break;
-                }
+                let _ = tx.send(String::from_utf8_lossy(&got).into_owned());
+                let _ = s.write_all(answer);
             }
-            let _ = tx.send(String::from_utf8_lossy(&got).into_owned());
-            let _ = s.write_all(answer);
         });
         (url, rx)
     }
@@ -1630,6 +1696,110 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         assert!(log.contains("tools/call get_me → ALLOWED "));
     }
 
+    const CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#;
+
+    /// A failed call is audited by name, once.
+    #[test]
+    fn failed_tools_call_logs_the_audit_line_once() {
+        let Some(curl) = real_curl() else { return };
+        let (url, _got) = fake_upstream(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+        let (_, log) = through(url, curl, CALL);
+        assert_eq!(
+            log.matches("tools/call get_me → FAIL 502 ").count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+    }
+
+    #[test]
+    fn timed_out_tools_call_logs_the_audit_line_once() {
+        let Some(curl) = real_curl() else { return };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", l.local_addr().unwrap());
+        // Accept and never answer.
+        std::thread::spawn(move || {
+            let held = l.accept();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            drop(held);
+        });
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        ep.timeout_secs = 1;
+        let (_, log) = serve_on(&ep, "POST", CALL);
+        assert_eq!(
+            log.matches("tools/call get_me → TIMEOUT ").count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(log.matches("tools/call").count(), 1, "{log}");
+        assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
+    }
+
+    /// A stream that primed an event id and closed keeps the call in flight,
+    /// so the client's GET with `Last-Event-ID` gets the filtered response.
+    #[test]
+    fn a_primed_stream_resumes_with_last_event_id() {
+        let Some(curl) = real_curl() else { return };
+        const ANSWERS: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 1\nretry: 10\ndata:\n\n",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 2\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_me\"},{\"name\":\"delete_repo\"}]}}\n\n",
+        ];
+        let (url, got) = fake_upstreams(ANSWERS.to_vec());
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        let (reply, log) = serve_on(&ep, "POST", CALL);
+        assert!(
+            reply.contains("id: 1\nretry: 10\ndata:\n\n"),
+            "priming not passed"
+        );
+        assert!(
+            !log.contains("tools/call"),
+            "audited before the response: {log}"
+        );
+        assert_eq!(
+            ep.pending.lock().unwrap().in_flight(),
+            1,
+            "resumable id freed"
+        );
+        let (reply, log) = serve_with(&ep, "GET", "", "Last-Event-ID: 1\r\n");
+        got.recv().unwrap();
+        assert!(
+            got.recv().unwrap().contains("Last-Event-ID: 1"),
+            "resume header not sent"
+        );
+        assert!(
+            reply.contains("get_me") && !reply.contains("delete_repo"),
+            "resume reply"
+        );
+        assert_eq!(
+            log.matches("tools/call get_me → ALLOWED ").count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(ep.pending.lock().unwrap().in_flight(), 0);
+    }
+
+    #[test]
+    fn two_session_headers_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (curl, ran) = fake_curl(dir.path());
+        let ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        let (reply, log) = serve_with(
+            &ep,
+            "POST",
+            LIST,
+            "Mcp-Session-Id: A\r\nMcp-Session-Id: B\r\n",
+        );
+        assert!(reply.starts_with("HTTP/1.1 400"), "reply assertion");
+        assert!(
+            log.contains("more than one Mcp-Session-Id"),
+            "log assertion"
+        );
+        assert!(!ran.exists(), "curl ran");
+    }
+
     /// `filter_events` over `stream`: what the client got, and why it closed.
     fn sse(stream: &str) -> (String, Option<&'static str>) {
         let ep = for_spec(&gh_spec(), &Fixed(Some("T")), PathBuf::from("/c"), "x").unwrap();
@@ -1641,6 +1811,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             spec: ep.policy.as_ref().unwrap(),
             pending: &ep.pending,
             audit: None,
+            resumable: false,
         };
         let mut input = std::io::Cursor::new(stream.as_bytes().to_vec());
         let why = filter_events(&mut input, &mut server, &mut f).err();
@@ -1716,9 +1887,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             spec: ep.policy.as_ref().unwrap(),
             pending: &ep.pending,
             audit: None,
+            resumable: false,
         };
         // The response answers a request in flight.
-        on_client(LIST, f.spec, &mut f.lock());
+        on_client(LIST, f.spec, "", &mut f.lock());
         let got = relay(input.as_bytes(), &mut server, Some(&mut f));
         drop(server);
         let mut reply = String::new();

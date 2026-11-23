@@ -24,14 +24,13 @@ pub enum Action {
 /// itself, when it was sent, the tool for a `tools/call`). `done` holds the
 /// audit line for the last `tools/call` answered (design 6.4), for the
 /// caller to log: tool, outcome and duration, never arguments or results.
-/// Keys are (session, id): the third field is the session the next message
-/// belongs to (the remote `Mcp-Session-Id`, "" for stdio), so two clients
-/// sharing an endpoint neither collide on ids nor cancel each other's.
+/// Keys are (session, id), the session being the remote `Mcp-Session-Id`
+/// ("" for stdio), so two clients sharing an endpoint neither collide on
+/// ids nor cancel each other's.
 #[derive(Default)]
 pub struct Pending(
     HashMap<(String, String), (Value, Instant, Option<String>)>,
     pub Option<String>,
-    pub String,
 );
 
 impl Pending {
@@ -49,11 +48,13 @@ impl Pending {
 
     /// Forget a request that will get no response (its exchange ended),
     /// unless the id has since been reused by a request sent at another time.
-    pub fn remove(&mut self, session: &str, id: &str, sent: Instant) {
+    /// Returns its tool, for a `tools/call` still in flight.
+    pub fn remove(&mut self, session: &str, id: &str, sent: Instant) -> Option<String> {
         let key = (session.to_string(), id.to_string());
         if self.0.get(&key).is_some_and(|e| e.1 == sent) {
-            self.0.remove(&key);
+            return self.0.remove(&key).and_then(|e| e.2);
         }
+        None
     }
 
     /// Drop requests older than `deadline` (design 5.6). For each, a timeout
@@ -105,7 +106,7 @@ pub(crate) fn error_line(id: &Value, code: i64, message: &str) -> String {
 }
 
 /// A message from the client, on its way to the server.
-pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
+pub fn on_client(line: &str, spec: &Spec, session: &str, pending: &mut Pending) -> Action {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return Action::Reply(error_line(&Value::Null, -32700, "parse error"), None),
@@ -145,8 +146,8 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
         // for an id not in flight has nothing to cancel.
         if method == "notifications/cancelled" {
             let req = msg.pointer("/params/requestId").map(Value::to_string);
-            let session = pending.2.clone();
-            let Some((_, sent, tool)) = req.and_then(|r| pending.0.remove(&(session, r))) else {
+            let key = req.map(|r| (session.to_string(), r));
+            let Some((_, sent, tool)) = key.and_then(|k| pending.0.remove(&k)) else {
                 return Action::Drop;
             };
             if let Some(tool) = tool {
@@ -169,7 +170,7 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
             Some(format!("{} → DENIED invalid id", log_method(method))),
         );
     }
-    let key = (pending.2.clone(), id.to_string());
+    let key = (session.to_string(), id.to_string());
     if pending.0.contains_key(&key) {
         return Action::Reply(
             error_line(id, DENIED, "cplt: request id already in flight"),
@@ -295,7 +296,7 @@ pub(crate) fn unambiguous(msg: &Value) -> Result<(), String> {
 }
 
 /// A message from the server, on its way to the client.
-pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
+pub fn on_server(line: &str, spec: &Spec, session: &str, pending: &mut Pending) -> Action {
     let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(line) else {
         return Action::Drop;
     };
@@ -312,7 +313,7 @@ pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     }
     let Some((_, sent, tool)) = obj
         .get("id")
-        .and_then(|id| pending.0.remove(&(pending.2.clone(), id.to_string())))
+        .and_then(|id| pending.0.remove(&(session.to_string(), id.to_string())))
     else {
         return Action::Drop;
     };
@@ -388,11 +389,11 @@ mod tests {
                 .to_string()
         };
         assert!(matches!(
-            on_client(&call("delete_app"), &s, &mut p),
+            on_client(&call("delete_app"), &s, "", &mut p),
             Action::Reply(..)
         ));
         assert!(matches!(
-            on_client(&call("get_nais_context"), &s, &mut p),
+            on_client(&call("get_nais_context"), &s, "", &mut p),
             Action::Forward(_)
         ));
         assert!(check(with(base(), "/argChecks", json!({"x": "regex"}))).is_err());
@@ -406,15 +407,15 @@ mod tests {
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute_graphql","arguments":{"query":q}}}).to_string()
         };
         assert!(matches!(
-            on_client(&call(json!("mutation { x }")), &s, &mut p),
+            on_client(&call(json!("mutation { x }")), &s, "", &mut p),
             Action::Reply(..)
         ));
         assert!(matches!(
-            on_client(&call(json!(1)), &s, &mut p),
+            on_client(&call(json!(1)), &s, "", &mut p),
             Action::Reply(..)
         ));
         assert!(matches!(
-            on_client(&call(json!("{ me { id } }")), &s, &mut p),
+            on_client(&call(json!("{ me { id } }")), &s, "", &mut p),
             Action::Forward(_)
         ));
     }
@@ -424,7 +425,12 @@ mod tests {
         let s = check(base()).unwrap();
         let mut p = Pending::default();
         assert!(matches!(
-            on_client(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, &s, &mut p),
+            on_client(
+                r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+                &s,
+                "",
+                &mut p
+            ),
             Action::Reply(..)
         ));
         let init = |v: &str| {
@@ -432,11 +438,11 @@ mod tests {
                 .to_string()
         };
         assert!(matches!(
-            on_client(&init("2025-03-26"), &s, &mut p),
+            on_client(&init("2025-03-26"), &s, "", &mut p),
             Action::Reply(..)
         ));
         assert!(matches!(
-            on_client(&init("2025-11-25"), &s, &mut p),
+            on_client(&init("2025-11-25"), &s, "", &mut p),
             Action::Forward(_)
         ));
     }
@@ -446,19 +452,23 @@ mod tests {
         let s = check(base()).unwrap();
         let mut p = Pending::default();
         let list = r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#;
-        assert!(matches!(on_client(list, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(
+            on_client(list, &s, "", &mut p),
+            Action::Forward(_)
+        ));
         let resp = r#"{"jsonrpc":"2.0","id":"a","result":{"tools":[{"name":"get_nais_context"},{"name":"delete_app"}]}}"#;
-        let Action::Forward(out) = on_server(resp, &s, &mut p) else {
+        let Action::Forward(out) = on_server(resp, &s, "", &mut p) else {
             panic!()
         };
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["result"]["tools"], json!([{"name": "get_nais_context"}]));
         // Same id again: no longer pending.
-        assert_eq!(on_server(resp, &s, &mut p), Action::Drop);
+        assert_eq!(on_server(resp, &s, "", &mut p), Action::Drop);
         assert_eq!(
             on_server(
                 r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
                 &s,
+                "",
                 &mut p
             ),
             Action::Drop
@@ -467,6 +477,7 @@ mod tests {
             on_server(
                 r#"{"jsonrpc":"2.0","id":9,"method":"roots/list"}"#,
                 &s,
+                "",
                 &mut p
             ),
             Action::Reply(..)
@@ -480,19 +491,55 @@ mod tests {
         let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let cancel =
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
-        p.2 = "A".into();
-        assert!(matches!(on_client(list, &s, &mut p), Action::Forward(_)));
-        p.2 = "B".into();
-        assert!(matches!(on_client(list, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(
+            on_client(list, &s, "A", &mut p),
+            Action::Forward(_)
+        ));
+        assert!(matches!(
+            on_client(list, &s, "B", &mut p),
+            Action::Forward(_)
+        ));
         assert_eq!(p.in_flight(), 2);
         // B cancels its own id 1, then has nothing left to cancel.
-        assert!(matches!(on_client(cancel, &s, &mut p), Action::Forward(_)));
-        assert_eq!(on_client(cancel, &s, &mut p), Action::Drop);
+        assert!(matches!(
+            on_client(cancel, &s, "B", &mut p),
+            Action::Forward(_)
+        ));
+        assert_eq!(on_client(cancel, &s, "B", &mut p), Action::Drop);
         assert_eq!(p.in_flight(), 1, "B's cancel reached A's request");
-        p.2 = "A".into();
         let resp = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        assert!(matches!(on_server(resp, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(
+            on_server(resp, &s, "A", &mut p),
+            Action::Forward(_)
+        ));
         assert_eq!(p.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_stale_remove_leaves_a_reused_id_alone() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        assert!(matches!(
+            on_client(list, &s, "", &mut p),
+            Action::Forward(_)
+        ));
+        let a = p.sent("", "1").unwrap();
+        // A's response frees id 1; B reuses it at a later instant.
+        let resp = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert!(matches!(
+            on_server(resp, &s, "", &mut p),
+            Action::Forward(_)
+        ));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(matches!(
+            on_client(list, &s, "", &mut p),
+            Action::Forward(_)
+        ));
+        assert_ne!(p.sent("", "1"), Some(a));
+        // A's exchange ends and frees what it thinks is its id.
+        assert_eq!(p.remove("", "1", a), None);
+        assert_eq!(p.in_flight(), 1, "A's stale remove freed B's request");
     }
 
     #[test]
@@ -503,7 +550,7 @@ mod tests {
         for id in ["null", "{}", "[1]", "true", long.as_str()] {
             let msg = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#);
             assert!(
-                matches!(on_client(&msg, &s, &mut p), Action::Reply(..)),
+                matches!(on_client(&msg, &s, "", &mut p), Action::Reply(..)),
                 "id {id} accepted"
             );
         }
@@ -512,7 +559,7 @@ mod tests {
             r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/list"}}"#,
             "a".repeat(256)
         );
-        assert!(matches!(on_client(&ok, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(on_client(&ok, &s, "", &mut p), Action::Forward(_)));
     }
 
     #[test]
@@ -521,10 +568,15 @@ mod tests {
         let mut p = Pending::default();
         for i in 0..MAX_IN_FLIGHT {
             let l = json!({"jsonrpc":"2.0","id":i,"method":"ping"}).to_string();
-            assert!(matches!(on_client(&l, &s, &mut p), Action::Forward(_)));
+            assert!(matches!(on_client(&l, &s, "", &mut p), Action::Forward(_)));
         }
         assert!(matches!(
-            on_client(r#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#, &s, &mut p),
+            on_client(
+                r#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#,
+                &s,
+                "",
+                &mut p
+            ),
             Action::Reply(..)
         ));
     }
@@ -538,29 +590,29 @@ mod tests {
         };
         for i in 0..MAX_IN_FLIGHT {
             assert!(matches!(
-                on_client(&call(i), &s, &mut p),
+                on_client(&call(i), &s, "", &mut p),
                 Action::Forward(_)
             ));
         }
         assert!(matches!(
-            on_client(&call(99), &s, &mut p),
+            on_client(&call(99), &s, "", &mut p),
             Action::Reply(..)
         ));
         for i in 0..MAX_IN_FLIGHT {
             let c = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":i}}).to_string();
-            assert!(matches!(on_client(&c, &s, &mut p), Action::Forward(_)));
+            assert!(matches!(on_client(&c, &s, "", &mut p), Action::Forward(_)));
         }
         // A cancel for nothing in flight goes nowhere.
         let stray =
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":0}}"#;
-        assert_eq!(on_client(stray, &s, &mut p), Action::Drop);
+        assert_eq!(on_client(stray, &s, "", &mut p), Action::Drop);
         assert!(matches!(
-            on_client(&call(99), &s, &mut p),
+            on_client(&call(99), &s, "", &mut p),
             Action::Forward(_)
         ));
         // The late response to a cancelled call is dropped.
         let late = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
-        assert_eq!(on_server(late, &s, &mut p), Action::Drop);
+        assert_eq!(on_server(late, &s, "", &mut p), Action::Drop);
     }
 
     #[test]
@@ -571,12 +623,13 @@ mod tests {
             json!({"jsonrpc":"2.0","id":i,"method":"tools/call","params":{"name":t,"arguments":{"team":"s3cr3t-arg"}}}).to_string()
         };
         assert!(matches!(
-            on_client(&call(1, "get_nais_context"), &s, &mut p),
+            on_client(&call(1, "get_nais_context"), &s, "", &mut p),
             Action::Forward(_)
         ));
         on_server(
             r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"s3cr3t-res"}]}}"#,
             &s,
+            "",
             &mut p,
         );
         let allowed = p.1.take().unwrap();
@@ -586,12 +639,13 @@ mod tests {
             "{allowed}"
         );
         assert!(matches!(
-            on_client(&call(2, "get_nais_context"), &s, &mut p),
+            on_client(&call(2, "get_nais_context"), &s, "", &mut p),
             Action::Forward(_)
         ));
         on_server(
             r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"s3cr3t-res"}}"#,
             &s,
+            "",
             &mut p,
         );
         let failed = p.1.take().unwrap();
@@ -599,7 +653,8 @@ mod tests {
             failed.starts_with("tools/call get_nais_context → FAIL -32603 "),
             "{failed}"
         );
-        let Action::Reply(_, Some(denied)) = on_client(&call(3, "delete_app"), &s, &mut p) else {
+        let Action::Reply(_, Some(denied)) = on_client(&call(3, "delete_app"), &s, "", &mut p)
+        else {
             panic!("not denied");
         };
         assert!(
@@ -607,19 +662,21 @@ mod tests {
             "{denied}"
         );
         // A non-integer code is the server's content: not copied.
-        on_client(&call(4, "get_nais_context"), &s, &mut p);
+        on_client(&call(4, "get_nais_context"), &s, "", &mut p);
         on_server(
             r#"{"jsonrpc":"2.0","id":4,"error":{"code":{"token":"s3cr3t-res"}}}"#,
             &s,
+            "",
             &mut p,
         );
         let odd = p.1.take().unwrap();
         assert!(odd.contains("→ FAIL invalid error code "), "{odd}");
         // A cancelled call still leaves its line.
-        on_client(&call(5, "get_nais_context"), &s, &mut p);
+        on_client(&call(5, "get_nais_context"), &s, "", &mut p);
         on_client(
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}"#,
             &s,
+            "",
             &mut p,
         );
         let cancelled = p.1.take().unwrap();
@@ -631,8 +688,13 @@ mod tests {
             assert!(!l.contains("s3cr3t"), "{l}");
         }
         // Other methods leave no audit line.
-        on_client(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#, &s, &mut p);
-        on_server(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#, &s, &mut p);
+        on_client(
+            r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#,
+            &s,
+            "",
+            &mut p,
+        );
+        on_server(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#, &s, "", &mut p);
         assert!(p.1.is_none());
     }
 
@@ -641,7 +703,10 @@ mod tests {
         let s = check(base()).unwrap();
         let mut p = Pending::default();
         let ping = r#"{"jsonrpc":"2.0","id":"x","method":"ping"}"#;
-        assert!(matches!(on_client(ping, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(
+            on_client(ping, &s, "", &mut p),
+            Action::Forward(_)
+        ));
         assert!(p.evict(Duration::from_secs(120)).is_empty());
         let out = p.evict(Duration::ZERO);
         assert_eq!(out.len(), 1);
@@ -656,7 +721,7 @@ mod tests {
         let cancel: Value = serde_json::from_str(&out[0].1).unwrap();
         assert_eq!(cancel["params"]["requestId"], "x");
         assert_eq!(
-            on_server(r#"{"jsonrpc":"2.0","id":"x","result":{}}"#, &s, &mut p),
+            on_server(r#"{"jsonrpc":"2.0","id":"x","result":{}}"#, &s, "", &mut p),
             Action::Drop
         );
         assert!(p.0.is_empty());
@@ -688,10 +753,10 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"1999"}}"#,
             r#"{"jsonrpc":"2.0","method":"tools/list"}"#,
         ] {
-            assert_eq!(on_client(m, &s, &mut p), Action::Drop, "{m}");
+            assert_eq!(on_client(m, &s, "", &mut p), Action::Drop, "{m}");
         }
         let ok = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        assert!(matches!(on_client(ok, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(on_client(ok, &s, "", &mut p), Action::Forward(_)));
     }
 
     #[test]
@@ -700,12 +765,15 @@ mod tests {
         let mut p = Pending::default();
         // serde keeps the last duplicate; the server must see the same.
         let dup = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_app","name":"get_nais_context"}}"#;
-        let Action::Forward(out) = on_client(dup, &s, &mut p) else {
+        let Action::Forward(out) = on_client(dup, &s, "", &mut p) else {
             panic!()
         };
         assert!(!out.contains("delete_app"), "{out}");
         let fold = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute_graphql","arguments":{"query":"{ a }","Query":"mutation { x }"}}}).to_string();
-        assert!(matches!(on_client(&fold, &s, &mut p), Action::Reply(..)));
+        assert!(matches!(
+            on_client(&fold, &s, "", &mut p),
+            Action::Reply(..)
+        ));
     }
 
     #[test]
@@ -713,11 +781,14 @@ mod tests {
         let s = check(base()).unwrap();
         let mut p = Pending::default();
         let ping = r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#;
-        assert!(matches!(on_client(ping, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(
+            on_client(ping, &s, "", &mut p),
+            Action::Forward(_)
+        ));
         let list = r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#;
-        assert!(matches!(on_client(list, &s, &mut p), Action::Reply(..)));
+        assert!(matches!(on_client(list, &s, "", &mut p), Action::Reply(..)));
         let resp = r#"{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"delete_app"}]}}"#;
-        let Action::Forward(out) = on_server(resp, &s, &mut p) else {
+        let Action::Forward(out) = on_server(resp, &s, "", &mut p) else {
             panic!()
         };
         assert!(!out.contains("delete_app"), "{out}");
@@ -733,9 +804,12 @@ mod tests {
             r#"{"jsonrpc":"2.0","ID":1,"method":"notifications/initialized"}"#,
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"execute_graphql\",\"arguments\":{\"query\":\"{ a }\",\"querſ\":1,\"Query\":\"mutation { x }\"}}}",
         ] {
-            assert!(matches!(on_client(m, &s, &mut p), Action::Reply(..)), "{m}");
+            assert!(
+                matches!(on_client(m, &s, "", &mut p), Action::Reply(..)),
+                "{m}"
+            );
         }
         let ok = r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"Name":"x"}}}"#;
-        assert!(matches!(on_client(ok, &s, &mut p), Action::Forward(_)));
+        assert!(matches!(on_client(ok, &s, "", &mut p), Action::Forward(_)));
     }
 }
