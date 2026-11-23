@@ -774,14 +774,7 @@ fn cache_gh_token_to_file(
     }
     // No silent grants (#1078): a token file that could not be written in full
     // must not leave gh pointed at an empty or truncated credential.
-    match write_token_files(scratch_dir, &files, &token) {
-        Ok(()) => {
-            cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
-        }
-        Err(e) => eprintln!(
-            "cplt: could not write the gh token cache ({e}); gh in the sandbox will not be authenticated"
-        ),
-    }
+    apply_token_files(cmd, scratch_dir, &files, &token, serve);
     if exec {
         // OpenCode: the same token as its GitHub Copilot login, when the user
         // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
@@ -813,6 +806,25 @@ fn opencode_handover_applies(
 
 /// Write every token file in `names` under `dir`, or none: on any error the
 /// files already written are removed again, so gh never reads a partial set.
+/// Points gh at the token dir only when every file was written (#1078).
+fn apply_token_files(cmd: &mut Command, dir: &Path, files: &[&str], token: &str, serve: bool) {
+    match write_token_files(dir, files, token) {
+        Ok(()) => {
+            cmd.env(GH_TOKEN_DIR_ENV, dir);
+        }
+        Err(e) => {
+            let lost = if serve {
+                "; Copilot's login handover is lost too"
+            } else {
+                ""
+            };
+            eprintln!(
+                "cplt: could not write the gh token cache ({e}); gh in the sandbox will not be authenticated{lost}"
+            );
+        }
+    }
+}
+
 fn write_token_files(dir: &Path, names: &[&str], token: &str) -> std::io::Result<()> {
     for (i, name) in names.iter().enumerate() {
         if let Err(e) = write_token_file(&dir.join(name), token) {
@@ -4017,8 +4029,28 @@ mod which_real_gh_tests {
 
 #[cfg(test)]
 mod token_file_tests {
-    use super::write_token_files;
+    use super::{GH_TOKEN_DIR_ENV, apply_token_files, write_token_files};
     use std::os::unix::fs::PermissionsExt;
+
+    fn dir_env(cmd: &std::process::Command) -> Option<std::ffi::OsString> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == GH_TOKEN_DIR_ENV)
+            .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn token_dir_env_only_set_when_write_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = std::process::Command::new("true");
+        apply_token_files(&mut cmd, dir.path(), &[".gh-token"], "tok", true);
+        assert_eq!(dir_env(&cmd), Some(dir.path().as_os_str().to_owned()));
+
+        std::fs::create_dir_all(dir.path().join(".gh-exec-token/x")).unwrap();
+        let mut cmd = std::process::Command::new("true");
+        apply_token_files(&mut cmd, dir.path(), &[".gh-exec-token"], "tok", true);
+        assert_eq!(dir_env(&cmd), None);
+    }
 
     #[test]
     fn writes_all_token_files_0600() {

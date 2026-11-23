@@ -535,6 +535,24 @@ fn curl_get(url: &str, version: &str) -> Result<String, UpdateError> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
+/// Rate limit and outages (resolve, connect, timeout, TLS, recv, HTTP 5xx) are
+/// `RateLimited`/`NetworkUnreachable`; anything else (404, bad URL) is a real
+/// failure and keeps the curl exit code so it is not mistaken for an outage.
+fn classify_curl_failure(code: Option<i32>, stderr: &str) -> UpdateError {
+    let stderr = stderr.trim();
+    if stderr.contains("403") || stderr.contains("rate limit") {
+        return UpdateError::RateLimited;
+    }
+    let code_str = code.map_or("signal".to_string(), |c| c.to_string());
+    let detail = format!("{stderr} (curl exit {code_str})");
+    let server_error = (500..600).any(|c| stderr.contains(&format!("returned error: {c}")));
+    if server_error || matches!(code, Some(6 | 7 | 28 | 35 | 56)) {
+        UpdateError::NetworkUnreachable(detail)
+    } else {
+        UpdateError::DownloadFailed(detail)
+    }
+}
+
 /// HTTP GET expecting JSON, with Accept header.
 #[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_get_json(url: &str, version: &str) -> Result<String, UpdateError> {
@@ -558,11 +576,10 @@ fn curl_get_json(url: &str, version: &str) -> Result<String, UpdateError> {
         .map_err(|e| UpdateError::Io(format!("Cannot run /usr/bin/curl: {e}")))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("403") || stderr.contains("rate limit") {
-            return Err(UpdateError::RateLimited);
-        }
-        return Err(UpdateError::NetworkUnreachable(stderr.into_owned()));
+        return Err(classify_curl_failure(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
 
     Ok(String::from_utf8(output.stdout)?)
@@ -995,6 +1012,30 @@ fn find_sudo() -> Result<PathBuf, UpdateError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn curl_failure_classification() {
+        let e = classify_curl_failure;
+        assert!(matches!(
+            e(Some(22), "error: 403"),
+            UpdateError::RateLimited
+        ));
+        for c in [6, 7, 28, 35, 56] {
+            assert!(matches!(
+                e(Some(c), "x"),
+                UpdateError::NetworkUnreachable(_)
+            ));
+        }
+        let m = "curl: (22) The requested URL returned error: 504";
+        assert!(matches!(e(Some(22), m), UpdateError::NetworkUnreachable(d) if d.contains("504")));
+        let m = "curl: (22) The requested URL returned error: 404";
+        assert!(matches!(e(Some(22), m), UpdateError::DownloadFailed(d) if d.contains("exit 22")));
+        assert!(matches!(
+            e(Some(3), "bad url"),
+            UpdateError::DownloadFailed(_)
+        ));
+        assert!(matches!(e(None, "x"), UpdateError::DownloadFailed(_)));
+    }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     /// Write `bytes` to a fresh file at `path`.
