@@ -31,6 +31,11 @@ pub struct Pending(
 );
 
 impl Pending {
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.0.len()
+    }
+
     /// Drop requests older than `deadline` (design 5.6). For each, a timeout
     /// error for the client and a cancel for the server; a late response is
     /// then dropped as unsolicited.
@@ -50,6 +55,25 @@ impl Pending {
         });
         out
     }
+}
+
+/// A client-supplied name as it may appear in a log line: itself when it
+/// matches `^[A-Za-z0-9_.-]{1,128}$`, else `<invalid>`, so no agent byte
+/// can forge or break a log line.
+pub(crate) fn log_name(s: &str) -> &str {
+    log_token(s, b"_.-")
+}
+
+/// A JSON-RPC method for a log line: as `log_name`, plus `/`.
+fn log_method(s: &str) -> &str {
+    log_token(s, b"_.-/")
+}
+
+fn log_token<'a>(s: &'a str, extra: &[u8]) -> &'a str {
+    let ok = (1..=128).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b));
+    if ok { s } else { "<invalid>" }
 }
 
 pub(crate) fn error_line(id: &Value, code: i64, message: &str) -> String {
@@ -82,10 +106,7 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
                 -32600,
                 "cplt: ambiguous field name",
             ),
-            Some(format!(
-                "→ DENIED ambiguous key {:?}",
-                key.escape_debug().to_string()
-            )),
+            Some(format!("→ DENIED ambiguous key {:?}", log_name(&key))),
         );
     }
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
@@ -119,13 +140,13 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     if pending.0.contains_key(&id.to_string()) {
         return Action::Reply(
             error_line(id, DENIED, "cplt: request id already in flight"),
-            Some(format!("{method} → DENIED duplicate id")),
+            Some(format!("{} → DENIED duplicate id", log_method(method))),
         );
     }
-    let deny = |why: String| {
+    let deny = |why: String, logged: String| {
         Action::Reply(
             error_line(id, DENIED, &format!("cplt: {why}")),
-            Some(format!("{method} → DENIED {why}")),
+            Some(format!("{} → DENIED {logged}", log_method(method))),
         )
     };
     match method {
@@ -134,10 +155,11 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
                 .pointer("/params/protocolVersion")
                 .and_then(Value::as_str);
             if !v.is_some_and(|v| PROTOCOL_VERSIONS.contains(&v)) {
-                return deny(format!(
-                    "MCP protocol {} is not supported; use one of {PROTOCOL_VERSIONS:?}",
-                    v.unwrap_or("(none)")
-                ));
+                let why = |v: &str| {
+                    format!("MCP protocol {v} is not supported; use one of {PROTOCOL_VERSIONS:?}")
+                };
+                let v = v.unwrap_or("(none)");
+                return deny(why(v), why(log_name(v)));
             }
         }
         "tools/call" => {
@@ -146,12 +168,13 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if !spec.allow.contains(tool) {
-                return deny(format!(
-                    "tool {:?} is not allowed for {}. Fix: nav-pilot mcp enable {}",
-                    tool.escape_debug().to_string(),
-                    spec.id,
-                    spec.id
-                ));
+                let why = |t: &str| {
+                    format!(
+                        "tool {t:?} is not allowed for {}. Fix: nav-pilot mcp enable {}",
+                        spec.id, spec.id
+                    )
+                };
+                return deny(why(tool), why(log_name(tool)));
             }
             if spec.graphql.contains(tool) {
                 // A server that folds case would see another key as `query`.
@@ -163,7 +186,8 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
                             .any(|k| k != "query" && k.eq_ignore_ascii_case("query"))
                     });
                 if shadow {
-                    return deny(format!("{tool}: an argument key folds to query"));
+                    let why = |t: &str| format!("{t}: an argument key folds to query");
+                    return deny(why(tool), why(log_name(tool)));
                 }
                 let query = msg
                     .pointer("/params/arguments/query")
@@ -172,7 +196,11 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
                     .ok_or("no query argument".to_string())
                     .and_then(graphql_read_only)
                 {
-                    return deny(format!("{tool}: {e}"));
+                    // The parser's message quotes the query: not logged.
+                    return deny(
+                        format!("{tool}: {e}"),
+                        format!("{}: read-only check failed", log_name(tool)),
+                    );
                 }
             }
         }
@@ -181,13 +209,13 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     if pending.0.len() >= MAX_IN_FLIGHT {
         return Action::Reply(
             error_line(id, DENIED, "cplt: too many requests in flight; retry"),
-            Some(format!("{method} → DENIED in-flight cap")),
+            Some(format!("{} → DENIED in-flight cap", log_method(method))),
         );
     }
     let tool = (method == "tools/call")
         .then(|| msg.pointer("/params/name").and_then(Value::as_str))
         .flatten()
-        .map(str::to_string);
+        .map(|t| log_name(t).to_string());
     pending
         .0
         .insert(id.to_string(), (id.clone(), Instant::now(), tool));

@@ -170,6 +170,7 @@ fn endpoint(token: SecretToken, secret: &str, curl: PathBuf, upstream: &str) -> 
         tag: "github-mcp".into(),
         timeout_secs: crate::mcp_broker::remote::MAX_TIME_SECS,
         policy: None,
+        pending: std::sync::Mutex::default(),
     }
 }
 

@@ -1262,6 +1262,11 @@ on the host, outside the sandbox, and points your client's entry at
 - Only the tools in the spec's `tools.allow` are listed or callable. For
   `execute_graphql`, cplt refuses mutations, subscriptions and documents with
   more than one operation.
+- A remote spec that uses your gh token always gets `X-MCP-Readonly: true`
+  and `X-MCP-Lockdown: true` from cplt. The only header the spec may set is
+  `X-MCP-Toolsets`, a non-empty list of toolset names (`a-z`, `0-9`, `_`,
+  `-`, comma). When the spec sets it, the agent's copy is dropped; otherwise
+  the agent's passes. Any other header in the spec is refused at launch.
 - Copilot CLI gets `--additional-mcp-config` with an entry named exactly the
   server id (`io.github.nais/nais-mcp`), so a "Registry only" MCP policy
   still allows it, and `--disable-mcp-server` for your own entries that run

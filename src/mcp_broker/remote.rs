@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use super::credential::{CredentialSource, GH_TOKEN};
 use super::policy::{Action, Pending, on_client, on_server};
@@ -78,8 +78,7 @@ pub struct Log {
 impl Log {
     /// `tag` and `upstream` are the endpoint's own, so a second endpoint
     /// never logs as GitHub's.
-    fn line(&self, tag: &str, upstream: &str, method: &str, status: &str) {
-        let method = method.escape_debug().to_string();
+    fn line(&self, tag: &str, upstream: &str, method: &'static str, status: &str) {
         let status = status.escape_debug().to_string();
         let tag = tag.escape_debug().to_string();
         let upstream = upstream.escape_debug().to_string();
@@ -123,6 +122,28 @@ pub struct Endpoint {
     /// way; `None` for the built-in GitHub endpoint (#797), which forwards
     /// as before.
     pub(crate) policy: Option<Spec>,
+    /// Requests in flight across every connection to this endpoint, so a
+    /// cancel on one connection reaches a call running on another. Bounded
+    /// by `MAX_IN_FLIGHT` in `on_client`; freed on response, cancel or
+    /// timeout. Locked only around each message, never across a relay.
+    pub(crate) pending: Mutex<Pending>,
+}
+
+/// The per-exchange view of an endpoint's policy: the audit line of the
+/// last `tools/call` this exchange answered is kept here, not in the
+/// shared `Pending`, so concurrent connections never log each other's.
+struct Filter<'a> {
+    spec: &'a Spec,
+    pending: &'a Mutex<Pending>,
+    audit: Option<String>,
+}
+
+impl<'a> Filter<'a> {
+    fn lock(&self) -> std::sync::MutexGuard<'a, Pending> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// The endpoint for one validated remote spec, or why it cannot start.
@@ -150,6 +171,7 @@ pub(crate) fn for_spec(
         tag: spec.id.clone(),
         timeout_secs: spec.timeout_secs,
         policy: Some(spec.clone()),
+        pending: Mutex::default(),
     })
 }
 
@@ -412,15 +434,16 @@ impl Endpoint {
     ) {
         let head = String::from_utf8_lossy(head);
         let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
-        let method = lines
-            .next()
-            .and_then(|l| l.split(' ').next())
-            .unwrap_or_default()
-            .to_string();
-        if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
-            reply(&mut client, "405 Method Not Allowed");
-            return log.line(&self.tag, &self.upstream, &method, "BLOCKED-METHOD");
-        }
+        // A static string from here on: no request byte reaches the log.
+        let method: &'static str = match lines.next().and_then(|l| l.split(' ').next()) {
+            Some("GET") => "GET",
+            Some("POST") => "POST",
+            Some("DELETE") => "DELETE",
+            _ => {
+                reply(&mut client, "405 Method Not Allowed");
+                return log.line(&self.tag, &self.upstream, "<other>", "BLOCKED-METHOD");
+            }
+        };
         let headers: Vec<(String, String)> = lines
             .take_while(|l| !l.is_empty())
             .map(|l| match l.split_once(':') {
@@ -437,49 +460,61 @@ impl Endpoint {
         };
         if header("transfer-encoding").is_some() {
             reply(&mut client, "411 Length Required");
-            return log.line(&self.tag, &self.upstream, &method, "FAIL chunked request");
+            return log.line(&self.tag, &self.upstream, method, "FAIL chunked request");
         }
         let len = match header("content-length").map(str::parse::<usize>) {
             None => 0,
             Some(Ok(n)) if n <= MAX_BODY => n,
             _ => {
                 reply(&mut client, "413 Content Too Large");
-                return log.line(&self.tag, &self.upstream, &method, "FAIL body length");
+                return log.line(&self.tag, &self.upstream, method, "FAIL body length");
             }
         };
         let mut body = vec![0; len];
         if !read_body(&mut client, &mut body, body_limit) || body.contains(&0) {
             reply(&mut client, "400 Bad Request");
-            return log.line(&self.tag, &self.upstream, &method, "FAIL bad body");
+            return log.line(&self.tag, &self.upstream, method, "FAIL bad body");
         }
         // The spec's tool policy, as for a stdio server: one JSON-RPC
         // message per POST (batches refused), checked and re-serialised.
-        let mut pending = Pending::default();
+        let mut filter = self.policy.as_ref().map(|spec| Filter {
+            spec,
+            pending: &self.pending,
+            audit: None,
+        });
         // Only a POST body is checked, so no other method may carry one.
         if self.policy.is_some() && method != "POST" && !body.is_empty() {
             reply(&mut client, "400 Bad Request");
-            return log.line(&self.tag, &self.upstream, &method, "FAIL body on non-POST");
+            return log.line(&self.tag, &self.upstream, method, "FAIL body on non-POST");
         }
-        if let Some(spec) = &self.policy
+        if let Some(f) = &mut filter
             && method == "POST"
         {
-            match on_client(&String::from_utf8_lossy(&body), spec, &mut pending) {
+            let action = {
+                let mut p = f.lock();
+                // curl gives up at the same deadline, so nothing is left to cancel.
+                let _ = p.evict(std::time::Duration::from_secs(self.timeout_secs));
+                let action = on_client(&String::from_utf8_lossy(&body), f.spec, &mut p);
+                f.audit = p.1.take();
+                action
+            };
+            match action {
                 Action::Forward(line) => body = line.into_bytes(),
                 Action::Reply(line, why) => {
                     json_reply(&mut client, &line);
                     let why = why.unwrap_or_else(|| "DENIED".into());
-                    return log.line(&self.tag, &self.upstream, &method, &why);
+                    return log.line(&self.tag, &self.upstream, method, &why);
                 }
                 Action::Drop => {
                     reply(&mut client, "202 Accepted");
-                    return log.line(&self.tag, &self.upstream, &method, "DROPPED");
+                    return log.line(&self.tag, &self.upstream, method, "DROPPED");
                 }
             }
         }
         let Some(config) = curl_config(
             &self.upstream,
             via,
-            &method,
+            method,
             &headers,
             &body,
             self.token.expose(),
@@ -487,14 +522,14 @@ impl Endpoint {
             self.policy.is_some(),
         ) else {
             reply(&mut client, "400 Bad Request");
-            return log.line(&self.tag, &self.upstream, &method, "FAIL bad header");
+            return log.line(&self.tag, &self.upstream, method, "FAIL bad header");
         };
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             reply(&mut client, "503 Service Unavailable");
             return log.line(
                 &self.tag,
                 &self.upstream,
-                &method,
+                method,
                 "FAIL proxy shutting down",
             );
         }
@@ -506,12 +541,7 @@ impl Endpoint {
             .spawn()
         else {
             reply(&mut client, "502 Bad Gateway");
-            return log.line(
-                &self.tag,
-                &self.upstream,
-                &method,
-                "FAIL curl did not start",
-            );
+            return log.line(&self.tag, &self.upstream, method, "FAIL curl did not start");
         };
         CHILDREN
             .lock()
@@ -537,11 +567,7 @@ impl Endpoint {
             .take()
             .is_some_and(|mut s| s.write_all(&config).is_ok());
         let status = match child.stdout.take() {
-            Some(out) if wrote => relay(
-                out,
-                &mut client,
-                self.policy.as_ref().map(|spec| (spec, &mut pending)),
-            ),
+            Some(out) if wrote => relay(out, &mut client, filter.as_mut()),
             _ => None,
         };
         CHILDREN
@@ -550,8 +576,8 @@ impl Endpoint {
             .retain(|&(_, p)| p != child.id());
         let _ = child.kill();
         let _ = child.wait();
-        if let Some(audit) = pending.1.take() {
-            log.line(&self.tag, &self.upstream, &method, &audit);
+        if let Some(audit) = filter.and_then(|f| f.audit) {
+            log.line(&self.tag, &self.upstream, method, &audit);
         }
         if let Some((code, closed)) = status {
             // A GET answered 405 is the MCP spec's "no standalone SSE stream",
@@ -566,7 +592,7 @@ impl Endpoint {
             log.line(
                 &self.tag,
                 &self.upstream,
-                &method,
+                method,
                 &format!("{verdict} {code}{note}"),
             );
         } else {
@@ -578,7 +604,7 @@ impl Endpoint {
             log.line(
                 &self.tag,
                 &self.upstream,
-                &method,
+                method,
                 &format!("FAIL upstream: {}", err.trim()),
             );
         }
@@ -597,7 +623,7 @@ impl Endpoint {
 fn relay(
     out: impl Read,
     client: &mut TcpStream,
-    filter: Option<(&Spec, &mut Pending)>,
+    filter: Option<&mut Filter>,
 ) -> Option<(String, Option<&'static str>)> {
     let mut out = BufReader::new(out);
     let mut status = String::new();
@@ -646,13 +672,13 @@ fn relay(
                 let _ = std::io::copy(&mut out, client);
             }
         }
-        Some((spec, pending)) if ctype == "text/event-stream" => {
+        Some(f) if ctype == "text/event-stream" => {
             head += "\r\n";
             if client.write_all(head.as_bytes()).is_ok() {
-                closed = filter_events(&mut out, client, spec, pending).err();
+                closed = filter_events(&mut out, client, f).err();
             }
         }
-        Some((spec, pending)) => {
+        Some(f) => {
             let mut body = Vec::new();
             let read = (&mut out)
                 .take(MAX_BODY as u64 + 1)
@@ -665,7 +691,7 @@ fn relay(
             } else if ctype != "application/json" {
                 Err("not JSON")
             } else {
-                filter_message(&body, spec, pending)
+                filter_message(&body, f)
             };
             let text = match filtered {
                 Ok(t) => t,
@@ -683,10 +709,18 @@ fn relay(
 
 /// One server message through the policy: the line to pass (empty when the
 /// policy drops it), or an error when it is not JSON.
-fn filter_message(data: &[u8], spec: &Spec, pending: &mut Pending) -> Result<String, &'static str> {
+fn filter_message(data: &[u8], f: &mut Filter) -> Result<String, &'static str> {
     let text = std::str::from_utf8(data).map_err(|_| "unparsable message")?;
     serde_json::from_str::<serde_json::Value>(text).map_err(|_| "unparsable message")?;
-    Ok(match on_server(text, spec, pending) {
+    let action = {
+        let mut p = f.lock();
+        let action = on_server(text, f.spec, &mut p);
+        if let Some(a) = p.1.take() {
+            f.audit = Some(a);
+        }
+        action
+    };
+    Ok(match action {
         Action::Forward(line) => line,
         // A server request is not delivered (D13); there is no channel back
         // to the server on this exchange, so it is dropped.
@@ -699,8 +733,7 @@ fn filter_message(data: &[u8], spec: &Spec, pending: &mut Pending) -> Result<Str
 fn filter_events(
     out: &mut impl BufRead,
     client: &mut TcpStream,
-    spec: &Spec,
-    pending: &mut Pending,
+    f: &mut Filter,
 ) -> Result<(), &'static str> {
     loop {
         let (mut fields, mut data, mut size) = (String::new(), Vec::<String>::new(), 0usize);
@@ -747,7 +780,7 @@ fn filter_events(
         let event = if data.is_empty() {
             fields + "\n"
         } else {
-            let msg = filter_message(data.join("\n").as_bytes(), spec, pending)?;
+            let msg = filter_message(data.join("\n").as_bytes(), f)?;
             if msg.is_empty() {
                 continue;
             }
@@ -788,6 +821,7 @@ mod tests {
             tag: "github-mcp".into(),
             timeout_secs: MAX_TIME_SECS,
             policy: None,
+            pending: Mutex::default(),
         }
     }
 
@@ -991,15 +1025,10 @@ mod tests {
             level: ProxyLogLevel::None,
             file: Some(path.clone()),
         };
-        log.line(
-            "t\x1b",
-            "u\r\n",
-            "GET\r\n2099-01-01 POST",
-            "OK\n\x1b[2K forged",
-        );
+        log.line("t\x1b", "u\r\n", "GET", "OK\n\x1b[2K forged");
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 1, "{text:?}");
-        assert!(!text.contains('\x1b') && !text.contains('\r'), "{text:?}");
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains('\x1b') && !text.contains('\r'));
     }
 
     #[test]
@@ -1215,6 +1244,11 @@ mod tests {
     fn through_as(method: &str, upstream: String, curl: PathBuf, body: &str) -> (String, String) {
         let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
         ep.upstream = upstream;
+        serve_on(&ep, method, body)
+    }
+
+    /// One request on a fresh connection to `ep`: the reply and the log.
+    fn serve_on(ep: &Endpoint, method: &str, body: &str) -> (String, String) {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("log");
         let log = Log {
@@ -1246,6 +1280,76 @@ mod tests {
         )
     }
 
+    /// A cancel on a second connection reaches the upstream while the call
+    /// it names is still running on the first, and frees the call's slot;
+    /// a cancel for an id not in flight is dropped (stdio semantics).
+    #[test]
+    fn cross_connection_cancel_is_forwarded() {
+        let Some(curl) = real_curl() else { return };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", l.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Hold the call's connection open until the cancel has come in;
+            // the two curls may connect in either order.
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let (mut c, _) = l.accept().unwrap();
+                let (mut got, mut buf) = (Vec::new(), [0; 4096]);
+                while !got.ends_with(b"}}") {
+                    match c.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let got = String::from_utf8_lossy(&got).into_owned();
+                if got.contains("notifications/cancelled") {
+                    let _ = c.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+                    let _ = tx.send(got);
+                } else {
+                    let _ = seen_tx.send(());
+                    held.push(c);
+                }
+            }
+            drop(held);
+        });
+        let mut ep = for_spec(&gh_spec(), &Fixed(Some("T")), curl, "x").unwrap();
+        ep.upstream = url;
+        let ep = std::sync::Arc::new(ep);
+        let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#;
+        let first = {
+            let ep = ep.clone();
+            std::thread::spawn(move || serve_on(&ep, "POST", call))
+        };
+        let in_flight = || ep.pending.lock().unwrap().in_flight();
+        // The call has reached the upstream, so it is in flight.
+        seen.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("call never reached the upstream");
+        let unknown =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}"#;
+        let (reply, log) = serve_on(&ep, "POST", unknown);
+        assert!(
+            reply.starts_with("HTTP/1.1 202"),
+            "unknown id not answered 202"
+        );
+        assert!(log.contains("DROPPED"), "unknown id not dropped");
+        let cancel =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#;
+        let (_, log) = serve_on(&ep, "POST", cancel);
+        let sent = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(
+            sent.contains("notifications/cancelled"),
+            "cancel not forwarded"
+        );
+        assert!(
+            log.contains("tools/call get_me → CANCELLED"),
+            "no cancel audit"
+        );
+        assert_eq!(in_flight(), 0, "slot not freed");
+        let _ = first.join();
+    }
+
     const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
 
     #[test]
@@ -1258,18 +1362,15 @@ mod tests {
             dir.path().join("curl"),
             call,
         );
-        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(reply.starts_with("HTTP/1.1 200"));
         let body = reply.split("\r\n\r\n").nth(1).unwrap();
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["id"], 7);
         assert_eq!(v["error"]["code"], super::super::DENIED);
         assert!(!ran.exists(), "curl ran for a denied call");
         // The endpoint's own upstream, never the built-in GitHub one.
-        assert!(
-            log.contains("https://up.example/mcp tools/call") && log.contains("DENIED"),
-            "{log}"
-        );
-        assert!(!log.contains(UPSTREAM), "{log}");
+        assert!(log.contains("https://up.example/mcp tools/call") && log.contains("DENIED"));
+        assert!(!log.contains(UPSTREAM));
     }
 
     fn fake_curl(dir: &std::path::Path) -> (PathBuf, PathBuf) {
@@ -1293,21 +1394,12 @@ mod tests {
         );
         let (reply, log) = through(url.clone(), curl, LIST);
         let sent = got.recv().unwrap();
-        assert!(sent.contains("Authorization: Bearer T"), "{sent}");
-        assert!(
-            sent.contains("X-MCP-Lockdown: true") && !sent.contains("false"),
-            "{sent}"
-        );
-        assert!(
-            reply.contains("get_me") && !reply.contains("delete_repo"),
-            "{reply}"
-        );
+        assert!(sent.contains("Authorization: Bearer T"));
+        assert!(sent.contains("X-MCP-Lockdown: true") && !sent.contains("false"));
+        assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
         let body = reply.split("\r\n\r\n").nth(1).unwrap();
-        assert!(
-            reply.contains(&format!("Content-Length: {}\r\n", body.len())),
-            "{reply}"
-        );
-        assert!(log.contains(&url) && log.contains("FORWARDED 200"), "{log}");
+        assert!(reply.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(log.contains(&url) && log.contains("FORWARDED 200"));
     }
 
     #[test]
@@ -1320,17 +1412,11 @@ data: not json\n\n\
 data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad\"}]}}\n\n",
         );
         let (reply, log) = through(url, curl, LIST);
-        assert!(reply.contains(": ping\n\n"), "{reply}");
-        assert!(reply.contains("event: message\ndata: {"), "{reply}");
-        assert!(
-            reply.contains("get_me") && !reply.contains("delete_repo"),
-            "{reply}"
-        );
-        assert!(
-            !reply.contains("not json") && !reply.contains("after_bad"),
-            "{reply}"
-        );
-        assert!(log.contains("FAIL 200 (unparsable message)"), "{log}");
+        assert!(reply.contains(": ping\n\n"));
+        assert!(reply.contains("event: message\ndata: {"));
+        assert!(reply.contains("get_me") && !reply.contains("delete_repo"));
+        assert!(!reply.contains("not json") && !reply.contains("after_bad"));
+        assert!(log.contains("FAIL 200 (unparsable message)"));
     }
 
     #[test]
@@ -1345,8 +1431,8 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
                 dir.path().join("curl"),
                 call,
             );
-            assert!(reply.starts_with("HTTP/1.1 400"), "{m}: {reply}");
-            assert!(log.contains("FAIL body on non-POST"), "{log}");
+            assert!(reply.starts_with("HTTP/1.1 400"));
+            assert!(log.contains("FAIL body on non-POST"));
         }
         assert!(!ran.exists(), "curl ran for a non-POST body");
     }
@@ -1370,7 +1456,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         );
         let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_me","arguments":{}}}"#;
         let (_, log) = through(url, curl, call);
-        assert!(log.contains("tools/call get_me → ALLOWED "), "{log}");
+        assert!(log.contains("tools/call get_me → ALLOWED "));
     }
 
     /// `filter_events` over `stream`: what the client got, and why it closed.
@@ -1379,15 +1465,13 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (mut server, _) = l.accept().unwrap();
-        let mut pending = Pending::default();
+        let mut f = Filter {
+            spec: ep.policy.as_ref().unwrap(),
+            pending: &ep.pending,
+            audit: None,
+        };
         let mut input = std::io::Cursor::new(stream.as_bytes().to_vec());
-        let why = filter_events(
-            &mut input,
-            &mut server,
-            ep.policy.as_ref().unwrap(),
-            &mut pending,
-        )
-        .err();
+        let why = filter_events(&mut input, &mut server, &mut f).err();
         drop(server);
         let mut got = String::new();
         c.read_to_string(&mut got).unwrap();
@@ -1422,8 +1506,8 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: 1\rdata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"delete_repo\"}]}}\n\n",
         );
         let (reply, log) = through(url, curl, LIST);
-        assert!(!reply.contains("delete_repo"), "{reply}");
-        assert!(log.contains("FAIL 200"), "{log}");
+        assert!(!reply.contains("delete_repo"));
+        assert!(log.contains("FAIL 200"));
     }
 
     #[test]
@@ -1433,7 +1517,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"after_bad
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\ndelete_repo",
         );
         let (reply, log) = through(url, curl, LIST);
-        assert!(!reply.contains("delete_repo"), "{reply}");
-        assert!(log.contains("FAIL 200 (not JSON)"), "{log}");
+        assert!(!reply.contains("delete_repo"));
+        assert!(log.contains("FAIL 200 (not JSON)"));
     }
 }
