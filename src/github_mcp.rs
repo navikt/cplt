@@ -865,8 +865,12 @@ mod tests {
         );
         let mut reply = String::new();
         c.read_to_string(&mut reply).unwrap();
-        assert!(reply.starts_with("HTTP/1.1 503"), "{reply:?}");
-        assert_eq!(reply.matches("HTTP/1.1").count(), 1, "{reply:?}");
+        assert!(reply.starts_with("HTTP/1.1 503"), "expected 503");
+        assert_eq!(
+            reply.matches("HTTP/1.1").count(),
+            1,
+            "expected one response"
+        );
         assert!(!ran.exists(), "curl ran after shutdown");
     }
 
