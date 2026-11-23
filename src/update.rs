@@ -535,18 +535,19 @@ fn curl_get(url: &str, version: &str) -> Result<String, UpdateError> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-/// Rate limit and outages (resolve, connect, timeout, TLS, recv, HTTP 5xx) are
+/// Rate limit (HTTP 403/429) and outages (proxy/host resolve, connect, timeout, TLS, recv, HTTP 5xx) are
 /// `RateLimited`/`NetworkUnreachable`; anything else (404, bad URL) is a real
 /// failure and keeps the curl exit code so it is not mistaken for an outage.
 fn classify_curl_failure(code: Option<i32>, stderr: &str) -> UpdateError {
     let stderr = stderr.trim();
-    if stderr.contains("403") || stderr.contains("rate limit") {
+    let http = |c: u16| stderr.contains(&format!("error: {c}"));
+    if http(403) || http(429) || stderr.contains("rate limit") {
         return UpdateError::RateLimited;
     }
     let code_str = code.map_or("signal".to_string(), |c| c.to_string());
     let detail = format!("{stderr} (curl exit {code_str})");
     let server_error = (500..600).any(|c| stderr.contains(&format!("returned error: {c}")));
-    if server_error || matches!(code, Some(6 | 7 | 28 | 35 | 56)) {
+    if server_error || matches!(code, Some(5 | 6 | 7 | 16 | 28 | 35 | 52 | 56 | 92)) {
         UpdateError::NetworkUnreachable(detail)
     } else {
         UpdateError::DownloadFailed(detail)
@@ -1016,11 +1017,17 @@ mod tests {
     #[test]
     fn curl_failure_classification() {
         let e = classify_curl_failure;
+        for m in [
+            "error: 403",
+            "curl: (22) The requested URL returned error: 429",
+        ] {
+            assert!(matches!(e(Some(22), m), UpdateError::RateLimited));
+        }
         assert!(matches!(
-            e(Some(22), "error: 403"),
-            UpdateError::RateLimited
+            e(Some(3), "bad url /v1403x"),
+            UpdateError::DownloadFailed(_)
         ));
-        for c in [6, 7, 28, 35, 56] {
+        for c in [5, 6, 7, 16, 28, 35, 52, 56, 92] {
             assert!(matches!(
                 e(Some(c), "x"),
                 UpdateError::NetworkUnreachable(_)

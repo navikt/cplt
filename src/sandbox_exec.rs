@@ -804,8 +804,6 @@ fn opencode_handover_applies(
         && child_env_value(cmd, "OPENCODE_AUTH_CONTENT", inherit_env).is_none()
 }
 
-/// Write every token file in `names` under `dir`, or none: on any error the
-/// files already written are removed again, so gh never reads a partial set.
 /// Points gh at the token dir only when every file was written (#1078).
 fn apply_token_files(cmd: &mut Command, dir: &Path, files: &[&str], token: &str, serve: bool) {
     match write_token_files(dir, files, token) {
@@ -825,16 +823,25 @@ fn apply_token_files(cmd: &mut Command, dir: &Path, files: &[&str], token: &str,
     }
 }
 
+/// Write every token file in `names` under `dir`, or none: on any error every
+/// requested name and its temp file is removed, including caches left by an
+/// earlier setup in the same scratch dir (the bubblewrap fallback configures
+/// twice), so gh never reads a partial or stale set.
 fn write_token_files(dir: &Path, names: &[&str], token: &str) -> std::io::Result<()> {
-    for (i, name) in names.iter().enumerate() {
+    for name in names {
         if let Err(e) = write_token_file(&dir.join(name), token) {
-            for done in &names[..i] {
-                let _ = std::fs::remove_file(dir.join(done));
+            for n in names {
+                let _ = std::fs::remove_file(dir.join(n));
+                let _ = std::fs::remove_file(dir.join(token_tmp_name(n)));
             }
             return Err(e);
         }
     }
     Ok(())
+}
+
+fn token_tmp_name(name: &str) -> String {
+    format!("{name}.tmp.{}", std::process::id())
 }
 
 /// Write the token to a temp name in the same dir, fsync, then rename, so the
@@ -843,9 +850,8 @@ fn write_token_files(dir: &Path, names: &[&str], token: &str) -> std::io::Result
 fn write_token_file(token_path: &Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut tmp_name = token_path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp = token_path.with_file_name(tmp_name);
+    let name = token_path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = token_path.with_file_name(token_tmp_name(&name));
     let res = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -4081,5 +4087,33 @@ mod token_file_tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from(".gh-exec-token")]);
+    }
+
+    /// The bubblewrap fallback configures twice with one scratch dir: a failed
+    /// second setup must remove the caches the first one wrote, and unset the env.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn failed_rewrite_removes_earlier_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [".gh-token", ".gh-exec-token"];
+        for n in names {
+            std::fs::write(dir.path().join(n), "old").unwrap();
+        }
+        // A taken temp name makes the first write fail.
+        std::fs::write(dir.path().join(super::token_tmp_name(names[0])), "").unwrap();
+        let mut cmd = std::process::Command::new("true");
+        apply_token_files(&mut cmd, dir.path(), &names, "tok", true);
+        assert_eq!(dir_env(&cmd), None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A successful second setup replaces the first cleanly.
+        for n in names {
+            std::fs::write(dir.path().join(n), "old").unwrap();
+        }
+        write_token_files(dir.path(), &names, "tok").unwrap();
+        for n in names {
+            assert_eq!(std::fs::read_to_string(dir.path().join(n)).unwrap(), "tok");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 }
