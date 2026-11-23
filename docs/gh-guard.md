@@ -313,7 +313,9 @@ A `*.ghe.com` tenant is not GHES: `gh` reads `GH_TOKEN` for it, so set
 it appears: a URL of any scheme, `HOST/owner/repo`, scp `git@HOST:owner/repo`,
 a `--repo` value, or free text in `--title` or `--body`. A title or body that
 merely mentions such a host therefore runs without the token; pass the text
-with `--body-file` instead.
+with `--body-file` instead. A `gh auth` command that names no host, such as
+plain `gh auth status`, runs as `--hostname github.com` when it gets the token,
+since gh would otherwise send the token to every host it is logged in to.
 
 A `GH_TOKEN` environment variable would be inherited by every tool, MCP server,
 and subprocess the agent spawns. The file gives it to the first reader only,

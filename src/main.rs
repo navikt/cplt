@@ -6212,7 +6212,6 @@ fn exec_real(
     use std::os::unix::process::CommandExt;
 
     let mut command = std::process::Command::new(real_binary);
-    command.args(args);
     command.env_remove("GH_HOST");
     command.env_remove("GH_REPO");
     if let Some(repo) = repo_scope {
@@ -6232,13 +6231,26 @@ fn exec_real(
         && gh_proxy::is_auth_git_credential_get_request(&arg_refs)
         && !gh_proxy::is_help_request(&arg_refs)
     {
+        command.args(args);
         return exec_credential_helper(command, name);
     }
+    // A host-iterating `gh auth` command gets `--hostname github.com` when the
+    // token rides along, so gh never sends it to another host in hosts.yml.
+    let pinned = (name == "gh")
+        .then(|| gh_proxy::pin_auth_hostname(&arg_refs))
+        .flatten();
+    let pinned_refs: Option<Vec<&str>> = pinned
+        .as_ref()
+        .map(|p| p.iter().map(String::as_str).collect());
+    let token_args = pinned_refs.as_deref().unwrap_or(&arg_refs);
     if name == "gh"
-        && gh_proxy::github_token_allowed(&arg_refs, repo_scope, host_pin)
+        && gh_proxy::github_token_allowed(token_args, repo_scope, host_pin)
         && let Some(token) = exec_gh_token()
     {
         command.env("GH_TOKEN", token);
+        command.args(token_args);
+    } else {
+        command.args(args);
     }
     let err = command.exec();
     ui::error(&format!("Failed to exec {name}: {err}"));

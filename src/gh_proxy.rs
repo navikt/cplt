@@ -115,7 +115,41 @@ fn github_token_allowed_for(
             let (named, ambiguous) = scan_hostnames(args);
             ambiguous || named.iter().any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
         }
-        || args.iter().any(|a| names_token_tenant(a)))
+        || args.iter().any(|a| names_token_tenant(a))
+        // These iterate every host in hosts.yml without `--hostname`, tenants
+        // included; `exec_real` adds `--hostname github.com` via
+        // [`pin_auth_hostname`] so the token can ride along.
+        || (auth_host_subcommand(args).is_some() && scan_hostnames(args).0.is_empty()))
+}
+
+/// Index of a `gh auth` subcommand that, with no `--hostname`, acts on every
+/// host in hosts.yml (gh 2.105 `--help`: all of them take `-h/--hostname`).
+fn auth_host_subcommand(args: &[&str]) -> Option<usize> {
+    const SUBS: &[&str] = &[
+        "status",
+        "refresh",
+        "setup-git",
+        "switch",
+        "logout",
+        "token",
+    ];
+    let (root, _) = root_command(args);
+    let i = root.filter(|&i| args[i] == "auth")? + 1;
+    args.get(i).filter(|s| SUBS.contains(s)).map(|_| i)
+}
+
+/// `args` with `--hostname github.com` after the `gh auth` subcommand, when it
+/// names no host and would otherwise send `GH_TOKEN` to every host (#1070).
+#[must_use]
+pub fn pin_auth_hostname(args: &[&str]) -> Option<Vec<String>> {
+    let i = auth_host_subcommand(args)?;
+    let (named, ambiguous) = scan_hostnames(args);
+    if !named.is_empty() || ambiguous {
+        return None;
+    }
+    let mut out: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    out.splice(i + 1..=i, ["--hostname".into(), DEFAULT_GH_HOST.into()]);
+    Some(out)
 }
 
 /// Whether `s` mentions, anywhere, a host other than github.com that gh hands
@@ -132,7 +166,9 @@ fn github_token_allowed_for(
 /// that is the safe direction, and `--body-file` avoids it.
 fn names_token_tenant(s: &str) -> bool {
     // Go's url.Parse unescapes `%2e` in a host, so decode before splitting.
-    let decoded = percent_decode(s).to_ascii_lowercase();
+    // Unicode lowercase as Go's strings.ToLower, which maps U+0130 `İ` to `i`
+    // where Rust yields `i` plus a combining dot.
+    let decoded = percent_decode(s).replace('\u{130}', "i").to_lowercase();
     decoded
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
         .map(|t| t.trim_end_matches('.'))
@@ -12200,8 +12236,36 @@ mod tests {
         ] {
             assert!(!ok(args), "{args:?}");
         }
-        assert!(ok(&["auth", "status"]));
+        // No host: gh would iterate hosts.yml, tenants included (#1070).
+        assert!(!ok(&["auth", "status"]));
+        let pinned = pin_auth_hostname(&["auth", "status", "--", "x"]).unwrap();
+        assert_eq!(
+            pinned,
+            ["auth", "status", "--hostname", "github.com", "--", "x"]
+        );
+        let refs: Vec<&str> = pinned.iter().map(String::as_str).collect();
+        assert!(ok(&refs));
+        for sub in ["refresh", "setup-git", "switch", "logout", "token"] {
+            assert!(!ok(&["auth", sub]), "{sub}");
+            assert!(pin_auth_hostname(&["auth", sub]).is_some(), "{sub}");
+        }
+        assert_eq!(
+            pin_auth_hostname(&["auth", "status", "-h", "github.com"]),
+            None
+        );
+        assert_eq!(pin_auth_hostname(&["pr", "status"]), None);
         assert!(ok(&["auth", "status", "-h", "github.com"]));
+        // Root `-h` takes a value, so `auth` is still the command.
+        assert!(ok(&["-h", "github.com", "auth", "status"]));
+        for args in [
+            &["repo", "view", "g\u{130}thub.localhost/o/r"][..],
+            &["repo", "view", "-R", "g\u{130}thub.localhost/o/r"],
+            &["repo", "view", "--repo=g\u{130}thub.localhost/o/r"],
+            &["repo", "clone", "https://g\u{130}thub.localhost/o/r"],
+            &["repo", "clone", "git@g\u{130}thub.localhost:o/r"],
+        ] {
+            assert!(!ok(args), "{args:?}");
+        }
         // Outside `gh auth`, -h is help, not a host.
         assert!(ok(&["pr", "list", "-h"]));
         assert_eq!(
@@ -12244,7 +12308,8 @@ mod tests {
         let jq = ["auth", "status", "--json", "hosts", "--jq", "-length"];
         assert!(requested_hostnames(&jq).is_empty());
         assert!(host_ok(&jq));
-        assert!(ok(&jq));
+        let pinned = pin_auth_hostname(&jq).unwrap();
+        assert!(ok(&pinned.iter().map(String::as_str).collect::<Vec<_>>()));
         let user = ["auth", "token", "-hgithub.com", "-uother"];
         assert_eq!(requested_hostnames(&user), vec!["github.com"]);
         assert_eq!(
@@ -12331,7 +12396,7 @@ mod tests {
         ] {
             assert!(!ok(args), "{args:?}");
         }
-        assert!(ok(&["auth", "status"]));
+        assert!(ok(&["auth", "status", "--hostname", "github.com"]));
         assert!(requested_hostnames(&["auth", "-h"]).is_empty());
     }
 
