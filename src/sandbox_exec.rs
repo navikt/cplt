@@ -600,6 +600,11 @@ fn inject_gh_token_if_needed(
 
 /// gh's `hosts.yml`, located the way gh does: `GH_CONFIG_DIR`, then
 /// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
+/// A regular file, or a link to one: never a FIFO or device (#1052).
+pub(super) fn is_regular_file(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file())
+}
+
 pub(super) fn gh_hosts_yml() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     crate::discover::gh_hosts_yml(&home)
@@ -749,7 +754,7 @@ fn cache_gh_token_to_file(
             agent,
             deny_env,
             substitute,
-            gh_hosts_yml().is_some_and(|p| p.exists()),
+            gh_hosts_yml().is_some_and(|p| is_regular_file(&p)),
         );
     if !serve && !exec {
         return;
@@ -2824,6 +2829,19 @@ echo "failed to read keyring" >&2; exit 1"#,
 
     /// A `gh` that fails hands over nothing — including when it prints to
     /// stdout on the way out, which `.trim()` alone would have accepted.
+    #[test]
+    fn a_fifo_hosts_yml_is_not_gh_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("hosts.yml");
+        crate::untrusted::tests::mkfifo(&fifo);
+        assert!(!is_regular_file(&fifo));
+        let link = dir.path().join("link.yml");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        assert!(!is_regular_file(&link));
+        std::fs::write(dir.path().join("real.yml"), "").unwrap();
+        assert!(is_regular_file(&dir.path().join("real.yml")));
+    }
+
     #[test]
     fn a_failing_gh_hands_over_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");

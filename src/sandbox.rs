@@ -2058,6 +2058,8 @@ pub fn keychain_substitute(
     setting: Option<bool>,
     writable: &[PathBuf],
 ) -> Option<crate::agent::KeychainSubstitute> {
+    // Every stored-token lookup this process makes is checked against these.
+    let _ = crate::discover::GH_LOOKUP_WRITABLE.set(writable.to_vec());
     if cfg!(target_os = "linux") {
         return secret_service_substitute(
             agent,
@@ -2091,11 +2093,12 @@ pub fn keychain_substitute(
             // Maintainer call: never switch identity silently. gh signed in as
             // someone other than Copilot's own login keeps the grant (#696).
             if agent == Agent::Copilot {
-                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable).ok()?);
-                if let Some(why) = account_mismatch(
-                    gh.as_deref(),
-                    copilot_keychain_acct(gh.as_deref()).as_deref(),
-                ) {
+                // Fail closed (#1052, #1053): an agent-writable hosts.yml, or a
+                // Keychain answer cplt cannot pin to one account, keeps the grant.
+                let hosts = exec::gh_hosts_yml();
+                if let Err(why) =
+                    copilot_account_check(hosts.as_deref(), writable, copilot_keychain_acct)
+                {
                     let _ = ACCOUNT_MISMATCH.set(why);
                     return None;
                 }
@@ -2108,7 +2111,7 @@ pub fn keychain_substitute(
 /// gh is logged in on the host (its `hosts.yml` exists), so the sandbox will
 /// carry its token for `gh` and OpenCode (#693, #695).
 pub fn gh_configured() -> bool {
-    exec::gh_hosts_yml().is_some_and(|p| p.exists())
+    exec::gh_hosts_yml().is_some_and(|p| exec::is_regular_file(&p))
 }
 
 /// Why the substitute was skipped for an account mismatch, for the launch
@@ -2249,27 +2252,114 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
 /// refusal; a path that does not resolve gives no login (fail closed). The
 /// path is resolved once, and the check and the read both use that result.
 fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Result<Option<String>, ()> {
-    let Ok(real) = std::fs::canonicalize(hosts) else {
-        return Ok(None);
-    };
-    if hosts_agent_writable(hosts, &real, writable) {
+    let real = resolve_unwritable(hosts, writable)?;
+    // A hard link inside a writable tree shares the inode: no path check sees it.
+    if std::fs::symlink_metadata(&real).is_ok_and(|m| std::os::unix::fs::MetadataExt::nlink(&m) > 1)
+    {
         return Err(());
     }
     let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT);
     Ok(text.ok().flatten().as_deref().and_then(gh_login))
 }
 
+/// Resolve `path` one symlink hop at a time. `Err` when any path on the way
+/// (the name, every ancestor, every hop and the hop's parent) lies in a tree
+/// in `writable`, or the chain exceeds 40 links. Checking only the name and
+/// the final target misses `/safe -> <writable>/hop -> /other`: the agent
+/// re-points the hop to another account's config or a FIFO (#1080 review).
+/// A missing tail is appended lexically, after its existing prefix resolved.
+pub(crate) fn resolve_unwritable(path: &Path, writable: &[PathBuf]) -> Result<PathBuf, ()> {
+    use std::path::Component;
+    let inside = |p: &Path| hosts_agent_writable(p, p, writable);
+    let mut todo: std::collections::VecDeque<std::ffi::OsString> =
+        path.iter().map(ToOwned::to_owned).collect();
+    let mut cur = PathBuf::new();
+    let mut hops = 0;
+    let mut missing = false;
+    while let Some(part) = todo.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir | Component::Prefix(_)) => cur = PathBuf::from(&part),
+            Some(Component::ParentDir) => {
+                cur.pop();
+                // `cur` held only resolved dirs before the missing name, so
+                // its parent exists: resume checking links (#1080 review).
+                missing = std::fs::symlink_metadata(&cur).is_err();
+            }
+            Some(Component::Normal(_)) => {
+                let next = cur.join(&part);
+                if inside(&next) {
+                    return Err(());
+                }
+                if !missing {
+                    match std::fs::symlink_metadata(&next) {
+                        Ok(m) if m.file_type().is_symlink() => {
+                            hops += 1;
+                            let target = std::fs::read_link(&next).map_err(|_| ())?;
+                            if hops > 40 {
+                                return Err(());
+                            }
+                            for c in target.iter().rev() {
+                                todo.push_front(c.to_owned());
+                            }
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(_) => missing = true,
+                    }
+                }
+                cur = next;
+            }
+            _ => {}
+        }
+    }
+    if inside(&cur) { Err(()) } else { Ok(cur) }
+}
+
 /// The agent could have written `hosts`: the path as named (a link the agent
 /// could re-point) or `real`, where it resolved, lies in a tree in `writable`.
 /// A dotfile-manager link to a tree the agent cannot write (stow, chezmoi,
 /// home-manager) stays usable.
-fn hosts_agent_writable(hosts: &Path, real: &Path, writable: &[PathBuf]) -> bool {
+pub(crate) fn hosts_agent_writable(hosts: &Path, real: &Path, writable: &[PathBuf]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |m: std::fs::Metadata| (m.dev(), m.ino());
+    // Identity, not spelling: on case-insensitive or normalising APFS
+    // `<root>/PROJ` and an NFD name are the same dir as `<root>/Proj` (#1080).
+    let roots: Vec<_> = writable
+        .iter()
+        .filter_map(|w| std::fs::metadata(w).ok().map(id))
+        .collect();
     let inside = |p: &Path| {
         writable
             .iter()
-            .any(|w| p.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| p.starts_with(w)))
+            .any(|w| p.starts_with(w) || p.starts_with(canonical_prefix(w)))
+            || std::fs::symlink_metadata(p).is_ok_and(|m| roots.contains(&id(m)))
+            || p.ancestors()
+                .skip(1)
+                .any(|a| std::fs::metadata(a).is_ok_and(|m| roots.contains(&id(m))))
     };
     inside(hosts) || inside(real)
+}
+
+/// `p` with its longest existing prefix canonicalised and the missing tail
+/// appended, so a not-yet-created root under `/tmp` still matches `/private/tmp`.
+fn canonical_prefix(p: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut a = p;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(a) {
+            return tail
+                .iter()
+                .rev()
+                .fold(c, |c, t: &&std::ffi::OsStr| c.join(t));
+        }
+        match (a.parent(), a.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                a = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// The github.com `user:` from gh's `hosts.yml`.
@@ -2290,32 +2380,68 @@ fn gh_login(hosts_yml: &str) -> Option<String> {
     None
 }
 
+/// `Err(reason)` unless gh's login is anchored and matches Copilot's single
+/// Keychain account. An agent-writable `hosts.yml` or an unreadable or
+/// ambiguous Keychain answer fails closed (#1052, #1053).
+fn copilot_account_check(
+    hosts: Option<&Path>,
+    writable: &[PathBuf],
+    keychain: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    let gh = match hosts.map(|p| anchored_gh_login(p, writable)) {
+        Some(Err(())) => return Err("gh's hosts.yml is writable from the sandbox".into()),
+        gh => gh.and_then(Result::ok).flatten(),
+    };
+    let acct = keychain()?;
+    account_mismatch(gh.as_deref(), acct.as_deref()).map_or(Ok(()), Err)
+}
+
 /// The `acct` attribute of Copilot CLI's own Keychain item (`copilot-cli`),
-/// shaped `https://github.com:<login>`. Read on the host from the item's
-/// attributes only (no `-w`/`-g`), so the secret is never read and nothing
+/// shaped `https://github.com:<login>`. Read on the host from item attributes
+/// only (`dump-keychain` without `-d`), so the secret is never read and nothing
 /// prompts. Unlike `~/.copilot/config.json`, the sandboxed agent cannot
 /// rewrite this without the Keychain grant it is about to lose.
 ///
-/// Tries the item for `gh_login` first, so several stored accounts resolve to
-/// the matching one; otherwise whichever item `security` returns first.
-/// `None` when there is no item, `security` fails, or it outlives 1 s.
-fn copilot_keychain_acct(gh_login: Option<&str>) -> Option<String> {
+/// `Ok(None)` when there is no item. `Err` when `security` fails, outlives
+/// 1 s, or there are items for several accounts: cplt cannot tell which one
+/// Copilot uses, so the caller keeps the grant (#1053).
+fn copilot_keychain_acct() -> Result<Option<String>, String> {
     if !cfg!(target_os = "macos") {
-        return None;
+        return Ok(None);
     }
-    let query = |acct: Option<&str>| {
-        #[allow(clippy::disallowed_methods)] // absolute system path
-        let mut cmd = std::process::Command::new("/usr/bin/security");
-        cmd.args(["find-generic-password", "-s", "copilot-cli"]);
-        if let Some(a) = acct {
-            cmd.args(["-a", a]);
+    #[allow(clippy::disallowed_methods)] // absolute system path
+    let mut cmd = std::process::Command::new("/usr/bin/security");
+    cmd.arg("dump-keychain");
+    let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))
+        .ok_or("`security dump-keychain` failed or did not answer within 1 s")?;
+    copilot_keychain_accts(&String::from_utf8_lossy(&out))
+}
+
+/// The single Copilot account in `security dump-keychain` output.
+fn copilot_keychain_accts(out: &str) -> Result<Option<String>, String> {
+    let mut accts: Vec<String> = Vec::new();
+    for item in out.split("keychain: ").skip(1) {
+        // `security` prints a service in hex only when it is not plain ASCII,
+        // so a hex `svce` is never `copilot-cli`: skip it.
+        if !item
+            .lines()
+            .any(|l| l.trim() == "\"svce\"<blob>=\"copilot-cli\"")
+        {
+            continue;
         }
-        let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
-        keychain_acct(&String::from_utf8_lossy(&out))
-    };
-    gh_login
-        .and_then(|u| query(Some(&format!("https://github.com:{u}"))))
-        .or_else(|| query(None))
+        let Some(a) = keychain_acct(item) else {
+            return Err("the Keychain lists a Copilot item whose account cplt cannot parse".into());
+        };
+        if !accts.contains(&a) {
+            accts.push(a);
+        }
+    }
+    match accts.len() {
+        0 | 1 => Ok(accts.pop()),
+        n => Err(format!(
+            "the Keychain holds {n} Copilot accounts and cplt cannot tell which one Copilot uses"
+        )),
+    }
 }
 
 /// The `"acct"<blob>="..."` value from `security find-generic-password` output.
@@ -7752,9 +7878,10 @@ mod tests {
 mod account_tests {
     use super::{
         COPILOT_CONFIG_LIMIT, CopilotConfigAccount, ProcAdvice, SecretServiceSkip,
-        account_mismatch, anchored_gh_login, copilot_config_account, copilot_has_native_login,
-        gh_login, hosts_agent_writable, keychain_acct, proc_self_limit_text,
-        secret_service_substitute, secret_tool_args, unix_sockets_unrestricted,
+        account_mismatch, anchored_gh_login, copilot_account_check, copilot_config_account,
+        copilot_has_native_login, copilot_keychain_accts, gh_login, hosts_agent_writable,
+        keychain_acct, proc_self_limit_text, resolve_unwritable, secret_service_substitute,
+        secret_tool_args, unix_sockets_unrestricted,
     };
 
     #[test]
@@ -7776,6 +7903,56 @@ mod account_tests {
             None
         );
         assert_eq!(keychain_acct(""), None);
+    }
+
+    #[test]
+    fn several_copilot_keychain_accounts_are_ambiguous() {
+        let item = |a: &str, svce: &str| {
+            format!(
+                "keychain: \"/k\"\nattributes:\n    \"acct\"<blob>=\"https://github.com:{a}\"\n    \"svce\"<blob>=\"{svce}\"\n"
+            )
+        };
+        let one =
+            item("alice", "copilot-cli") + &item("alice", "copilot-cli") + &item("x", "other");
+        assert_eq!(
+            copilot_keychain_accts(&one).unwrap().as_deref(),
+            Some("https://github.com:alice")
+        );
+        assert_eq!(copilot_keychain_accts(&item("x", "other")), Ok(None));
+        let two = item("alice", "copilot-cli") + &item("alice-work", "copilot-cli");
+        assert!(copilot_keychain_accts(&two).is_err());
+        // An unparsable account or service on a possible Copilot item is ambiguous.
+        let hex_acct = "keychain: \"/k\"\n    \"acct\"<blob>=0x68747470  \"https\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
+        assert!(copilot_keychain_accts(&(item("alice", "copilot-cli") + hex_acct)).is_err());
+        let no_acct = "keychain: \"/k\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
+        assert!(copilot_keychain_accts(no_acct).is_err());
+        let hex_svce = "keychain: \"/k\"\n    \"acct\"<blob>=\"x\"\n    \"svce\"<blob>=0x636F70\n";
+        assert_eq!(copilot_keychain_accts(hex_svce), Ok(None));
+        let mixed = item("alice", "copilot-cli") + hex_svce;
+        assert_eq!(
+            copilot_keychain_accts(&mixed).unwrap().as_deref(),
+            Some("https://github.com:alice")
+        );
+        let null_svce = "keychain: \"/k\"\n    \"svce\"<blob>=<NULL>\n";
+        assert_eq!(copilot_keychain_accts(null_svce), Ok(None));
+    }
+
+    #[test]
+    fn copilot_account_check_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rw = tmp.path().join("rw");
+        std::fs::create_dir(&rw).unwrap();
+        let hosts = rw.join("hosts.yml");
+        std::fs::write(&hosts, "github.com:\n    user: alice\n").unwrap();
+        let alice = || Ok(Some("https://github.com:alice".to_string()));
+        assert_eq!(copilot_account_check(Some(&hosts), &[], alice), Ok(()));
+        // Agent-writable hosts.yml no longer degrades to "unknown, proceed".
+        assert!(
+            copilot_account_check(Some(&hosts), std::slice::from_ref(&rw), || Ok(None)).is_err()
+        );
+        // A Keychain timeout or ambiguity keeps the grant.
+        assert!(copilot_account_check(Some(&hosts), &[], || Err("timeout".into())).is_err());
+        assert!(copilot_account_check(None, &[], || Err("2 accounts".into())).is_err());
     }
 
     #[test]
@@ -7998,9 +8175,65 @@ mod account_tests {
         let dangling = ro.join("dangling.yml");
         std::os::unix::fs::symlink(ro.join("gone.yml"), &dangling).unwrap();
         assert_eq!(anchored_gh_login(&dangling, &writable), Ok(None));
+        // An intermediate hop inside the writable tree: the agent can re-point it.
+        let hop = rw.join("hop");
+        std::os::unix::fs::symlink(&good, &hop).unwrap();
+        let chain = ro.join("chain.yml");
+        std::os::unix::fs::symlink(&hop, &chain).unwrap();
+        assert_eq!(anchored_gh_login(&chain, &writable), Err(()));
+        // A loop is refused, not followed forever.
+        let lp = ro.join("loop.yml");
+        std::os::unix::fs::symlink(&lp, &lp).unwrap();
+        assert_eq!(anchored_gh_login(&lp, &writable), Err(()));
         // The check runs on the real path it is given, not a fresh resolution.
         assert!(hosts_agent_writable(&good, &planted, &writable));
         assert!(!hosts_agent_writable(&good, &good, &writable));
+        // A missing name then `..` resumes link checks: alias -> rw is seen.
+        std::os::unix::fs::symlink(&rw, ro.join("alias")).unwrap();
+        let back = ro.join("missing/../alias/hosts.yml");
+        assert_eq!(anchored_gh_login(&back, &writable), Err(()));
+        // A hard link from the writable tree shares the inode.
+        let hard = ro.join("hard.yml");
+        std::fs::write(&hard, yml).unwrap();
+        std::fs::hard_link(&hard, rw.join("hard.yml")).unwrap();
+        assert_eq!(anchored_gh_login(&hard, &writable), Err(()));
+    }
+
+    /// A writable root and the gh path may spell one dir differently: case on
+    /// case-insensitive APFS, NFC against NFD (#1080 review).
+    #[test]
+    fn gh_login_anchor_compares_writable_roots_by_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yml = "github.com:\n    user: mallory\n";
+        for (made, spelled) in [("Proj", "PROJ"), ("caf\u{e9}", "cafe\u{301}")] {
+            let root = tmp.path().join(made);
+            std::fs::create_dir_all(root.join("gh")).unwrap();
+            std::fs::write(root.join("gh/hosts.yml"), yml).unwrap();
+            let other = tmp.path().join(spelled).join("gh/hosts.yml");
+            if !other.exists() {
+                eprintln!("skip {spelled}: volume tells the spellings apart");
+                continue;
+            }
+            assert_eq!(
+                resolve_unwritable(&other, std::slice::from_ref(&root)),
+                Err(())
+            );
+            assert_eq!(anchored_gh_login(&other, &[root]), Err(()));
+        }
+    }
+
+    /// A writable root that does not exist yet, under a symlinked ancestor.
+    #[test]
+    fn missing_writable_root_under_symlinked_ancestor_still_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let via = tmp.path().join("via");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        let writable = vec![via.join("new")];
+        let p = std::fs::canonicalize(&real).unwrap().join("new/hosts.yml");
+        assert!(hosts_agent_writable(&p, &p, &writable));
+        assert_eq!(resolve_unwritable(&p, &writable), Err(()));
     }
 
     #[test]
