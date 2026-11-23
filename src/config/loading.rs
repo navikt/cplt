@@ -345,6 +345,15 @@ impl Config {
             .collect();
         allow_private_domains.sort_unstable();
         allow_private_domains.dedup();
+        // An IP literal or inet_aton alias is blocked before DNS whatever this
+        // list says, so the entry would do nothing. Say so and drop it (#1102).
+        allow_private_domains.retain(|d| {
+            let alias = crate::proxy::is_ip_alias(d);
+            if alias {
+                ui::warn(&crate::proxy::ip_alias_ignored_msg(d));
+            }
+            !alias
+        });
         for domain in &allow_private_domains {
             if domain.trim().is_empty() {
                 return Err(ConfigError::Validation(
@@ -1959,6 +1968,13 @@ impl Resolved {
                 // validation rejects "" but not "." or " ", which normalize to
                 // the same nothing. Skip them here so the two paths agree.
                 if domain.is_empty() {
+                    continue;
+                }
+                // `cplt trust accept` refuses an alias, but an approval on file
+                // from before that rule still lists one. Warn and drop it, as the
+                // config path does: the pre-DNS guard blocks it anyway (#1102).
+                if crate::proxy::is_ip_alias(&domain) {
+                    ui::warn(&crate::proxy::ip_alias_ignored_msg(&domain));
                     continue;
                 }
                 if !self.allow_private_domains.contains(&domain) {
@@ -3642,6 +3658,21 @@ validate = false
         assert!(resolved.allow_ports.contains(&5432));
     }
 
+    /// #1102: an IP-alias entry would do nothing, so it is dropped (with a
+    /// warning) rather than kept as an apparent grant.
+    #[test]
+    fn allow_private_domains_drops_ip_aliases_at_load() {
+        let config = Config::parse(
+            "[proxy]\nallow_private_domains = [\"intern.nav.no\", \"10.1\", \"0x0a.1.2.3\"]\n",
+        )
+        .expect("config parses");
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(
+            resolved.allow_private_domains,
+            vec!["intern.nav.no".to_string()]
+        );
+    }
+
     #[test]
     fn apply_repo_config_proxy_proposals() {
         // The global config already allows one of the proposed domains, so the
@@ -3659,6 +3690,8 @@ validate = false
                         "Intern.NAV.no".to_string(),
                         "mimir.nav.cloud.nais.io.".to_string(),
                         ".".to_string(),
+                        // Legacy approval from before `trust accept` refused aliases (#1102).
+                        "10.1".to_string(),
                     ],
                     ..Default::default()
                 },

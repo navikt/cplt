@@ -296,6 +296,18 @@ fn detects_dot_local_hostname() {
 #[test]
 fn allows_normal_hostnames() {
     assert!(!is_private_hostname("api.github.com"));
+    // #1102: inet_aton aliases are IP literals in disguise.
+    for alias in [
+        "10.1",
+        "0x0a.1.2.3",
+        "012.0.0.1",
+        "167772161",
+        "127.1",
+        "10.1.",
+    ] {
+        assert!(is_private_hostname(alias), "{alias}");
+    }
+    assert!(!is_private_hostname("1password.com"));
     assert!(!is_private_hostname("registry.npmjs.org"));
 }
 

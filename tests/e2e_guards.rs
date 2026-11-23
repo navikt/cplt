@@ -1052,6 +1052,69 @@ fn gh_gate_pins_host_and_scopes_token_for_cross_repo_api_reads() {
     );
 }
 
+/// #1088: with no host in argv the token rides along with `GH_HOST=github.com`,
+/// so a hosts.yml listing only a tenant cannot redirect it; an argv naming a
+/// tenant gets no token, and the user is told why.
+#[test]
+fn gh_gate_pins_github_host_with_token_and_withholds_it_for_tenant_argv() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s|%s|%s\\n' \"${GH_HOST-}\" \"${GH_TOKEN-}\" \"$*\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let token_dir = temp.path().join("tokens");
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join(".gh-exec-token"), "gho_github_token\n").unwrap();
+
+    let run = |args: &[&str]| {
+        let out = cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--")
+            .args(args)
+            .env_remove("GH_HOST")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .output()
+            .expect("cplt gh-gate should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let (out, err) = run(&["repo", "list"]);
+    assert_eq!(out, "github.com|gho_github_token|repo list");
+    assert!(!err.contains("GitHub token withheld"), "{err}");
+
+    for tenant in [
+        &["search", "code", "ghe.community"][..],
+        &["search", "repos", "x", "--owner=octo.GHE.com"][..],
+        &["search", "code", "github.localhost"][..],
+    ] {
+        let (out, err) = run(tenant);
+        assert!(
+            out.starts_with("||"),
+            "token must be withheld for {tenant:?}: {out}"
+        );
+        assert!(err.contains("GitHub token withheld"), "{tenant:?}: {err}");
+    }
+}
+
 #[test]
 fn gh_gate_allows_same_repo_api_endpoint() {
     let (_, _, ok) = gh_gate(&["api", "/repos/navikt/cplt/pulls"]);

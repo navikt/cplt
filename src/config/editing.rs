@@ -75,10 +75,16 @@ fn parse_value_for_key(
             // Comma-separated: "path1,path2" or single "path1"
             let mut arr = toml_edit::Array::new();
             for item in value.split(',') {
+                let item = if is_private_domains_key(key_info) {
+                    crate::proxy::normalize_hostname(item)
+                } else {
+                    item.trim().to_string()
+                };
+                refuse_private_domain_ip(key_info, &item)?;
                 if is_gh_hosts_key(key_info) {
-                    super::validation::validate_gh_host(item.trim())?;
+                    super::validation::validate_gh_host(&item)?;
                 }
-                arr.push(item.trim());
+                arr.push(item);
             }
             Ok(toml_edit::Value::Array(arr))
         }
@@ -87,6 +93,28 @@ fn parse_value_for_key(
             key_info.section, key_info.key
         ))),
     }
+}
+
+/// `allow_private_domains` cannot allow an IP target, inet_aton aliases
+/// included (#1102): the proxy blocks those before DNS. Refuse while the user
+/// is at the keyboard instead of storing an entry that does nothing.
+pub(crate) fn refuse_private_domain_ip(
+    key_info: &ConfigKeyInfo,
+    value: &str,
+) -> Result<(), ConfigError> {
+    if (key_info.section, key_info.key) == ("proxy", "allow_private_domains")
+        && crate::proxy::is_ip_alias(value)
+    {
+        return Err(ConfigError::Validation(format!(
+            "{value} is an IP address, not a DNS name. cplt blocks private IP targets \
+             whatever proxy.allow_private_domains says. Give the host a DNS name and allow that."
+        )));
+    }
+    Ok(())
+}
+
+fn is_private_domains_key(key_info: &ConfigKeyInfo) -> bool {
+    (key_info.section, key_info.key) == ("proxy", "allow_private_domains")
 }
 
 fn is_gh_hosts_key(key_info: &ConfigKeyInfo) -> bool {
@@ -107,6 +135,23 @@ fn parse_element_for_key(
     key_info: &ConfigKeyInfo,
     value: &str,
 ) -> Result<toml_edit::Value, ConfigError> {
+    parse_element(key_info, value, false)
+}
+
+/// `removing` skips every refusal and normalisation: an entry that is already
+/// in the file, bad or not, must always be removable.
+fn parse_element(
+    key_info: &ConfigKeyInfo,
+    value: &str,
+    removing: bool,
+) -> Result<toml_edit::Value, ConfigError> {
+    let normalised;
+    let value = if !removing && is_private_domains_key(key_info) {
+        normalised = crate::proxy::normalize_hostname(value);
+        normalised.as_str()
+    } else {
+        value
+    };
     match key_info.value_type {
         ConfigValueType::U16Array => {
             let n: u16 = value.parse().map_err(|_| {
@@ -118,14 +163,14 @@ fn parse_element_for_key(
             Ok(toml_edit::value(i64::from(n)).into_value().unwrap())
         }
         ConfigValueType::StrArray => {
-            if value.contains(',') {
+            if !removing && value.contains(',') {
                 return Err(ConfigError::Validation(format!(
                     "value contains a comma. Add one value at a time:\n  \
                      cplt config set {}.{} <VALUE>",
                     key_info.section, key_info.key
                 )));
             }
-            if is_gh_hosts_key(key_info) {
+            if !removing && is_gh_hosts_key(key_info) {
                 super::validation::validate_gh_host(value)?;
             }
             // A `*` in a domain matches nothing: matching is exact host plus
@@ -133,7 +178,8 @@ fn parse_element_for_key(
             // at launch; for a config array it can be refused at the point of
             // typing, which is better — the user is right there, and the
             // correction is mechanical.
-            if is_domain_key(key_info)
+            if !removing
+                && is_domain_key(key_info)
                 && let Some(bare) = value.strip_prefix("*.")
             {
                 return Err(ConfigError::Validation(format!(
@@ -143,12 +189,20 @@ fn parse_element_for_key(
                     key_info.section, key_info.key
                 )));
             }
-            if is_domain_key(key_info) && value.contains('*') {
+            if !removing && is_domain_key(key_info) && value.contains('*') {
                 return Err(ConfigError::Validation(format!(
                     "{value} contains a wildcard, which matches no host. Matching is exact \
                      host plus subdomains — name the domain itself and every subdomain is \
                      covered."
                 )));
+            }
+            if !removing {
+                refuse_private_domain_ip(key_info, value)?;
+            }
+            // Removal matches the spelling as typed; the caller tries the
+            // expanded and normalised forms after it.
+            if removing {
+                return Ok(toml_edit::value(value).into_value().unwrap());
             }
             // Expand ~ so stored values are always absolute paths.
             // For non-path keys (e.g. pass_env), expand_tilde is a no-op.
@@ -242,7 +296,25 @@ pub fn remove_array_element_in_doc(
     key_info: &ConfigKeyInfo,
     value: &str,
 ) -> Result<bool, ConfigError> {
-    let element = parse_element_for_key(key_info, value)?;
+    // Match order: the exact typed string, the tilde-expanded form (what
+    // `set --append` stores for path keys), then the normalised form (what it
+    // stores for proxy.allow_private_domains). Never validates.
+    let mut candidates = vec![parse_element(key_info, value, true)?];
+    if matches!(key_info.value_type, ConfigValueType::StrArray) {
+        let expanded = expand_tilde(value);
+        candidates.push(parse_element(
+            key_info,
+            expanded.to_string_lossy().as_ref(),
+            true,
+        )?);
+        if is_private_domains_key(key_info) {
+            candidates.push(parse_element(
+                key_info,
+                &crate::proxy::normalize_hostname(value),
+                true,
+            )?);
+        }
+    }
 
     let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) else {
         return Ok(false); // Section doesn't exist — nothing to remove
@@ -259,11 +331,25 @@ pub fn remove_array_element_in_doc(
         )));
     };
 
-    // Find and remove all matching elements (handles manual duplicates)
+    // Every entry any rule matches: each rule names the same path or domain,
+    // so removing all of them never widens what is removed.
     let mut removed = false;
-    while let Some(idx) = array_index_of(arr, &element) {
-        arr.remove(idx);
-        removed = true;
+    for c in &candidates {
+        while let Some(idx) = array_index_of(arr, c) {
+            arr.remove(idx);
+            removed = true;
+        }
+    }
+    if is_private_domains_key(key_info) {
+        let want = crate::proxy::normalize_hostname(value);
+        if !want.is_empty() {
+            let before = arr.len();
+            arr.retain(|v| {
+                v.as_str()
+                    .is_none_or(|s| crate::proxy::normalize_hostname(s) != want)
+            });
+            removed |= arr.len() != before;
+        }
     }
 
     // Clean up empty arrays
@@ -627,6 +713,93 @@ mod tests {
             let err = on.unwrap_err().to_string();
             assert!(err.contains("macOS-only"), "{err}");
         }
+    }
+
+    /// #1102: an IP literal or inet_aton alias cannot be allowed by name.
+    #[test]
+    fn allow_private_domains_refuses_ip_aliases_at_set() {
+        let info = lookup_key("proxy.allow_private_domains").unwrap();
+        for bad in ["10.1", "0x0a.1.2.3", "012.0.0.1", "167772161", "10.0.0.5"] {
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            let err = set_value_in_doc(&mut doc, info, bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a DNS name"), "{bad}: {err}");
+            let err = parse_element_for_key(info, bad).unwrap_err().to_string();
+            assert!(err.contains("not a DNS name"), "{bad}: {err}");
+        }
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        set_value_in_doc(&mut doc, info, "intern.nav.no").unwrap();
+        parse_element_for_key(info, "1password.com").unwrap();
+    }
+
+    #[test]
+    fn allow_private_domains_normalises_before_validating_and_removal_always_works() {
+        let info = lookup_key("proxy.allow_private_domains").unwrap();
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(set_value_in_doc(&mut doc, info, " 167772161").is_err());
+        assert!(append_value_in_doc(&mut doc, info, " 167772161 ").is_err());
+        append_value_in_doc(&mut doc, info, " Intern.NAV.no. ").unwrap();
+        assert!(doc.to_string().contains("\"intern.nav.no\""), "{doc}");
+        let mut doc = "[proxy]\nallow_private_domains = [\"10.1\", \"a.no\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(remove_array_element_in_doc(&mut doc, info, "10.1").unwrap());
+        assert!(!doc.to_string().contains("10.1"), "{doc}");
+        // set stores the normalised form.
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        set_value_in_doc(&mut doc, info, " Intern.NAV.no. ").unwrap();
+        assert!(
+            doc.to_string()
+                .contains("allow_private_domains = [\"intern.nav.no\"]"),
+            "{doc}"
+        );
+        // unset finds a normalised entry by its mixed-case spelling.
+        assert!(remove_array_element_in_doc(&mut doc, info, "Intern.NAV.no").unwrap());
+        assert!(!doc.to_string().contains("intern"), "{doc}");
+        // an empty entry does not block removing others.
+        let mut doc = "[proxy]\nallow_private_domains = [\"\", \"a.no\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(remove_array_element_in_doc(&mut doc, info, "A.no").unwrap());
+        assert!(doc.to_string().contains("\"\""), "{doc}");
+        assert!(!doc.to_string().contains("a.no"), "{doc}");
+    }
+
+    #[test]
+    fn removal_does_not_expand_tilde() {
+        let info = lookup_key("allow.read").unwrap();
+        let mut doc = "[allow]\nread = [\"~/t\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
+    }
+
+    #[test]
+    fn removal_match_order_exact_then_expanded_then_normalised() {
+        let info = lookup_key("allow.read").unwrap();
+        let home = expand_tilde("~/t").to_string_lossy().to_string();
+        let parse = |s: &str| s.parse::<toml_edit::DocumentMut>().unwrap();
+        // every spelling of the same path goes: literal and expanded.
+        let mut doc = parse(&format!("[allow]\nread = [\"{home}\", \"~/t\"]\n"));
+        assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
+        assert!(!doc.to_string().contains(&home) && !doc.to_string().contains("~/t"));
+        // expanded fallback.
+        let mut doc = parse(&format!("[allow]\nread = [\"{home}\"]\n"));
+        assert!(remove_array_element_in_doc(&mut doc, info, "~/t").unwrap());
+        // normalised fallback.
+        let info = lookup_key("proxy.allow_private_domains").unwrap();
+        let mut doc = parse("[proxy]\nallow_private_domains = [\"A.no\", \"a.no\"]\n");
+        assert!(remove_array_element_in_doc(&mut doc, info, "A.no").unwrap());
+        assert!(!doc.to_string().to_lowercase().contains("a.no"), "{doc}");
+        let mut doc = parse("[proxy]\nallow_private_domains = [\"a.no\"]\n");
+        assert!(remove_array_element_in_doc(&mut doc, info, "A.no.").unwrap());
+        // every spelling goes, whichever rule matches it.
+        let mut doc = parse("[proxy]\nallow_private_domains = [\"A.no.\", \"b.no\", \"B.no\"]\n");
+        assert!(remove_array_element_in_doc(&mut doc, info, "B.NO").unwrap());
+        assert!(!doc.to_string().to_lowercase().contains("b.no"), "{doc}");
+        assert!(remove_array_element_in_doc(&mut doc, info, "a.no").unwrap());
+        assert!(!doc.to_string().contains("allow_private_domains"), "{doc}");
     }
 
     #[test]
