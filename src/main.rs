@@ -10294,18 +10294,26 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     );
     let macos = cfg!(target_os = "macos");
     // The value a variable will have in the child, as the launch's
-    // `child_env_value` sees it: Copilot's token variables are in
-    // ENV_ALLOWLIST; anything else arrives only through --pass-env or
-    // --inherit-env (#1066).
+    // `child_env_value` sees it: the launch's own env builder, so
+    // --pass-env, --inherit-env and per-agent suppression match (#1092).
+    let parent_env: Vec<(String, String)> = std::env::vars().collect();
+    let sandbox_env = cplt::sandbox::build_sandbox_env(
+        &parent_env,
+        &resolved.pass_env,
+        resolved.inherit_env,
+        &[],
+        None,
+        None,
+        active_agent,
+    );
     let child_env = |k: &str| {
-        (resolved.inherit_env
-            || resolved.pass_env.iter().any(|p| p == k)
-            || (active_agent == agent::Agent::Copilot
-                && agent::Agent::Copilot
-                    .keychain_substitute_env_vars()
-                    .contains(&k)))
-        .then(|| std::env::var(k).ok())
-        .flatten()
+        if let Some((_, v)) = sandbox_env.vars.iter().rev().find(|(n, _)| n == k) {
+            Some(v.clone())
+        } else if sandbox_env.clear_first || sandbox_env.remove.iter().any(|n| n == k) {
+            None
+        } else {
+            std::env::var(k).ok()
+        }
     };
     let env_token = active_agent
         .keychain_substitute_env_vars()
