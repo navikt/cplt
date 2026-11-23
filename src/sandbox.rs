@@ -2312,12 +2312,46 @@ pub(crate) fn resolve_unwritable(path: &Path, writable: &[PathBuf]) -> Result<Pa
 /// A dotfile-manager link to a tree the agent cannot write (stow, chezmoi,
 /// home-manager) stays usable.
 pub(crate) fn hosts_agent_writable(hosts: &Path, real: &Path, writable: &[PathBuf]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |m: std::fs::Metadata| (m.dev(), m.ino());
+    // Identity, not spelling: on case-insensitive or normalising APFS
+    // `<root>/PROJ` and an NFD name are the same dir as `<root>/Proj` (#1080).
+    let roots: Vec<_> = writable
+        .iter()
+        .filter_map(|w| std::fs::metadata(w).ok().map(id))
+        .collect();
     let inside = |p: &Path| {
         writable
             .iter()
-            .any(|w| p.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| p.starts_with(w)))
+            .any(|w| p.starts_with(w) || p.starts_with(canonical_prefix(w)))
+            || std::fs::symlink_metadata(p).is_ok_and(|m| roots.contains(&id(m)))
+            || p.ancestors()
+                .skip(1)
+                .any(|a| std::fs::metadata(a).is_ok_and(|m| roots.contains(&id(m))))
     };
     inside(hosts) || inside(real)
+}
+
+/// `p` with its longest existing prefix canonicalised and the missing tail
+/// appended, so a not-yet-created root under `/tmp` still matches `/private/tmp`.
+fn canonical_prefix(p: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut a = p;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(a) {
+            return tail
+                .iter()
+                .rev()
+                .fold(c, |c, t: &&std::ffi::OsStr| c.join(t));
+        }
+        match (a.parent(), a.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                a = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// The github.com `user:` from gh's `hosts.yml`.
@@ -2379,22 +2413,12 @@ fn copilot_keychain_acct() -> Result<Option<String>, String> {
 fn copilot_keychain_accts(out: &str) -> Result<Option<String>, String> {
     let mut accts: Vec<String> = Vec::new();
     for item in out.split("keychain: ").skip(1) {
-        let svce = item
+        // `security` prints a service in hex only when it is not plain ASCII,
+        // so a hex `svce` is never `copilot-cli`: skip it.
+        if !item
             .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with("\"svce\""));
-        let mut matched = false;
-        for l in svce {
-            match l.strip_prefix("\"svce\"<blob>=\"") {
-                Some(v) => matched |= v == "copilot-cli\"",
-                // A hex or otherwise encoded service could be Copilot's: ambiguous.
-                None if l != "\"svce\"<blob>=<NULL>" => {
-                    return Err("the Keychain lists an item cplt cannot parse".into());
-                }
-                None => {}
-            }
-        }
-        if !matched {
+            .any(|l| l.trim() == "\"svce\"<blob>=\"copilot-cli\"")
+        {
             continue;
         }
         let Some(a) = keychain_acct(item) else {
@@ -7848,8 +7872,8 @@ mod account_tests {
         COPILOT_CONFIG_LIMIT, CopilotConfigAccount, ProcAdvice, SecretServiceSkip,
         account_mismatch, anchored_gh_login, copilot_account_check, copilot_config_account,
         copilot_has_native_login, copilot_keychain_accts, gh_login, hosts_agent_writable,
-        keychain_acct, proc_self_limit_text, secret_service_substitute, secret_tool_args,
-        unix_sockets_unrestricted,
+        keychain_acct, proc_self_limit_text, resolve_unwritable, secret_service_substitute,
+        secret_tool_args, unix_sockets_unrestricted,
     };
 
     #[test]
@@ -7895,7 +7919,12 @@ mod account_tests {
         let no_acct = "keychain: \"/k\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
         assert!(copilot_keychain_accts(no_acct).is_err());
         let hex_svce = "keychain: \"/k\"\n    \"acct\"<blob>=\"x\"\n    \"svce\"<blob>=0x636F70\n";
-        assert!(copilot_keychain_accts(hex_svce).is_err());
+        assert_eq!(copilot_keychain_accts(hex_svce), Ok(None));
+        let mixed = item("alice", "copilot-cli") + hex_svce;
+        assert_eq!(
+            copilot_keychain_accts(&mixed).unwrap().as_deref(),
+            Some("https://github.com:alice")
+        );
         let null_svce = "keychain: \"/k\"\n    \"svce\"<blob>=<NULL>\n";
         assert_eq!(copilot_keychain_accts(null_svce), Ok(None));
     }
@@ -8151,6 +8180,43 @@ mod account_tests {
         // The check runs on the real path it is given, not a fresh resolution.
         assert!(hosts_agent_writable(&good, &planted, &writable));
         assert!(!hosts_agent_writable(&good, &good, &writable));
+    }
+
+    /// A writable root and the gh path may spell one dir differently: case on
+    /// case-insensitive APFS, NFC against NFD (#1080 review).
+    #[test]
+    fn gh_login_anchor_compares_writable_roots_by_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yml = "github.com:\n    user: mallory\n";
+        for (made, spelled) in [("Proj", "PROJ"), ("caf\u{e9}", "cafe\u{301}")] {
+            let root = tmp.path().join(made);
+            std::fs::create_dir_all(root.join("gh")).unwrap();
+            std::fs::write(root.join("gh/hosts.yml"), yml).unwrap();
+            let other = tmp.path().join(spelled).join("gh/hosts.yml");
+            if !other.exists() {
+                eprintln!("skip {spelled}: volume tells the spellings apart");
+                continue;
+            }
+            assert_eq!(
+                resolve_unwritable(&other, std::slice::from_ref(&root)),
+                Err(())
+            );
+            assert_eq!(anchored_gh_login(&other, &[root]), Err(()));
+        }
+    }
+
+    /// A writable root that does not exist yet, under a symlinked ancestor.
+    #[test]
+    fn missing_writable_root_under_symlinked_ancestor_still_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let via = tmp.path().join("via");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        let writable = vec![via.join("new")];
+        let p = std::fs::canonicalize(&real).unwrap().join("new/hosts.yml");
+        assert!(hosts_agent_writable(&p, &p, &writable));
+        assert_eq!(resolve_unwritable(&p, &writable), Err(()));
     }
 
     #[test]

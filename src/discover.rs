@@ -2098,6 +2098,17 @@ mod tests {
                 "file grant"
             );
         });
+        // A file-only grant spelled through a symlinked dir, before hosts.yml exists.
+        let fresh = root.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::os::unix::fs::symlink(&fresh, root.join("freshlink")).unwrap();
+        let linked_grant = vec![root.join("freshlink/hosts.yml")];
+        with(fresh.to_str().unwrap(), &|| {
+            assert!(
+                gh_lookup_config_dir(&root, &linked_grant).is_err(),
+                "file grant via symlinked dir, hosts.yml missing"
+            );
+        });
         // A missing dir under an alias of a writable tree.
         std::os::unix::fs::symlink(&rw, root.join("alias")).unwrap();
         with(root.join("alias/missing/gh").to_str().unwrap(), &|| {
