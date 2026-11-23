@@ -270,7 +270,7 @@ impl UpstreamProxy {
     /// proxy. An IPv6 literal host (stored without brackets) is wrapped back in
     /// brackets so the result is a valid socket address (`[::1]:3128`); names
     /// and IPv4 addresses are used verbatim.
-    fn socket_addr(&self) -> String {
+    pub(crate) fn socket_addr(&self) -> String {
         if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -650,6 +650,10 @@ pub struct ProxyState {
     // aggregate totals even when a host record exceeds a retention limit.
     domain_collector: Arc<DomainCollector>,
 
+    // Set by `ProxyHandle::shutdown`; the GitHub MCP endpoint starts no curl
+    // after it, so none outlives the proxy.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+
     // Test-only: injectable DNS resolver to simulate fake DNS responses.
     #[cfg(test)]
     resolver: Option<ResolverFn>,
@@ -717,6 +721,9 @@ impl ProxyHandle {
                 &std::net::SocketAddr::from(([127, 0, 0, 1], self.port)),
                 Duration::from_secs(1),
             );
+            // After the flag: a curl spawned from here on sees it and dies
+            // itself. Only once, like the wake-up: the port may be reused.
+            crate::github_mcp::kill_children(&self.shutdown_flag);
         }
     }
 
@@ -949,6 +956,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     let collection_started_at = Instant::now();
     let (domain_collector, classification_wake_rx) = DomainCollector::new();
 
+    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = Arc::new(ProxyState {
         policy,
         log_file: opts.log_file,
@@ -957,11 +965,11 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         upstream: opts.upstream,
         upstream_no_proxy: opts.upstream_no_proxy,
         domain_collector: domain_collector.clone(),
+        shutdown: shutdown_flag.clone(),
         #[cfg(test)]
         resolver: opts.resolver,
     });
 
-    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = shutdown_flag.clone();
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let accept_collector = domain_collector.clone();
@@ -1206,12 +1214,38 @@ fn handle_connection(
         // OpenCode's GitHub MCP entry (#797): served on this port so the
         // sandbox needs no new one. The head was read under this proxy's size
         // cap and deadline, and the connection counts against its limit.
-        classification.complete(None);
+        // The token leaves only for the endpoint's pinned upstream, under the
+        // same domain policy and upstream proxy as a CONNECT to it: the request
+        // path is agent-chosen, so skipping the gates would bypass the user's
+        // blocklist and allowlist for this host.
+        let (host, port) = endpoint.authority();
+        let target = format!("{host}:{port}");
+        let verdict = classify_connect(&state.net_policy(), &host, port);
+        if verdict != NetVerdict::Allowed {
+            log_connection(
+                state,
+                Some(&mut classification),
+                "CONNECT",
+                &target,
+                verdict.status(),
+            );
+            reject(&mut client, blocked_body(verdict));
+            return;
+        }
+        let via = state
+            .upstream
+            .as_ref()
+            .filter(|_| !host_matches_no_proxy(&host, &state.upstream_no_proxy));
+        let route = match via {
+            Some(u) => format!("CONNECTED (github-mcp via {})", u.socket_addr()),
+            None => "CONNECTED (github-mcp)".to_string(),
+        };
+        log_connection(state, Some(&mut classification), "CONNECT", &target, &route);
         let log = crate::github_mcp::Log {
             level: state.log_level,
             file: state.log_file.clone(),
         };
-        endpoint.serve(client, &head, &log);
+        endpoint.serve(client, &head, &log, via, timeout, &state.shutdown);
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
@@ -1234,6 +1268,18 @@ fn bad_connect_target(target: &str) -> &str {
         "***@<redacted>"
     } else {
         target
+    }
+}
+
+/// The 403 body for a host outside the allowlist, with the next step.
+const ALLOWLIST_BLOCK_BODY: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n";
+
+/// The 403 body for a refused GitHub MCP request: the allowlist hint where it
+/// applies, as `handle_connect` gives it.
+fn blocked_body(verdict: NetVerdict) -> &'static [u8] {
+    match verdict {
+        NetVerdict::BlockedAllowlist => ALLOWLIST_BLOCK_BODY,
+        _ => b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n",
     }
 }
 
@@ -1681,7 +1727,7 @@ fn handle_connect(
                 target,
                 "BLOCKED-ALLOWLIST",
             );
-            reject(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n");
+            reject(&mut client, ALLOWLIST_BLOCK_BODY);
             return;
         }
         NetVerdict::Blocked => {
@@ -3237,6 +3283,7 @@ mod tests {
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resolver: None,
         }
     }
@@ -3922,6 +3969,38 @@ mod tests {
     /// close the listening port and let the accept thread finish, with no
     /// polling interval to wait out. A second shutdown is a no-op.
     #[test]
+    fn shutdown_kills_its_github_mcp_children() {
+        let (_, accept_done_rx) = mpsc::sync_channel(1);
+        let (collector, classification_wake_rx) = DomainCollector::new();
+        let handle = ProxyHandle {
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            port: 0,
+            domain_collector: collector,
+            collection_started_at: Instant::now(),
+            accept_done_rx,
+            classification_wake_rx,
+        };
+        #[allow(clippy::disallowed_methods)] // absolute path
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let key = Arc::as_ptr(&handle.shutdown_flag) as usize;
+        crate::github_mcp::CHILDREN
+            .lock()
+            .unwrap()
+            .push((key, child.id()));
+        handle.shutdown();
+        // SIGKILL ends it at once; a missed kill shows as sleep's clean exit.
+        let killed = !child.wait().unwrap().success();
+        crate::github_mcp::CHILDREN
+            .lock()
+            .unwrap()
+            .retain(|&(o, _)| o != key);
+        assert!(killed, "shutdown left the curl child running");
+    }
+
+    #[test]
     fn shutdown_wakes_the_blocked_accept_loop_and_closes_the_port() {
         require_localhost_tcp!();
         let up = spawn_fake_upstream();
@@ -4258,10 +4337,9 @@ mod tests {
     fn github_mcp_endpoint_forwards_through_curl() {
         use std::io::BufRead;
         let up = TcpListener::bind("127.0.0.1:0").unwrap();
-        let upstream = format!(
-            "http://127.0.0.1:{}/mcp/readonly",
-            up.local_addr().unwrap().port()
-        );
+        let up_port = up.local_addr().unwrap().port();
+        let up_zero = up.try_clone().unwrap();
+        let upstream = format!("http://127.0.0.1:{up_port}/mcp/readonly");
         assert!(
             crate::github_mcp::install_for_test(&upstream, "TOKEN", "s3cr3t").is_some(),
             "no curl in the trusted dirs: this test cannot run without it"
@@ -4291,7 +4369,7 @@ mod tests {
             s.write_all(b"7\r\ndata:2\n\r\n0\r\n\r\n").unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
-        let p = head_test_proxy(1, Duration::from_secs(10), dir.path().join("log"));
+        let p = head_test_proxy(up_port, Duration::from_secs(10), dir.path().join("log"));
 
         let mut bad = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
         bad.write_all(b"GET /s3cr3u HTTP/1.1\r\n\r\n").unwrap();
@@ -4346,6 +4424,97 @@ mod tests {
         big.write_all(b"POST /s3cr3t HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n")
             .unwrap();
         assert!(read_status_line(&mut big).starts_with("HTTP/1.1 413"));
+        p.shutdown();
+
+        // The endpoint is process-global, so the routing cases share it here.
+        let post = b"POST /s3cr3t HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+
+        // A blocklist naming the upstream host refuses before curl runs.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "127.0.0.1\n").unwrap();
+        let log = dir.path().join("log-blocked");
+        let p = routed_test_proxy(
+            up_port,
+            Duration::from_secs(10),
+            log.clone(),
+            Some(blocked),
+            None,
+        );
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(post).unwrap();
+        assert!(read_status_line(&mut c).starts_with("HTTP/1.1 403"));
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains(&format!("CONNECT 127.0.0.1:{up_port} BLOCKED")),
+            "{logged}"
+        );
+        p.shutdown();
+
+        // proxy.upstream carries the request, as a tunnel to the pinned host.
+        let corp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let corp_port = corp.local_addr().unwrap().port();
+        let (ctx, crx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (s, _) = corp.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&s).read_line(&mut line).unwrap();
+            ctx.send(line).unwrap();
+            let _ = (&s).write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        });
+        let via = UpstreamProxy::parse(&format!("http://127.0.0.1:{corp_port}")).unwrap();
+        let p = routed_test_proxy(
+            up_port,
+            Duration::from_secs(10),
+            dir.path().join("l2"),
+            None,
+            Some(via),
+        );
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(post).unwrap();
+        let line = crx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            line.starts_with(&format!("CONNECT 127.0.0.1:{up_port} ")),
+            "{line}"
+        );
+        assert!(read_status_line(&mut c).starts_with("HTTP/1.1 502"));
+        p.shutdown();
+
+        // The ambient-proxy guarantee is covered without touching the process
+        // env: see `github_mcp::tests::curl_runs_with_a_cleared_env_and_bounded_times`.
+
+        // A body trickled in under the per-read timeout still meets one deadline.
+        let p = head_test_proxy(up_port, Duration::from_secs(2), dir.path().join("l4"));
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(b"POST /s3cr3t HTTP/1.1\r\nContent-Length: 40\r\n\r\n")
+            .unwrap();
+        let mut w = c.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(300));
+                if w.write_all(b" ").is_err() {
+                    break;
+                }
+            }
+        });
+        c.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        assert!(read_status_line(&mut c).starts_with("HTTP/1.1 400"));
+        p.shutdown();
+
+        // `--proxy-timeout 0` means the default, not an instant body deadline.
+        std::thread::spawn(move || {
+            let (s, _) = up_zero.accept().unwrap();
+            let mut r = std::io::BufReader::new(&s);
+            let mut l = String::new();
+            while r.read_line(&mut l).unwrap() > 2 {
+                l.clear();
+            }
+            let _ = (&s).write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        });
+        let p = head_test_proxy(up_port, Duration::ZERO, dir.path().join("l5"));
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(post).unwrap();
+        let status = read_status_line(&mut c);
+        assert!(status.starts_with("HTTP/1.1 204"), "{status}");
         p.shutdown();
     }
 
@@ -4431,12 +4600,22 @@ mod tests {
 
     /// Proxy that lets CONNECT reach `origin_port` on IPv4 loopback directly.
     fn head_test_proxy(origin_port: u16, timeout: Duration, log: PathBuf) -> ProxyHandle {
+        routed_test_proxy(origin_port, timeout, log, None, None)
+    }
+
+    fn routed_test_proxy(
+        origin_port: u16,
+        timeout: Duration,
+        log: PathBuf,
+        blocked_file: Option<PathBuf>,
+        upstream: Option<UpstreamProxy>,
+    ) -> ProxyHandle {
         let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let resolver: ResolverFn =
             Arc::new(move |_h: &str, p: u16| Some(std::net::SocketAddr::new(loopback, p)));
         start(ProxyOptions {
             port: 0,
-            blocked_file: None,
+            blocked_file,
             subscription_blocklist: Vec::new(),
             allowed_ports: vec![443],
             allow_localhost_ports: vec![origin_port],
@@ -4452,7 +4631,7 @@ mod tests {
             log_file: Some(log),
             log_level: ProxyLogLevel::None,
             timeout,
-            upstream: None,
+            upstream,
             upstream_no_proxy: Vec::new(),
             resolver: Some(resolver),
         })
