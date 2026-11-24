@@ -2830,6 +2830,30 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The tail of an in-sandbox wrapper that runs `cplt` with `args` (#1158).
+///
+/// Not `exec`: a failed `exec` ends a non-interactive `sh` before any
+/// fallback runs, and the sandbox denies exec of a cplt that lives under a
+/// temp dir. So run it, and on 126 check whether cplt itself cannot start; if
+/// so, say which `feature` broke and how to fix it, on the terminal when there
+/// is one, and keep the exit status. The probe only runs on that failure.
+#[must_use]
+pub fn run_cplt_or_explain(cplt: &str, args: &str, feature: &str) -> String {
+    let msg = shell_escape(&format!(
+        "cplt: {feature} failed: the sandbox cannot run cplt at {cplt}. \
+         Install cplt outside temp dirs, e.g. brew install navikt/tap/cplt."
+    ));
+    let c = shell_escape(cplt);
+    format!(
+        "{c} {args}\n\
+         s=$?\n\
+         if [ \"$s\" = 126 ] && ! {c} --version >/dev/null 2>&1; then\n  \
+         {{ printf '%s\\n' {msg} >/dev/tty; }} 2>/dev/null || printf '%s\\n' {msg} >&2\n\
+         fi\n\
+         exit \"$s\"\n"
+    )
+}
+
 /// Generate the shell wrapper script content.
 ///
 /// The wrapper intercepts `gh` invocations, calls `cplt gh-gate` for
@@ -2850,7 +2874,6 @@ pub fn generate_wrapper_script(
     cplt_bin: &str,
     policy: &crate::config::GhGuardPolicy,
 ) -> String {
-    let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
     let repo_scope_flag = repo_scope
         .iter()
@@ -2901,12 +2924,18 @@ pub fn generate_wrapper_script(
             .collect()
     };
     format!(
-        r#"#!/bin/sh
+        r"#!/bin/sh
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag} -- "$@"
-"#
+{run}",
+        run = run_cplt_or_explain(
+            cplt_bin,
+            &format!(
+                "gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag} -- \"$@\""
+            ),
+            "the gh guard",
+        ),
     )
 }
 
@@ -6669,7 +6698,6 @@ pub fn generate_git_wrapper_script(
     policy: &crate::config::GitGuardPolicy,
     repo_facts: &RepoFacts,
 ) -> String {
-    let cplt_escaped = shell_escape(cplt_bin);
     let git_escaped = shell_escape(real_git);
     let mode_flag = match policy.mode {
         crate::config::EnforcementMode::Block => "--mode=block",
@@ -6714,12 +6742,18 @@ pub fn generate_git_wrapper_script(
         format!(" --allow-push-rules='{}'", json.replace('\'', "'\\''"))
     };
     format!(
-        r#"#!/bin/sh
+        r"#!/bin/sh
 # cplt git proxy — blocks git push in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} {protect_default_flag}{allow_push_flag}{repo_facts_flag} -- "$@"
-"#
+{run}",
+        run = run_cplt_or_explain(
+            cplt_bin,
+            &format!(
+                "git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} {protect_default_flag}{allow_push_flag}{repo_facts_flag} -- \"$@\""
+            ),
+            "the git guard",
+        ),
     )
 }
 
@@ -6731,6 +6765,43 @@ mod tests {
     /// One object, three renderings: the launch prints the block form, warn
     /// mode the same body under a label that does not say BLOCKED, and the
     /// agent-addressed lines close both. Nothing here is derived from text.
+    /// #1158: a wrapper whose cplt cannot be executed says so on stderr (no
+    /// tty here) and exits non-zero, instead of dying silently in `exec`.
+    #[test]
+    fn wrapper_explains_when_cplt_cannot_run() {
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let cplt = dir.path().join("cplt");
+        std::fs::write(&cplt, "#!/bin/sh\n").unwrap(); // mode 0644: not executable
+        let script = dir.path().join("w");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n{}",
+                run_cplt_or_explain(&cplt.to_string_lossy(), "x", "the gh guard")
+            ),
+        )
+        .unwrap();
+        #[allow(clippy::disallowed_methods)] // test: /bin/sh on the script just written
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg(&script);
+        // SAFETY: setsid is async-signal-safe; drops the tty so the line goes to stderr.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(126), "{err}");
+        assert!(
+            err.contains("cplt: the gh guard failed: the sandbox cannot run cplt at")
+                && err.contains("brew install navikt/tap/cplt"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn a_refusal_renders_from_its_fields() {
         let refusal = Refusal {
@@ -7591,15 +7662,18 @@ mod tests {
             "/usr/local/bin/cplt",
             &crate::config::GhGuardPolicy::default(),
         );
-        assert_eq!(
-            script,
-            "#!/bin/sh\n\
+        assert!(
+            script.starts_with(
+                "#!/bin/sh\n\
              # cplt gh proxy — blocks destructive gh operations in sandboxed agents.\n\
              # This wrapper is auto-generated. Do not edit.\n\
              \n\
-             exec '/usr/local/bin/cplt' gh-gate --real-gh '/usr/bin/gh' --repo-scope 'navikt/cplt' \
+             '/usr/local/bin/cplt' gh-gate --real-gh '/usr/bin/gh' --repo-scope 'navikt/cplt' \
              --real-git '/usr/bin/git' --mode=block --scope-check --block-auth-token \
-             --unknown-command=block --no-allow-api-write --no-allow-pr-merge -- \"$@\"\n"
+             --unknown-command=block --no-allow-api-write --no-allow-pr-merge -- \"$@\"\n\
+             s=$?\n"
+            ),
+            "{script}"
         );
     }
 

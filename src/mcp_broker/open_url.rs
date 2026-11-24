@@ -649,11 +649,16 @@ pub fn shim_script(cplt: &str, socket: &str, hosts: &[String], real: Option<&str
         "#!/bin/sh\n\
          case \"$#:$1\" in 1:*) u=$1 ;; 2:-u|2:--) u=$2 ;; *) u= ;; esac\n\
          case \"$u\" in https://*) \
-         exec env {SOCKET_ENV}={} {HOSTS_ENV}={} {} mcp-open-url \"$u\" ;; esac\n\
+         export {SOCKET_ENV}={} {HOSTS_ENV}={}\n\
+         {run};; esac\n\
          {fallback}\n",
         sh_quote(socket),
         sh_quote(&hosts.join(",")),
-        sh_quote(cplt),
+        run = crate::gh_proxy::run_cplt_or_explain(
+            cplt,
+            "mcp-open-url \"$u\"",
+            "opening the MCP login link"
+        ),
     )
 }
 
