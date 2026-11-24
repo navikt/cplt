@@ -143,6 +143,9 @@ pub fn with_scratch_home(cmd: &mut Command) {
     for tv in cplt::sandbox::TOOL_PATH_ENV_VARS {
         cmd.env_remove(tv.name);
     }
+    // Read-only SDK dirs are checked separately from TOOL_PATH_ENV_VARS, and a
+    // CI runner's JAVA_HOME lies outside the scratch HOME, so cplt would warn.
+    cmd.env_remove("JAVA_HOME").env_remove("DOTNET_ROOT");
 }
 
 /// The checkout, canonicalized: the tree the suites build fixtures in when
