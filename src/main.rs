@@ -1906,13 +1906,11 @@ fn merge_tool_path_env_overrides(
         // so this is the single choke point where the effective grant is vetted.
         // Applies to read grants too (read access to `/` or `$HOME` over-grants).
         if !cplt::sandbox::tool_override_path_is_safe(&path, home) {
-            if !resolved.quiet {
-                ui::warn(&format!(
-                    "Ignoring {} = {}: resolves to an unsafe root or HOME and would defeat the sandbox",
-                    ovr.name,
-                    path.to_string_lossy().escape_debug()
-                ));
-            }
+            ui::warn(&format!(
+                "Ignoring {} = {}: resolves to an unsafe root or HOME and would defeat the sandbox",
+                ovr.name,
+                path.to_string_lossy().escape_debug()
+            ));
             continue;
         }
         // The same tree as the default, reached through a link
@@ -1940,9 +1938,9 @@ fn merge_tool_path_env_overrides(
                 .iter()
                 .chain(reads)
                 .any(|g| std::fs::canonicalize(g).is_ok_and(|g| path.starts_with(g)));
-            // `cplt exec` promises clean stderr: quiet hides this, like the
-            // other launch warnings.
-            if !resolved.quiet && !covered {
+            // Not gated on `quiet`: `cplt exec` and `cplt doctor` force it, and the
+            // tool then fails with a bare EPERM (#1128).
+            if !covered {
                 ui::warn(&format!(
                     "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
                  under ~/.cache, ~/Library/Caches (not a personal-app cache), another cplt \
@@ -1962,16 +1960,14 @@ fn merge_tool_path_env_overrides(
         }
         // Second layer: never open a protected path.
         if let Some(prot) = cplt::sandbox::env_tool_path_protected(home, &path) {
-            if !resolved.quiet {
-                ui::warn(&format!(
-                    "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
-                 added and writes there stay denied. Point {} at a directory outside it.",
-                    ovr.name,
-                    path.to_string_lossy().escape_debug(),
-                    prot.to_string_lossy().escape_debug(),
-                    ovr.name
-                ));
-            }
+            ui::warn(&format!(
+                "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
+             added and writes there stay denied. Point {} at a directory outside it.",
+                ovr.name,
+                path.to_string_lossy().escape_debug(),
+                prot.to_string_lossy().escape_debug(),
+                ovr.name
+            ));
             continue;
         }
         // One root per default tree: a second segment of a list var
@@ -10245,13 +10241,8 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                 ));
             }
         }
-        Some(Err(line)) => findings.push(Finding::warning(
-            line,
-            Some(format!(
-                "fix the file, or unset {}",
-                config::MANAGED_CONFIG_ENV
-            )),
-        )),
+        // The refusal line carries its own remedy.
+        Some(Err(line)) => findings.push(Finding::warning(line, None)),
         None => {}
     }
     // ── network: the policy `cplt check net` classifies against (#604) ──

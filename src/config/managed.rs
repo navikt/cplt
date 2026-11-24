@@ -71,6 +71,7 @@ fn open_beneath(dir: &Path, rel: &Path, check_from: usize) -> std::io::Result<st
         libc::O_RDONLY | libc::O_DIRECTORY,
     )?;
     let parts: Vec<_> = rel.components().collect();
+    let mut walked = dir.to_path_buf();
     for (i, c) in parts.iter().enumerate() {
         let std::path::Component::Normal(name) = c else {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -81,6 +82,7 @@ fn open_beneath(dir: &Path, rel: &Path, check_from: usize) -> std::io::Result<st
             libc::O_RDONLY | libc::O_DIRECTORY
         };
         cur = open(cur.as_raw_fd(), name, flags)?;
+        walked.push(name);
         if i + 1 < parts.len() && i >= check_from {
             // SAFETY: zeroed stat is a valid out-parameter; `cur` is an open fd.
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -90,10 +92,7 @@ fn open_beneath(dir: &Path, rel: &Path, check_from: usize) -> std::io::Result<st
             // SAFETY: geteuid has no preconditions and cannot fail.
             let euid = unsafe { libc::geteuid() };
             if (st.st_uid != euid && st.st_uid != 0) || st.st_mode & 0o022 != 0 {
-                return Err(std::io::Error::other(format!(
-                    "the directory {} is not owned by you or root, or is group/world-writable",
-                    esc(&name.to_string_lossy())
-                )));
+                return Err(std::io::Error::other(OpenDir(walked.clone())));
             }
         }
     }
@@ -187,7 +186,41 @@ pub fn load_managed(
     ))
 }
 
+/// `s` for a POSIX shell: escaped for the terminal, quoted unless plain.
+fn q(s: &Path) -> String {
+    let e = esc(&s.to_string_lossy());
+    if !e.is_empty()
+        && e.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+@%:,=".contains(c))
+    {
+        e
+    } else {
+        format!("'{}'", e.replace('\'', r"'\''"))
+    }
+}
+
+/// A directory on the walk that is not owned by the user or root, or is
+/// group/world-writable. Carries the path so the refusal can say `chmod go-w`.
+#[derive(Debug)]
+struct OpenDir(PathBuf);
+
+impl std::fmt::Display for OpenDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the directory {} is not owned by you or root, or is group/world-writable",
+            esc(&self.0.to_string_lossy())
+        )
+    }
+}
+
+impl std::error::Error for OpenDir {}
+
 /// [`load_managed`] with every input explicit, for tests.
+///
+/// Every refusal names its cause and one specific remedy, for someone who
+/// never set `CPLT_MANAGED_CONFIG` (a wrapper such as nav-pilot did). Unsetting
+/// the variable comes last, as the way to run without the layer.
 pub fn load_managed_from(
     value: &OsStr,
     account_home: Option<&Path>,
@@ -195,92 +228,183 @@ pub fn load_managed_from(
     writable: &[PathBuf],
 ) -> Result<ManagedConfig, String> {
     let path = Path::new(value);
-    let refuse = |why: &str| {
+    let refuse = |why: &str, fix: &str| {
         format!(
-            "{MANAGED_CONFIG_ENV}={} ignored: {why}. Continuing without the managed config.",
+            "{MANAGED_CONFIG_ENV}={} ignored: {why}. {fix} To run without the managed layer, unset {MANAGED_CONFIG_ENV}. Continuing without the managed config.",
             esc(&path.to_string_lossy())
         )
     };
+    let dir_hint = format!("Have the wrapper that set it write the file under ~/{TRUSTED_DIR}.");
     if !path.is_absolute() {
-        return Err(refuse("the path must be absolute"));
+        return Err(refuse(
+            "the path must be absolute",
+            "The wrapper that set it must pass an absolute path.",
+        ));
     }
     let home = account_home
         .and_then(|h| std::fs::canonicalize(h).ok())
-        .ok_or_else(|| refuse("cannot find the account's home directory"))?;
+        .ok_or_else(|| {
+            refuse(
+                "cannot find the account's home directory",
+                "cplt reads it from the passwd entry; check that your account has an existing home directory.",
+            )
+        })?;
     // The sandbox denies the trusted dir as spelled from `$HOME`.
-    if env_home
-        .and_then(|h| std::fs::canonicalize(h).ok())
-        .as_ref()
-        != Some(&home)
-    {
+    let canon_env_home = env_home.and_then(|h| std::fs::canonicalize(h).ok());
+    if canon_env_home.as_ref() != Some(&home) {
+        let shown = env_home.map_or_else(|| "unset".to_string(), |h| esc(&h.to_string_lossy()));
+        let tmp = [env_home, canon_env_home.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|h| h.starts_with("/tmp") || h.starts_with("/private/tmp"));
         return Err(refuse(
-            "HOME is not the account's home directory, so the sandbox would not deny the managed directory",
+            &format!(
+                "HOME is not the account's home directory (HOME is {shown}, your account home is {}), so the sandbox would not deny the managed directory{}",
+                esc(&home.to_string_lossy()),
+                if tmp {
+                    "; /tmp and /private/tmp are agent-writable by design"
+                } else {
+                    ""
+                }
+            ),
+            &format!("Launch with HOME unset or equal to {}.", q(&home)),
         ));
     }
-    let under = || refuse(&format!("it must lie under ~/{TRUSTED_DIR}"));
+    let under = || refuse(&format!("it must lie under ~/{TRUSTED_DIR}"), &dir_hint);
     let trusted = std::fs::canonicalize(home.join(TRUSTED_DIR)).map_err(|_| under())?;
     // A linked `.config/cplt` or `managed.d` points trust at a tree an
     // earlier session may have written.
     if trusted != home.join(TRUSTED_DIR) {
-        return Err(refuse(&format!("~/{TRUSTED_DIR} or a parent is a symlink")));
+        return Err(refuse(
+            &format!("~/{TRUSTED_DIR} or a parent is a symlink"),
+            &format!(
+                "Replace the link with a real directory ({} resolves to {}), then have the wrapper rewrite the file.",
+                q(&home.join(TRUSTED_DIR)),
+                q(&trusted)
+            ),
+        ));
     }
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|e| refuse(&format!("cannot resolve it ({})", esc(&e.to_string()))))?;
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        refuse(
+            &format!("cannot resolve it ({})", esc(&e.to_string())),
+            "Check that the file exists; the wrapper that set it must recreate it.",
+        )
+    })?;
     let rel = canonical.strip_prefix(&trusted).map_err(|_| under())?;
-    crate::sandbox::resolve_unwritable(path, writable)
-        .map_err(|()| refuse("it lies in or passes through a tree this session can write"))?;
+    crate::sandbox::resolve_unwritable(path, writable).map_err(|()| {
+        let tree = writable
+            .iter()
+            .find(|w| canonical.starts_with(w) || path.starts_with(w) || trusted.starts_with(w));
+        let which = tree.map_or_else(
+            || "a writable root".to_string(),
+            |w| format!("the writable tree {}", q(w)),
+        );
+        refuse(
+            &format!("it lies in or passes through a tree this session can write ({which})"),
+            "Remove the grant that makes it writable: an `allow.write` entry, a project, repo or HOME that contains it, or an env-set tool dir such as PNPM_HOME or CARGO_HOME. Check with `cplt config show`.",
+        )
+    })?;
     // The name itself must not be a link: whoever can re-point it chooses the file.
+    let as_file = "The wrapper that wrote it must rewrite it as a regular file";
+    let wrapper_fix = |m: &str| format!("{as_file} ({m}).");
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(refuse("it is a symlink"));
+        return Err(refuse("it is a symlink", &wrapper_fix(&q(path))));
     }
     // Open what is read relative to the trusted dir, never following a link,
     // so a hop flipped after the canonicalize above cannot swap the file.
     let file = open_managed(&trusted, rel).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::Other && e.get_ref().is_some() {
-            refuse(&e.to_string())
+        if let Some(d) = e.get_ref().and_then(|r| r.downcast_ref::<OpenDir>()) {
+            refuse(&d.to_string(), &format!("Run: chmod go-w {}", q(&d.0)))
         } else if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
-            refuse("a component changed into a symlink while it was opened")
+            refuse(
+                "a component changed into a symlink while it was opened",
+                &format!(
+                    "Replace any link under {} with a real directory and rerun.",
+                    q(&home.join(".config/cplt"))
+                ),
+            )
         } else {
-            refuse(&format!("cannot open it ({})", esc(&e.to_string())))
+            refuse(
+                &format!("cannot open it ({})", esc(&e.to_string())),
+                &format!("Check that {} exists and is readable by you.", q(path)),
+            )
         }
     })?;
     // fstat the open descriptor so nothing can swap the file between check and read.
-    let meta = file
-        .metadata()
-        .map_err(|e| refuse(&format!("cannot stat it ({})", esc(&e.to_string()))))?;
+    let meta = file.metadata().map_err(|e| {
+        refuse(
+            &format!("cannot stat it ({})", esc(&e.to_string())),
+            &format!("Check that {} is readable by you.", q(path)),
+        )
+    })?;
     {
         use std::os::unix::fs::MetadataExt;
         if meta.nlink() > 1 {
-            return Err(refuse("it has more than one hard link"));
+            return Err(refuse(
+                "it has more than one hard link",
+                &wrapper_fix(&q(path)),
+            ));
         }
         // SAFETY: geteuid has no preconditions and cannot fail.
         if meta.uid() != unsafe { libc::geteuid() } {
-            return Err(refuse("it is not owned by the current user"));
+            return Err(refuse(
+                "it is not owned by the current user",
+                &wrapper_fix(&q(path)),
+            ));
         }
         if meta.mode() & 0o022 != 0 {
-            return Err(refuse("it is group- or world-writable"));
+            return Err(refuse(
+                "it is group- or world-writable",
+                &format!("Run: chmod 644 {}", q(path)),
+            ));
         }
     }
     if !meta.is_file() {
-        return Err(refuse("it is not a regular file"));
+        return Err(refuse("it is not a regular file", &wrapper_fix(&q(path))));
     }
+    let invalid = |why: &str, raw: &str| {
+        let by = wrote_by(raw);
+        refuse(
+            why,
+            &format!("{by} wrote an invalid file; update or reinstall it."),
+        )
+    };
     if meta.len() > LIMIT {
-        return Err(refuse(&format!("it is larger than {LIMIT} bytes")));
+        return Err(invalid(&format!("it is larger than {LIMIT} bytes"), ""));
     }
     let mut raw = String::new();
     // One byte past the cap: a file that grew after the fstat is refused, not truncated.
     file.take(LIMIT + 1)
         .read_to_string(&mut raw)
-        .map_err(|e| refuse(&format!("cannot read it ({})", esc(&e.to_string()))))?;
+        .map_err(|e| invalid(&format!("cannot read it ({})", esc(&e.to_string())), ""))?;
     if raw.len() as u64 > LIMIT {
-        return Err(refuse(&format!("it is larger than {LIMIT} bytes")));
+        return Err(invalid(&format!("it is larger than {LIMIT} bytes"), ""));
     }
-    let (managed_by, allow_private_domains) = parse(&raw).map_err(|e| refuse(&e))?;
+    let (managed_by, allow_private_domains) = parse(&raw).map_err(|e| invalid(&e, &raw))?;
     Ok(ManagedConfig {
         path: path.to_path_buf(),
         managed_by,
         allow_private_domains,
     })
+}
+
+/// Who wrote a file that failed to parse: its `managed_by` when that is a
+/// plain name, otherwise "the wrapper".
+fn wrote_by(raw: &str) -> String {
+    toml::from_str::<toml::Table>(raw)
+        .ok()
+        .and_then(|t| match t.get("managed_by") {
+            Some(toml::Value::String(s))
+                if !s.is_empty()
+                    && s.len() <= 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) =>
+            {
+                Some(s.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| "the wrapper".to_string())
 }
 
 /// Parse and check the header and keys. Errors name the offending key,
@@ -501,6 +625,92 @@ mod tests {
         h.refused(p.as_os_str(), &[], "group/world-writable");
         set(&cplt, 0o755);
         assert!(h.load(p.as_os_str(), &[]).is_ok());
+    }
+
+    /// #1129: each refusal ends with a fix for its own cause, and the
+    /// last-resort unset comes after it.
+    #[test]
+    fn every_refusal_carries_its_own_remedy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        let fix = |e: &str, want: &str| {
+            let at = e.find(want).unwrap_or_else(|| panic!("no {want:?} in {e}"));
+            let unset = e.find("unset CPLT_MANAGED_CONFIG").expect(e);
+            assert!(at < unset, "remedy must precede the unset hint: {e}");
+        };
+        let h = Home::new();
+        let p = write(&h.managed_d(), "nav-pilot.toml", GOOD);
+        let ps = p.to_string_lossy().to_string();
+        set(&p, 0o664);
+        fix(
+            &h.refused(p.as_os_str(), &[], "group- or world-writable"),
+            &format!("chmod 644 {ps}"),
+        );
+        set(&p, 0o600);
+        let cplt = h.path().join(".config/cplt");
+        set(&cplt, 0o777);
+        fix(
+            &h.refused(p.as_os_str(), &[], "group/world-writable"),
+            &format!(
+                "chmod go-w {}",
+                std::fs::canonicalize(&cplt).unwrap().display()
+            ),
+        );
+        set(&cplt, 0o755);
+        let other = tempfile::tempdir().unwrap();
+        let e =
+            load_managed_from(p.as_os_str(), Some(h.path()), Some(other.path()), &[]).unwrap_err();
+        let home = std::fs::canonicalize(h.path()).unwrap();
+        fix(
+            &e,
+            &format!("Launch with HOME unset or equal to {}", home.display()),
+        );
+        assert!(
+            e.contains(&format!("your account home is {}", home.display())),
+            "{e}"
+        );
+        assert!(!e.contains("agent-writable by design"), "{e}");
+        let e = load_managed_from(
+            p.as_os_str(),
+            Some(h.path()),
+            Some(Path::new("/tmp/x")),
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("agent-writable by design"), "{e}");
+        let out = write(h.path(), "x.toml", GOOD);
+        fix(
+            &h.refused(out.as_os_str(), &[], "must lie under"),
+            "Have the wrapper that set it write the file under ~/.config/cplt/managed.d",
+        );
+        let link = h.managed_d().join("l.toml");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        fix(
+            &h.refused(link.as_os_str(), &[], "it is a symlink"),
+            "must rewrite it as a regular file",
+        );
+        std::fs::hard_link(&p, h.managed_d().join("other")).unwrap();
+        fix(
+            &h.refused(p.as_os_str(), &[], "hard link"),
+            "must rewrite it as a regular file",
+        );
+        std::fs::remove_file(h.managed_d().join("other")).unwrap();
+        let e = h.refused(p.as_os_str(), &[h.managed_d()], "can write");
+        assert!(e.contains(&format!("{}", h.managed_d().display())), "{e}");
+        fix(&e, "Remove the grant");
+        fix(
+            &refused_body(
+                "managed_by = \"nav-pilot\"\nschema = 2\n",
+                "unknown schema 2",
+            ),
+            "nav-pilot wrote an invalid file; update or reinstall it",
+        );
+        fix(
+            &refused_body("not toml [", "not valid TOML"),
+            "the wrapper wrote an invalid file; update or reinstall it",
+        );
     }
 
     #[test]
