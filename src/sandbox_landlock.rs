@@ -420,6 +420,17 @@ fn refused_link(home: &Path, path: &Path, what: &str) -> bool {
     true
 }
 
+/// True, after a warning, when a writable AppDir root is reached through a
+/// symlink ([`policy::refused_writable_app_root`]): following it would grant
+/// write wherever a previous session pointed it.
+fn refused_app_root(home: &Path, path: &Path) -> bool {
+    let Some(target) = policy::refused_writable_app_root(home, path) else {
+        return false;
+    };
+    crate::ui::warn(&policy::app_root_warning(path, &target));
+    true
+}
+
 /// A credential entry that a symlink moves into a granted tree (#551).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,6 +690,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 None => true,
             };
             if include && refused_link(home, &path, "application directory") {
+                continue;
+            }
+            if include && write.contains(&path) && refused_app_root(home, &path) {
                 continue;
             }
             if include {
@@ -6126,6 +6140,41 @@ mod tests {
             assert!(
                 found,
                 "With existing_app_dirs=None, at least one mise app dir path should appear in policy"
+            );
+        });
+    }
+
+    #[test]
+    fn symlinked_writable_app_dir_roots_get_no_rule() {
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+            let elsewhere = home.join(".config/othertool");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let roots: Vec<PathBuf> = policy::app_dirs()
+                .iter()
+                .flat_map(|d| d.write_paths(&home))
+                .filter(|p| p.starts_with(&home))
+                .collect();
+            assert!(!roots.is_empty());
+            for root in &roots {
+                std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, root).unwrap();
+            }
+            let project = home.join("project");
+            let config = test_config(&project, &home);
+            let policy = generate_policy(&config);
+            for root in &roots {
+                assert!(
+                    !policy.fs_rules.iter().any(|r| &r.path == root),
+                    "symlinked writable app dir {} still granted",
+                    root.display()
+                );
+            }
+            assert!(
+                !policy
+                    .fs_rules
+                    .iter()
+                    .any(|r| r.path == elsewhere && r.access.write)
             );
         });
     }

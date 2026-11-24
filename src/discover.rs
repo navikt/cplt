@@ -736,10 +736,16 @@ pub fn discover_tools(home_dir: &Path, tool_roots: &[ToolRoot]) -> ToolDiscovery
         .flat_map(|app_dir| {
             let write_set: std::collections::HashSet<_> =
                 app_dir.write_paths(home_dir).into_iter().collect();
-            app_dir
-                .all_paths(home_dir)
-                .into_iter()
-                .filter(move |p| write_set.contains(p) || p.exists())
+            app_dir.all_paths(home_dir).into_iter().filter(move |p| {
+                if !write_set.contains(p) {
+                    return p.exists();
+                }
+                let refused = crate::sandbox::refused_writable_app_root(home_dir, p);
+                if let Some(target) = &refused {
+                    ui::warn(&crate::sandbox::app_root_warning(p, target));
+                }
+                refused.is_none()
+            })
         })
         .map(|p| p.to_string_lossy().to_string())
         .collect();

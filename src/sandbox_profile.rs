@@ -1986,6 +1986,11 @@ fn emit_tool_dirs(
             if validate_sbpl_path(&path).is_err() {
                 continue;
             }
+            if write_paths.contains(&path)
+                && crate::sandbox::policy::refused_writable_app_root(home_dir, &path).is_some()
+            {
+                continue;
+            }
             let p = path.display();
             if read_paths.contains(&path) {
                 sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");

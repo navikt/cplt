@@ -56,6 +56,33 @@ ignores the failed write of `_update-notifier-last-checked` in the root, so
 `~/.m2` and `~/.yarn` and their writable subdirectories before launch, since
 the sandbox cannot.
 
+## uv's data directory is read-only (behaviour change)
+
+Inside cplt, `~/.local/share/uv` is read-only. The host runs the `uv tool`
+environments and uv-managed Pythons stored there, so a sandboxed session must
+not change them. `~/.cache/uv` stays writable, so `uv sync`, `uv run`, `uvx`
+and `uv pip install` into a project venv work as before, and Pythons already
+installed there still run.
+
+`uv tool install` and `uv python install` inside cplt now fail with a
+permission error. Run them outside cplt:
+
+```sh
+uv tool install <tool>
+uv python install 3.13
+```
+
+Or, knowing that the agent can then change what the host runs, grant it:
+
+```sh
+cplt --allow-write ~/.local/share/uv
+```
+
+A writable application directory reached through a symlink (`~/.cache/uv`,
+`~/.cache/mise`, or `~/.cache` itself being a link) is no longer granted: cplt
+warns and skips it, since a sandboxed session could have planted that link.
+Remove the link, or grant the target with `--allow-write`.
+
 ## `sandbox.readonly_host_tool_paths` (off by default)
 
 With this key on, tool downloads and settings the host runs later are
