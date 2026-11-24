@@ -331,12 +331,19 @@ jobs:
           # only links it from a postinstall script, which stays off.
           prefix="$RUNNER_TEMP/opencode-v2"
           pkg="@opencode/cli-darwin-arm64"
-          ver=$(npm view "$pkg@${{ matrix.opencode }}" version --json 2>/dev/null | jq -r 'if type == "array" then .[-1] elif type == "string" then . else empty end' || true)
-          if [ -z "$ver" ]; then
-            echo "::notice::OpenCode ${{ matrix.opencode }} is not published; skipping this cell"
-            echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
-            exit 0
+          spec="${{ matrix.opencode }}"
+          # Only a bare minor that npm does not have yet skips; any other
+          # failure, and any failure for an exact pin, fails the cell.
+          if ! out=$(npm view "$pkg@$spec" version --json 2>/dev/null); then
+            if [[ "$spec" =~ ^[0-9]+\.[0-9]+$ ]] && jq -e '.error.code == "E404"' <<<"$out" >/dev/null 2>&1; then
+              echo "::notice::OpenCode $spec is not published; skipping this cell"
+              echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::npm view $pkg@$spec failed: $out"
+            exit 1
           fi
+          ver=$(jq -er 'if type == "array" then .[-1] else . end' <<<"$out")
           npm install --ignore-scripts --no-save --prefix "$prefix" "$pkg@$ver"
           bin="$prefix/node_modules/$pkg/bin/opencode"
           "$bin" --version
@@ -401,12 +408,19 @@ jobs:
           set -euo pipefail
           prefix="$RUNNER_TEMP/opencode-v2"
           pkg="@opencode/cli-linux-x64"
-          ver=$(npm view "$pkg@${{ matrix.opencode }}" version --json 2>/dev/null | jq -r 'if type == "array" then .[-1] elif type == "string" then . else empty end' || true)
-          if [ -z "$ver" ]; then
-            echo "::notice::OpenCode ${{ matrix.opencode }} is not published; skipping this cell"
-            echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
-            exit 0
+          spec="${{ matrix.opencode }}"
+          # Only a bare minor that npm does not have yet skips; any other
+          # failure, and any failure for an exact pin, fails the cell.
+          if ! out=$(npm view "$pkg@$spec" version --json 2>/dev/null); then
+            if [[ "$spec" =~ ^[0-9]+\.[0-9]+$ ]] && jq -e '.error.code == "E404"' <<<"$out" >/dev/null 2>&1; then
+              echo "::notice::OpenCode $spec is not published; skipping this cell"
+              echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::npm view $pkg@$spec failed: $out"
+            exit 1
           fi
+          ver=$(jq -er 'if type == "array" then .[-1] else . end' <<<"$out")
           npm install --ignore-scripts --no-save --prefix "$prefix" "$pkg@$ver"
           bin="$prefix/node_modules/$pkg/bin/opencode"
           "$bin" --version
@@ -422,6 +436,11 @@ jobs:
           cargo test --test integration_linux opencode_v2 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
           if grep -q "SKIPPED (opencode v2)" "$RUNNER_TEMP/test-output.log"; then
             echo "::error::OpenCode v2 tests skipped although the binary is installed"
+            exit 1
+          fi
+          # #1141: the bubblewrap pid namespace ends every session service.
+          if left=$(pgrep -af -- 'serve --service'); then
+            echo "::error::OpenCode service left running after the tests: $left"
             exit 1
           fi
 

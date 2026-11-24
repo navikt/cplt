@@ -5773,12 +5773,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                  drop --no-scratch-dir (or sandbox.scratch_dir = false) to run it."
             );
         };
-        #[cfg(target_os = "macos")]
-        {
-            _v2_service = Some(cplt::opencode_v2::ServiceGuard::new(scratch));
-        }
         let mut session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        #[cfg(target_os = "macos")]
+        {
+            _v2_service = Some(cplt::opencode_v2::ServiceGuard::new(scratch, session.port));
+        }
         v2_model = std::mem::replace(&mut session.model, Err(())).ok();
         v2_tui = std::mem::take(&mut session.tui);
         if resolved.github_mcp_proxy {

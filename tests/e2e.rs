@@ -12161,13 +12161,19 @@ paths = [
         /// #1141: the service `service start` leaves behind is stopped when
         /// the session ends. A pid of a process outside the session, planted
         /// in the session registration, is left alone.
+        /// Listens on the session port, as the real service does.
+        const LISTEN: &str = "import json,os,socket,time; \
+            p=json.load(open(os.environ['OPENCODE_CONFIG_DIR']+'/service.json'))['port']; \
+            s=socket.socket(); s.bind(('127.0.0.1',p)); s.listen(); time.sleep(300)";
+
         fn service_stub(home: &Home, pid_of: &str) {
             let stub = home.bin.join("opencode");
             std::fs::write(
                 &stub,
                 format!(
                     "#!/bin/sh\ncase \"$1\" in\n--version) echo opencode v2.3.2;;\n\
-                     service) sleep 300 </dev/null >/dev/null 2>&1 & echo $! > daemon.pid\n\
+                     service) /usr/bin/python3 -I -c \"{LISTEN}\" </dev/null >/dev/null 2>&1 & echo $! > daemon.pid\n\
+                     sleep 1\n\
                      echo \"{{\\\"pid\\\":$({pid_of})}}\" > \"$XDG_STATE_HOME/opencode/service.json\";;\n\
                      run) exit 0;;\nesac\n"
                 ),
@@ -12225,6 +12231,56 @@ paths = [
             unsafe { libc::kill(daemon, libc::SIGKILL) };
             assert_eq!(o.status.code(), Some(0), "{err}");
             assert!(survived, "cplt killed a process it did not start\n{err}");
+        }
+
+        /// The agent swaps its state dir for a link to a dir another
+        /// sandboxed process can write, and registers that process there.
+        /// Seatbelt would say the victim may write the linked "state dir";
+        /// the victim must still survive.
+        #[test]
+        fn redirected_registration_spares_another_sandbox() {
+            require_sandbox!();
+            let home = home();
+            let shared = home.proj.join("shared");
+            std::fs::create_dir_all(&shared).unwrap();
+            let profile = format!(
+                "(version 1)(deny default)(allow process*)(allow file-read*)(allow sysctl-read)\
+                 (allow mach-lookup)(allow file-write* (subpath \"{}\"))",
+                shared.display()
+            );
+            #[allow(clippy::disallowed_methods)] // absolute path
+            let mut victim = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "/bin/sleep", "300"])
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::write(home.proj.join("victim.pid"), victim.id().to_string()).unwrap();
+            let stub = home.bin.join("opencode");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n--version) echo opencode v2.3.2;;\n\
+                     service) rm -rf \"$XDG_STATE_HOME/opencode\"; ln -s {0} \"$XDG_STATE_HOME/opencode\"\n\
+                     echo \"{{\\\"pid\\\":$(cat victim.pid)}}\" > {0}/service.json;;\n\
+                     run) exit 0;;\nesac\n",
+                    shared.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let o = home.cmd(&["--", "run", "hi"]).output().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            let registered =
+                std::fs::read_to_string(shared.join("service.json")).unwrap_or_default();
+            let survived = victim.try_wait().unwrap().is_none();
+            let _ = victim.kill();
+            let _ = victim.wait();
+            assert_eq!(o.status.code(), Some(0), "{err}");
+            assert!(
+                registered.contains(&victim.id().to_string()),
+                "{registered}\n{err}"
+            );
+            assert!(survived, "cplt killed another sandbox's process\n{err}");
         }
 
         #[test]

@@ -843,52 +843,56 @@ pub fn host_warnings(home: &Path) -> Vec<String> {
 /// (and whose pids the registration would name, not the host's).
 #[cfg(target_os = "macos")]
 pub struct ServiceGuard {
-    state: PathBuf,
+    registration: PathBuf,
+    port: u16,
 }
 
 #[cfg(target_os = "macos")]
 impl ServiceGuard {
-    pub fn new(scratch: &Path) -> Self {
+    pub fn new(scratch: &Path, port: u16) -> Self {
         Self {
-            state: scratch.join("opencode-v2/state"),
+            registration: scratch.join("opencode-v2/state/opencode/service.json"),
+            port,
         }
+    }
+
+    /// The registration, and every path under the session's state dir, is
+    /// agent-writable, so identity rests on neither: the process must be
+    /// sandboxed and listen on the loopback port cplt picked for this
+    /// session. A service the user started outside cplt is not sandboxed;
+    /// another session's service listens on its own port.
+    fn owns(&self, pid: i32) -> bool {
+        sandboxed(pid) && listens_on(pid, self.port)
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for ServiceGuard {
     fn drop(&mut self) {
-        let Some(pid) = host_service_pid(&self.state.join("opencode/service.json")) else {
+        let Some(pid) = host_service_pid(&self.registration) else {
             return;
         };
-        // The registration is agent-writable: kill only a process confined
-        // to this session, never a service the user started outside cplt.
-        if !in_session(pid, &self.state) {
+        if !self.owns(pid) {
             return;
         }
-        stop(pid);
+        // SAFETY: plain signals to a pid just checked.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+        }
+        // Checked again: the pid may have been reused in the meantime.
+        if self.owns(pid) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 }
 
-/// SIGTERM, then SIGKILL if it is still there after 3 s.
+/// macOS hides other processes' environments, so ask Seatbelt.
 #[cfg(target_os = "macos")]
-fn stop(pid: i32) {
-    // SAFETY: plain signals to a pid checked by the caller.
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-    for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if unsafe { libc::kill(pid, 0) } != 0 {
-            return;
-        }
-    }
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-}
-
-/// macOS hides other processes' environments, so ask Seatbelt instead: the
-/// process is sandboxed and may write this session's state dir, which only a
-/// profile generated for this session grants.
-#[cfg(target_os = "macos")]
-fn in_session(pid: i32, state: &Path) -> bool {
+fn sandboxed(pid: i32) -> bool {
     unsafe extern "C" {
         fn sandbox_check(
             pid: libc::pid_t,
@@ -897,21 +901,27 @@ fn in_session(pid: i32, state: &Path) -> bool {
             ...
         ) -> libc::c_int;
     }
-    const SANDBOX_FILTER_PATH: libc::c_int = 1;
-    let Ok(path) = std::ffi::CString::new(state.join("opencode").as_os_str().as_encoded_bytes())
-    else {
-        return false;
-    };
-    // SAFETY: NUL-terminated strings that outlive the calls.
-    unsafe {
-        sandbox_check(pid, std::ptr::null(), 0) == 1
-            && sandbox_check(
-                pid,
-                c"file-write-create".as_ptr(),
-                SANDBOX_FILTER_PATH,
-                path.as_ptr(),
-            ) == 0
-    }
+    // SAFETY: a null operation only asks whether `pid` is sandboxed.
+    unsafe { sandbox_check(pid, std::ptr::null(), 0) == 1 }
+}
+
+/// Whether `pid` holds a TCP listener on `port`. Runs only at teardown, when
+/// a registration names a live process.
+#[cfg(target_os = "macos")]
+fn listens_on(pid: i32, port: u16) -> bool {
+    #[allow(clippy::disallowed_methods)] // absolute path
+    std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-t", "-sTCP:LISTEN"])
+        .arg(format!("-p{pid}"))
+        .arg(format!("-iTCP@127.0.0.1:{port}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == pid.to_string())
+        })
 }
 
 /// The pid in a service registration, if that process is alive.
