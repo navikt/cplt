@@ -5533,6 +5533,11 @@ paths = [
         std::os::unix::fs::symlink("/", &root_link).unwrap();
         let root_link = root_link.to_str().unwrap().to_string();
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        // Absolute, so only the SBPL check (not "outside the repository") can refuse it.
+        std::fs::create_dir(outside.path().join("a(b")).unwrap();
+        let paren_link = outside.path().join("paren-link");
+        std::os::unix::fs::symlink(outside.path().join("a(b"), &paren_link).unwrap();
+        let paren_link = paren_link.to_str().unwrap().to_string();
         // (key, value, .cplt.toml body when the file can express it)
         let cases: &[(&str, &str, Option<&str>)] = &[
             ("allow.read", "/", None),
@@ -5542,6 +5547,8 @@ paths = [
                 Some("[propose.allow]\nread = [\"rel-root\"]\n"),
             ),
             ("allow.read", &root_link, Some("")),
+            // SBPL-unsafe target: refused on every platform, not only macOS.
+            ("allow.read", &paren_link, Some("paren")),
             (
                 "allow.write",
                 "~/.ssh",
@@ -5554,9 +5561,6 @@ paths = [
         for (key, value, toml) in cases {
             let repo = temp_repo("test-org/refuse");
             std::os::unix::fs::symlink("/", repo.path().join("rel-root")).unwrap();
-            std::fs::create_dir(outside.path().join("a(b")).unwrap_or(());
-            std::os::unix::fs::symlink(outside.path().join("a(b"), repo.path().join("paren"))
-                .unwrap();
             let out = cplt_cmd()
                 .env("HOME", home)
                 .args(["config", "set", "--repo", key, value])
@@ -5575,14 +5579,13 @@ paths = [
             let Some(toml) = toml else { continue };
             let body = if toml.is_empty() {
                 format!("[propose.allow]\nread = [{root_link:?}]\n")
+            } else if *toml == "paren" {
+                format!("[propose.allow]\nread = [{paren_link:?}]\n")
             } else {
                 (*toml).to_string()
             };
             std::fs::write(repo.path().join(".cplt.toml"), body).unwrap();
-            assert!(git_ok(
-                repo.path(),
-                &["add", ".cplt.toml", "rel-root", "paren"]
-            ));
+            assert!(git_ok(repo.path(), &["add", ".cplt.toml", "rel-root"]));
             assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
             let show = cplt_cmd()
                 .env("HOME", home)
