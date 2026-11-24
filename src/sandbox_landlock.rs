@@ -4135,6 +4135,39 @@ mod tests {
         }
     }
 
+    /// `sandbox.readonly_host_tool_paths`: with the twins applied, the wrapper
+    /// distributions and `~/.konan` get no write rule; their sibling caches
+    /// keep theirs. Landlock needs no deny for these: the grant itself shrinks.
+    #[test]
+    fn readonly_host_tool_twins_drop_the_write_rule() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        for key in [false, true] {
+            let mut dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+                .iter()
+                .map(|d| d.resolve(&home, &[]))
+                .collect();
+            if key {
+                crate::sandbox::apply_readonly_host_tool_paths(&mut dirs);
+            }
+            let mut config = test_config(&project, &home);
+            config.existing_home_tool_dirs = Some(&dirs);
+            let policy = generate_policy(&config);
+            let write = |rel: &str| {
+                policy
+                    .fs_rules
+                    .iter()
+                    .any(|r| r.path == home.join(rel) && r.access.write)
+            };
+            for rel in [".gradle/wrapper", ".m2/wrapper", ".konan"] {
+                assert_eq!(write(rel), !key, "key={key} {rel}");
+            }
+            for rel in [".gradle/caches", ".m2/repository", ".npm/_npx"] {
+                assert!(write(rel), "key={key} {rel}");
+            }
+        }
+    }
+
     /// The carve-outs are a table with a stated reason each, not an absence:
     /// every one of them keeps EXECUTE, and `.gradle/jdks` gets its own rule
     /// because it is not a `HOME_TOOL_DIRS` entry.

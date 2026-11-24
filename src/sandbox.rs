@@ -6703,6 +6703,21 @@ mod tests {
             .expect("an ordinary grant is the point of the feature");
     }
 
+    /// `sandbox.readonly_host_tool_paths`: the overlays reach the bwrap
+    /// read-only set only with the key on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ro_protect_set_carries_host_tool_overlays_only_with_the_key() {
+        let home = Path::new("/fake/test");
+        let mut config = test_config(home, &[]);
+        let overlays: Vec<PathBuf> = HOST_TOOL_RO_OVERLAYS.iter().map(|p| home.join(p)).collect();
+        let paths = super::ro_protect_paths(&config, &[], &[]);
+        assert!(overlays.iter().all(|o| !paths.contains(o)), "{paths:?}");
+        config.readonly_host_tool_paths = true;
+        let paths = super::ro_protect_paths(&config, &[], &[]);
+        assert!(overlays.iter().all(|o| paths.contains(o)), "{paths:?}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn ro_protect_set_carries_the_copilot_package_dirs_for_copilot_only() {

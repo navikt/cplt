@@ -10297,6 +10297,42 @@ fn deny_nested_git_emits_create_deny_only_when_set() {
     assert!(on.contains(r#"/\.git/(.+/)?\.[gG][iI][tT]$"))"#), "{on}");
 }
 
+/// `sandbox.readonly_host_tool_paths` adds one block of write denies, after
+/// the tool-dir grants, and nothing else: with the key off the profile is the
+/// key-on profile minus that block.
+#[test]
+fn readonly_host_tool_paths_adds_only_the_overlay_denies() {
+    let base = base_profile_options();
+    let off = generate_profile(&base, &[]);
+    let on = generate_profile(
+        &SandboxConfig {
+            readonly_host_tool_paths: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let header = ";; sandbox.readonly_host_tool_paths";
+    assert!(!off.contains(header));
+    let start = on.find(header).expect("overlay block missing");
+    let end = start + on[start..].find("\n\n").unwrap() + 2;
+    let block = &on[start..end];
+    for rel in cplt::sandbox::HOST_TOOL_RO_OVERLAYS {
+        let line = format!(
+            "(deny file-write* (subpath \"{}\"))",
+            base.home_dir.join(rel).display()
+        );
+        assert!(block.contains(&line), "{block}");
+    }
+    assert_eq!(format!("{}{}", &on[..start], &on[end..]), off);
+    let tool_grant = on
+        .find(&format!("{}/.cache", base.home_dir.display()))
+        .expect("~/.cache grant");
+    assert!(
+        start > tool_grant,
+        "the deny must follow the ~/.cache grant"
+    );
+}
+
 // ── Config coverage tests ─────────────────────────────────────────────────────
 
 /// Ensures every scalar key registered in CONFIG_KEYS appears in `config show`
