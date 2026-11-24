@@ -12164,7 +12164,8 @@ paths = [
         /// Listens on the session port, as the real service does.
         const LISTEN: &str = "import json,os,socket,time; \
             p=json.load(open(os.environ['OPENCODE_CONFIG_DIR']+'/service.json'))['port']; \
-            s=socket.socket(); s.bind(('127.0.0.1',p)); s.listen(); time.sleep(300)";
+            s=socket.socket(); s.bind(('127.0.0.1',p)); s.listen(); \
+            exec(os.environ.get('STUB_ON_TERM','')); time.sleep(300)";
 
         fn service_stub(home: &Home, pid_of: &str) {
             let stub = home.bin.join("opencode");
@@ -12204,6 +12205,35 @@ paths = [
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
             assert!(gone, "session service {pid} outlived the session\n{err}");
+        }
+
+        /// A service whose SIGTERM handler closes its listener and hangs
+        /// still gets SIGKILL.
+        #[test]
+        fn service_that_ignores_sigterm_is_killed() {
+            require_sandbox!();
+            let home = home();
+            service_stub(&home, "cat daemon.pid");
+            let o = home
+                .cmd(&["--pass-env", "STUB_ON_TERM", "--", "run", "hi"])
+                .env(
+                    "STUB_ON_TERM",
+                    "import signal; signal.signal(signal.SIGTERM, lambda *a: s.close())",
+                )
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert_eq!(o.status.code(), Some(0), "{err}");
+            let pid: i32 = std::fs::read_to_string(home.proj.join("daemon.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let gone = !alive(pid);
+            if !gone {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(gone, "service {pid} survived SIGTERM\n{err}");
         }
 
         #[test]

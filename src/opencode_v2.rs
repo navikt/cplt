@@ -875,6 +875,7 @@ impl Drop for ServiceGuard {
         if !self.owns(pid) {
             return;
         }
+        let started = start_time(pid);
         // SAFETY: plain signals to a pid just checked.
         unsafe { libc::kill(pid, libc::SIGTERM) };
         for _ in 0..30 {
@@ -883,11 +884,23 @@ impl Drop for ServiceGuard {
                 return;
             }
         }
-        // Checked again: the pid may have been reused in the meantime.
-        if self.owns(pid) {
+        // SIGTERM may have closed the listener, so the port check cannot be
+        // repeated; the start time shows the pid was not reused.
+        if started.is_some() && start_time(pid) == started {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }
+}
+
+/// When `pid` started, as (seconds, microseconds).
+#[cfg(target_os = "macos")]
+fn start_time(pid: i32) -> Option<(u64, u64)> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a live buffer of `size` bytes.
+    let n =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (n == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
 /// macOS hides other processes' environments, so ask Seatbelt.
