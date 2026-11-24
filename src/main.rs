@@ -7368,6 +7368,9 @@ fn is_same_file(real: &Path, name: &str) -> bool {
 /// The trees `check`, `doctor` and `config show` test a managed file against
 /// (#1095): the launch set without the agent dirs and the probed tool dirs.
 /// Only an extra refusal; trust itself is the fixed dirs in the passwd home.
+/// Kept as a list: the loader runs before the policy exists. The guarantee is
+/// `sandbox::refuse_policy_write_into_state`, which refuses any write rule at,
+/// above or inside the state dir, so the managed file is never writable.
 fn managed_layer_writable(
     home: &Path,
     project: &Path,
@@ -13779,6 +13782,29 @@ fn lapsed_approval_notice(stored: Option<&trust::TrustEntry>, lapsed: &[&str]) -
     }
 }
 
+/// The first proposed `allow.write` entry that is, contains or lies inside
+/// cplt's state dir (`$HOME`'s or the passwd home's), as an error line.
+fn state_dir_write_proposal(project_dir: &std::path::Path, writes: &[String]) -> Option<String> {
+    let states: Vec<PathBuf> = [
+        std::env::var_os("HOME").map(PathBuf::from),
+        config::account_home(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|h| h.join(".config/cplt"))
+    .collect();
+    writes.iter().find_map(|w| {
+        let path = project_dir.join(config::expand_tilde(w));
+        let state = states.iter().find(|s| sandbox::overlaps_state(&path, s))?;
+        Some(format!(
+            "allow.write entry {w:?} in .cplt.toml would let the sandbox write cplt's state \
+             directory {}, so it cannot be approved. Approve the other keys by name \
+             (`cplt trust accept <key>`), or ask the repository to narrow that entry.",
+            state.display()
+        ))
+    })
+}
+
 fn trust_accept(
     project_dir: &std::path::Path,
     loaded: &repo_config::LoadedRepoConfig,
@@ -14050,6 +14076,15 @@ fn trust_accept(
         }
         keys.to_vec()
     };
+
+    // A write grant at, above or inside cplt's state dir would reach the
+    // trusted managed.d (#1095); the launch refuses it, so refuse it here first.
+    if keys_to_accept.iter().any(|k| k == "allow.write")
+        && let Some(e) = state_dir_write_proposal(project_dir, &loaded.config.propose.allow.write)
+    {
+        ui::error(&e);
+        return ExitCode::FAILURE;
+    }
 
     // Only when approving that key (#1110): an alias must not block `trust accept allow_docker`.
     let aliases = if keys_to_accept
@@ -15576,6 +15611,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// #1095: `trust accept` refuses an allow.write at, above or inside the
+    /// state dir; other entries pass.
+    #[test]
+    fn trust_accept_refuses_write_into_state_dir() {
+        let home = PathBuf::from("/nonexistent-cplt-1095/home");
+        temp_env::with_var("HOME", Some(&home), || {
+            let p = Path::new("/nonexistent-cplt-1095/repo");
+            for w in ["~/.config", "~", "~/.config/cplt/managed.d"] {
+                assert!(
+                    state_dir_write_proposal(p, &[w.to_string()]).is_some(),
+                    "{w}"
+                );
+            }
+            assert!(state_dir_write_proposal(p, &["build".into(), "~/.cache/x".into()]).is_none());
+        });
+    }
     use clap::Parser;
 
     fn parse(args: &[&str]) -> Cli {

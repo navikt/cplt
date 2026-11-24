@@ -743,6 +743,10 @@ fn prepare_locked(
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
     let base = std::cell::OnceCell::new();
+    if !inspect_only && let Some(home) = crate::config::account_home() {
+        let policy = base.get_or_init(|| landlock_mod::generate_policy(config));
+        refuse_policy_write_into_state(config, policy, &home.join(CPLT_STATE_DIR))?;
+    }
     let mut canonical_grants = validate_cache_exec_dirs(config, &base)?;
     validate_exec_grants(config)?;
     canonical_grants.extend(prepare_cypress_app_data(config, inspect_only, &base)?);
@@ -1244,6 +1248,9 @@ fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, home: &Path) -> Stri
                 tilde(p, home)
             ),
             "the allow.write grant" => layer_remedy(p, home, None),
+            "the project directory" | "the named repository" if home.starts_with(p) => {
+                "HOME lies inside the project. Point HOME outside the project.".to_string()
+            }
             "the project directory" | "the named repository" => "Launch cplt from inside \
                 the repository, not from ~/.config, $HOME or a directory that contains them."
                 .to_string(),
@@ -1487,6 +1494,54 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
 
 /// cplt's state root moved by `XDG_CONFIG_HOME` (#830) must not lie in a tree
 /// the agent can write: it could forge `opencode-snapshot-clean` and skip the
+/// The guarantee behind the hand-kept lists above (#1095): no write-capable
+/// rule of the generated policy may be, contain, or lie inside `state` (the
+/// passwd home's `~/.config/cplt`, which holds the trusted `managed.d`).
+/// The early checks give better messages; this one sees every rule, including
+/// the env-derived ones (XDG_RUNTIME_DIR sockets, XDG_DATA_HOME app dirs,
+/// `--allow-socket`) the lists miss. Both backends draw their write grants
+/// from the same config, so the Landlock rule set stands in for macOS too.
+pub(crate) fn refuse_policy_write_into_state(
+    config: &SandboxConfig,
+    policy: &landlock_mod::LandlockPolicy,
+    state: &Path,
+) -> Result<(), String> {
+    let Some(rule) = policy
+        .fs_rules
+        .iter()
+        .find(|r| (r.access.write || r.access.create_dirs) && overlaps_state(&r.path, state))
+    else {
+        return Ok(());
+    };
+    let source = writable_trees(config)
+        .into_iter()
+        .find(|(t, _)| rule.path.starts_with(t))
+        .map_or(
+            "a write grant derived from the environment (XDG_RUNTIME_DIR, XDG_DATA_HOME, \
+             --allow-socket or a tool's own variable)",
+            |(_, why)| why,
+        );
+    Err(format!(
+        "{source} {} would let the sandbox write cplt's state directory {}, which holds \
+         the trusted managed config. Point that path outside {}.",
+        rule.path.display(),
+        state.display(),
+        state.display()
+    ))
+}
+
+/// `path` is `state`, an ancestor of it, or inside it: lexically, and again
+/// with symlinks resolved where the paths exist.
+#[must_use]
+pub fn overlaps_state(path: &Path, state: &Path) -> bool {
+    let hit = |p: &Path, s: &Path| p.starts_with(s) || s.starts_with(p);
+    hit(path, state)
+        || hit(
+            &crate::config::canonicalize_deepest(path),
+            &crate::config::canonicalize_deepest(state),
+        )
+}
+
 /// audit scan. When it does, state stays in the legacy `~/.config/cplt`, a
 /// denied dotfile, for this launch. `main` pins this before any state read;
 /// this is the backstop with the fully resolved grants.
@@ -1505,9 +1560,18 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, &tree) {
             return Err(state_ancestor_refusal(why, &tree, &dir, config.home_dir));
         }
-        // A writable tree inside the state dir lets the agent plant files there.
-        let state = crate::config::canonicalize_deepest(&config.home_dir.join(CPLT_STATE_DIR));
-        if crate::config::canonicalize_deepest(&tree).starts_with(&state) {
+        // A writable tree inside the state dir lets the agent plant files there,
+        // `$HOME`'s or the passwd home's (which holds the trusted managed.d).
+        let canon_tree = crate::config::canonicalize_deepest(&tree);
+        if let Some(state) = [
+            Some(config.home_dir.join(CPLT_STATE_DIR)),
+            policy::passwd_state_dir(config.home_dir),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|d| crate::config::canonicalize_deepest(&d))
+        .find(|s| canon_tree.starts_with(s))
+        {
             return Err(format!(
                 "{why} {} lies inside cplt's state directory {}, so the sandbox could \
                  write there. Move it out of that directory.",
@@ -7300,6 +7364,72 @@ mod tests {
             validate_config_paths(&config).expect_err("must be refused")
         });
         assert!(error.contains("cp)lt"), "{error}");
+    }
+
+    #[test]
+    fn home_inside_project_remedy_says_move_home() {
+        let p = Path::new("/w/proj");
+        let home = p.join("home");
+        let err = state_ancestor_refusal(
+            "the project directory",
+            p,
+            &home.join(CPLT_STATE_DIR),
+            &home,
+        );
+        assert!(err.contains("Point HOME outside the project"), "{err}");
+    }
+
+    /// #1095 guarantee: every write-capable rule of the generated policy is
+    /// checked against the passwd state dir, so the env-derived grants the
+    /// hand-kept lists miss are refused too, and the default config is not.
+    #[test]
+    fn policy_write_into_state_dir_is_refused() {
+        let home = Path::new("/nonexistent-cplt-1095/home");
+        let state = home.join(CPLT_STATE_DIR);
+        let refused = |config: &SandboxConfig, env: &[(&str, Option<PathBuf>)]| {
+            temp_env::with_vars(env, || {
+                let policy = landlock_mod::generate_policy(config);
+                refuse_policy_write_into_state(config, &policy, &state)
+            })
+        };
+        let unset: Vec<(&str, Option<PathBuf>)> =
+            vec![("XDG_RUNTIME_DIR", None), ("XDG_DATA_HOME", None)];
+        assert_eq!(refused(&test_config(home, &[]), &unset), Ok(()));
+
+        // XDG_RUNTIME_DIR under managed.d with docker/podman/gpg sockets.
+        let mut c = test_config(home, &[]);
+        c.allow_docker = true;
+        c.allow_gpg_signing = true;
+        let run = vec![
+            ("XDG_RUNTIME_DIR", Some(state.join("managed.d/run"))),
+            ("XDG_DATA_HOME", None),
+        ];
+        if cfg!(target_os = "linux") {
+            assert!(refused(&c, &run).is_err());
+        }
+        // XDG_DATA_HOME inside the state dir, normal and relocated HOME.
+        let data = vec![
+            ("XDG_RUNTIME_DIR", None),
+            ("XDG_DATA_HOME", Some(state.join("data"))),
+        ];
+        let mut c = test_config(home, &[]);
+        c.agent = Agent::OpenCode;
+        assert!(refused(&c, &data).is_err());
+        let moved = Path::new("/nonexistent-cplt-1095/moved");
+        let mut c = test_config(moved, &[]);
+        c.agent = Agent::OpenCode;
+        assert!(refused(&c, &data).is_err());
+        // --allow-socket ~/.config.
+        let sock = [home.join(".config")];
+        let mut c = test_config(home, &[]);
+        c.extra_socket = &sock;
+        assert!(refused(&c, &unset).is_err());
+        // A named root's git dir inside the state dir.
+        let git = [state.join("x.git")];
+        let mut c = test_config(home, &[]);
+        c.named_root_git_dirs = &git;
+        let err = refused(&c, &unset).unwrap_err();
+        assert!(err.contains(NAMED_GIT_DIR_SOURCE), "{err}");
     }
 
     /// #1095: a write grant on cplt's state dir or an ancestor (`~/.config`,

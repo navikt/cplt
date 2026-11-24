@@ -47,7 +47,10 @@ pub const TRUSTED_DIR: &str = ".config/cplt/managed.d";
 /// Open `rel` beneath the directory `dir`, one component at a time with
 /// `O_NOFOLLOW`, so the file opened is under `dir` whatever happens to the
 /// tree meanwhile. Non-blocking, so a FIFO cannot hang the launch.
-fn open_beneath(dir: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+/// Directories at index `check_from` and deeper must be owned by the user or
+/// root and not group/world-writable, checked by `fstat` on the held fd, so
+/// nobody else can swap an entry below them.
+fn open_beneath(dir: &Path, rel: &Path, check_from: usize) -> std::io::Result<std::fs::File> {
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     let open = |at: libc::c_int, name: &OsStr, flags: libc::c_int| {
@@ -78,6 +81,21 @@ fn open_beneath(dir: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
             libc::O_RDONLY | libc::O_DIRECTORY
         };
         cur = open(cur.as_raw_fd(), name, flags)?;
+        if i + 1 < parts.len() && i >= check_from {
+            // SAFETY: zeroed stat is a valid out-parameter; `cur` is an open fd.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(cur.as_raw_fd(), &raw mut st) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            if (st.st_uid != euid && st.st_uid != 0) || st.st_mode & 0o022 != 0 {
+                return Err(std::io::Error::other(format!(
+                    "the directory {} is not owned by you or root, or is group/world-writable",
+                    esc(&name.to_string_lossy())
+                )));
+            }
+        }
     }
     Ok(std::fs::File::from(cur))
 }
@@ -89,7 +107,9 @@ fn open_managed(trusted: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
     let chain = trusted
         .strip_prefix("/")
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-    open_beneath(Path::new("/"), &chain.join(rel))
+    // From the home dir down: `trusted` is `<home>/.config/cplt/managed.d`.
+    let home_idx = chain.components().count().saturating_sub(4);
+    open_beneath(Path::new("/"), &chain.join(rel), home_idx)
 }
 
 /// A managed file that passed every check.
@@ -216,7 +236,9 @@ pub fn load_managed_from(
     // Open what is read relative to the trusted dir, never following a link,
     // so a hop flipped after the canonicalize above cannot swap the file.
     let file = open_managed(&trusted, rel).map_err(|e| {
-        if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
+        if e.kind() == std::io::ErrorKind::Other && e.get_ref().is_some() {
+            refuse(&e.to_string())
+        } else if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
             refuse("a component changed into a symlink while it was opened")
         } else {
             refuse(&format!("cannot open it ({})", esc(&e.to_string())))
@@ -234,6 +256,9 @@ pub fn load_managed_from(
         // SAFETY: geteuid has no preconditions and cannot fail.
         if meta.uid() != unsafe { libc::geteuid() } {
             return Err(refuse("it is not owned by the current user"));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(refuse("it is group- or world-writable"));
         }
     }
     if !meta.is_file() {
@@ -458,6 +483,24 @@ mod tests {
         assert_eq!(m.managed_by, "nav-pilot");
         assert_eq!(m.allow_private_domains, ["b.nav.no", "intern.nav.no"]);
         assert_eq!(m.tag(), "managed:nav-pilot");
+    }
+
+    #[test]
+    fn refuses_group_or_world_writable_file_or_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        let h = Home::new();
+        let p = write(&h.managed_d(), "nav-pilot.toml", GOOD);
+        set(&p, 0o664);
+        h.refused(p.as_os_str(), &[], "group- or world-writable");
+        set(&p, 0o644);
+        let cplt = h.path().join(".config/cplt");
+        set(&cplt, 0o777);
+        h.refused(p.as_os_str(), &[], "group/world-writable");
+        set(&cplt, 0o755);
+        assert!(h.load(p.as_os_str(), &[]).is_ok());
     }
 
     #[test]
