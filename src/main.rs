@@ -4167,17 +4167,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         }
     }
 
-    // HTTPS push to GitHub with nothing to answer git's credential prompt
-    // (#1121). One git config read, and only while the gh guard is off.
-    if !resolved.gh_guard.enabled
-        && let Some(hint) = cplt::doctor::push_hint(
-            cplt::doctor::push_remote(&project_dir, cplt::gh_proxy::gh_hosts()).as_ref(),
-            false,
-        )
-    {
-        ui::warn(&hint);
-    }
-
     let launch_dir = if active_agent == agent::Agent::Pi && invocation_dir.starts_with(&project_dir)
     {
         invocation_dir
@@ -5807,6 +5796,25 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             prepared.keychain_substitute().is_some(),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // HTTPS push to GitHub with nothing to answer git's credential prompt
+    // (#1121). One git config read, and only while the gh guard is off.
+    if !resolved.gh_guard.enabled
+        && let Some(hint) = cplt::doctor::push_hint(
+            cplt::doctor::push_remote(
+                &project_dir,
+                cplt::gh_proxy::gh_hosts(),
+                cfg!(target_os = "macos")
+                    && active_agent.needs_keychain()
+                    && prepared.keychain_substitute().is_none(),
+            )
+            .as_ref(),
+            false,
+            cplt::doctor::gh_guard_fix(cli.no_gh_guard),
+        )
+    {
+        ui::warn(&hint);
     }
 
     // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
@@ -10701,16 +10709,18 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // The agent's own login only: git's HTTPS credentials are the push line.
     println!("auth:        agent login: {auth_line}");
     findings.extend(auth_finding);
-    let push = doctor::push_remote(&project_dir, cplt::gh_proxy::gh_hosts());
+    let push = doctor::push_remote(
+        &project_dir,
+        cplt::gh_proxy::gh_hosts(),
+        macos && active_agent.needs_keychain() && keychain_substitute.is_none(),
+    );
     println!(
         "push:        {}",
         doctor::push_line(push.as_ref(), resolved.gh_guard.enabled, auth.gh_cli_auth)
     );
-    if let Some(hint) = doctor::push_hint(push.as_ref(), resolved.gh_guard.enabled) {
-        findings.push(Finding::warning(
-            hint,
-            Some(doctor::ENABLE_GH_GUARD.to_string()),
-        ));
+    let guard_fix = doctor::gh_guard_fix(cli.no_gh_guard);
+    if let Some(hint) = doctor::push_hint(push.as_ref(), resolved.gh_guard.enabled, guard_fix) {
+        findings.push(Finding::warning(hint, Some(guard_fix.to_string())));
     }
     println!();
     println!("{}", doctor::PASTE_HINT);

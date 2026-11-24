@@ -1517,6 +1517,18 @@ pub fn exit_nonzero(findings: &[Finding]) -> bool {
 
 /// The command that turns the gh guard on, as the push hint prints it.
 pub const ENABLE_GH_GUARD: &str = "cplt config set gh_guard.enabled true";
+/// The fix when the guard is off because of the command-line flag.
+pub const DROP_NO_GH_GUARD: &str = "drop --no-gh-guard";
+
+/// The push hint's fix for where the guard was turned off.
+#[must_use]
+pub fn gh_guard_fix(no_gh_guard_flag: bool) -> &'static str {
+    if no_gh_guard_flag {
+        DROP_NO_GH_GUARD
+    } else {
+        ENABLE_GH_GUARD
+    }
+}
 
 /// What decides whether `git push` over HTTPS can authenticate inside the
 /// sandbox (#1121). Read from git config only: no network, no `gh`.
@@ -1542,15 +1554,15 @@ pub struct PushRemote {
 /// shortcut: ignores `branch.<b>.pushRemote` and `url.*.insteadOf`; upgrade if
 /// a remote rewritten to HTTPS that way needs the hint.
 #[must_use]
-pub fn push_remote(project_dir: &Path, hosts: &[String]) -> Option<PushRemote> {
+pub fn push_remote(project_dir: &Path, hosts: &[String], keychain: bool) -> Option<PushRemote> {
     let out = crate::git::output(project_dir, &["config", "--list", "-z", "--show-scope"])?;
     if !out.status.success() {
         return None;
     }
-    parse_push_remote(&String::from_utf8_lossy(&out.stdout), hosts)
+    parse_push_remote(&String::from_utf8_lossy(&out.stdout), hosts, keychain)
 }
 
-fn parse_push_remote(list: &str, hosts: &[String]) -> Option<PushRemote> {
+fn parse_push_remote(list: &str, hosts: &[String], keychain: bool) -> Option<PushRemote> {
     let mut fields = list.split('\0');
     let mut entries = Vec::new();
     while let (Some(scope), Some(kv)) = (fields.next(), fields.next()) {
@@ -1586,7 +1598,7 @@ fn parse_push_remote(list: &str, hosts: &[String]) -> Option<PushRemote> {
             // An empty value resets the list, as git does.
             if v.is_empty() {
                 usable_helpers.clear();
-            } else if !helper_needs_guard(v) {
+            } else if helper_answers_in_sandbox(v, keychain) {
                 usable_helpers.push(v.clone());
             }
         }
@@ -1599,23 +1611,37 @@ fn parse_push_remote(list: &str, hosts: &[String]) -> Option<PushRemote> {
     })
 }
 
-/// Helpers that cannot answer inside the sandbox on their own: gh's (its token
-/// store is reached only through the gh guard) and `store`, whose
-/// `~/.git-credentials` the sandbox denies.
-fn helper_needs_guard(helper: &str) -> bool {
-    helper.contains("gh auth git-credential") || helper.split_whitespace().next() == Some("store")
+/// Whether a helper can answer inside the sandbox without the gh guard,
+/// measured on macOS (#1121): gh's own reaches its token store only through
+/// the guard; `store` reads `~/.git-credentials`, which the sandbox denies;
+/// `cache` fails with "unable to connect to cache daemon: Operation not
+/// permitted"; `osxkeychain` and GCM (Keychain store by default) answer only
+/// when this session keeps the Keychain grant (`keychain`). Anything else is
+/// assumed to work, so the hint never fires on a guess.
+fn helper_answers_in_sandbox(helper: &str, keychain: bool) -> bool {
+    if helper.contains("gh auth git-credential") {
+        return false;
+    }
+    let name = helper.split_whitespace().next().unwrap_or_default();
+    let name = name.rsplit('/').next().unwrap_or(name);
+    let name = name.strip_prefix("git-credential-").unwrap_or(name);
+    match name {
+        "store" | "cache" => false,
+        "osxkeychain" | "manager" | "manager-core" => keychain,
+        _ => true,
+    }
 }
 
 /// The one launch line for an HTTPS GitHub push that nothing can
 /// authenticate, or `None`.
 #[must_use]
-pub fn push_hint(push: Option<&PushRemote>, gh_guard: bool) -> Option<String> {
+pub fn push_hint(push: Option<&PushRemote>, gh_guard: bool, fix: &str) -> Option<String> {
     let p = push?;
     let host = p.https_host.as_deref()?;
     (!gh_guard && p.usable_helpers.is_empty()).then(|| {
         format!(
             "git push to https://{host} will fail: no credential helper works in the \
-             sandbox while the gh guard is off. Turn it on: {ENABLE_GH_GUARD}"
+             sandbox while the gh guard is off. Turn it on: {fix}"
         )
     })
 }
@@ -2748,14 +2774,19 @@ mod tests {
         let p = parse_push_remote(
             &list(&[("local", "remote.origin.url", "https://github.com/o/r.git")]),
             &gh(),
+            false,
         )
         .unwrap();
-        let hint = push_hint(Some(&p), false).expect("hint");
+        let hint = push_hint(Some(&p), false, ENABLE_GH_GUARD).expect("hint");
         assert!(
             hint.ends_with("cplt config set gh_guard.enabled true"),
             "{hint}"
         );
-        assert_eq!(push_hint(Some(&p), true), None, "guard on: no hint");
+        assert_eq!(
+            push_hint(Some(&p), true, ENABLE_GH_GUARD),
+            None,
+            "guard on: no hint"
+        );
         assert!(
             push_line(Some(&p), false, true).contains("no usable credential helper, gh guard off")
         );
@@ -2768,9 +2799,9 @@ mod tests {
             "https://gitlab.com/o/r.git",
             "ssh://github.com/o/r",
         ] {
-            let p =
-                parse_push_remote(&list(&[("local", "remote.origin.url", url)]), &gh()).unwrap();
-            assert_eq!(push_hint(Some(&p), false), None, "{url}");
+            let p = parse_push_remote(&list(&[("local", "remote.origin.url", url)]), &gh(), false)
+                .unwrap();
+            assert_eq!(push_hint(Some(&p), false, ENABLE_GH_GUARD), None, "{url}");
             assert!(push_line(Some(&p), false, false).contains("the gh guard does not apply"));
         }
     }
@@ -2793,22 +2824,63 @@ mod tests {
                 ("local", "remote.pushDefault", "fork"),
             ]),
             &gh(),
+            false,
         )
         .unwrap();
         assert_eq!(p.remote, "fork");
         assert_eq!(p.https_host.as_deref(), Some("github.com"));
         // The empty scoped value reset osxkeychain; gh and store need the guard.
         assert!(p.usable_helpers.is_empty(), "{:?}", p.usable_helpers);
-        assert!(push_hint(Some(&p), false).is_some());
+        assert!(push_hint(Some(&p), false, ENABLE_GH_GUARD).is_some());
         let keychain = parse_push_remote(
             &list(&[
                 ("global", "credential.helper", "osxkeychain"),
                 ("local", "remote.origin.url", "https://github.com/o/r"),
             ]),
             &gh(),
+            false,
         )
         .unwrap();
-        assert_eq!(push_hint(Some(&keychain), false), None);
-        assert_eq!(parse_push_remote(&list(&[]), &gh()), None, "no remote");
+        assert!(
+            push_hint(Some(&keychain), false, ENABLE_GH_GUARD).is_some(),
+            "no Keychain grant"
+        );
+        let granted = parse_push_remote(
+            &list(&[
+                ("global", "credential.helper", "osxkeychain"),
+                ("local", "remote.origin.url", "https://github.com/o/r"),
+            ]),
+            &gh(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            push_hint(Some(&granted), false, ENABLE_GH_GUARD),
+            None,
+            "Keychain granted"
+        );
+        assert_eq!(
+            parse_push_remote(&list(&[]), &gh(), false),
+            None,
+            "no remote"
+        );
+    }
+
+    #[test]
+    fn helpers_usable_only_where_measured_to_answer() {
+        for (h, kc, ok) in [
+            ("cache --timeout 900", true, false),
+            ("store", true, false),
+            ("!/opt/homebrew/bin/gh auth git-credential", true, false),
+            ("osxkeychain", false, false),
+            ("osxkeychain", true, true),
+            ("/usr/local/bin/git-credential-manager", false, false),
+            ("manager", true, true),
+            ("libsecret", false, true),
+        ] {
+            assert_eq!(helper_answers_in_sandbox(h, kc), ok, "{h} keychain={kc}");
+        }
+        assert!(gh_guard_fix(true).contains("--no-gh-guard"));
+        assert_eq!(gh_guard_fix(false), ENABLE_GH_GUARD);
     }
 }

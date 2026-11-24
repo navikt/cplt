@@ -602,6 +602,41 @@ mod e2e_tests {
         );
         assert!(run(&["--agent", "shell", "doctor"]).contains("gh guard on"));
 
+        // Off by the flag: the fix is to drop the flag, not `config set`.
+        let out = run(&[
+            "--no-gh-guard",
+            "--agent",
+            "shell",
+            "--yes",
+            "--",
+            "-c",
+            "true",
+        ]);
+        assert!(
+            out.contains(HINT) && out.contains("drop --no-gh-guard"),
+            "{out}"
+        );
+        // osxkeychain cannot answer without the session's Keychain grant,
+        // which the shell never gets: the hint still fires.
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "credential.helper", "osxkeychain"]
+        ));
+        let out = run(&[
+            "--no-gh-guard",
+            "--agent",
+            "shell",
+            "--yes",
+            "--",
+            "-c",
+            "true",
+        ]);
+        assert!(out.contains(HINT), "osxkeychain without the grant:\n{out}");
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "--unset", "credential.helper"]
+        ));
+
         run(&["config", "set", "gh_guard.enabled", "false", "--force"]);
         assert!(crate::common::git_ok(
             repo.path(),
