@@ -22,22 +22,50 @@ REQUIRED_HEADINGS = (
 
 exempt_authors = ("dependabot[bot]", "github-actions[bot]")
 
-REQUIRED_CODE_JOBS = (
-    "unit-tests",
-    "integration-tests",
-    # Matrix cells of ci.yaml opencode-v2-e2e*; keep in step with its matrix.
-    "opencode-v2-e2e-2.0.24",
-    "opencode-v2-e2e-2.3.2",
-    "opencode-v2-e2e-2.4",
-    "opencode-v2-e2e-linux-2.0.24",
-    "opencode-v2-e2e-linux-2.3.2",
-    "opencode-v2-e2e-linux-2.4",
-    "linux-integration-tests",
-    "mcp-broker-e2e-ubuntu-22.04",
-    "mcp-broker-e2e-ubuntu-24.04",
-    "doctor-fix-e2e-own",
-    "doctor-fix-e2e-shipped",
-)
+CI_WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yaml"
+
+
+def required_code_jobs(workflow: Path = CI_WORKFLOW) -> list[str]:
+    """Check-run names of the jobs ci-ok `needs`, minus pr-body-check, read from ci.yaml.
+
+    Deriving them keeps this gate from drifting when a job is renamed or gains a matrix.
+    Stdlib only, so it reads the workflow line-wise: `needs` and matrix axes must be
+    single-line flow lists and `name:` a plain scalar, and it fails loudly otherwise.
+    """
+    lines = workflow.read_text(encoding="utf-8").splitlines()
+    jobs: dict[str, list[str]] = {}
+    key = None
+    in_jobs = False
+    for line in lines:
+        if re.match(r"^jobs:\s*$", line):
+            in_jobs = True
+        elif in_jobs and (m := re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)):
+            key = m.group(1)
+            jobs[key] = []
+        elif in_jobs and key and (line.startswith("    ") or not line.strip()):
+            jobs[key].append(line)
+        elif in_jobs and line.strip() and not line.startswith(" "):
+            in_jobs = False
+    m = re.search(r"^    needs:\s*\[(.*)\]\s*$", "\n".join(jobs["ci-ok"]), re.M)
+    if not m:
+        raise ValueError("ci-ok `needs` is not a single-line flow list in ci.yaml")
+    names: list[str] = []
+    for need in (n.strip() for n in m.group(1).split(",")):
+        if need == "pr-body-check":
+            continue
+        body = "\n".join(jobs[need])
+        nm = re.search(r"^    name:\s*(.+?)\s*$", body, re.M)
+        template = nm.group(1).strip("\"'") if nm else need
+        axes = re.findall(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}", template)
+        expanded = [template]
+        for axis in axes:
+            am = re.search(rf"^        {re.escape(axis)}:\s*\[(.*)\]\s*$", body, re.M)
+            if not am:
+                raise ValueError(f"job {need}: matrix axis {axis!r} is not a single-line flow list")
+            values = [v.strip().strip("\"'") for v in am.group(1).split(",")]
+            expanded = [re.sub(rf"\$\{{\{{\s*matrix\.{re.escape(axis)}\s*\}}\}}", v, t) for t in expanded for v in values]
+        names.extend(expanded)
+    return names
 
 TEMPLATE_EXAMPLE = """```markdown
 ## Summary
@@ -198,7 +226,7 @@ def verify_code_checks(repo: str, head_sha: str) -> list[str]:
 
     errors: list[str] = []
     short_sha = head_sha[:7]
-    for job in REQUIRED_CODE_JOBS:
+    for job in required_code_jobs():
         run = latest_by_name.get(job)
         if run is None:
             errors.append(
