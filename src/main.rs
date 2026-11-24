@@ -2584,8 +2584,11 @@ fn push_helper_env(
         None,
         agent,
     );
+    // The launch strips `deny_env` after the builder (sandbox_exec.rs).
     let has = |k: &str| {
-        if let Some((_, v)) = env.vars.iter().rev().find(|(n, _)| n == k) {
+        if resolved.deny_env.iter().any(|d| d == k) {
+            false
+        } else if let Some((_, v)) = env.vars.iter().rev().find(|(n, _)| n == k) {
             !v.trim().is_empty()
         } else if env.clear_first || env.remove.iter().any(|n| n == k) {
             false

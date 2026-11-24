@@ -684,12 +684,15 @@ mod e2e_tests {
             repo.path(),
             &["config", "credential.helper", "!gh auth git-credential"]
         ));
-        let run = |pass: bool| {
+        let run = |pass: bool, deny: bool| {
             let mut cmd = crate::common::cplt_local(&home, repo.path());
             cmd.env("GH_TOKEN", "ghp_probe")
                 .args(["--agent", "shell", "--yes"]);
             if pass {
                 cmd.args(["--pass-env", "GH_TOKEN"]);
+            }
+            if deny {
+                cmd.args(["--deny-env", "GH_TOKEN"]);
             }
             let o = cmd
                 .args(["--", "-c", "true"])
@@ -701,9 +704,16 @@ mod e2e_tests {
                 String::from_utf8_lossy(&o.stderr)
             )
         };
-        assert!(run(false).contains(HINT), "token not passed: hint fires");
-        let out = run(true);
+        assert!(
+            run(false, false).contains(HINT),
+            "token not passed: hint fires"
+        );
+        let out = run(true, false);
         assert!(!out.contains(HINT), "token passed: no hint\n{out}");
+        assert!(
+            run(true, true).contains(HINT),
+            "passed but denied: the child has no token, hint fires"
+        );
     }
 
     #[test]
