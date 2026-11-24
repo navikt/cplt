@@ -6127,6 +6127,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             settled,
         );
     }
+    if let Some(broker) = &mcp_broker {
+        // #1091: every host-opener decision, whatever the log level.
+        let opens = broker.open_url_records();
+        if !opens.is_empty() {
+            ui::info(&format!("host opener: {}", opens.join("; ")));
+        }
+    }
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),

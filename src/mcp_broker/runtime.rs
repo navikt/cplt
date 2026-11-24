@@ -89,6 +89,8 @@ pub(crate) struct Shared {
     /// Hosts `open_url` may open; empty means the op is off.
     open_hosts: Vec<String>,
     open_limiter: super::open_url::Limiter,
+    /// Every `open_url` decision, for the post-session report.
+    open_records: Mutex<Vec<String>>,
     /// Set by [`Broker::disable_open_url`].
     open_off: AtomicBool,
     /// Open connections (socket clients and egress tunnels together).
@@ -387,6 +389,7 @@ impl Broker {
             servers,
             open_hosts,
             open_limiter: super::open_url::Limiter::default(),
+            open_records: Mutex::new(Vec::new()),
             open_off: AtomicBool::new(false),
             home: home.to_path_buf(),
             log,
@@ -486,6 +489,16 @@ impl Broker {
     #[must_use]
     pub fn open_url_hosts(&self) -> &[String] {
         &self.shared.open_hosts
+    }
+
+    /// Every `open_url` decision this session (host and reason, no query).
+    #[must_use]
+    pub fn open_url_records(&self) -> Vec<String> {
+        self.shared
+            .open_records
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_default()
     }
 
     /// Turn `open_url` off for this session.
@@ -1524,6 +1537,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
                 &shared.open_limiter,
                 &shared.home,
                 &shared.log,
+                &shared.open_records,
             );
         }
         return;

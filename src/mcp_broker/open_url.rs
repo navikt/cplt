@@ -31,6 +31,8 @@ const OAUTH_CREDENTIAL: &str = "oauth";
 
 /// Opens per [`WINDOW`], and the window itself.
 const MAX_OPENS: usize = 3;
+/// Decisions kept for the post-session report.
+const MAX_RECORDS: usize = 200;
 const WINDOW: Duration = Duration::from_secs(60);
 
 /// Hosts a URL may name: each oauth spec's `remote` URL host (the fleet
@@ -129,11 +131,29 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
         Some(d) => crate::proxy::is_domain_match(host, &[d.to_string()]),
         None => *h == host,
     });
-    if allowed {
-        Ok(())
-    } else {
-        Err(HOST_NOT_ALLOWED)
+    if !allowed {
+        return Err(HOST_NOT_ALLOWED);
     }
+    // A suffix match is not enough: the opener must get a real DNS name.
+    if !is_dns_name(host) {
+        return Err("host is not a valid DNS name");
+    }
+    Ok(())
+}
+
+/// Letters, digits, `-` and `.` labels, and not an IP literal or alias
+/// (`127.0.0.1`, `10.1`): config rejects those for `allow_private_domains`.
+fn is_dns_name(h: &str) -> bool {
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    h.len() <= 253
+        && h.split('.').all(label_ok)
+        && !crate::proxy::is_ip_alias(h)
+        && h.parse::<std::net::IpAddr>().is_err()
 }
 
 const HOST_NOT_ALLOWED: &str = "host not allowed";
@@ -199,13 +219,7 @@ fn dns_host(url: &str) -> Option<String> {
         .to_ascii_lowercase();
     // The domain matcher ignores one root dot, so the printed host must too.
     let h = h.strip_suffix('.').map(str::to_owned).unwrap_or(h);
-    let label_ok = |l: &str| {
-        (1..=63).contains(&l.len())
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    };
-    (h.len() <= 253 && h.split('.').all(label_ok)).then_some(h)
+    is_dns_name(&h).then_some(h)
 }
 
 /// macOS only (owner decision 2026-11-17): LaunchServices picks the handler
@@ -365,7 +379,18 @@ pub(crate) fn serve(
     limiter: &Limiter,
     home: &Path,
     log: &super::Log,
+    records: &Mutex<Vec<String>>,
 ) {
+    // Every decision is kept for the post-session report, whatever the log
+    // level or file. Host and reason only, never the URL's query.
+    let note = |text: String| {
+        log.line("open_url", &text);
+        if let Ok(mut r) = records.lock()
+            && r.len() < MAX_RECORDS
+        {
+            r.push(text);
+        }
+    };
     let Some(url) = super::runtime::read_line(reader, MAX_LEN as u64 + 2) else {
         return;
     };
@@ -379,27 +404,24 @@ pub(crate) fn serve(
     let answer = match checked.and_then(|()| limiter.take(Instant::now())) {
         Err(why) => {
             match &host {
-                Some(h) => log.line("open_url", &format!("DENIED {h} {why}")),
-                None => log.line("open_url", &format!("DENIED {why}")),
+                Some(h) => note(format!("DENIED {h} {why}")),
+                None => note(format!("DENIED {why}")),
             }
             refusal(host.as_deref(), why, hosts)
         }
         Ok(busy) => match opener(HOST_OPENER).map(|o| run_opener(&o, &url, home, &busy)) {
             Some(Ok(())) => {
                 // The host only: the query carries OAuth state and PKCE.
-                log.line(
-                    "open_url",
-                    &format!("ALLOWED {}", host.as_deref().unwrap_or("")),
-                );
+                note(format!("ALLOWED {}", host.as_deref().unwrap_or("")));
                 "ok".to_string()
             }
             Some(Err(e)) => {
-                log.line("open_url", &format!("FAIL {e}"));
+                note(format!("FAIL {e}"));
                 "failed: the host opener did not open the URL".to_string()
             }
             None => {
                 limiter.busy.store(false, Ordering::Release);
-                log.line("open_url", "FAIL no opener");
+                note("FAIL no opener".into());
                 "failed: no opener on the host".to_string()
             }
         },
@@ -767,6 +789,7 @@ mod tests {
                     level: crate::proxy::ProxyLogLevel::None,
                     file: None,
                 },
+                &Mutex::new(Vec::new()),
             );
             assert_eq!(
                 String::from_utf8(out).unwrap(),
@@ -793,6 +816,7 @@ mod tests {
             &Limiter::default(),
             Path::new("/nonexistent"),
             &log,
+            &Mutex::new(Vec::new()),
         );
         let out = String::from_utf8(out).unwrap();
         assert_eq!(out, "denied: userinfo in URL\n");
@@ -1305,10 +1329,80 @@ mod tests {
             &Limiter::default(),
             Path::new("/h"),
             &log,
+            &Mutex::new(Vec::new()),
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "denied: evil.example is not allowed to open in the host browser. If you trust it, copy the URL into your browser yourself.\n"
+        );
+    }
+
+    /// Copilot review on #1124: a suffix match needs a valid DNS host too.
+    #[test]
+    fn allowed_suffix_still_needs_a_valid_dns_host() {
+        let list = vec![".intern.example".to_string()];
+        assert_eq!(
+            check("https://bad_label.intern.example/", &list),
+            Err("host is not a valid DNS name")
+        );
+        assert_eq!(dns_host("https://bad_label.intern.example/"), None);
+        assert_eq!(check("https://ok-label.intern.example/", &list), Ok(()));
+    }
+
+    /// Copilot review on #1124: an IP literal or alias is no DNS name, so no
+    /// `allow_private_domains` suggestion (config rejects it).
+    #[test]
+    fn ip_hosts_get_no_config_suggestion() {
+        for u in ["https://127.0.0.1/", "https://10.1/", "https://10.1.2.3./"] {
+            assert_eq!(dns_host(u), None, "{u}");
+            let mut out = Vec::new();
+            serve(
+                &mut format!("{u}\n").as_bytes(),
+                &mut out,
+                &[".intern.example".to_string()],
+                &Limiter::default(),
+                Path::new("/nonexistent"),
+                &super::super::Log {
+                    level: crate::proxy::ProxyLogLevel::None,
+                    file: None,
+                },
+                &Mutex::new(Vec::new()),
+            );
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(out, "denied: host not allowed\n", "{u}");
+        }
+    }
+
+    /// Copilot review on #1124: every decision is recorded without a log
+    /// file or level, host and reason only.
+    #[test]
+    fn every_decision_is_recorded_without_the_query() {
+        let records = Mutex::new(Vec::new());
+        let log = super::super::Log {
+            level: crate::proxy::ProxyLogLevel::None,
+            file: None,
+        };
+        for u in [
+            "https://evil.example/cb?code=SECRET",
+            "https://u@evil.example/?code=SECRET",
+        ] {
+            serve(
+                &mut format!("{u}\n").as_bytes(),
+                &mut Vec::new(),
+                &["gw.example".into()],
+                &Limiter::default(),
+                Path::new("/nonexistent"),
+                &log,
+                &records,
+            );
+        }
+        let r = records.into_inner().unwrap();
+        assert_eq!(
+            r,
+            vec![
+                "DENIED evil.example host not allowed".to_string(),
+                "DENIED userinfo in URL".to_string()
+            ]
         );
     }
 }
