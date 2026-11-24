@@ -12720,6 +12720,25 @@ mod agent_stubs {
             let w = warning(var, &h.join(rel)).expect("the refusal should be reported");
             assert!(!w.contains("config set"), "no grant hint for ~/{rel}: {w}");
         }
+        // A symlinked persistence dir (`~/bin -> ~/tools`) is matched by identity,
+        // and a path `validate_sbpl_path` would reject later gets no hint.
+        std::fs::create_dir_all(h.join("tools")).unwrap();
+        std::os::unix::fs::symlink(h.join("tools"), h.join("bin")).unwrap();
+        std::fs::create_dir_all(h.join("pnpm(old)")).unwrap();
+        for rel in ["bin", "pnpm(old)"] {
+            let w = warning("PNPM_HOME", &h.join(rel)).expect("the refusal should be reported");
+            assert!(!w.contains("config set"), "no grant hint for ~/{rel}: {w}");
+        }
+        // JAVA_HOME gets the same one-step hint, read-only.
+        std::fs::create_dir_all(h.join("jdk")).unwrap();
+        let w = warning("JAVA_HOME", &h.join("jdk")).expect("JAVA_HOME=~/jdk should be refused");
+        assert!(
+            w.contains(&format!(
+                "cplt config set allow.read {}",
+                h.join("jdk").display()
+            )),
+            "JAVA_HOME hint: {w}"
+        );
         let pnpm = h.join("pnpm");
         let w = warning("PNPM_HOME", &pnpm).expect("PNPM_HOME=~/pnpm should be refused");
         let hint = w

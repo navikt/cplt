@@ -3983,14 +3983,21 @@ const ENV_TOOL_NO_HINT_SUBPATHS: &[&str] = &[
 #[must_use]
 pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
     let text = path.to_string_lossy();
-    if text.escape_debug().to_string() != text || !tool_override_path_is_safe(path, home) {
+    // The printed command must survive `Config::merge`, which refuses these.
+    if text.escape_debug().to_string() != text
+        || validate_sbpl_path(path).is_err()
+        || !tool_override_path_is_safe(path, home)
+    {
         return false;
     }
     if env_tool_path_protected(home, path).is_some() {
         return false;
     }
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_ascii_lowercase());
     let me = lower(path);
+    let my_id = id(path);
     let homes = std::iter::once(home.to_path_buf()).chain(config::account_home());
     !homes
         .flat_map(|h| {
@@ -3998,8 +4005,18 @@ pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
             [h, canon]
         })
         .flat_map(|h| ENV_TOOL_NO_HINT_SUBPATHS.iter().map(move |rel| h.join(rel)))
-        .map(|d| lower(&d))
-        .any(|d| me.starts_with(&d) || d.starts_with(&me))
+        .any(|d| {
+            let ld = lower(&d);
+            // Spelling covers entries that do not exist yet; identity covers a
+            // symlinked entry (`~/bin -> ~/tools`) reached by its target.
+            me.starts_with(&ld)
+                || ld.starts_with(&me)
+                || id(&d).is_some_and(|did| {
+                    path.ancestors().any(|a| id(a) == Some(did))
+                        || std::fs::canonicalize(&d)
+                            .is_ok_and(|c| c.ancestors().any(|a| id(a) == my_id))
+                })
+        })
 }
 
 /// Validate that a path is safe for interpolation into SBPL profile strings.

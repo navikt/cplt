@@ -1959,14 +1959,7 @@ fn merge_tool_path_env_overrides(
             // tool then fails with a bare EPERM (#1128).
             if !covered {
                 let kind = if ovr.write { "write" } else { "read" };
-                let fix = if cplt::sandbox::env_tool_dir_hint_ok(home, &path) {
-                    format!(
-                        "Move it there, or grant it in one step: cplt config set allow.{kind} {}",
-                        shell_quote(&path.to_string_lossy())
-                    )
-                } else {
-                    format!("Point {} elsewhere.", ovr.name)
-                };
+                let fix = tool_dir_grant_fix(home, &path, kind, ovr.name);
                 ui::warn(&format!(
                     "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
                  under ~/.cache, ~/Library/Caches (not a personal-app cache), another cplt \
@@ -7606,6 +7599,19 @@ impl HostProbe {
     }
 }
 
+/// The next step for a refused env tool dir: a copy-pasteable grant when the
+/// path passes the hint safety checks, otherwise "point it elsewhere".
+fn tool_dir_grant_fix(home: &Path, path: &Path, kind: &str, var: &str) -> String {
+    if cplt::sandbox::env_tool_dir_hint_ok(home, path) {
+        format!(
+            "Move it there, or grant it in one step: cplt config set allow.{kind} {}",
+            shell_quote(&path.to_string_lossy())
+        )
+    } else {
+        format!("Point {var} elsewhere.")
+    }
+}
+
 /// An env var naming a tool directory, accepted only when it exists and does not
 /// resolve to an unsafe root that would defeat the sandbox.
 fn tool_dir_from_env(var: &str, home_dir: &Path, quiet: bool) -> Option<PathBuf> {
@@ -7645,9 +7651,9 @@ fn accept_tool_dir(
         if !quiet {
             ui::warn(&format!(
                 "Ignoring {var} = {}: an env-set SDK dir is granted read only under a known SDK or tool \
-             root (~/.sdkman, ~/.jdks, /usr/lib/jvm, /Library/Java, mise, asdf, ...). Grant it \
-             with `allow.read` if you mean to.",
-                path.to_string_lossy().escape_debug()
+             root (~/.sdkman, ~/.jdks, /usr/lib/jvm, /Library/Java, mise, asdf, ...). {}",
+                path.to_string_lossy().escape_debug(),
+                tool_dir_grant_fix(home_dir, &path, "read", var)
             ));
         }
         return None;
