@@ -1892,6 +1892,7 @@ fn merge_tool_path_env_overrides(
     resolved: &mut config::Resolved,
     home: &Path,
     project_dir: &Path,
+    repo_dirs: &[PathBuf],
 ) -> Vec<ToolRoot> {
     let mut roots = Vec::new();
     // Read only the handful of recognized tool-path vars rather than snapshotting
@@ -1959,7 +1960,10 @@ fn merge_tool_path_env_overrides(
             // tool then fails with a bare EPERM (#1128).
             if !covered {
                 let kind = if ovr.write { "write" } else { "read" };
-                let fix = tool_dir_grant_fix(home, &path, kind, ovr.name);
+                let hint_roots: Vec<&Path> = std::iter::once(project_dir)
+                    .chain(repo_dirs.iter().map(PathBuf::as_path))
+                    .collect();
+                let fix = tool_dir_grant_fix(home, &path, kind, ovr.name, &hint_roots);
                 ui::warn(&format!(
                     "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
                  under ~/.cache, ~/Library/Caches (not a personal-app cache), another cplt \
@@ -5525,7 +5529,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     warn_inject_token_without_guard(&resolved);
 
     // Probe the host for everything the sandbox profile depends on.
-    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir, &repo_paths);
     // After the probe, which adds env-relocated tool grants (GOCACHE, ...) to
     // `resolved`, and before the first state read below.
     pin_state_out_of_grants(
@@ -7565,8 +7569,16 @@ impl HostProbe {
     /// Also grants tool paths relocated via env vars (GOPATH, CARGO_HOME, ...)
     /// by mutating `resolved`: the grant and the tool discovery share the same
     /// tool roots, so they must not be able to drift apart.
-    fn probe(resolved: &mut config::Resolved, home_dir: &Path, project_dir: &Path) -> Self {
-        let tool_roots = merge_tool_path_env_overrides(resolved, home_dir, project_dir);
+    fn probe(
+        resolved: &mut config::Resolved,
+        home_dir: &Path,
+        project_dir: &Path,
+        repo_dirs: &[PathBuf],
+    ) -> Self {
+        let tool_roots = merge_tool_path_env_overrides(resolved, home_dir, project_dir, repo_dirs);
+        let hint_roots: Vec<&Path> = std::iter::once(project_dir)
+            .chain(repo_dirs.iter().map(PathBuf::as_path))
+            .collect();
         if resolved.allow_build_credentials {
             merge_build_credentials(resolved, home_dir);
         }
@@ -7590,18 +7602,18 @@ impl HostProbe {
             // JDK read access when installed outside TOOL_READ_DIRS. Covers
             // sdkman (~/.sdkman/candidates/java/), actions/setup-java
             // (hostedtoolcache), jabba, or any other manager under HOME.
-            java_home: tool_dir_from_env("JAVA_HOME", home_dir, resolved.quiet),
+            java_home: tool_dir_from_env("JAVA_HOME", home_dir, resolved, &hint_roots),
             // .NET SDK read access when installed outside TOOL_READ_DIRS (e.g.
             // actions/setup-dotnet hostedtoolcache, or dotnet-install.sh into a
             // custom directory under $HOME).
-            dotnet_root: tool_dir_from_env("DOTNET_ROOT", home_dir, resolved.quiet),
+            dotnet_root: tool_dir_from_env("DOTNET_ROOT", home_dir, resolved, &hint_roots),
         }
     }
 }
 
 /// The next step for a refused env tool dir: a copy-pasteable grant when the
 /// path passes the hint safety checks, otherwise "point it elsewhere".
-fn tool_dir_grant_fix(home: &Path, path: &Path, kind: &str, var: &str) -> String {
+fn tool_dir_grant_fix(home: &Path, path: &Path, kind: &str, var: &str, roots: &[&Path]) -> String {
     // A read grant is offered only for a dir that looks like the SDK it names.
     let sdk_ok = kind != "read"
         || match var {
@@ -7609,7 +7621,7 @@ fn tool_dir_grant_fix(home: &Path, path: &Path, kind: &str, var: &str) -> String
             "DOTNET_ROOT" => path.join("dotnet").is_file(),
             _ => false,
         };
-    if sdk_ok && cplt::sandbox::env_tool_dir_hint_ok(home, path) {
+    if sdk_ok && cplt::sandbox::env_tool_dir_hint_ok(home, path, roots) {
         format!(
             "Move it there, or grant it in one step: cplt config set allow.{kind} {}",
             shell_quote(&path.to_string_lossy())
@@ -7621,8 +7633,26 @@ fn tool_dir_grant_fix(home: &Path, path: &Path, kind: &str, var: &str) -> String
 
 /// An env var naming a tool directory, accepted only when it exists and does not
 /// resolve to an unsafe root that would defeat the sandbox.
-fn tool_dir_from_env(var: &str, home_dir: &Path, quiet: bool) -> Option<PathBuf> {
-    accept_tool_dir(var, std::env::var(var).ok(), home_dir, quiet)
+fn tool_dir_from_env(
+    var: &str,
+    home_dir: &Path,
+    resolved: &config::Resolved,
+    roots: &[&Path],
+) -> Option<PathBuf> {
+    let granted: Vec<&Path> = resolved
+        .allow_read
+        .iter()
+        .chain(&resolved.allow_write)
+        .map(PathBuf::as_path)
+        .collect();
+    accept_tool_dir(
+        var,
+        std::env::var(var).ok(),
+        home_dir,
+        resolved.quiet,
+        roots,
+        &granted,
+    )
 }
 
 /// The value half of [`tool_dir_from_env`], separate so it can be tested without
@@ -7639,6 +7669,8 @@ fn accept_tool_dir(
     value: Option<String>,
     home_dir: &Path,
     quiet: bool,
+    roots: &[&Path],
+    granted: &[&Path],
 ) -> Option<PathBuf> {
     let path = std::fs::canonicalize(value?).ok()?;
     if crate::is_unsafe_root(&path, home_dir) {
@@ -7655,12 +7687,17 @@ fn accept_tool_dir(
         return None;
     }
     if !cplt::sandbox::env_tool_dir_allowed(var, &path, home_dir, false, &[]) {
-        if !quiet {
+        // An explicit grant already covers it: the printed fix must not loop.
+        // The grant itself (`allow.read`) is applied by the policy builder.
+        let covered = granted
+            .iter()
+            .any(|g| std::fs::canonicalize(g).is_ok_and(|g| path.starts_with(g)));
+        if !quiet && !covered {
             ui::warn(&format!(
                 "Ignoring {var} = {}: an env-set SDK dir is granted read only under a known SDK or tool \
              root (~/.sdkman, ~/.jdks, /usr/lib/jvm, /Library/Java, mise, asdf, ...). {}",
                 path.to_string_lossy().escape_debug(),
-                tool_dir_grant_fix(home_dir, &path, "read", var)
+                tool_dir_grant_fix(home_dir, &path, "read", var, roots)
             ));
         }
         return None;
@@ -8469,7 +8506,7 @@ fn prepare_shell_sandbox(
     project_dir: &Path,
     repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
-    let mut probe = HostProbe::probe(resolved, home_dir, project_dir);
+    let mut probe = HostProbe::probe(resolved, home_dir, project_dir, repos.dirs);
     // Like `exec`, `check` never writes the managed block, so it probes
     // without the root AGENTS.md read (#252).
     probe.root_agents_md = None;
@@ -8645,7 +8682,7 @@ fn run_exec_command(
         mcp_broker: _,
         mcp_refusal: _,
     } = {
-        let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+        let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir, &repo_paths);
         // `exec` never writes the managed block, so it gets no read on a root
         // AGENTS.md cplt did not write (#252).
         probe.root_agents_md = None;
@@ -10335,7 +10372,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     }
 
     // ── the policy a launch would build, for the rules below ──
-    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir, &repo_paths);
     let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
     if active_agent == agent::Agent::OpenCode {
         agent_dirs.extend(agent::opencode_launch_config_grants(
@@ -17381,7 +17418,7 @@ mod tests {
                 let mut r = config::Config::default()
                     .merge(config::CliFlags::default())
                     .unwrap();
-                merge_tool_path_env_overrides(&mut r, &home, &home);
+                merge_tool_path_env_overrides(&mut r, &home, &home, &[]);
                 r.policy_fingerprint()
             })
         };
@@ -17599,12 +17636,44 @@ mod tests {
     }
 
     #[test]
+    fn covered_sdk_dir_does_not_warn_again() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let jdk = h.join("sdk/jdk-21");
+        std::fs::create_dir_all(&jdk).unwrap();
+        std::fs::write(jdk.join("release"), "").unwrap();
+        let v = || Some(jdk.to_string_lossy().into_owned());
+        // Not asserting the warning text: the grant must simply be recognised.
+        let granted = [h.join("sdk")];
+        let g: Vec<&Path> = granted.iter().map(PathBuf::as_path).collect();
+        assert_eq!(accept_tool_dir("JAVA_HOME", v(), &h, false, &[], &g), None);
+    }
+
+    #[test]
+    fn hint_for_project_with_project_dir_elsewhere() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let jdk = h.join("work/jdk");
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&jdk).unwrap();
+        std::fs::write(jdk.join("release"), "").unwrap();
+        let fix = |roots: &[&Path]| tool_dir_grant_fix(&h, &jdk, "read", "JAVA_HOME", roots);
+        assert!(fix(&[&proj]).contains("config set"));
+        // `work` holds the project: no hint for it.
+        let work = h.join("work");
+        assert!(
+            !tool_dir_grant_fix(&h, &work, "write", "GOCACHE", &[&proj]).contains("config set")
+        );
+    }
+
+    #[test]
     fn sdk_read_hint_needs_a_marker() {
         let home = tempfile::tempdir().unwrap();
         let h = std::fs::canonicalize(home.path()).unwrap();
         let jdk = h.join("sdk/jdk-21");
         std::fs::create_dir_all(&jdk).unwrap();
-        let fix = |var| tool_dir_grant_fix(&h, &jdk, "read", var);
+        let fix = |var| tool_dir_grant_fix(&h, &jdk, "read", var, &[]);
         assert!(!fix("JAVA_HOME").contains("config set"), "no marker yet");
         std::fs::write(jdk.join("release"), "").unwrap();
         assert!(fix("JAVA_HOME").contains("config set allow.read"));
@@ -17627,9 +17696,12 @@ mod tests {
     #[test]
     fn tool_dir_env_var_that_is_unset_or_missing_grants_nothing() {
         let home = tempfile::env::temp_dir();
-        assert_eq!(accept_tool_dir("JAVA_HOME", None, &home, false), None);
         assert_eq!(
-            accept_tool_dir("JAVA_HOME", Some(String::new()), &home, false),
+            accept_tool_dir("JAVA_HOME", None, &home, false, &[], &[]),
+            None
+        );
+        assert_eq!(
+            accept_tool_dir("JAVA_HOME", Some(String::new()), &home, false, &[], &[]),
             None,
             "an exported-but-empty JAVA_HOME must not resolve to the cwd"
         );
@@ -17638,7 +17710,9 @@ mod tests {
                 "JAVA_HOME",
                 Some("/definitely/not/a/jdk".to_string()),
                 &home,
-                false
+                false,
+                &[],
+                &[],
             ),
             None
         );
@@ -17654,12 +17728,14 @@ mod tests {
                 "JAVA_HOME",
                 Some(home.to_string_lossy().into_owned()),
                 &home,
-                false
+                false,
+                &[],
+                &[],
             ),
             None
         );
         assert_eq!(
-            accept_tool_dir("JAVA_HOME", Some("/".to_string()), &home, false),
+            accept_tool_dir("JAVA_HOME", Some("/".to_string()), &home, false, &[], &[]),
             None
         );
     }
@@ -17675,7 +17751,9 @@ mod tests {
                 "JAVA_HOME",
                 Some(jdk.to_string_lossy().into_owned()),
                 &home,
-                false
+                false,
+                &[],
+                &[],
             ),
             Some(jdk)
         );
@@ -17693,7 +17771,9 @@ mod tests {
                 "JAVA_HOME",
                 Some(keychains.to_string_lossy().into_owned()),
                 &home,
-                false
+                false,
+                &[],
+                &[],
             ),
             None
         );
@@ -17712,7 +17792,7 @@ mod tests {
             .unwrap()
             .merge(config::CliFlags::default())
             .unwrap();
-        let probe = HostProbe::probe(&mut resolved, &home, &project);
+        let probe = HostProbe::probe(&mut resolved, &home, &project, &[]);
         assert_eq!(probe.home_dir, home);
         assert_eq!(probe.project_dir, project);
         // A directory that is not a git work tree has no worktree common dir.
@@ -18269,7 +18349,7 @@ mod tests {
         resolved.agents_md = true;
 
         let grants = |resolved: &mut config::Resolved| {
-            let probe = HostProbe::probe(resolved, &home, &sub);
+            let probe = HostProbe::probe(resolved, &home, &sub, &[]);
             let cfg = build_sandbox_config(
                 resolved,
                 &probe,
@@ -18320,7 +18400,7 @@ mod tests {
         let lit = format!("(literal \"{}\")", agents.display());
 
         let granted_after_upsert = |resolved: &mut config::Resolved| {
-            let probe = HostProbe::probe(resolved, &home, &sub);
+            let probe = HostProbe::probe(resolved, &home, &sub, &[]);
             let cfg = build_sandbox_config(
                 resolved,
                 &probe,

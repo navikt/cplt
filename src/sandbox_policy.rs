@@ -3992,6 +3992,10 @@ const ENV_TOOL_HINT_DENIED_COMPONENTS: &[&str] = &[
     "plugins",
     "functions",
     "completions",
+    "node_modules",
+    "conf.d",
+    "site-functions",
+    "pack",
 ];
 
 /// Whether an env-set tool dir that failed only the positive rule may be
@@ -4002,36 +4006,59 @@ const ENV_TOOL_HINT_DENIED_COMPONENTS: &[&str] = &[
 /// is offered only when, both as spelled and resolved, it is strictly inside
 /// `$HOME`, its first component is a non-hidden dir outside the personal-data
 /// and `Library` set, no component is an exec/hook name, neither it nor an
-/// ancestor under `$HOME` is on `PATH`, and it is not protected or cplt state.
-/// Anything else gets a grant hint without a path.
+/// ancestor under `$HOME` is on `PATH`, it is not protected or cplt state,
+/// and it neither is, contains, nor is an ancestor of `roots` (the resolved
+/// project dir and every named repo root).
+///
+/// The component-name list is a deny list layered on that structure, so the
+/// residual is names it does not know: `lua`, `systemd` or a `node_modules`
+/// variant in a non-git app dir may still get a hint. Anything refused gets a
+/// grant hint without a path.
 #[must_use]
-pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
+pub fn env_tool_dir_hint_ok(home: &Path, path: &Path, roots: &[&Path]) -> bool {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
-    // The launch dir is the project: a grant over it or its parent is no tool dir.
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|c| config::canonicalize_deepest(&c));
+    let real = config::canonicalize_deepest(path);
     env_tool_dir_hint_ok_with(home, path, &path_var)
-        && !cwd.is_some_and(|c| c.starts_with(config::canonicalize_deepest(path)))
+        && !roots.iter().any(|r| {
+            let r = config::canonicalize_deepest(r);
+            r.starts_with(&real) || real.starts_with(&r)
+        })
 }
 
-/// A repo, a bare repo, or a dir holding repos: a write grant there reaches
-/// hooks and config of code the sandbox was not asked to touch.
+/// Entries scanned, and depth searched, for repos below a candidate dir.
+const REPO_SCAN_MAX_ENTRIES: usize = 2000;
+const REPO_SCAN_MAX_DEPTH: usize = 4;
+
+/// A repo, a bare repo, or a dir holding repos within `REPO_SCAN_MAX_DEPTH`:
+/// a write grant there reaches hooks and config of code the sandbox was not
+/// asked to touch. Fails closed: an unreadable dir or a hit scan bound counts
+/// as a repo area. Symlinks are never followed.
 fn looks_like_repo_area(dir: &Path) -> bool {
-    let has_git = |d: &Path| d.join(".git").symlink_metadata().is_ok();
-    if has_git(dir)
+    let mut budget = REPO_SCAN_MAX_ENTRIES;
+    repo_area_walk(dir, REPO_SCAN_MAX_DEPTH, &mut budget)
+}
+
+fn repo_area_walk(dir: &Path, depth: usize, budget: &mut usize) -> bool {
+    if dir.join(".git").symlink_metadata().is_ok()
         || (dir.join("HEAD").exists() && dir.join("objects").is_dir() && dir.join("refs").is_dir())
     {
         return true;
     }
-    // Fail closed on an unreadable or huge dir.
-    let Ok(rd) = std::fs::read_dir(dir) else {
+    if depth == 0 {
         return false;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return true;
     };
-    let mut n = 0;
-    for e in rd.flatten() {
-        n += 1;
-        if n > 2000 || has_git(&e.path()) {
+    for e in rd {
+        let Ok(e) = e else { return true };
+        if *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        // `DirEntry::file_type` does not follow symlinks.
+        let Ok(ft) = e.file_type() else { return true };
+        if ft.is_dir() && repo_area_walk(&e.path(), depth - 1, budget) {
             return true;
         }
     }
@@ -5131,6 +5158,10 @@ mod tests {
             "tools/plugins",
             "tools/functions",
             "tools/completions",
+            "tools/node_modules",
+            "tools/conf.d",
+            "tools/site-functions",
+            "tools/pack",
             "OneDrive",
             "OneDrive - Nav/x",
             "Google Drive/x",
@@ -5183,13 +5214,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn env_tool_dir_hint_refuses_project_repo_roots_and_their_ancestors() {
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        for d in ["work/proj/sub", "other/tool", "repos/r1", "pnpm"] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        let proj = h.join("work/proj");
+        let repo = h.join("repos/r1");
+        let roots: [&Path; 2] = [&proj, &repo];
+        // Equal, ancestor, descendant of a root.
+        for rel in ["work/proj", "work", "work/proj/sub", "repos/r1", "repos"] {
+            assert!(!env_tool_dir_hint_ok(&h, &h.join(rel), &roots), "~/{rel}");
+        }
+        // Unrelated dirs still hint, whatever the cwd is.
+        for rel in ["pnpm", "other/tool"] {
+            assert!(env_tool_dir_hint_ok(&h, &h.join(rel), &roots), "~/{rel}");
+        }
+    }
+
+    #[test]
+    fn env_tool_dir_hint_refuses_deep_repo_layout_and_hit_bound() {
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::create_dir_all(h.join("deep/github.com/org/repo/.git")).unwrap();
+        std::fs::create_dir_all(h.join("clean/a/b/c")).unwrap();
+        let none = std::ffi::OsString::new();
+        assert!(!env_tool_dir_hint_ok_with(&h, &h.join("deep"), &none));
+        assert!(env_tool_dir_hint_ok_with(&h, &h.join("clean"), &none));
+        // A symlink to a repo is not followed, so it is no repo area.
+        std::os::unix::fs::symlink(h.join("deep"), h.join("clean/a/link")).unwrap();
+        assert!(env_tool_dir_hint_ok_with(&h, &h.join("clean"), &none));
+        // Over the entry cap: fail closed.
+        let big = h.join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..=REPO_SCAN_MAX_ENTRIES {
+            std::fs::create_dir(big.join(format!("d{i}"))).unwrap();
+        }
+        assert!(!env_tool_dir_hint_ok_with(&h, &big, &none));
+    }
+
+    #[test]
+    fn env_tool_dir_hint_refuses_unreadable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let d = h.join("locked");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::read_dir(&d).is_err(); // false when running as root
+        let none = std::ffi::OsString::new();
+        let ok = env_tool_dir_hint_ok_with(&h, &d, &none);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!denied || !ok);
+    }
+
     #[cfg(unix)]
     #[test]
     fn env_tool_dir_hint_refuses_non_utf8_path() {
         use std::os::unix::ffi::OsStrExt;
         let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
         let bad = h.join(std::ffi::OsStr::from_bytes(b"t\xffools"));
-        assert!(!env_tool_dir_hint_ok(&h, &bad));
+        assert!(!env_tool_dir_hint_ok(&h, &bad, &[]));
     }
 
     /// The pinned-state line touches no state file before validation: a

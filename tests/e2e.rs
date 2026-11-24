@@ -12777,6 +12777,20 @@ mod agent_stubs {
             ],
             "JAVA_HOME hint: {w}"
         );
+        // Following the read hint must silence the warning, not loop.
+        let args = split(&hint_of(&w));
+        assert!(
+            cmd("JAVA_HOME", &h.join("jdk"))
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            warning("JAVA_HOME", &h.join("jdk")),
+            None,
+            "the read grant should silence the JAVA_HOME warning"
+        );
         let pnpm = h.join("pnpm");
         let w = warning("PNPM_HOME", &pnpm).expect("PNPM_HOME=~/pnpm should be refused");
         let args = split(&hint_of(&w));
