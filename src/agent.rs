@@ -267,21 +267,11 @@ fn opencode_v2_within(
         return Some(major_at_least_2(ver));
     }
     let is_v1_npm = parts.iter().any(|p| p == "opencode-ai");
-    let Ok(meta) = std::fs::metadata(&real) else {
+    let Some(key) = version_cache_key(&real) else {
         return is_v1_npm.then_some(false);
     };
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    let key = format!("{}\t{}\t{mtime}\t", real.display(), meta.len());
     let cache = cache_dir.join("opencode-version");
-    if let Some(v) = crate::untrusted::read_untrusted(&cache, SMALL_FILE_LIMIT)
-        .ok()
-        .flatten()
-        .and_then(|c| c.strip_prefix(&key).map(|v| v.trim().to_string()))
-    {
+    if let Some(v) = cached_version(&cache, &key) {
         return Some(major_at_least_2(&v));
     }
     let first = crate::discover::PROBE_TIMEOUT;
@@ -296,6 +286,65 @@ fn opencode_v2_within(
     // The 1.x npm package, reached through a shim that did not canonicalize
     // into it; v2's packages are all `@opencode/*`, caught above.
     is_v1_npm.then_some(false)
+}
+
+/// The cache key for a binary: path, size and mtime, so an upgrade in place
+/// is probed again.
+fn version_cache_key(real: &Path) -> Option<String> {
+    let meta = std::fs::metadata(real).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    Some(format!("{}\t{}\t{mtime}\t", real.display(), meta.len()))
+}
+
+fn cached_version(cache: &Path, key: &str) -> Option<String> {
+    crate::untrusted::read_untrusted(cache, SMALL_FILE_LIMIT)
+        .ok()
+        .flatten()
+        .and_then(|c| c.strip_prefix(key).map(|v| v.trim().to_string()))
+}
+
+/// The OpenCode version, from its install path or the cache
+/// [`is_opencode_v2`] fills. Never runs the binary.
+pub fn opencode_version(bin: &Path, home: &Path) -> Option<String> {
+    let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    let parts: Vec<String> = real
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(v) = parts
+        .windows(2)
+        .find(|w| w[0] == "opencode" || w[0] == "opencode-v2")
+        .and_then(|w| crate::discover::parse_version(&w[1]))
+    {
+        return Some(v);
+    }
+    let cache = home
+        .join(crate::sandbox::CPLT_STATE_DIR)
+        .join("opencode-version");
+    cached_version(&cache, &version_cache_key(&real)?)
+}
+
+/// OpenCode v2 releases cplt has run end to end (#1138): `run` and the TUI.
+pub const OPENCODE_V2_TESTED: (&str, &str) = ("2.0.24", "2.4");
+
+/// A note when `version` is outside [`OPENCODE_V2_TESTED`].
+pub fn opencode_v2_untested(version: &str) -> Option<String> {
+    let num = |v: &str| -> Vec<u32> { v.split('.').filter_map(|p| p.parse().ok()).collect() };
+    let v = num(version);
+    let (lo, hi) = (num(OPENCODE_V2_TESTED.0), num(OPENCODE_V2_TESTED.1));
+    let above = v.iter().take(hi.len()).cmp(hi.iter()).is_gt();
+    (v < lo || above).then(|| {
+        format!(
+            "OpenCode {version} is outside the range cplt has tested ({} to {}.x). \
+             If it fails under cplt, run `cplt doctor` and report the error at \
+             https://github.com/navikt/cplt/issues.",
+            OPENCODE_V2_TESTED.0, OPENCODE_V2_TESTED.1
+        )
+    })
 }
 
 fn major_at_least_2(version: &str) -> bool {
@@ -3697,6 +3746,28 @@ impl std::fmt::Display for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_v2_untested_range() {
+        for ok in ["2.0.24", "2.1.4", "2.3.2", "2.4.1", "2.4"] {
+            assert_eq!(opencode_v2_untested(ok), None, "{ok}");
+        }
+        for bad in ["2.0.23", "2.5.0", "3.0.0"] {
+            assert!(opencode_v2_untested(bad).is_some(), "{bad}");
+        }
+        let none = Path::new("/nonexistent-cplt-cache");
+        assert_eq!(
+            opencode_version(
+                Path::new("/brew/Cellar/opencode-v2/2.3.2/bin/opencode"),
+                none
+            ),
+            Some("2.3.2".into())
+        );
+        assert_eq!(
+            opencode_version(Path::new("/nonexistent-cplt/bin/opencode"), none),
+            None
+        );
+    }
 
     #[test]
     fn opencode_v2_is_detected_from_its_install_path() {

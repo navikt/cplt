@@ -722,6 +722,34 @@ fn profile_tail(
     Ok((before, tail))
 }
 
+/// Runs inside the sandbox as `sh -c RUN_WRAPPER <opencode> run …`: start the
+/// session service, run, then stop the service so it does not outlive the
+/// session.
+const RUN_WRAPPER: &str = "\"$0\" service start >/dev/null || exit $?; \"$0\" \"$@\"; rc=$?; \
+                           \"$0\" service stop >/dev/null 2>&1; exit $rc";
+
+/// The program and arguments for a v2 launch (#1138).
+///
+/// From 2.2, `opencode run` never starts the background service: with no
+/// registered one it spawns a private `serve --port 0` and talks to it on a
+/// random loopback port. The profile opens loopback to the session port only,
+/// so that connect fails with `Transport: EPERM`, and opening every loopback
+/// port would reopen the SSRF path the localhost deny closes. So cplt starts
+/// the session's own service first (the one the TUI starts by itself), and
+/// `run` finds it through the session's registration. `--server` and
+/// `--standalone` are the user's explicit choice and are left alone.
+pub fn launch(bin: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    let explicit = args
+        .iter()
+        .any(|a| a == "--standalone" || a == "--server" || a.starts_with("--server="));
+    if args.first().map(String::as_str) != Some("run") || explicit {
+        return (bin.to_path_buf(), args.to_vec());
+    }
+    let mut out = vec!["-c".into(), RUN_WRAPPER.into(), bin.display().to_string()];
+    out.extend(args.iter().cloned());
+    (PathBuf::from("/bin/sh"), out)
+}
+
 /// Host-side notes for a v2 launch, read by cplt and never passed into the
 /// sandbox:
 ///
@@ -994,6 +1022,30 @@ fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_starts_the_session_service_first() {
+        let bin = Path::new("/x/opencode");
+        let a = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let (prog, args) = launch(bin, &a(&["run", "hi"]));
+        assert_eq!(prog, Path::new("/bin/sh"));
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("service start") && args[1].contains("service stop"));
+        assert_eq!(&args[2..], &a(&["/x/opencode", "run", "hi"])[..]);
+        for keep in [
+            &["run", "--server", "u"][..],
+            &["run", "--server=u"],
+            &["run", "--standalone"],
+            &[],
+            &["serve"],
+        ] {
+            assert_eq!(
+                launch(bin, &a(keep)),
+                (bin.to_path_buf(), a(keep)),
+                "{keep:?}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

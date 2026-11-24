@@ -6061,6 +6061,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         ui::warn(&e);
     }
 
+    // #1138: v2 `run` needs the session service started for it.
+    let (exec_bin, exec_args) = if opencode_v2 {
+        cplt::opencode_v2::launch(&agent_bin, &copilot_args)
+    } else {
+        (agent_bin.clone(), copilot_args.clone())
+    };
+
     // Run agent inside sandbox, wrapped in the post-session audit lifecycle.
     // The audit is on by default and suppressed by --no-audit or --quiet. The
     // baseline is captured just before exec and the report printed just after,
@@ -6100,8 +6107,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         || {
             sandbox::exec_sandboxed(
                 &prepared,
-                &agent_bin,
-                &copilot_args,
+                &exec_bin,
+                &exec_args,
                 &launch_dir,
                 &repo_paths,
                 &resolved.pass_env,
@@ -10715,6 +10722,13 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         && agent_bin_result
             .as_ref()
             .is_ok_and(|bin| agent::is_opencode_v2(bin, &home_dir) != Some(false));
+    if opencode_v2
+        && let Ok(bin) = &agent_bin_result
+        && let Some(note) =
+            agent::opencode_version(bin, &home_dir).and_then(|v| agent::opencode_v2_untested(&v))
+    {
+        findings.push(Finding::warning(note, None));
+    }
     if opencode_v2
         && let Some(note) = doctor::opencode_v2_auth_content_note(
             &cli.pass_env,
