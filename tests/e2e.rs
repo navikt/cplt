@@ -11458,7 +11458,7 @@ paths = [
         );
     }
 
-    /// #1097: a trusted managed `proxy.allowed_domains` entry passes a strict
+    /// #1097: a trusted managed `allow.domains` entry passes a strict
     /// allowlist while an unlisted host stays blocked, and without an
     /// allowlist in force the managed list does not start one: the unlisted
     /// host stays allowed. Same debug-only home seam as above.
@@ -11472,7 +11472,7 @@ paths = [
         let file = dir.join("nav.toml");
         std::fs::write(
             &file,
-            "managed_by = \"nav-pilot\"\nschema = 1\n[proxy]\nallowed_domains = [\"managed-only.example\"]\n",
+            "managed_by = \"nav-pilot\"\nschema = 1\n[allow]\ndomains = [\"managed-only.example\"]\n",
         )
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -11509,6 +11509,19 @@ paths = [
         assert!(
             open.contains("ALLOWED"),
             "the managed list must not switch on an allowlist:\n{open}"
+        );
+        let got = cplt_cmd()
+            .env("HOME", &home)
+            .env("CPLT_TEST_ACCOUNT_HOME", &home)
+            .env("CPLT_MANAGED_CONFIG", &file)
+            .current_dir(&proj)
+            .args(["config", "get", "allow.domains"])
+            .output()
+            .expect("cplt should run");
+        let err = String::from_utf8_lossy(&got.stderr);
+        assert!(
+            err.contains("managed-only.example  [managed:nav-pilot]"),
+            "config get must tag managed entries:\n{err}"
         );
     }
 

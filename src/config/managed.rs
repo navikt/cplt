@@ -24,9 +24,8 @@
 //! escaped, and the launch continues without the layer.
 //!
 //! The layer can only add entries to `proxy.allow_private_domains` and
-//! `proxy.allowed_domains` (#1097): never anything that widens file access or
-//! weakens the sandbox. Managed `allowed_domains` is a list, not a file, and
-//! joins `allow.domains`: it widens an allowlist already in force and never
+//! `allow.domains` (#1097): never anything that widens file access or
+//! weakens the sandbox. Managed `allow.domains` joins the user's list: it widens an allowlist already in force and never
 //! turns one on, so it cannot move a user between blocklist and allowlist mode.
 
 use std::collections::BTreeMap;
@@ -130,8 +129,8 @@ pub struct ManagedConfig {
     pub managed_by: String,
     /// Normalized, validated DNS names, sorted, deduplicated.
     pub allow_private_domains: Vec<String>,
-    /// `proxy.allowed_domains`, checked the same way. Joins `allow.domains`.
-    pub allowed_domains: Vec<String>,
+    /// `allow.domains`, checked the same way.
+    pub allow_domains: Vec<String>,
 }
 
 impl ManagedConfig {
@@ -471,13 +470,13 @@ pub fn load_managed_from(
     if raw.len() as u64 > LIMIT {
         return Err(invalid(&format!("it is larger than {LIMIT} bytes"), ""));
     }
-    let (managed_by, allow_private_domains, allowed_domains) =
+    let (managed_by, allow_private_domains, allow_domains) =
         parse(&raw).map_err(|e| invalid(&e, &raw))?;
     Ok(ManagedConfig {
         path: path.to_path_buf(),
         managed_by,
         allow_private_domains,
-        allowed_domains,
+        allow_domains,
     })
 }
 
@@ -539,29 +538,36 @@ fn parse(raw: &str) -> Result<Parsed, String> {
     for (key, value) in &table {
         match (key.as_str(), value) {
             ("managed_by" | "schema", _) => {}
-            ("proxy", toml::Value::Table(proxy)) => {
-                for (k, v) in proxy {
-                    let out = match k.as_str() {
-                        "allow_private_domains" => &mut private,
-                        "allowed_domains" => &mut allowed,
+            (t @ ("proxy" | "allow"), toml::Value::Table(sub)) => {
+                for (k, v) in sub {
+                    let out = match (t, k.as_str()) {
+                        ("proxy", "allow_private_domains") => &mut private,
+                        ("allow", "domains") => &mut allowed,
+                        // One key, one meaning: in user config this names a file.
+                        ("proxy", "allowed_domains") => {
+                            return Err(
+                                "key `proxy.allowed_domains` is not allowed in a managed config; list extra domains under `[allow] domains`".into(),
+                            );
+                        }
                         _ => {
                             return Err(format!(
-                                "key `proxy.{}` is not allowed in a managed config",
+                                "key `{t}.{}` is not allowed in a managed config",
                                 esc(k)
                             ));
                         }
                     };
+                    let k = format!("{t}.{k}");
                     let list = v
                         .as_array()
                         .filter(|a| a.iter().all(toml::Value::is_str))
-                        .ok_or_else(|| format!("`proxy.{k}` must be a list of strings"))?;
+                        .ok_or_else(|| format!("`{k}` must be a list of strings"))?;
                     for d in list {
                         let raw = d.as_str().unwrap_or_default();
                         let d = crate::proxy::normalize_hostname(raw);
                         // #1102: an IP literal or inet_aton alias is never a name.
                         if !is_dns_name(&d) || crate::proxy::is_ip_alias(&d) {
                             return Err(format!(
-                                "`proxy.{k}` entry \"{}\" is not a DNS name with at least one dot",
+                                "`{k}` entry \"{}\" is not a DNS name with at least one dot",
                                 esc(raw)
                             ));
                         }
@@ -616,7 +622,7 @@ impl super::types::Resolved {
         self.allow_private_domains.dedup();
         // Into `allow.domains`, never the `allowed_domains` file or the
         // default allowlist: it extends an allowlist in force, never starts one.
-        for d in &managed.allowed_domains {
+        for d in &managed.allow_domains {
             if !self.allow_domains.contains(d) {
                 self.allow_domains.push(d.clone());
             }
@@ -1574,7 +1580,6 @@ mod tests {
     #[test]
     fn refuses_disallowed_keys_by_name() {
         for (body, key) in [
-            ("[allow]\nwrite = [\"/\"]\n", "allow"),
             ("[sandbox]\npreset = \"open\"\n", "sandbox"),
             (
                 "[proxy]\nallowed_domains_file = \"/x\"\n",
@@ -1667,7 +1672,7 @@ mod tests {
             path: PathBuf::from("/m"),
             managed_by: "nav-pilot".into(),
             allow_private_domains: vec!["b.nav.no".into(), "intern.nav.no".into()],
-            allowed_domains: Vec::new(),
+            allow_domains: Vec::new(),
         };
         r.apply_managed(&m);
         assert_eq!(
@@ -1682,20 +1687,20 @@ mod tests {
         assert_eq!(r.managed_tag("user.nav.no", &user_domains), None);
     }
 
-    /// #1097: managed `allowed_domains` joins `allow.domains` (the list that
+    /// #1097: managed `allow.domains` joins `allow.domains` (the list that
     /// widens an allowlist in force and never starts one). It never sets the
     /// `allowed_domains` file or the default allowlist, so the mode is the
     /// user's; it never removes a user entry or adds a private domain.
     #[test]
-    fn managed_allowed_domains_extend_but_never_switch_allowlist_mode() {
+    fn managed_allow_domains_extend_but_never_switch_allowlist_mode() {
         let h = Home::new();
         let p = write(
             &h.managed_d(),
             "m.toml",
-            "managed_by = \"nav-pilot\"\nschema = 1\n[proxy]\nallowed_domains = [\"API.Nav.no.\", \"user.nav.no\"]\n",
+            "managed_by = \"nav-pilot\"\nschema = 1\n[allow]\ndomains = [\"API.Nav.no.\", \"user.nav.no\"]\n",
         );
         let m = h.load(p.as_os_str(), &[]).unwrap();
-        assert_eq!(m.allowed_domains, ["api.nav.no", "user.nav.no"]);
+        assert_eq!(m.allow_domains, ["api.nav.no", "user.nav.no"]);
         assert!(m.allow_private_domains.is_empty());
         for user in [
             "[allow]\ndomains = [\"user.nav.no\", \"own.example.com\"]\n",
@@ -1736,21 +1741,26 @@ mod tests {
     }
 
     #[test]
-    fn refuses_bad_managed_allowed_domains() {
+    fn refuses_bad_managed_allow_domains() {
         for (body, why) in [
             (
-                "allowed_domains = \"/etc/list\"",
-                "`proxy.allowed_domains` must be a list",
+                "[proxy]\nallowed_domains = [\"a.nav.no\"]",
+                "list extra domains under `[allow] domains`",
             ),
-            ("allowed_domains = [\"127.0.0.1\"]", "is not a DNS name"),
-            ("allowed_domains = [\"1.0x1\"]", "is not a DNS name"),
-            ("allowed_domains = [\"*.nav.no\"]", "is not a DNS name"),
-            ("allowed_domains = [\"localhost\"]", "is not a DNS name"),
+            (
+                "[allow]\ndomains = \"a.nav.no\"",
+                "`allow.domains` must be a list",
+            ),
+            ("[allow]\ndomains = [\"127.0.0.1\"]", "is not a DNS name"),
+            ("[allow]\ndomains = [\"1.0x1\"]", "is not a DNS name"),
+            ("[allow]\ndomains = [\"*.nav.no\"]", "is not a DNS name"),
+            ("[allow]\ndomains = [\"localhost\"]", "is not a DNS name"),
+            (
+                "[allow]\nwrite = [\"/\"]",
+                "key `allow.write` is not allowed",
+            ),
         ] {
-            refused_body(
-                &format!("managed_by = \"x\"\nschema = 1\n[proxy]\n{body}\n"),
-                why,
-            );
+            refused_body(&format!("managed_by = \"x\"\nschema = 1\n{body}\n"), why);
         }
     }
 
