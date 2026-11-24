@@ -20,7 +20,8 @@ mod validation;
 
 // Re-export public API
 pub use display::{
-    display_config, explain_all, explain_key, get_config_value, localhost_any_ignored_suffix,
+    RepoLayer, display_config, explain_all, explain_key, get_config_value, key_json,
+    localhost_any_ignored_suffix,
 };
 pub use editing::{
     ConfigSetOp, append_value_in_doc, array_entries_in_doc, get_value_from_doc,

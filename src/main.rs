@@ -1214,6 +1214,11 @@ enum ConfigAction {
     Get {
         /// Config key in section.key format (e.g., sandbox.quiet, proxy.port)
         key: String,
+
+        /// Emit one JSON object: {"schema":1,"key":...,"value":...,"source":
+        /// "default|cli|local|user|managed|repo","set":bool}. Unknown key: exit 2.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Set a config value. Creates the config file if it doesn't exist.
@@ -11795,7 +11800,7 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
         ConfigAction::Show => run_config_show(),
         ConfigAction::Path { local } => run_config_path(local),
         ConfigAction::Init => init_config(),
-        ConfigAction::Get { key } => run_config_get(&key),
+        ConfigAction::Get { key, json } => run_config_get(&key, json),
         ConfigAction::Set {
             key,
             values,
@@ -12247,7 +12252,70 @@ fn run_config_hosts(name: &str, json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_config_get(key: &str) -> ExitCode {
+/// `config get --json`: errors are JSON on stdout too, so a launcher parses one stream.
+fn run_config_get_json(key: &str) -> ExitCode {
+    let fail = |code: u8, msg: &str, what: &str| {
+        println!(
+            "{}",
+            serde_json::json!({"schema": 1, "error": what, "key": key})
+        );
+        ui::error(msg);
+        ExitCode::from(code)
+    };
+    let key_info = match config::lookup_key(key) {
+        Ok(k) => k,
+        Err(e) => return fail(2, &e.to_string(), "unknown key"),
+    };
+    let loaded = match config::Config::load_file() {
+        Ok(l) => l,
+        Err(e) => return fail(1, &e.to_string(), "cannot load config"),
+    };
+    let local = local_for_display();
+    let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
+    let managed =
+        match load_managed_for_display(loaded.as_ref(), local.as_ref(), project_dir.as_deref()) {
+            Some(Ok(m)) => Some(m),
+            Some(Err(line)) => {
+                ui::warn(&line);
+                None
+            }
+            None => None,
+        };
+    // The launch gate's own rule: only a current approval bound to this checkout grants.
+    let repo = project_dir
+        .as_deref()
+        .and_then(|dir| repo_config::load_repo_config(dir).ok().flatten());
+    let approved: Vec<String> =
+        repo.as_ref()
+            .zip(project_dir.as_deref())
+            .map_or_else(Vec::new, |(l, dir)| {
+                let entry = trust::load_trust(dir);
+                let verdict = trust::verdict(entry.as_ref(), dir, l);
+                trust::granted_keys(entry.as_ref(), verdict, &l.config.propose)
+            });
+    let approved_refs: Vec<&str> = approved.iter().map(String::as_str).collect();
+    let layer = repo.as_ref().map(|l| config::RepoLayer {
+        config: &l.config,
+        dir: &l.dir,
+        approved: &approved_refs,
+    });
+    println!(
+        "{}",
+        config::key_json(
+            key_info,
+            loaded.as_ref(),
+            local.as_ref(),
+            layer.as_ref(),
+            managed.as_ref()
+        )
+    );
+    ExitCode::SUCCESS
+}
+
+fn run_config_get(key: &str, json: bool) -> ExitCode {
+    if json {
+        return run_config_get_json(key);
+    }
     let key_info = match config::lookup_key(key) {
         Ok(k) => k,
         Err(e) => {

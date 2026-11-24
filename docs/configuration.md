@@ -979,7 +979,23 @@ cplt config explain                       # list all keys with descriptions
 cplt config explain sandbox.pass_env      # explain a specific key
 cplt config validate                      # check for syntax errors and unknown keys
 cplt config hosts --agent copilot --json  # an agent's effective hosts (built-in plus hosts detected on this machine), see docs/proxy.md
+cplt config get --json sandbox.allow_localhost_any  # machine-readable, see below
 ```
+
+#### Machine-readable: `config get --json`
+
+For launchers such as nav-pilot. Prints one JSON object on stdout; the text form of `config get` is unchanged.
+
+```json
+{"schema":1,"key":"sandbox.allow_localhost_any","value":false,"source":"default","set":false}
+```
+
+- `value` is typed (bool, number, string or array), the effective value after the same precedence as a launch.
+- `source` is the layer that supplied it: `default`, `cli`, `local`, `user`, `managed` or `repo`. `set` is `false` only when no layer set the key and the value is the built-in default. A preset that moves the default counts as set, by the layer that chose the preset. `cli` is reserved: `config get` takes no per-key flags, so it is not emitted today.
+- A `.cplt.toml` proposal is `repo` only when approved for this checkout (`cplt trust accept`). An unapproved proposal sets nothing. A proposal to turn a guard on (`gh_guard`, `git_push_prevention`) needs no approval and applies at launch, so it reports `repo` too. An explicit `false` in your own config still wins over an approved `repo` `true`, as at launch.
+- For list keys that a managed file or an approved proposal extends (`allow.domains`, `proxy.allow_private_domains`, and the other `[propose]` lists), `value` is the union, as at launch, and `source` names the layer that added entries. Managed adds `"managed_by"` with the file's name.
+- Unknown key: exit code 2, `{"schema":1,"error":"unknown key","key":"..."}` on stdout and a human line on stderr. An unreadable config file: exit 1 with `"error":"cannot load config"`.
+- The contract is add-only: new fields may appear, existing ones keep their meaning. Check `schema` first.
 
 ## Build-host credentials (`sandbox.allow_build_credentials`)
 

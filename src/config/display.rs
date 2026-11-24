@@ -171,6 +171,23 @@ pub fn get_config_value(
     loaded: Option<&LoadedConfig>,
     local: Option<&LoadedConfig>,
 ) -> (String, ConfigLayer) {
+    if let Some((val, layer)) = file_value(key_info, loaded, local) {
+        return (format_toml_value(&val), layer);
+    }
+
+    let baseline = active_preset(loaded, local)
+        .baseline()
+        .value_for_key(key_info.section, key_info.key)
+        .unwrap_or_else(|| key_info.default_display.to_string());
+    (baseline, ConfigLayer::Baseline)
+}
+
+/// The value a config FILE sets for the key, local above global.
+fn file_value(
+    key_info: &ConfigKeyInfo,
+    loaded: Option<&LoadedConfig>,
+    local: Option<&LoadedConfig>,
+) -> Option<(toml::Value, ConfigLayer)> {
     for (file, layer) in [(local, ConfigLayer::Local), (loaded, ConfigLayer::Global)] {
         if let Some(file) = file
             && let Ok(root) = file.raw.parse::<toml::Table>()
@@ -179,15 +196,169 @@ pub fn get_config_value(
                 .and_then(|section| section.get(key_info.key))
                 .or_else(|| legacy_guard_alias(&root, key_info))
         {
-            return (format_toml_value(val), layer);
+            return Some((val.clone(), layer));
+        }
+    }
+    None
+}
+
+/// An approved-or-not `.cplt.toml` as `config get --json` needs it: the
+/// proposal plus the keys the launch gate (`trust::granted_keys`) approved.
+pub struct RepoLayer<'a> {
+    pub config: &'a crate::repo_config::RepoConfig,
+    pub dir: &'a std::path::Path,
+    pub approved: &'a [&'a str],
+}
+
+/// `cplt config get --json KEY`: the typed effective value, the layer that
+/// supplied it and whether any layer set it (nav-pilot contract, add-only).
+///
+/// No second resolver: files come from [`file_value`], booleans from the
+/// launch's own merge plus `Resolved::apply_repo_config` (so an untrusted
+/// proposal sets nothing), and the two list keys a managed file or repo may
+/// extend are unioned the way the launch unions them.
+pub fn key_json(
+    key_info: &ConfigKeyInfo,
+    loaded: Option<&LoadedConfig>,
+    local: Option<&LoadedConfig>,
+    repo: Option<&RepoLayer<'_>>,
+    managed: Option<&super::managed::ManagedConfig>,
+) -> serde_json::Value {
+    use serde_json::{Value, json};
+    let dotted = format!("{}.{}", key_info.section, key_info.key);
+    let (mut value, mut source, mut set): (Value, &str, bool) =
+        if let Some((v, layer)) = file_value(key_info, loaded, local) {
+            let name = if layer == ConfigLayer::Local {
+                "local"
+            } else {
+                "user"
+            };
+            (toml_to_json(&v), name, true)
+        } else {
+            let (shown, _) = get_config_value(key_info, loaded, local);
+            // A preset moved the baseline: the layer that chose the preset set it.
+            let moved = shown != key_info.default_display;
+            let name = if local.is_some_and(|l| l.config.sandbox.preset.is_some()) {
+                "local"
+            } else {
+                "user"
+            };
+            (
+                typed_from_display(&shown, key_info.value_type),
+                if moved { name } else { "default" },
+                moved,
+            )
+        };
+    let mut managed_by = None;
+
+    if key_info.value_type == ConfigValueType::Bool
+        && let Some(r) = repo
+        && let Ok(mut resolved) = loaded
+            .map(|l| l.config.clone())
+            .unwrap_or_default()
+            .merge_with_local(local.map(|l| &l.config), CliFlags::default())
+    {
+        resolved.apply_repo_config(r.config, r.dir, r.approved);
+        if resolved.bool_layer(key_info.section, key_info.key) == Some(ConfigLayer::Repo)
+            && let Some(row) = super::registry::bool_key(key_info.section, key_info.key)
+        {
+            value = Value::Bool((row.resolved)(&resolved));
+            source = "repo";
+            set = true;
         }
     }
 
-    let baseline = active_preset(loaded, local)
-        .baseline()
-        .value_for_key(key_info.section, key_info.key)
-        .unwrap_or_else(|| key_info.default_display.to_string());
-    (baseline, ConfigLayer::Baseline)
+    let mut union = |extra: Vec<Value>, label: &'static str| {
+        let Value::Array(items) = &mut value else {
+            return false;
+        };
+        let before = items.len();
+        for e in extra {
+            if !items.contains(&e) {
+                items.push(e);
+            }
+        }
+        if items.len() > before {
+            source = label;
+            set = true;
+        }
+        items.len() > before
+    };
+    if let Some(m) = managed {
+        let extra = match dotted.as_str() {
+            "allow.domains" => &m.allow_domains,
+            "proxy.allow_private_domains" => &m.allow_private_domains,
+            _ => &Vec::new(),
+        };
+        if union(extra.iter().map(|d| json!(d)).collect(), "managed") {
+            managed_by = Some(m.managed_by.clone());
+        }
+    }
+    if let Some(r) = repo
+        && r.approved.contains(&dotted.as_str())
+    {
+        let p = &r.config.propose;
+        let extra: Vec<Value> = match dotted.as_str() {
+            "allow.read" => p.allow.read.iter().map(|x| json!(x)).collect(),
+            "allow.write" => p.allow.write.iter().map(|x| json!(x)).collect(),
+            "allow.socket" => p.allow.socket.iter().map(|x| json!(x)).collect(),
+            "allow.ports" => p.allow.ports.iter().map(|x| json!(x)).collect(),
+            "allow.localhost" => p.allow.localhost.iter().map(|x| json!(x)).collect(),
+            "allow.domains" => p.allow.domains.iter().map(|x| json!(x)).collect(),
+            "sandbox.pass_env" => p.pass_env.iter().map(|x| json!(x)).collect(),
+            "proxy.allow_private_domains" => p
+                .proxy
+                .allow_private_domains
+                .iter()
+                .map(|x| json!(x))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if union(extra, "repo") {
+            managed_by = None;
+        }
+    }
+
+    let mut out = json!({"schema": 1, "key": dotted, "value": value, "source": source, "set": set});
+    if let Some(name) = managed_by {
+        out["managed_by"] = json!(name);
+    }
+    out
+}
+
+fn toml_to_json(v: &toml::Value) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+}
+
+/// A baseline value, which only exists as display text, as typed JSON.
+fn typed_from_display(shown: &str, ty: ConfigValueType) -> serde_json::Value {
+    use serde_json::{Value, json};
+    match ty {
+        ConfigValueType::Bool => shown
+            .parse::<bool>()
+            .map_or_else(|_| json!(shown), Value::Bool),
+        ConfigValueType::U16 | ConfigValueType::U64 => shown
+            .parse::<u64>()
+            .map_or_else(|_| json!(shown), |n| json!(n)),
+        ConfigValueType::Str => json!(shown),
+        ConfigValueType::U16Array | ConfigValueType::StrArray | ConfigValueType::ArrayOfTables => {
+            let inner = shown
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim();
+            let items = inner
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| match (ty, s.parse::<u64>()) {
+                    (ConfigValueType::U16Array, Ok(n)) => json!(n),
+                    _ => json!(s),
+                })
+                .collect();
+            Value::Array(items)
+        }
+    }
 }
 
 fn format_toml_value(val: &toml::Value) -> String {
