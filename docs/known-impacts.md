@@ -369,6 +369,16 @@ like the SDK (`bin/java` or `release` for `JAVA_HOME`, `dotnet` for
 `DOTNET_ROOT`). Anything else, including every dir outside your home, gets the
 warning without a path: grant it by hand only if you mean to.
 
+The path is also withheld when it is, contains or sits inside the project dir
+or a named repo (`--project-dir`, `--repo-dir`), and when a git repo or bare
+repo sits within four levels below it (the scan is capped at 2000 entries; a dir
+that is unreadable or hits the cap gets no path). The component names
+`node_modules`, `conf.d`, `site-functions`, `pack`, `plugins`, `functions` and
+`completions` are refused as well. That name list is a deny list on top of the
+allow-list structure above, so it has a residual: other names that load code,
+such as `lua` or `systemd`, still get a path when they sit in a non-git app dir
+under your home.
+
 ## cplt's state directory inside a writable tree (behaviour change)
 
 cplt now refuses to launch when a tree the agent can write holds cplt's state directory (`~/.config/cplt`, or `$XDG_CONFIG_HOME/cplt`). That directory holds the config, the trust store and the managed config, so an agent that could write it could approve its own next launch. The check applies whether or not `CPLT_MANAGED_CONFIG` is set (#1095). These setups launched on 2026.11.20 and are refused now:

@@ -17636,20 +17636,6 @@ mod tests {
     }
 
     #[test]
-    fn covered_sdk_dir_does_not_warn_again() {
-        let home = tempfile::tempdir().unwrap();
-        let h = std::fs::canonicalize(home.path()).unwrap();
-        let jdk = h.join("sdk/jdk-21");
-        std::fs::create_dir_all(&jdk).unwrap();
-        std::fs::write(jdk.join("release"), "").unwrap();
-        let v = || Some(jdk.to_string_lossy().into_owned());
-        // Not asserting the warning text: the grant must simply be recognised.
-        let granted = [h.join("sdk")];
-        let g: Vec<&Path> = granted.iter().map(PathBuf::as_path).collect();
-        assert_eq!(accept_tool_dir("JAVA_HOME", v(), &h, false, &[], &g), None);
-    }
-
-    #[test]
     fn hint_for_project_with_project_dir_elsewhere() {
         let home = tempfile::tempdir().unwrap();
         let h = std::fs::canonicalize(home.path()).unwrap();

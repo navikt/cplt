@@ -4047,8 +4047,11 @@ fn repo_area_walk(dir: &Path, depth: usize, budget: &mut usize) -> bool {
     if depth == 0 {
         return false;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return true;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        // Nothing there yet, so no repo either.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
     for e in rd {
         let Ok(e) = e else { return true };
