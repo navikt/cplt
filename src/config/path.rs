@@ -549,10 +549,16 @@ pub fn canonicalize_strict(path: &Path) -> std::io::Result<PathBuf> {
 /// Callers granting access refuse that case ([`nofollow_names_symlink`]);
 /// a deny simply applies to `/<x>`.
 pub(crate) fn strip_nofollow(path: &Path) -> PathBuf {
-    match path.strip_prefix("/.nofollow") {
-        Ok(rest) if cfg!(target_os = "macos") => Path::new("/").join(rest),
-        _ => path.to_path_buf(),
+    // Repeated to a fixed point: `/.nofollow/.nofollow/x` is `/x` to the
+    // kernel, and stripping once would leave a second prefix for the next
+    // caller to peel off after every check on the first result had passed.
+    let mut cur = path.to_path_buf();
+    while cfg!(target_os = "macos")
+        && let Ok(rest) = cur.strip_prefix("/.nofollow")
+    {
+        cur = Path::new("/").join(rest);
     }
+    cur
 }
 
 /// True when `path` is spelled `/.nofollow/<x>` and `<x>` is a symlink: the
@@ -776,11 +782,12 @@ pub(super) fn resolve_config_path(
     config_dir: Option<&PathBuf>,
 ) -> Result<PathBuf, ConfigError> {
     let full = anchored(path, config_dir);
-    canonicalize_strict(&full).map_err(|_| {
-        ConfigError::Validation(format!(
-            "path does not exist or is inaccessible: {}",
-            full.display()
-        ))
+    canonicalize_strict(&full).map_err(|e| {
+        ConfigError::Validation(if e.kind() == std::io::ErrorKind::InvalidInput {
+            format!("{}: {e}", full.display())
+        } else {
+            format!("path does not exist or is inaccessible: {}", full.display())
+        })
     })
 }
 

@@ -620,6 +620,14 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
             ));
         }
         reject_path_traversal(path, "propose.allow.read/write/socket")?;
+        let stripped = crate::config::strip_nofollow(&crate::config::lexically_normalized(
+            std::path::Path::new(path),
+        ));
+        if stripped == std::path::Path::new("/") {
+            return Err(format!(
+                "propose.allow entry {path:?} is the filesystem root, which would grant everything."
+            ));
+        }
         crate::sandbox::validate_sbpl_path(&PathBuf::from(path))?;
     }
 

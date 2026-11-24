@@ -6979,15 +6979,7 @@ except Exception as e:
         cfg: Option<&Path>,
         args: &[&str],
     ) -> (String, String) {
-        let mut cmd = cplt_cmd();
-        cmd.env("HOME", home)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("XDG_DATA_HOME", home.join(".local/share"))
-            .env("XDG_STATE_HOME", home.join(".local/state"))
-            .env("XDG_CACHE_HOME", home.join(".cache"))
-            .env("GH_CONFIG_DIR", home.join(".config/gh"))
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+        let mut cmd = firmlink_cmd(home);
         if let Some(cfg) = cfg {
             cmd.env("CPLT_CONFIG", cfg);
         }
@@ -7004,6 +6996,42 @@ except Exception as e:
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    /// `cplt` with HOME, every XDG dir and gh/git config in the scratch `home`.
+    fn firmlink_cmd(home: &Path) -> Command {
+        let mut cmd = cplt_cmd();
+        cmd.env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("GH_CONFIG_DIR", home.join(".config/gh"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd
+    }
+
+    /// Commit `toml` as the project's `.cplt.toml` and approve it through the
+    /// trust store, as a teammate would. Only a committed, trusted file
+    /// reaches the launch, so a repo-layer test without this proves nothing.
+    /// Returns `cplt trust accept --all`'s stderr (a refused file fails there).
+    fn commit_and_trust(home: &Path, project: &Path, toml: &str) -> String {
+        if !project.join(".git").exists() {
+            assert!(common::git_ok(project, &["init", "--quiet"]));
+        }
+        fs::write(project.join(".cplt.toml"), toml).unwrap();
+        assert!(common::git_ok(project, &["add", "-A"]));
+        assert!(common::git_ok(
+            project,
+            &["commit", "--quiet", "--allow-empty", "-m", "cfg"]
+        ));
+        let out = firmlink_cmd(home)
+            .current_dir(project)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("cplt trust accept");
+        String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
     /// Scratch (home, project, secret dir), all canonical.
@@ -7101,29 +7129,97 @@ except Exception as e:
         assert!(!out.contains("/System/Volumes/Data/"), "{out}");
     }
 
-    /// A bare `/.nofollow` spelling of the root, in every layer, must be
-    /// refused like `/`: no deny (or any rule) on `/` may reach the profile.
+    /// Every `/.nofollow` spelling of the root (any number of segments), as
+    /// a deny or a grant, in every layer, is refused like `/`: no rule on `/`
+    /// may reach the profile, and the refusal is said out loud.
     #[test]
     fn binary_nofollow_root_spellings_never_reach_the_profile() {
         let (tmp, home, project, _) = firmlink_fixture();
         let cfg = tmp.path().join("config.toml");
-        for spelling in ["/.nofollow", "/.nofollow/", "/.nofollow/."] {
-            let (out, _) = firmlink_profile(&home, &project, None, &["--deny-path", spelling]);
-            assert!(!out.contains("(subpath \"/\")"), "CLI {spelling}:\n{out}");
-            fs::write(&cfg, format!("[deny]\npaths = [\"{spelling}\"]\n")).unwrap();
-            let (out, _) = firmlink_profile(&home, &project, Some(&cfg), &[]);
+        let refused = |what: &str, out: &str, err: &str| {
             assert!(
-                !out.contains("(subpath \"/\")"),
-                "config {spelling}:\n{out}"
+                !out.contains("(subpath \"/\")") && err.contains("filesystem root"),
+                "{what}:\n{err}\n{out}"
             );
-            fs::write(
-                project.join(".cplt.toml"),
-                format!("[deny]\npaths = [\"{spelling}\"]\n"),
-            )
-            .unwrap();
-            let (out, _) = firmlink_profile(&home, &project, None, &[]);
-            assert!(!out.contains("(subpath \"/\")"), "repo {spelling}:\n{out}");
+        };
+        for spelling in [
+            "/.nofollow",
+            "/.nofollow/",
+            "/.nofollow/.",
+            "/.nofollow/.nofollow",
+            "/.nofollow/.nofollow/.nofollow",
+        ] {
+            for (flag, section, key) in [
+                ("--deny-path", "deny", "paths"),
+                ("--allow-read", "allow", "read"),
+            ] {
+                let (out, err) = firmlink_profile(&home, &project, None, &[flag, spelling]);
+                refused(&format!("CLI {flag} {spelling}"), &out, &err);
+                fs::write(&cfg, format!("[{section}]\n{key} = [\"{spelling}\"]\n")).unwrap();
+                let (out, err) = firmlink_profile(&home, &project, Some(&cfg), &[]);
+                refused(&format!("config {section} {spelling}"), &out, &err);
+                let section = if section == "allow" {
+                    "propose.allow"
+                } else {
+                    section
+                };
+                let trust_err = commit_and_trust(
+                    &home,
+                    &project,
+                    &format!("[{section}]\n{key} = [\"{spelling}\"]\n"),
+                );
+                let (out, err) = firmlink_profile(&home, &project, None, &[]);
+                refused(
+                    &format!("repo {section} {spelling}"),
+                    &out,
+                    &format!("{trust_err}{err}"),
+                );
+            }
         }
+    }
+
+    /// A committed symlink to `/` named in `deny.paths` passes every string
+    /// check; only the check on the resolved path refuses it.
+    #[test]
+    fn binary_repo_deny_symlink_to_root_is_refused() {
+        let (_tmp, home, project, _) = firmlink_fixture();
+        std::os::unix::fs::symlink("/", project.join("rootlink")).unwrap();
+        commit_and_trust(&home, &project, "[deny]\npaths = [\"rootlink\"]\n");
+        let (out, err) = firmlink_profile(&home, &project, None, &[]);
+        assert!(
+            !out.contains("(subpath \"/\")") && err.contains("filesystem root"),
+            "{err}\n{out}"
+        );
+    }
+
+    /// `cplt trust` shows where an obfuscated proposal path resolves, so a
+    /// reviewer never approves `/.nofollow/...` without seeing the real path.
+    #[test]
+    fn trust_show_names_the_canonical_path() {
+        let (tmp, home, project, _) = firmlink_fixture();
+        let docs = fs::canonicalize(tmp.path()).unwrap().join("docs");
+        let spelled = Path::new("/.nofollow/.nofollow").join(docs.strip_prefix("/").unwrap());
+        fs::write(
+            project.join(".cplt.toml"),
+            format!("[propose.allow]\nread = [\"{}\"]\n", spelled.display()),
+        )
+        .unwrap();
+        assert!(common::git_ok(&project, &["init", "--quiet"]));
+        assert!(common::git_ok(&project, &["add", "-A"]));
+        assert!(common::git_ok(
+            &project,
+            &["commit", "--quiet", "-m", "cfg"]
+        ));
+        let out = firmlink_cmd(&home)
+            .current_dir(&project)
+            .arg("trust")
+            .output()
+            .expect("cplt trust");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("(resolves to {})", docs.display())),
+            "{stdout}"
+        );
     }
 
     /// A `/.nofollow/<symlink>` grant names the link itself, which a grant
@@ -7149,13 +7245,16 @@ except Exception as e:
             !granted(&out) && err.contains("/.nofollow/"),
             "config:\n{err}\n{out}"
         );
-        fs::write(
-            project.join(".cplt.toml"),
-            format!("[propose.allow]\nread = [\"{s}\"]\n"),
-        )
-        .unwrap();
+        commit_and_trust(
+            &home,
+            &project,
+            &format!("[propose.allow]\nread = [\"{s}\"]\n"),
+        );
         let (out, err) = firmlink_profile(&home, &project, None, &[]);
-        assert!(!granted(&out), "repo:\n{err}\n{out}");
+        assert!(
+            !granted(&out) && err.contains("/.nofollow/"),
+            "repo:\n{err}\n{out}"
+        );
     }
 
     /// A firmlink-spelled `--project-dir` yields canonical rules.

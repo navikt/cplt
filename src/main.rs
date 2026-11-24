@@ -13563,6 +13563,19 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
     })
 }
 
+/// A `.cplt.toml` path as written, plus where it resolves when that differs,
+/// so a reviewer never approves `/.nofollow/...` or a symlink without seeing
+/// the path the rule will actually name.
+fn spelled_with_canonical(raw: &str, dir: &Path) -> String {
+    let spelled = dir.join(config::expand_tilde(raw));
+    let canonical = config::canonicalize_deepest(&spelled);
+    if canonical == spelled {
+        raw.to_string()
+    } else {
+        format!("{raw}  (resolves to {})", canonical.display())
+    }
+}
+
 fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoConfig) -> ExitCode {
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
     let trust_entry = trust::load_trust(project_dir);
@@ -13594,7 +13607,10 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
         println!("{blue}[cplt]{nc}  {green}[deny]{nc} {LABEL_DENY_APPLIED}");
         for p in &loaded.config.deny.paths {
-            println!("{blue}[cplt]{nc}    path: {p}");
+            println!(
+                "{blue}[cplt]{nc}    path: {}",
+                spelled_with_canonical(p, &loaded.dir)
+            );
         }
         for v in &loaded.config.deny.env {
             println!("{blue}[cplt]{nc}    env:  {v}");
@@ -13653,6 +13669,18 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             println!("{blue}[cplt]{nc}    {key:<35} {status}");
             if !approved && let Some(cost) = repo_config::propose_key_cost(key) {
                 println!("{blue}[cplt]{nc}      {dim}{cost}{nc}");
+            }
+            let paths = match key {
+                "allow.read" => &loaded.config.propose.allow.read,
+                "allow.write" => &loaded.config.propose.allow.write,
+                "allow.socket" => &loaded.config.propose.allow.socket,
+                _ => &Vec::new(),
+            };
+            for p in paths {
+                println!(
+                    "{blue}[cplt]{nc}      {}",
+                    spelled_with_canonical(p, &loaded.dir)
+                );
             }
             if key == "repos" {
                 for line in proposed_repo_lines(project_dir, loaded, trust_entry.as_ref()) {

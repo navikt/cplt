@@ -1269,6 +1269,24 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
             validate_grant_path(key, p, config.home_dir)?;
         }
     }
+    for p in config.extra_deny {
+        refuse_filesystem_root("deny path", p)?;
+    }
+    Ok(())
+}
+
+/// Refuse a rule on `/`, checked on the final resolved path every source
+/// (CLI, user config, `.cplt.toml`) feeds into. String checks upstream miss
+/// spellings such as `/.nofollow/.nofollow` or a symlink to `/`; a deny on
+/// `/` kills the launch and an allow on it is no sandbox at all.
+fn refuse_filesystem_root(key: &str, p: &Path) -> Result<(), String> {
+    if p == Path::new("/") {
+        return Err(format!(
+            "{key} {} resolves to the filesystem root, which cplt refuses. \
+             Name a specific path instead.",
+            p.display()
+        ));
+    }
     Ok(())
 }
 
@@ -1473,6 +1491,7 @@ pub fn state_ancestor_warning(
 /// # Errors
 /// The refusal text, ready to print.
 pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), String> {
+    refuse_filesystem_root(key, p)?;
     // A socket grant writes the path itself, outside the writable-tree lists
     // the managed loader and the macOS state pins draw from, so the
     // warn-instead-of-refuse treatment for ancestor grants cannot cover it.
