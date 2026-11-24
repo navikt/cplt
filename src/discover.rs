@@ -289,8 +289,9 @@ fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> 
     let probe = |no_refresh: bool| {
         let mut cmd = std::process::Command::new(gh);
         cmd.args(["auth", "token", "--hostname", "github.com"]);
-        // Without it gh refreshes an expiring token over the network and
-        // writes the keyring; doctor and offline launches must not (#1063).
+        // gh v2.103.0 added both token auto-refresh and `--no-refresh`. A
+        // refresh rewrites the keyring with a single-use refresh token, so a
+        // lost race deletes the stored login (#1063, #1147).
         if no_refresh {
             cmd.arg("--no-refresh");
         }
@@ -302,12 +303,12 @@ fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> 
         }
         bounded_run(cmd, timeout, true)
     };
-    // Retry only when gh names the flag as unknown (an older gh, which has no
-    // refresh to suppress). A denied Keychain read also exits 1; retrying it
-    // would prompt again with refresh back on. A timeout (None) never retries.
+    // Retry without the flag only on gh's own unknown-flag error: that gh is
+    // older than v2.103.0 and cannot refresh. Any other failure (a denied
+    // Keychain read also exits 1) or a timeout hands over nothing.
     let (ok, mut buf, stderr) = probe(true)?;
     if !ok {
-        if !String::from_utf8_lossy(&stderr).contains("unknown flag: --no-refresh") {
+        if !rejects_no_refresh_flag(&stderr) {
             return None;
         }
         let (ok, retry, _) = probe(false)?;
@@ -318,6 +319,15 @@ fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> 
     }
     let token = String::from_utf8_lossy(&buf).trim().to_string();
     (!token.is_empty()).then_some(token)
+}
+
+/// gh (cobra) prints exactly this as the first stderr line, then usage.
+fn rejects_no_refresh_flag(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .next()
+        .map(str::trim_end)
+        == Some("unknown flag: --no-refresh")
 }
 
 /// Bound both the child and its stdout: a descendant can keep the pipe open

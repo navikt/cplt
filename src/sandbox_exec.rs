@@ -2974,7 +2974,8 @@ echo gho_stored_fixture"#,
         );
     }
 
-    /// #1063: an older gh that rejects `--no-refresh` still hands over its token.
+    /// gh < 2.103.0 rejects `--no-refresh` and cannot refresh, so one retry
+    /// without the flag is safe and keeps its users working (#1063, #1147).
     #[test]
     fn an_older_gh_without_no_refresh_still_hands_the_token_over() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2983,7 +2984,7 @@ echo gho_stored_fixture"#,
             dir.path(),
             &format!(
                 r#"echo "$*" >> '{}'
-case "$*" in *--no-refresh*) echo "unknown flag: --no-refresh" >&2; exit 1;; esac
+case "$*" in *--no-refresh*) printf 'unknown flag: --no-refresh\n\nUsage:  gh auth token [flags]\n' >&2; exit 1;; esac
 echo gho_old"#,
                 log.display()
             ),
@@ -2995,6 +2996,27 @@ echo gho_old"#,
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "auth token --hostname github.com --no-refresh\nauth token --hostname github.com\n"
+        );
+    }
+
+    /// Only gh's exact unknown-flag line retries: an error that merely
+    /// mentions it must not turn refresh back on (#1147).
+    #[test]
+    fn an_error_mentioning_the_flag_is_not_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls");
+        let gh = gh_stub(
+            dir.path(),
+            &format!(
+                r#"echo "$*" >> '{}'
+echo "keyring locked; unknown flag: --no-refresh" >&2; exit 1"#,
+                log.display()
+            ),
+        );
+        assert_eq!(gh_auth_token(&gh, Duration::from_secs(10)), None);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "auth token --hostname github.com --no-refresh\n"
         );
     }
 
