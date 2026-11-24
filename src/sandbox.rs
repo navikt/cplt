@@ -1260,20 +1260,6 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
             validate_grant_path(key, p, config.home_dir)?;
         }
     }
-    // A socket grant writes the path itself, outside the writable-tree lists
-    // the managed loader and the macOS state pins draw from, so the
-    // warn-instead-of-refuse treatment for ancestor grants cannot cover it.
-    // A socket is a file; naming a directory above cplt's state is refused.
-    for p in config.extra_socket {
-        if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, p) {
-            return Err(format!(
-                "allow.socket names {}, which is cplt's state directory {} or contains it. \
-                 Name the socket file itself, outside that directory.",
-                p.display(),
-                dir.display()
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -1478,6 +1464,21 @@ pub fn state_ancestor_warning(
 /// # Errors
 /// The refusal text, ready to print.
 pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), String> {
+    // A socket grant writes the path itself, outside the writable-tree lists
+    // the managed loader and the macOS state pins draw from, so the
+    // warn-instead-of-refuse treatment for ancestor grants cannot cover it.
+    // A socket is a file; naming a directory above cplt's state is refused.
+    // Here, not only at launch, so `cplt config set` refuses it too.
+    if key == "allow.socket"
+        && let Some(dir) = policy::cplt_state_ancestor_grant(home_dir, p)
+    {
+        return Err(format!(
+            "allow.socket names {}, which is cplt's state directory {} or contains it. \
+             Name the socket file itself, outside that directory.",
+            p.display(),
+            dir.display()
+        ));
+    }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
             "{key} names {} — inside cplt's own state directory ({}). Nothing in there \

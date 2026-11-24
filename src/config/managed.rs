@@ -656,6 +656,14 @@ impl ManagedSnapshot {
             // refuses that layout, so nothing loads from it. Say so, unless it
             // was already so before the session (a stow-linked state dir).
             (before, None) => {
+                // A plain dir the walk cannot open (a fresh `managed.d` at
+                // mode 000, never held): move it aside through its parent,
+                // reached with no symlink hop.
+                if let Some((_, p, _)) = self.path.parent().and_then(open_dir)
+                    && std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.is_dir())
+                {
+                    return quarantine_dir(Some(&p), &self.path);
+                }
                 return (before.is_some() || lstat_id(&self.path) != self.lstat).then(|| {
                     format!(
                         "The session could write cplt's state directory, and {} is no \
@@ -796,10 +804,13 @@ fn quarantine_dir(parent: Option<&std::fs::File>, path: &Path) -> Option<String>
         return Some(quarantine_line(path, &name.to_string_lossy()));
     }
     let p = esc(&path.to_string_lossy());
+    let mut to = path.as_os_str().to_owned();
+    to.push(".quarantined");
+    let (from, to) = (q(path), q(Path::new(&to)));
     Some(format!(
         "The session could write cplt's state directory and changed {p}, and cplt could \
          not move it aside. The managed config there may now be the session's. Before the \
-         next launch, run: chmod -R u+w '{p}' && mv '{p}' '{p}.quarantined' — then review \
+         next launch, run: chmod -R u+rwx {from} && mv {from} {to} — then review \
          it, and remove the grant that covers ~/.config/cplt."
     ))
 }
@@ -1664,10 +1675,48 @@ mod tests {
         let h = Home::new();
         let gone = h.path().join("no/such/managed.d");
         let line = quarantine_dir(None, &gone).expect("never silent");
-        assert!(
-            line.contains("could not move it aside") && line.contains("mv '"),
-            "{line}"
+        assert!(line.contains("could not move it aside"), "{line}");
+        // Copilot on #1126: the command is shell-quoted, so an apostrophe in
+        // the home still names the right path.
+        let odd = h.path().join("it's/managed.d");
+        let line = quarantine_dir(None, &odd).unwrap();
+        let cmd = format!(
+            "mv {} {}",
+            q(&odd),
+            q(&h.path().join("it's/managed.d.quarantined"))
         );
+        assert!(line.contains(&cmd), "{line}");
+        assert!(!line.contains("'it's"), "{line}");
+    }
+
+    /// Copilot on #1126: `managed.d` created or replaced at mode 000 is not
+    /// held, so the walk cannot open it; it is still moved aside.
+    #[test]
+    fn snapshot_quarantines_an_unsearchable_created_or_replaced_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        for replaced in [false, true] {
+            let h = Home::new();
+            let d = h.managed_d();
+            if replaced {
+                write(&d, "nav-pilot.toml", GOOD);
+            } else {
+                std::fs::remove_dir(&d).unwrap();
+            }
+            let snap = ManagedSnapshot::take(h.path());
+            if replaced {
+                std::fs::rename(&d, d.parent().unwrap().join("old")).unwrap();
+            }
+            std::fs::create_dir(&d).unwrap();
+            write(&d, "planted.toml", GOOD);
+            mode(&d, 0o000).unwrap();
+            let line = snap.finish().expect("reported");
+            let _ = mode(&d, 0o700);
+            assert!(
+                !d.exists(),
+                "planted dir left loadable (replaced={replaced}): {line}"
+            );
+        }
     }
 
     /// A hard link planted in `managed.d` changes no content or mtime, only

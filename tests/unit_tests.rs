@@ -12236,3 +12236,18 @@ fn env_tool_dir_allowed_only_under_safe_roots() {
         &[]
     ));
 }
+
+/// Copilot on #1126: `cplt config set` validates through
+/// `validate_grant_path`, so the ancestor-socket refusal lives there and a
+/// setting the next launch rejects is never saved.
+#[test]
+fn config_set_refuses_socket_over_state_dir() {
+    let home = std::path::Path::new("/Users/someone");
+    let e = cplt::sandbox::validate_grant_path("allow.socket", &home.join(".config"), home)
+        .expect_err("ancestor socket grant must be refused");
+    assert!(e.contains("Name the socket file itself"), "{e}");
+    assert!(
+        cplt::sandbox::validate_grant_path("allow.write", &home.join(".config"), home).is_ok(),
+        "ancestor write grant stays warn-only"
+    );
+}
