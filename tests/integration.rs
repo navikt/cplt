@@ -5058,6 +5058,58 @@ int main(int argc, char **argv) {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
+    /// A write grant's root inside a read-only parent must not be removable or
+    /// replaceable: with the root swapped for a symlink, the next launch would
+    /// grant write wherever the link points.
+    #[test]
+    fn real_profile_pins_write_roots_against_symlink_swap() {
+        require_sandbox!();
+        let mk = |prefix| {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .unwrap()
+        };
+        let (project_dir, home_dir) = (mk(".cplt-swap-project-"), mk(".cplt-swap-home-"));
+        let project = fs::canonicalize(project_dir.path()).unwrap();
+        let home = fs::canonicalize(home_dir.path()).unwrap();
+        let roots = [
+            (".gradle/.tmp", ".gradle/init.d"),
+            (".yarn/berry", ".yarn/bin"),
+            (".npm/_logs", "Library/LaunchAgents"),
+            (".cargo/registry", ".cargo/bin"),
+        ];
+        for (root, target) in roots {
+            fs::create_dir_all(home.join(root)).unwrap();
+            fs::create_dir_all(home.join(target)).unwrap();
+        }
+        let profile = write_real_profile(&default_opts(&project, &home));
+        let mut failures = Vec::new();
+        for (root, target) in roots {
+            let (r, t) = (home.join(root), home.join(target));
+            let (r, t) = (r.display(), t.display());
+            for cmd in [
+                format!("rmdir '{r}' && ln -s '{t}' '{r}'; echo EXIT:$?"),
+                format!("mv '{r}' '{r}.x' && ln -s '{t}' '{r}'; echo EXIT:$?"),
+            ] {
+                let (out, _) = run_sandboxed(&profile, &cmd);
+                if out.contains("EXIT:0") || home.join(root).is_symlink() {
+                    failures.push(format!("{root}: swapped by {cmd:?}: {out:?}"));
+                }
+            }
+            if !home.join(root).is_dir() {
+                failures.push(format!("{root}: root removed"));
+            }
+            // Still writable inside.
+            let (out, _) = run_sandboxed(&profile, &format!("echo x > '{r}/f'; echo EXIT:$?"));
+            if !out.contains("EXIT:0") {
+                failures.push(format!("{root}: inside not writable: {out:?}"));
+            }
+        }
+        fs::remove_file(&profile).ok();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     /// `sandbox.readonly_host_tool_paths`: wrapper distributions, Kotlin/Native
     /// toolchains and the overlay subtrees (pre-commit envs, .NET global
     /// tools, NuGet config and plugins) are write-denied, while the caches
