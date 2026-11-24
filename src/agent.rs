@@ -307,7 +307,8 @@ fn cached_version(cache: &Path, key: &str) -> Option<String> {
         .and_then(|c| c.strip_prefix(key).map(|v| v.trim().to_string()))
 }
 
-/// The OpenCode version, from its install path or the cache
+/// The OpenCode version, from a Homebrew (`Cellar/opencode/X.Y.Z`) or mise
+/// (`installs/opencode/X.Y.Z`) install path, else the cache
 /// [`is_opencode_v2`] fills. Never runs the binary.
 pub fn opencode_version(bin: &Path, home: &Path) -> Option<String> {
     let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
@@ -316,9 +317,19 @@ pub fn opencode_version(bin: &Path, home: &Path) -> Option<String> {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
     if let Some(v) = parts
-        .windows(2)
-        .find(|w| w[0] == "opencode" || w[0] == "opencode-v2")
-        .and_then(|w| crate::discover::parse_version(&w[1]))
+        .windows(3)
+        .find(|w| {
+            matches!(w[0].as_str(), "Cellar" | "installs")
+                && matches!(w[1].as_str(), "opencode" | "opencode-v2")
+        })
+        .map(|w| w[2].as_str())
+        .filter(|v| {
+            let n: Vec<&str> = v.split('.').collect();
+            n.len() == 3
+                && n.iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_string)
     {
         return Some(v);
     }
@@ -3766,6 +3777,17 @@ mod tests {
         assert_eq!(
             opencode_version(Path::new("/nonexistent-cplt/bin/opencode"), none),
             None
+        );
+        for p in [
+            "/home/u/opencode/2fa/bin/opencode",
+            "/home/u/opencode/9/bin/opencode",
+            "/mise/installs/opencode/latest/bin/opencode",
+        ] {
+            assert_eq!(opencode_version(Path::new(p), none), None, "{p}");
+        }
+        assert_eq!(
+            opencode_version(Path::new("/m/installs/opencode/2.3.1/bin/opencode"), none),
+            Some("2.3.1".into())
         );
     }
 
