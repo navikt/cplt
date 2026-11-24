@@ -1126,7 +1126,8 @@ fn golden_check_exec_agrees_with_the_launch_in_both_modes() {
 }
 
 /// Copilot review on #1124: doctor lists the opener hosts only when a launch
-/// would install the opener; with `~/Library/Preferences` writable it says why not.
+/// would install the opener; with `~/Library/Preferences` writable it says why not (an explicit grant here;
+/// the scratch HOME under the temp dir is writable anyway).
 #[test]
 #[cfg(target_os = "macos")]
 fn golden_doctor_reports_the_opener_off_when_preferences_are_writable() {
@@ -1141,11 +1142,6 @@ fn golden_doctor_reports_the_opener_off_when_preferences_are_writable() {
         "[proxy]\nallow_private_domains = [\"intern.example.no\"]\n",
     )
     .unwrap();
-    let (out, err, _) = launch(&home, repo.path(), &["--agent", "shell", "doctor"]);
-    assert!(
-        out.contains("browser opener may open: intern.example.no"),
-        "{out}{err}"
-    );
     let grant = prefs.display().to_string();
     let (out, err, _) = launch(
         &home,
