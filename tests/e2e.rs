@@ -12686,7 +12686,13 @@ mod agent_stubs {
             .unwrap();
         let h = std::fs::canonicalize(dir.path()).unwrap();
         let proj = h.join("work/proj");
-        for d in ["pnpm", ".ssh/x", "Library/LaunchAgents", ".config/cplt/x"] {
+        for d in [
+            "pnpm",
+            ".ssh/x",
+            "Library/LaunchAgents",
+            ".config/cplt/x",
+            "go/bin",
+        ] {
             std::fs::create_dir_all(h.join(d)).unwrap();
         }
         std::fs::create_dir_all(&proj).unwrap();
@@ -12701,6 +12707,15 @@ mod agent_stubs {
                 .env("XDG_DATA_HOME", h.join(".local/share"))
                 .env("XDG_CACHE_HOME", h.join(".cache"))
                 .env("XDG_RUNTIME_DIR", h.join("run"))
+                // `~/bin` on PATH, as in a real shell: the hint skips PATH dirs.
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        h.join("bin").display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
                 .env(var, val);
             c
         };
@@ -12715,12 +12730,13 @@ mod agent_stubs {
             ("GOCACHE", ".ssh/x"),
             ("GOCACHE", "Library/LaunchAgents"),
             ("GOCACHE", ".config/cplt/x"),
+            ("GOCACHE", "go/bin"),
             ("GOCACHE", ""),
         ] {
             let w = warning(var, &h.join(rel)).expect("the refusal should be reported");
             assert!(!w.contains("config set"), "no grant hint for ~/{rel}: {w}");
         }
-        // A symlinked persistence dir (`~/bin -> ~/tools`) is matched by identity,
+        // A symlinked PATH dir (`~/bin -> ~/tools`) is matched by identity,
         // and a path `validate_sbpl_path` would reject later gets no hint.
         std::fs::create_dir_all(h.join("tools")).unwrap();
         std::os::unix::fs::symlink(h.join("tools"), h.join("bin")).unwrap();
@@ -12749,6 +12765,7 @@ mod agent_stubs {
         };
         // JAVA_HOME gets the same one-step hint, read-only.
         std::fs::create_dir_all(h.join("jdk")).unwrap();
+        std::fs::write(h.join("jdk/release"), "").unwrap();
         let w = warning("JAVA_HOME", &h.join("jdk")).expect("JAVA_HOME=~/jdk should be refused");
         assert_eq!(
             split(&hint_of(&w)),

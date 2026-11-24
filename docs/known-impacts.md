@@ -358,10 +358,16 @@ The warning ends with the command to run (`allow.read` for an SDK). Run it
 once and the next launch grants the dir (#1104). Or move the dir under
 `~/.cache`, for example `GOPATH=~/.cache/gopath`.
 
-No grant is offered when the dir is protected or a persistence point: a
-credential dir such as `~/.ssh`, cplt's own `~/.config/cplt` or anything else
-under `~/.config`, `~/Library/LaunchAgents`, `~/bin`, `~/.local/bin`, `$HOME`
-or a parent of it. There the warning says to point the variable elsewhere.
+The paste-ready command is printed only for a plain tool dir: strictly inside
+your home, under a first-level dir that is not hidden (`~/.cargo`, `~/.config`
+and the like) and not `~/Library`, `~/Applications`, `~/Documents`,
+`~/Desktop`, `~/Downloads` or another personal-data dir, with no path component
+named `bin`, `sbin`, `shims`, `hooks`, `.git`, `LaunchAgents`,
+`site-packages`, `startup`, `autostart` or `extensions`, not on your `PATH` or
+under a dir on it, and not protected. For `allow.read` the dir must also look
+like the SDK (`bin/java` or `release` for `JAVA_HOME`, `dotnet` for
+`DOTNET_ROOT`). Anything else, including every dir outside your home, gets the
+warning without a path: grant it by hand only if you mean to.
 
 ## cplt's state directory inside a writable tree (behaviour change)
 

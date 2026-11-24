@@ -7602,13 +7602,20 @@ impl HostProbe {
 /// The next step for a refused env tool dir: a copy-pasteable grant when the
 /// path passes the hint safety checks, otherwise "point it elsewhere".
 fn tool_dir_grant_fix(home: &Path, path: &Path, kind: &str, var: &str) -> String {
-    if cplt::sandbox::env_tool_dir_hint_ok(home, path) {
+    // A read grant is offered only for a dir that looks like the SDK it names.
+    let sdk_ok = kind != "read"
+        || match var {
+            "JAVA_HOME" => path.join("bin/java").is_file() || path.join("release").is_file(),
+            "DOTNET_ROOT" => path.join("dotnet").is_file(),
+            _ => false,
+        };
+    if sdk_ok && cplt::sandbox::env_tool_dir_hint_ok(home, path) {
         format!(
             "Move it there, or grant it in one step: cplt config set allow.{kind} {}",
             shell_quote(&path.to_string_lossy())
         )
     } else {
-        format!("Point {var} elsewhere.")
+        format!("Point {var} elsewhere, or grant it with `allow.{kind}` if you mean to.")
     }
 }
 
@@ -17588,6 +17595,22 @@ mod tests {
         assert!(
             matches!(warned, GateEffect::ExecPlain { notice: Some(_) }),
             "warn mode must let the force push through with a notice, got {warned:?}"
+        );
+    }
+
+    #[test]
+    fn sdk_read_hint_needs_a_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let jdk = h.join("sdk/jdk-21");
+        std::fs::create_dir_all(&jdk).unwrap();
+        let fix = |var| tool_dir_grant_fix(&h, &jdk, "read", var);
+        assert!(!fix("JAVA_HOME").contains("config set"), "no marker yet");
+        std::fs::write(jdk.join("release"), "").unwrap();
+        assert!(fix("JAVA_HOME").contains("config set allow.read"));
+        assert!(
+            !fix("DOTNET_ROOT").contains("config set"),
+            "not a dotnet root"
         );
     }
 

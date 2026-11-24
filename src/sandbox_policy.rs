@@ -3958,30 +3958,53 @@ pub fn env_tool_path_protected(home: &Path, path: &Path) -> Option<PathBuf> {
         })
 }
 
-/// Home paths an "Ignoring <VAR>" warning must never suggest granting with
-/// `cplt config set allow.write`, even though the deny lists do not close
-/// them: persistence points (launch agents, user `bin` dirs, everything under
-/// `~/.config`, which holds shell config and cplt's own) and `~/Library/Caches`
-/// itself, whose only rejected children are personal-app caches.
-const ENV_TOOL_NO_HINT_SUBPATHS: &[&str] = &[
-    "Library/LaunchAgents",
-    "Library/Caches",
-    "Library/Application Support",
-    "Library/Preferences",
-    ".config",
-    ".local/bin",
+/// First components under `$HOME` whose subtrees never get a paste-ready
+/// grant: personal data, app state and persistence points (`~/Library`).
+const ENV_TOOL_HINT_DENIED_TOP: &[&str] = &[
+    "library",
+    "applications",
+    "documents",
+    "desktop",
+    "downloads",
+    "pictures",
+    "music",
+    "movies",
+    "public",
+    "dropbox",
+    "icloud drive",
+];
+
+/// Path components that mark an exec, hook or autoload point anywhere below.
+const ENV_TOOL_HINT_DENIED_COMPONENTS: &[&str] = &[
     "bin",
+    "sbin",
+    "shims",
+    "hooks",
+    ".git",
+    "launchagents",
+    "site-packages",
+    "startup",
+    "autostart",
+    "extensions",
 ];
 
 /// Whether an env-set tool dir that failed only the positive rule may be
 /// offered back as a one-step `cplt config set allow.write <dir>` fix.
 ///
-/// Fails closed: no hint when `path` is `$HOME` or above it, a protected or
-/// cplt state path ([`env_tool_path_protected`]), at, above or inside an
-/// [`ENV_TOOL_NO_HINT_SUBPATHS`] entry in `$HOME` or the passwd home, or
-/// when its text would need escaping to print.
+/// An allow-list, because a deny-list of persistence points never ends
+/// (`~/.cargo/bin`, shims, shell plugin dirs, `/opt/homebrew`, ...). A path
+/// is offered only when, both as spelled and resolved, it is strictly inside
+/// `$HOME`, its first component is a non-hidden dir outside the personal-data
+/// and `Library` set, no component is an exec/hook name, neither it nor an
+/// ancestor under `$HOME` is on `PATH`, and it is not protected or cplt state.
+/// Anything else gets a grant hint without a path.
 #[must_use]
 pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    env_tool_dir_hint_ok_with(home, path, &path_var)
+}
+
+fn env_tool_dir_hint_ok_with(home: &Path, path: &Path, path_var: &std::ffi::OsStr) -> bool {
     // Lossy conversion would print a different path than the one refused.
     let Some(text) = path.to_str() else {
         return false;
@@ -3990,42 +4013,60 @@ pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
     if text.escape_debug().to_string() != text
         || validate_sbpl_path(path).is_err()
         || !tool_override_path_is_safe(path, home)
+        || env_tool_path_protected(home, path).is_some()
     {
         return false;
     }
-    if env_tool_path_protected(home, path).is_some() {
+    let Ok(home_real) = std::fs::canonicalize(home) else {
+        return false;
+    };
+    // `HOME=/` or `HOME=/Users` would make every system dir "inside home".
+    if home_real.components().count() < 3 {
+        return false;
+    }
+    let real = config::canonicalize_deepest(path);
+    let rel_ok = |p: &Path, h: &Path| {
+        let Ok(rel) = p.strip_prefix(h) else {
+            return false;
+        };
+        let comps: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        let Some(first) = comps.first() else {
+            return false; // `$HOME` itself
+        };
+        !first.starts_with('.')
+            && !ENV_TOOL_HINT_DENIED_TOP.contains(&first.as_str())
+            && comps
+                .iter()
+                .all(|c| c != ".." && !ENV_TOOL_HINT_DENIED_COMPONENTS.contains(&c.as_str()))
+    };
+    if !rel_ok(&real, &home_real) {
+        return false;
+    }
+    // The spelling, too: `~/go/bin -> ~/tools/x` still reads as a bin dir.
+    let spelled_home = if path.starts_with(home) {
+        home
+    } else {
+        &home_real
+    };
+    if !rel_ok(path, spelled_home) {
         return false;
     }
     use std::os::unix::fs::MetadataExt;
     let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
-    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_ascii_lowercase());
-    let me = lower(path);
-    let my_id = id(path);
-    // A dangling entry (`~/bin -> ~/tools/future-bin`) has no identity; its
-    // resolved target still names what the sandbox would create.
-    let me_real = lower(&config::canonicalize_deepest(path));
-    let homes = std::iter::once(home.to_path_buf()).chain(config::account_home());
-    !homes
-        .flat_map(|h| {
-            let canon = std::fs::canonicalize(&h).unwrap_or(h.clone());
-            [h, canon]
-        })
-        .flat_map(|h| ENV_TOOL_NO_HINT_SUBPATHS.iter().map(move |rel| h.join(rel)))
-        .any(|d| {
-            let ld = lower(&d);
-            let ld_real = lower(&config::canonicalize_deepest(&d));
-            // Spelling covers entries that do not exist yet; identity covers a
-            // symlinked entry (`~/bin -> ~/tools`) reached by its target.
-            me.starts_with(&ld)
-                || ld.starts_with(&me)
-                || me_real.starts_with(&ld_real)
-                || ld_real.starts_with(&me_real)
-                || id(&d).is_some_and(|did| {
-                    path.ancestors().any(|a| id(a) == Some(did))
-                        || std::fs::canonicalize(&d)
-                            .is_ok_and(|c| c.ancestors().any(|a| id(a) == my_id))
-                })
-        })
+    let on_path: Vec<PathBuf> = std::env::split_paths(path_var)
+        .filter(|p| p.is_absolute())
+        .map(|p| config::canonicalize_deepest(&p))
+        .collect();
+    let ids: Vec<_> = on_path.iter().filter_map(|p| id(p)).collect();
+    // A PATH dir inside the grant is as bad as the grant inside a PATH dir.
+    !on_path.iter().any(|p| p.starts_with(&real))
+        && !real
+            .ancestors()
+            .take_while(|a| *a != home_real)
+            .any(|a| on_path.iter().any(|p| p == a) || id(a).is_some_and(|i| ids.contains(&i)))
 }
 
 /// Validate that a path is safe for interpolation into SBPL profile strings.
@@ -4969,9 +5010,107 @@ mod tests {
         let h = std::fs::canonicalize(home.path()).unwrap();
         std::fs::create_dir_all(h.join("tools")).unwrap();
         std::os::unix::fs::symlink(h.join("tools/future-bin"), h.join("bin")).unwrap();
-        assert!(!env_tool_dir_hint_ok(&h, &h.join("tools")));
-        assert!(!env_tool_dir_hint_ok(&h, &h.join("tools/future-bin")));
-        assert!(env_tool_dir_hint_ok(&h, &h.join("elsewhere")));
+        let path_var = std::ffi::OsString::from(h.join("bin"));
+        assert!(!env_tool_dir_hint_ok_with(&h, &h.join("tools"), &path_var));
+        assert!(!env_tool_dir_hint_ok_with(
+            &h,
+            &h.join("tools/future-bin"),
+            &path_var
+        ));
+        assert!(env_tool_dir_hint_ok_with(
+            &h,
+            &h.join("elsewhere"),
+            &path_var
+        ));
+    }
+
+    /// Every persistence or exec point the review found under the old
+    /// deny-list (#1125) gets no paste-ready path; plain tool dirs do.
+    #[cfg(unix)]
+    #[test]
+    fn env_tool_dir_hint_is_an_allow_list() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let none = std::ffi::OsString::new();
+        for rel in [
+            ".cargo/bin",
+            "go/bin",
+            ".npm-global/bin",
+            ".bun/bin",
+            ".deno/bin",
+            ".volta/bin",
+            ".krew/bin",
+            ".pyenv/shims",
+            ".rbenv/shims",
+            ".asdf/shims",
+            ".oh-my-zsh/custom",
+            ".zsh",
+            ".zfunc",
+            ".vscode",
+            ".vscode/extensions",
+            ".cursor",
+            ".claude",
+            ".copilot",
+            ".codex",
+            ".githooks",
+            ".git-templates/hooks",
+            ".ipython/profile_default/startup",
+            ".local/lib/python3.12/site-packages",
+            "Library/Python/3.12/lib/python/site-packages",
+            "Library/Keychains",
+            "Library/Services",
+            "Library/Scripts",
+            "Library/Application Scripts",
+            "Library/Mail",
+            "Library/Mail/Messages",
+            "Library/Safari",
+            "Library/LaunchAgents",
+            "Library/Mobile Documents",
+            "Applications",
+            "Documents",
+            "Desktop/x",
+            "Downloads",
+            "iCloud Drive",
+            "Dropbox/x",
+            "bin",
+            ".local/bin",
+            ".config/x",
+            "tools/autostart",
+            "src/repo/.git",
+            "",
+        ] {
+            assert!(
+                !env_tool_dir_hint_ok_with(&h, &h.join(rel), &none),
+                "~/{rel}"
+            );
+        }
+        for abs in [
+            "/opt/homebrew",
+            "/opt/homebrew/bin",
+            "/usr/local",
+            "/usr/local/bin",
+            "/Library/LaunchAgents",
+            "/private/etc",
+            "/Users/Shared",
+            "/",
+        ] {
+            assert!(
+                !env_tool_dir_hint_ok_with(&h, Path::new(abs), &none),
+                "{abs}"
+            );
+        }
+        // On PATH, or under a dir on PATH.
+        std::fs::create_dir_all(h.join("tools/gobin/sub")).unwrap();
+        let p = std::ffi::OsString::from(h.join("tools/gobin"));
+        assert!(!env_tool_dir_hint_ok_with(&h, &h.join("tools/gobin"), &p));
+        assert!(!env_tool_dir_hint_ok_with(
+            &h,
+            &h.join("tools/gobin/sub"),
+            &p
+        ));
+        for rel in ["pnpm", "tools/gocache", "sdk/jdk-21"] {
+            assert!(env_tool_dir_hint_ok_with(&h, &h.join(rel), &p), "~/{rel}");
+        }
     }
 
     #[cfg(unix)]
