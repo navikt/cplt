@@ -1365,7 +1365,7 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
              proxy. New configs turn it on. With it on, direct connects fail, and on Linux \
              DNS and UDP are blocked too (see docs/known-impacts.md).",
             Some(
-                "cplt config set proxy.forced true, or `cplt config set proxy.forced false` to \
+                "cplt config set proxy.forced true, or `cplt config set --force proxy.forced false` (weakens the sandbox) to \
                  keep it off and silence this"
                     .to_string(),
             ),

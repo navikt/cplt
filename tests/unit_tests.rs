@@ -12350,3 +12350,92 @@ fn config_set_refuses_socket_over_state_dir() {
         "ancestor write grant stays warn-only"
     );
 }
+
+/// Every literal `cplt config set|unset ...` that cplt prints is pasted into
+/// the real binary, in a scratch HOME and repo, and must exit 0. A hint can
+/// then never suggest a command `cplt config set` refuses (a weakening value
+/// without `--force`, a hard-denied grant, an unknown key). Templates with
+/// placeholders are skipped by name; anything else the parser cannot read
+/// fails the test.
+#[test]
+fn every_hinted_config_command_pastes_and_works() {
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    rs_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let mut cmds = Vec::new();
+    for f in &files {
+        let raw = std::fs::read_to_string(f).unwrap();
+        // Hints only: drop the unit tests and comments, join `\` line wraps.
+        let code = raw.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let code: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut joined = String::new();
+        let mut rest = code.as_str();
+        while let Some(i) = rest.find("\\\n") {
+            joined.push_str(&rest[..i]);
+            rest = rest[i + 2..].trim_start();
+        }
+        joined.push_str(rest);
+        for (i, part) in joined.split('`').enumerate() {
+            if i % 2 == 1
+                && (part.starts_with("cplt config set ") || part.starts_with("cplt config unset "))
+            {
+                cmds.push((f.display().to_string(), part.to_string()));
+            }
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let repo = common::temp_repo("navikt/cplt-hint-test");
+    let mut checked = 0;
+    let mut refused = Vec::new();
+    for (file, cmd) in &cmds {
+        let is_template = ["{", "<", "...", "|", "HOST", "KEY"]
+            .iter()
+            .any(|t| cmd.contains(t));
+        if is_template {
+            continue;
+        }
+        // Shell quotes, as printed inside a Rust string literal.
+        let unquoted = cmd.replace("\\\"", "");
+        let args: Vec<&str> = unquoted.split_whitespace().skip(2).collect();
+        let known = |a: &&str| ["--force", "--local", "--repo", "--unset"].contains(a);
+        let plain: Vec<&&str> = args[1..].iter().filter(|a| !known(a)).collect();
+        assert!(
+            !plain.is_empty() && plain.iter().all(|a| !a.starts_with('-')),
+            "{file}: cannot parse hinted command `{cmd}`"
+        );
+        let out = common::cplt_cmd()
+            .args(["config"])
+            .args(&args)
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", home.path().join("cplt-cfg/config.toml"))
+            .current_dir(repo.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            refused.push(format!(
+                "{file}: hinted `{cmd}` is refused: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        checked += 1;
+    }
+    assert!(refused.is_empty(), "{}", refused.join("\n"));
+    assert!(checked >= 10, "only {checked} hinted commands checked");
+}

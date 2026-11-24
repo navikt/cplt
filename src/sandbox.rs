@@ -597,7 +597,8 @@ impl PreparedSandbox {
     /// say why not and how to fix it. The launch refuses on `Err`.
     #[cfg(target_os = "linux")]
     pub fn check_netns(&self) -> Result<(), String> {
-        const OFF: &str = "or run `cplt config set proxy.netns false`";
+        const OFF: &str =
+            "or run `cplt config set --force proxy.netns false` (weakens the sandbox)";
         if self.bwrap_wrapper.as_ref().is_none_or(|w| !w.netns()) {
             let fix = if bubblewrap::check_availability().is_none() {
                 format!("Install it ({})", crate::doctor::BWRAP_INSTALL_HINT)

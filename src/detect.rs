@@ -569,7 +569,7 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
                      ~/.npmrc is needed to install at all — without the grant the install \
                      fails with 401 (E401) rather than falling back. Grant it with the \
                      narrower `cplt config set allow.read \"~/.npmrc\"`, or with \
-                     `cplt config set sandbox.allow_build_credentials true` (personal \
+                     `cplt config set --force sandbox.allow_build_credentials true` (weakens the sandbox; personal \
                      config only), which also exposes ~/.gradle/gradle.properties and \
                      ~/.m2/settings.xml. pnpm cannot take the token from a project .npmrc, \
                      since it does not expand environment variables there."

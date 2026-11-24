@@ -4902,7 +4902,7 @@ fn start_proxy_if_enabled(
                 "conflicting options: proxy.forced ({}) requires the proxy, but it was \
                  explicitly disabled (--no-proxy or proxy.enabled = false). \
                  Remove one of them, or turn forced off with --no-proxy-forced or \
-                 `cplt config set proxy.forced false`.",
+                 `cplt config set --force proxy.forced false` (weakens the sandbox).",
                 resolved
                     .bool_layer("proxy", "forced")
                     .map_or_else(|| "set".to_string(), |l| l.to_string())
@@ -11839,7 +11839,7 @@ fn init_config() -> ExitCode {
             if can_force {
                 ui::info(
                     "proxy.forced = true: all traffic goes through the proxy. Turn it off with \
-                     `cplt config set proxy.forced false`.",
+                     `cplt config set --force proxy.forced false` (weakens the sandbox).",
                 );
             }
             ui::info("Edit it to customize sandbox defaults.");
