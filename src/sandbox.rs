@@ -981,6 +981,18 @@ fn validate_cache_exec_dirs(
     let mut granted = vec![(cache_base.clone(), actual_base.clone())];
     for subdir in config.allow_cache_exec {
         let named = cache_base.join(subdir);
+        let resolved = crate::config::canonicalize_deepest(&named);
+        let linked = resolved != actual_base.join(subdir);
+        // Before the app-root drop: with the key set, a link stops the launch.
+        if linked && config.refuse_cache_exec_links {
+            return Err(format!(
+                "allow_cache_exec path {} resolves through a symlink inside ~/.cache to \
+                 {}. sandbox.refuse_cache_exec_links is set, so cplt refuses a link the \
+                 sandbox could have planted. Replace the symlink with a real directory.",
+                named.display(),
+                resolved.display()
+            ));
+        }
         if let Some(root) = policy::under_refused_app_root(config.home_dir, &named) {
             crate::ui::warn(&format!(
                 "Not granting allow_cache_exec path {}: it is inside {}, which resolves \
@@ -990,17 +1002,7 @@ fn validate_cache_exec_dirs(
             ));
             continue;
         }
-        let resolved = crate::config::canonicalize_deepest(&named);
-        if resolved != actual_base.join(subdir) {
-            if config.refuse_cache_exec_links {
-                return Err(format!(
-                    "allow_cache_exec path {} resolves through a symlink inside ~/.cache to \
-                     {}. sandbox.refuse_cache_exec_links is set, so cplt refuses a link the \
-                     sandbox could have planted. Replace the symlink with a real directory.",
-                    named.display(),
-                    resolved.display()
-                ));
-            }
+        if linked {
             if let Some(why) = cache_exec_target_refusal(config, rules(), &resolved, &actual_base) {
                 return Err(format!(
                     "allow_cache_exec path {} resolves through a symlink to {}, and cplt will \
@@ -6382,6 +6384,15 @@ mod tests {
                     .iter()
                     .any(|(n, c)| *n == named || c.starts_with(&elsewhere)),
                 "{grants:?}"
+            );
+
+            // With sandbox.refuse_cache_exec_links set, the link still stops the launch.
+            config.refuse_cache_exec_links = true;
+            let base = std::cell::OnceCell::new();
+            let err = validate_cache_exec_dirs(&config, &base).unwrap_err();
+            assert!(
+                err.contains("sandbox.refuse_cache_exec_links is set"),
+                "{err}"
             );
         }
     }
