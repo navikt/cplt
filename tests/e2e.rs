@@ -12634,7 +12634,32 @@ mod agent_stubs {
         )
         .unwrap();
         commit("propose");
-        assert!(cplt(&["trust", "accept", "--all"]).status.success());
+        // `trust accept` now refuses a write grant over the state dir, so seed
+        // the value-pinned approval an older cplt would have written.
+        let seed_approval = |write: &str| {
+            let propose: cplt::repo_config::ProposeSection =
+                toml::from_str(&format!("[allow]\nwrite = [{write:?}]\n")).unwrap();
+            let mut entry = cplt::trust::TrustEntry::default();
+            entry.repo.remote =
+                cplt::trust::normalize_remote_url("https://github.com/acme/proj.git");
+            entry.repo.path = proj.display().to_string();
+            entry.repo.git_dir = std::fs::canonicalize(proj.join(".git"))
+                .unwrap()
+                .display()
+                .to_string();
+            cplt::trust::pin_keys(&mut entry.accepted, vec!["allow.write".into()], &propose);
+            assert!(
+                entry.accepted.keys == ["allow.write"],
+                "seeded approval should pin allow.write"
+            );
+            let file = cfg.join(format!(
+                "cplt/trust/{}.toml",
+                cplt::trust::repo_fingerprint(&proj)
+            ));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, toml::to_string(&entry).unwrap()).unwrap();
+        };
+        seed_approval("~/.config");
         std::fs::write(
             &global,
             format!("[allow]\nwrite = [{:?}]\n", cfg.to_str().unwrap()),
@@ -12655,7 +12680,10 @@ mod agent_stubs {
                 .success()
         );
         commit("drop");
-        assert!(cplt(&["trust", "accept", "--all"]).status.success());
+        assert!(
+            cplt(&["trust", "accept", "--all"]).status.success(),
+            "trust accept should succeed once the proposal is dropped"
+        );
 
         // The same proposal spelled as an absolute path: the printed `~/.config`
         // remedy still removes it.
@@ -12665,7 +12693,7 @@ mod agent_stubs {
         )
         .unwrap();
         commit("propose absolute");
-        assert!(cplt(&["trust", "accept", "--all"]).status.success());
+        seed_approval(cfg.to_str().unwrap());
         let err = launch_err(&[]);
         assert!(
             err.contains("`cplt config unset --repo allow.write ~/.config`"),
@@ -12683,7 +12711,10 @@ mod agent_stubs {
             "absolute-path proposal was not removed"
         );
         commit("drop absolute");
-        assert!(cplt(&["trust", "accept", "--all"]).status.success());
+        assert!(
+            cplt(&["trust", "accept", "--all"]).status.success(),
+            "trust accept should succeed once the proposal is dropped"
+        );
         assert!(
             cplt(&["config", "unset", "allow.write", "~/.config"])
                 .status
