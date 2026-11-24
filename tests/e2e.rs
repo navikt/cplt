@@ -12941,6 +12941,154 @@ mod agent_stubs {
         extra_args: &'static str,
     }
 
+    /// An env tool dir refused only by the positive rule (#1104) ends its
+    /// warning with a `cplt config set allow.write <dir>` line. Running that
+    /// line makes the next launch grant the dir. A protected, persistence or
+    /// cplt-state path, or `$HOME`, never gets the hint.
+    #[test]
+    fn e2e_env_tool_dir_hint_is_one_step() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-hint-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let proj = h.join("work/proj");
+        for d in [
+            "pnpm",
+            ".ssh/x",
+            "Library/LaunchAgents",
+            ".config/cplt/x",
+            "go/bin",
+        ] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let cmd = |var: &str, val: &std::path::Path| {
+            let mut c = cplt_cmd();
+            c.env_remove("CPLT_CONFIG")
+                .current_dir(&proj)
+                .env("HOME", &h)
+                .env("XDG_CONFIG_HOME", h.join(".config"))
+                .env("XDG_STATE_HOME", h.join(".local/state"))
+                .env("XDG_DATA_HOME", h.join(".local/share"))
+                .env("XDG_CACHE_HOME", h.join(".cache"))
+                .env("XDG_RUNTIME_DIR", h.join("run"))
+                // `~/bin` on PATH, as in a real shell: the hint skips PATH dirs.
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        h.join("bin").display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .env(var, val);
+            c
+        };
+        let warning = |var: &str, val: &std::path::Path| {
+            let out = cmd(var, val).arg("--print-profile").output().unwrap();
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .find(|l| l.contains(&format!("Ignoring {var} =")))
+                .map(str::to_string)
+        };
+        for (var, rel) in [
+            ("GOCACHE", ".ssh/x"),
+            ("GOCACHE", "Library/LaunchAgents"),
+            ("GOCACHE", ".config/cplt/x"),
+            ("GOCACHE", "go/bin"),
+            ("GOCACHE", ""),
+        ] {
+            let w = warning(var, &h.join(rel)).expect("the refusal should be reported");
+            assert!(!w.contains("config set"), "no grant hint for ~/{rel}: {w}");
+        }
+        // A symlinked PATH dir (`~/bin -> ~/tools`) is matched by identity,
+        // and a path `validate_sbpl_path` would reject later gets no hint.
+        std::fs::create_dir_all(h.join("tools")).unwrap();
+        std::os::unix::fs::symlink(h.join("tools"), h.join("bin")).unwrap();
+        std::fs::create_dir_all(h.join("pnpm(old)")).unwrap();
+        for rel in ["bin", "pnpm(old)"] {
+            let w = warning("PNPM_HOME", &h.join(rel)).expect("the refusal should be reported");
+            assert!(!w.contains("config set"), "no grant hint for ~/{rel}: {w}");
+        }
+        // The hint is shell-quoted (HOME may hold spaces), so split it with sh.
+        let split = |hint: &str| -> Vec<String> {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("for a in {hint}; do printf '%s\\0' \"$a\"; done"))
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(str::to_string)
+                .collect()
+        };
+        let hint_of = |w: &str| {
+            w.split_once("in one step: cplt ")
+                .map(|(_, rest)| rest.trim().to_string())
+                .expect("the warning should end with a one-step hint")
+        };
+        // JAVA_HOME gets the same one-step hint, read-only.
+        std::fs::create_dir_all(h.join("jdk")).unwrap();
+        std::fs::write(h.join("jdk/release"), "").unwrap();
+        let w = warning("JAVA_HOME", &h.join("jdk")).expect("JAVA_HOME=~/jdk should be refused");
+        assert_eq!(
+            split(&hint_of(&w)),
+            [
+                "config",
+                "set",
+                "allow.read",
+                h.join("jdk").to_str().unwrap()
+            ],
+            "JAVA_HOME hint: {w}"
+        );
+        // Following the read hint must silence the warning, not loop.
+        let args = split(&hint_of(&w));
+        assert!(
+            cmd("JAVA_HOME", &h.join("jdk"))
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            warning("JAVA_HOME", &h.join("jdk")),
+            None,
+            "the read grant should silence the JAVA_HOME warning"
+        );
+        let pnpm = h.join("pnpm");
+        let w = warning("PNPM_HOME", &pnpm).expect("PNPM_HOME=~/pnpm should be refused");
+        let args = split(&hint_of(&w));
+        assert_eq!(
+            args,
+            ["config", "set", "allow.write", pnpm.to_str().unwrap()]
+        );
+        assert!(
+            cmd("PNPM_HOME", &pnpm)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            warning("PNPM_HOME", &pnpm),
+            None,
+            "the grant should silence it"
+        );
+        let out = cmd("PNPM_HOME", &pnpm)
+            .args(["exec", "--", "/usr/bin/touch"])
+            .arg(pnpm.join("f"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the dir should be writable after the hint"
+        );
+        assert!(pnpm.join("f").exists());
+    }
+
     /// `GOCACHE=~/.config` is outside every env tool-dir root (#1104): it is
     /// dropped with a warning naming GOCACHE, and cplt's state dir stays
     /// unwritable (#1095).

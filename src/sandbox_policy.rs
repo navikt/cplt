@@ -3958,6 +3958,192 @@ pub fn env_tool_path_protected(home: &Path, path: &Path) -> Option<PathBuf> {
         })
 }
 
+/// First components under `$HOME` whose subtrees never get a paste-ready
+/// grant: personal data, app state and persistence points (`~/Library`).
+const ENV_TOOL_HINT_DENIED_TOP: &[&str] = &[
+    "library",
+    "applications",
+    "documents",
+    "desktop",
+    "downloads",
+    "pictures",
+    "music",
+    "movies",
+    "public",
+    "dropbox",
+    "icloud drive",
+    "onedrive",
+    "google drive",
+    "sites",
+];
+
+/// Path components that mark an exec, hook or autoload point anywhere below.
+const ENV_TOOL_HINT_DENIED_COMPONENTS: &[&str] = &[
+    "bin",
+    "sbin",
+    "shims",
+    "hooks",
+    ".git",
+    "launchagents",
+    "site-packages",
+    "startup",
+    "autostart",
+    "extensions",
+    "plugins",
+    "functions",
+    "completions",
+    "node_modules",
+    "conf.d",
+    "site-functions",
+    "pack",
+];
+
+/// Whether an env-set tool dir that failed only the positive rule may be
+/// offered back as a one-step `cplt config set allow.write <dir>` fix.
+///
+/// An allow-list, because a deny-list of persistence points never ends
+/// (`~/.cargo/bin`, shims, shell plugin dirs, `/opt/homebrew`, ...). A path
+/// is offered only when, both as spelled and resolved, it is strictly inside
+/// `$HOME`, its first component is a non-hidden dir outside the personal-data
+/// and `Library` set, no component is an exec/hook name, neither it nor an
+/// ancestor under `$HOME` is on `PATH`, it is not protected or cplt state,
+/// and it neither is, contains, nor is an ancestor of `roots` (the resolved
+/// project dir and every named repo root).
+///
+/// The component-name list is a deny list layered on that structure, so the
+/// residual is names it does not know: `lua`, `systemd` or a `node_modules`
+/// variant in a non-git app dir may still get a hint. Anything refused gets a
+/// grant hint without a path.
+#[must_use]
+pub fn env_tool_dir_hint_ok(home: &Path, path: &Path, roots: &[&Path]) -> bool {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let real = config::canonicalize_deepest(path);
+    env_tool_dir_hint_ok_with(home, path, &path_var)
+        && !roots.iter().any(|r| {
+            let r = config::canonicalize_deepest(r);
+            r.starts_with(&real) || real.starts_with(&r)
+        })
+}
+
+/// Entries scanned, and depth searched, for repos below a candidate dir.
+const REPO_SCAN_MAX_ENTRIES: usize = 2000;
+const REPO_SCAN_MAX_DEPTH: usize = 4;
+
+/// A repo, a bare repo, or a dir holding repos within `REPO_SCAN_MAX_DEPTH`:
+/// a write grant there reaches hooks and config of code the sandbox was not
+/// asked to touch. Fails closed: an unreadable dir or a hit scan bound counts
+/// as a repo area. Symlinks are never followed.
+fn looks_like_repo_area(dir: &Path) -> bool {
+    let mut budget = REPO_SCAN_MAX_ENTRIES;
+    repo_area_walk(dir, REPO_SCAN_MAX_DEPTH, &mut budget)
+}
+
+fn repo_area_walk(dir: &Path, depth: usize, budget: &mut usize) -> bool {
+    if dir.join(".git").symlink_metadata().is_ok()
+        || (dir.join("HEAD").exists() && dir.join("objects").is_dir() && dir.join("refs").is_dir())
+    {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        // Nothing there yet, so no repo either.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    for e in rd {
+        let Ok(e) = e else { return true };
+        if *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        // `DirEntry::file_type` does not follow symlinks.
+        let Ok(ft) = e.file_type() else { return true };
+        if ft.is_dir() && repo_area_walk(&e.path(), depth - 1, budget) {
+            return true;
+        }
+    }
+    false
+}
+
+fn env_tool_dir_hint_ok_with(home: &Path, path: &Path, path_var: &std::ffi::OsStr) -> bool {
+    // Lossy conversion would print a different path than the one refused.
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    // The printed command must survive `Config::merge`, which refuses these.
+    if text.escape_debug().to_string() != text
+        || validate_sbpl_path(path).is_err()
+        || !tool_override_path_is_safe(path, home)
+        || env_tool_path_protected(home, path).is_some()
+    {
+        return false;
+    }
+    let Ok(home_real) = std::fs::canonicalize(home) else {
+        return false;
+    };
+    // `HOME=/` or `HOME=/Users` would make every system dir "inside home".
+    if home_real.components().count() < 3 {
+        return false;
+    }
+    let real = config::canonicalize_deepest(path);
+    let rel_ok = |p: &Path, h: &Path| {
+        let Ok(rel) = p.strip_prefix(h) else {
+            return false;
+        };
+        let comps: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        let Some(first) = comps.first() else {
+            return false; // `$HOME` itself
+        };
+        !first.starts_with("onedrive - ")
+            && !ENV_TOOL_HINT_DENIED_TOP.contains(&first.as_str())
+            && comps.iter().all(|c| {
+                c != ".."
+                    && !c.starts_with('.')
+                    && !ENV_TOOL_HINT_DENIED_COMPONENTS.contains(&c.as_str())
+            })
+    };
+    if !rel_ok(&real, &home_real) {
+        return false;
+    }
+    // The spelling, too: `~/go/bin -> ~/tools/x` still reads as a bin dir.
+    let spelled_home = if path.starts_with(home) {
+        home
+    } else {
+        &home_real
+    };
+    if !rel_ok(path, spelled_home) {
+        return false;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let on_path: Vec<PathBuf> = std::env::split_paths(path_var)
+        .filter(|p| p.is_absolute())
+        .map(|p| config::canonicalize_deepest(&p))
+        .collect();
+    let ids: Vec<_> = on_path.iter().filter_map(|p| id(p)).collect();
+    // Inside a work tree, or a repo area itself.
+    if looks_like_repo_area(&real)
+        || real
+            .ancestors()
+            .take_while(|a| *a != home_real)
+            .any(|a| a.join(".git").symlink_metadata().is_ok())
+    {
+        return false;
+    }
+    // A PATH dir inside the grant is as bad as the grant inside a PATH dir.
+    !on_path.iter().any(|p| p.starts_with(&real))
+        && !real
+            .ancestors()
+            .take_while(|a| *a != home_real)
+            .any(|a| on_path.iter().any(|p| p == a) || id(a).is_some_and(|i| ids.contains(&i)))
+}
+
 /// Validate that a path is safe for interpolation into SBPL profile strings.
 /// Returns an error if the path contains characters that could break or inject SBPL rules.
 pub fn validate_sbpl_path(path: &Path) -> Result<(), String> {
@@ -4892,6 +5078,207 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn env_tool_dir_hint_refuses_dangling_persistence_link() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(h.join("tools")).unwrap();
+        std::os::unix::fs::symlink(h.join("tools/future-bin"), h.join("bin")).unwrap();
+        let path_var = std::ffi::OsString::from(h.join("bin"));
+        assert!(!env_tool_dir_hint_ok_with(&h, &h.join("tools"), &path_var));
+        assert!(!env_tool_dir_hint_ok_with(
+            &h,
+            &h.join("tools/future-bin"),
+            &path_var
+        ));
+        assert!(env_tool_dir_hint_ok_with(
+            &h,
+            &h.join("elsewhere"),
+            &path_var
+        ));
+    }
+
+    /// Every persistence or exec point the review found under the old
+    /// deny-list (#1125) gets no paste-ready path; plain tool dirs do.
+    #[cfg(unix)]
+    #[test]
+    fn env_tool_dir_hint_is_an_allow_list() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let none = std::ffi::OsString::new();
+        for rel in [
+            ".cargo/bin",
+            "go/bin",
+            ".npm-global/bin",
+            ".bun/bin",
+            ".deno/bin",
+            ".volta/bin",
+            ".krew/bin",
+            ".pyenv/shims",
+            ".rbenv/shims",
+            ".asdf/shims",
+            ".oh-my-zsh/custom",
+            ".zsh",
+            ".zfunc",
+            ".vscode",
+            ".vscode/extensions",
+            ".cursor",
+            ".claude",
+            ".copilot",
+            ".codex",
+            ".githooks",
+            ".git-templates/hooks",
+            ".ipython/profile_default/startup",
+            ".local/lib/python3.12/site-packages",
+            "Library/Python/3.12/lib/python/site-packages",
+            "Library/Keychains",
+            "Library/Services",
+            "Library/Scripts",
+            "Library/Application Scripts",
+            "Library/Mail",
+            "Library/Mail/Messages",
+            "Library/Safari",
+            "Library/LaunchAgents",
+            "Library/Mobile Documents",
+            "Applications",
+            "Documents",
+            "Desktop/x",
+            "Downloads",
+            "iCloud Drive",
+            "Dropbox/x",
+            "bin",
+            ".local/bin",
+            ".config/x",
+            "tools/autostart",
+            "src/repo/.git",
+            "Projects/x/.husky",
+            "src/repo/.githooks",
+            "code/node_modules/.bin",
+            "work/.vscode",
+            "src/repo/.github/workflows",
+            "src/repo/.devcontainer",
+            "tools/plugins",
+            "tools/functions",
+            "tools/completions",
+            "tools/node_modules",
+            "tools/conf.d",
+            "tools/site-functions",
+            "tools/pack",
+            "OneDrive",
+            "OneDrive - Nav/x",
+            "Google Drive/x",
+            "Sites",
+            "src/repo",
+            "src/repo/sub",
+            "src/bare.git",
+            "src",
+            "",
+        ] {
+            if rel.starts_with("src/") || rel == "src" {
+                std::fs::create_dir_all(h.join("src/repo/sub")).unwrap();
+                std::fs::create_dir_all(h.join("src/repo/.git")).unwrap();
+                let b = h.join("src/bare.git");
+                std::fs::create_dir_all(b.join("objects")).unwrap();
+                std::fs::create_dir_all(b.join("refs")).unwrap();
+                std::fs::write(b.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            }
+            assert!(
+                !env_tool_dir_hint_ok_with(&h, &h.join(rel), &none),
+                "~/{rel}"
+            );
+        }
+        for abs in [
+            "/opt/homebrew",
+            "/opt/homebrew/bin",
+            "/usr/local",
+            "/usr/local/bin",
+            "/Library/LaunchAgents",
+            "/private/etc",
+            "/Users/Shared",
+            "/",
+        ] {
+            assert!(
+                !env_tool_dir_hint_ok_with(&h, Path::new(abs), &none),
+                "{abs}"
+            );
+        }
+        // On PATH, or under a dir on PATH.
+        std::fs::create_dir_all(h.join("tools/gobin/sub")).unwrap();
+        let p = std::ffi::OsString::from(h.join("tools/gobin"));
+        assert!(!env_tool_dir_hint_ok_with(&h, &h.join("tools/gobin"), &p));
+        assert!(!env_tool_dir_hint_ok_with(
+            &h,
+            &h.join("tools/gobin/sub"),
+            &p
+        ));
+        for rel in ["pnpm", "tools/gocache", "sdk/jdk-21"] {
+            assert!(env_tool_dir_hint_ok_with(&h, &h.join(rel), &p), "~/{rel}");
+        }
+    }
+
+    #[test]
+    fn env_tool_dir_hint_refuses_project_repo_roots_and_their_ancestors() {
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        for d in ["work/proj/sub", "other/tool", "repos/r1", "pnpm"] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        let proj = h.join("work/proj");
+        let repo = h.join("repos/r1");
+        let roots: [&Path; 2] = [&proj, &repo];
+        // Equal, ancestor, descendant of a root.
+        for rel in ["work/proj", "work", "work/proj/sub", "repos/r1", "repos"] {
+            assert!(!env_tool_dir_hint_ok(&h, &h.join(rel), &roots), "~/{rel}");
+        }
+        // Unrelated dirs still hint, whatever the cwd is.
+        for rel in ["pnpm", "other/tool"] {
+            assert!(env_tool_dir_hint_ok(&h, &h.join(rel), &roots), "~/{rel}");
+        }
+    }
+
+    #[test]
+    fn env_tool_dir_hint_refuses_deep_repo_layout_and_hit_bound() {
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::create_dir_all(h.join("deep/github.com/org/repo/.git")).unwrap();
+        std::fs::create_dir_all(h.join("clean/a/b/c")).unwrap();
+        let none = std::ffi::OsString::new();
+        assert!(!env_tool_dir_hint_ok_with(&h, &h.join("deep"), &none));
+        assert!(env_tool_dir_hint_ok_with(&h, &h.join("clean"), &none));
+        // A symlink to a repo is not followed, so it is no repo area.
+        std::os::unix::fs::symlink(h.join("deep"), h.join("clean/a/link")).unwrap();
+        assert!(env_tool_dir_hint_ok_with(&h, &h.join("clean"), &none));
+        // Over the entry cap: fail closed.
+        let big = h.join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..=REPO_SCAN_MAX_ENTRIES {
+            std::fs::create_dir(big.join(format!("d{i}"))).unwrap();
+        }
+        assert!(!env_tool_dir_hint_ok_with(&h, &big, &none));
+    }
+
+    #[test]
+    fn env_tool_dir_hint_refuses_unreadable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let d = h.join("locked");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::read_dir(&d).is_err(); // false when running as root
+        let none = std::ffi::OsString::new();
+        let ok = env_tool_dir_hint_ok_with(&h, &d, &none);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!denied || !ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_tool_dir_hint_refuses_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let bad = h.join(std::ffi::OsStr::from_bytes(b"t\xffools"));
+        assert!(!env_tool_dir_hint_ok(&h, &bad, &[]));
+    }
+
     /// The pinned-state line touches no state file before validation: a
     /// planted symlink or FIFO there must not be written to or block.
     #[test]

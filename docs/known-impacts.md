@@ -351,14 +351,33 @@ SDK vars such as `JAVA_HOME` may also point at a known SDK root (`~/.sdkman`,
 `.envrc` can set these variables, so a dir elsewhere is refused with a warning:
 
 ```text
-Ignoring GOPATH = /Users/you/work/gopath: an env-set tool dir is granted only when ...
+Ignoring GOPATH = /Users/you/work/gopath: an env-set tool dir is granted only when ... Move it there, or grant it in one step: cplt config set allow.write /Users/you/work/gopath
 ```
 
-To keep using it, do one of these:
+The warning ends with the command to run (`allow.read` for an SDK). Run it
+once and the next launch grants the dir (#1104). Or move the dir under
+`~/.cache`, for example `GOPATH=~/.cache/gopath`.
 
-- Move it under `~/.cache`, for example `GOPATH=~/.cache/gopath`.
-- Grant it once: `cplt config set allow.write ~/work/gopath` (or `allow.read`
-  for an SDK).
+The paste-ready command is printed only for a plain tool dir: strictly inside
+your home, under a first-level dir that is not hidden (`~/.cargo`, `~/.config`
+and the like) and not `~/Library`, `~/Applications`, `~/Documents`,
+`~/Desktop`, `~/Downloads` or another personal-data dir, with no path component
+named `bin`, `sbin`, `shims`, `hooks`, `.git`, `LaunchAgents`,
+`site-packages`, `startup`, `autostart` or `extensions`, not on your `PATH` or
+under a dir on it, and not protected. For `allow.read` the dir must also look
+like the SDK (`bin/java` or `release` for `JAVA_HOME`, `dotnet` for
+`DOTNET_ROOT`). Anything else, including every dir outside your home, gets the
+warning without a path: grant it by hand only if you mean to.
+
+The path is also withheld when it is, contains or sits inside the project dir
+or a named repo (`--project-dir`, `--repo-dir`), and when a git repo or bare
+repo sits within four levels below it (the scan is capped at 2000 entries; a dir
+that is unreadable or hits the cap gets no path). The component names
+`node_modules`, `conf.d`, `site-functions`, `pack`, `plugins`, `functions` and
+`completions` are refused as well. That name list is a deny list on top of the
+allow-list structure above, so it has a residual: other names that load code,
+such as `lua` or `systemd`, still get a path when they sit in a non-git app dir
+under your home.
 
 ## cplt's state directory inside a writable tree (behaviour change)
 
