@@ -722,6 +722,87 @@ fn profile_tail(
     Ok((before, tail))
 }
 
+/// Runs inside the sandbox as `sh -c RUN_WRAPPER <opencode> run …`: start the
+/// session service, then `exec` into `run` so SIGTERM/SIGHUP forwarded to the
+/// child reach it directly. The service is not stopped here: it shuts itself
+/// down within 5 s once its registration (in the session scratch dir) is
+/// gone, which cplt removes at exit.
+const RUN_WRAPPER: &str = "\"$0\" service start >/dev/null || exit $?; exec \"$0\" \"$@\"";
+
+/// OpenCode global flags that take no value, and those that take one.
+const GLOBAL_FLAGS: [&str; 2] = ["--print-logs", "--pure"];
+const GLOBAL_VALUE_FLAGS: [&str; 1] = ["--log-level"];
+/// `run` flags that take a separate value.
+const RUN_VALUE_FLAGS: [&str; 12] = [
+    "-m",
+    "--model",
+    "--agent",
+    "-s",
+    "--session",
+    "--format",
+    "-f",
+    "--file",
+    "--dir",
+    "--title",
+    "--variant",
+    "--port",
+];
+
+/// Whether `args` is `[known global flags] run [flags] prompt…` that should be
+/// wrapped. Unknown global flags, `--server`/`--standalone` and help before
+/// the prompt or `--` leave the launch alone.
+fn wants_service(args: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        let a = a.as_str();
+        if GLOBAL_FLAGS.contains(&a) {
+            i += 1;
+        } else if GLOBAL_VALUE_FLAGS.contains(&a) {
+            i += 2;
+        } else if a.starts_with("--log-level=") {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if args.get(i).map(String::as_str) != Some("run") {
+        return false;
+    }
+    let mut it = args[i + 1..].iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        match a {
+            "--" => break,
+            "--standalone" | "--server" | "-h" | "--help" => return false,
+            _ if a.starts_with("--server=") => return false,
+            _ if RUN_VALUE_FLAGS.contains(&a) => {
+                it.next();
+            }
+            _ if a.starts_with('-') => {}
+            _ => break,
+        }
+    }
+    true
+}
+
+/// The program and arguments for a v2 launch (#1138).
+///
+/// From 2.2, `opencode run` never starts the background service: with no
+/// registered one it spawns a private `serve --port 0` and talks to it on a
+/// random loopback port. The profile opens loopback to the session port only,
+/// so that connect fails with `Transport: EPERM`, and opening every loopback
+/// port would reopen the SSRF path the localhost deny closes. So cplt starts
+/// the session's own service first (the one the TUI starts by itself), and
+/// `run` finds it through the session's registration. `--server` and
+/// `--standalone` are the user's explicit choice and are left alone.
+pub fn launch(bin: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    if !wants_service(args) {
+        return (bin.to_path_buf(), args.to_vec());
+    }
+    let mut out = vec!["-c".into(), RUN_WRAPPER.into(), bin.display().to_string()];
+    out.extend(args.iter().cloned());
+    (PathBuf::from("/bin/sh"), out)
+}
+
 /// Host-side notes for a v2 launch, read by cplt and never passed into the
 /// sandbox:
 ///
@@ -994,6 +1075,85 @@ fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_starts_the_session_service_first() {
+        let bin = Path::new("/x/opencode");
+        let a = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let (prog, args) = launch(bin, &a(&["run", "hi"]));
+        assert_eq!(prog, Path::new("/bin/sh"));
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("service start") && args[1].contains("exec \"$0\""));
+        assert!(!args[1].contains("service stop"));
+        assert_eq!(&args[2..], &a(&["/x/opencode", "run", "hi"])[..]);
+        for keep in [
+            &["run", "--server", "u"][..],
+            &["run", "--server=u"],
+            &["run", "--standalone"],
+            &["run", "--help"],
+            &["run", "-h"],
+            &["--print-logs", "--bogus", "run", "hi"],
+            &[],
+            &["serve"],
+        ] {
+            assert_eq!(
+                launch(bin, &a(keep)),
+                (bin.to_path_buf(), a(keep)),
+                "{keep:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_after_global_flags_and_prompt_flags() {
+        let bin = Path::new("/x/opencode");
+        let a = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for wrap in [
+            &["--print-logs", "run", "hi"][..],
+            &["--log-level", "DEBUG", "run", "hi"],
+            &["run", "-m", "p/m", "hi"],
+            &["run", "hi", "--server", "u"],
+            &["run", "--", "--standalone"],
+            &["run", "-m", "--server", "hi"],
+        ] {
+            assert_eq!(launch(bin, &a(wrap)).0, Path::new("/bin/sh"), "{wrap:?}");
+        }
+    }
+
+    /// Stub only: the wrapper must hand SIGTERM to `run` itself, not stop at `sh`.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test drives /bin/sh with a stub binary
+    fn run_receives_sigterm_sent_to_the_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = tmp.path().join("opencode");
+        let mark = tmp.path().join("got-term");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = service ] && exit 0\n\
+                 trap 'echo term > {}; exit 0' TERM\n\
+                 echo ready > {}/ready\n\
+                 while :; do sleep 0.1; done\n",
+                mark.display(),
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (prog, args) = launch(&stub, &["run".to_string(), "hi".to_string()]);
+        let mut child = std::process::Command::new(prog).args(args).spawn().unwrap();
+        for _ in 0..100 {
+            if tmp.path().join("ready").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(tmp.path().join("ready").exists(), "stub run never started");
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        child.wait().unwrap();
+        assert!(mark.exists(), "run did not receive SIGTERM");
+    }
+
     use super::*;
 
     #[test]

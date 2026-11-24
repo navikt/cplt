@@ -12053,6 +12053,30 @@ paths = [
             assert!(!err.contains("issues/710"), "{err}");
         }
 
+        /// #1138: v2.2+ `run` never starts the service and falls back to a
+        /// private server on a random loopback port, which the profile denies.
+        /// cplt starts the session service first, inside the sandbox, then
+        /// execs into `run`, whose exit code survives. It does not stop the
+        /// service: that shuts itself down once cplt removes its registration.
+        #[test]
+        fn run_starts_the_session_service_first() {
+            require_sandbox!();
+            let home = home();
+            let stub = home.bin.join("opencode");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\ncase \"$1\" in\n--version) echo opencode v2.3.2;;\n\
+                 service) echo \"$2\" >> calls;;\nrun) echo run >> calls; exit 7;;\nesac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let o = home.cmd(&["--", "run", "hi"]).output().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert_eq!(o.status.code(), Some(7), "{err}");
+            let calls = std::fs::read_to_string(home.proj.join("calls")).unwrap();
+            assert_eq!(calls, "start\nrun\n", "{err}");
+        }
+
         #[test]
         fn env_points_at_the_private_session() {
             require_sandbox!();

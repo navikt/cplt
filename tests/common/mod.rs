@@ -148,6 +148,9 @@ pub fn with_scratch_home(cmd: &mut Command) {
     for tv in cplt::sandbox::TOOL_PATH_ENV_VARS {
         cmd.env_remove(tv.name);
     }
+    // Read-only SDK dirs are checked separately from TOOL_PATH_ENV_VARS, and a
+    // CI runner's JAVA_HOME lies outside the scratch HOME, so cplt would warn.
+    cmd.env_remove("JAVA_HOME").env_remove("DOTNET_ROOT");
 }
 
 /// The checkout, canonicalized: the tree the suites build fixtures in when
@@ -226,6 +229,12 @@ pub fn with_real_home(cmd: &mut Command) {
     let xdg = scratch_home().join(".config");
     std::fs::create_dir_all(xdg.join("cplt/launch")).expect("scratch launch dir");
     cmd.env("HOME", real_home()).env("XDG_CONFIG_HOME", xdg);
+    // Real toolchains need their real SDK dirs: undo the scratch-HOME removal.
+    for var in ["JAVA_HOME", "DOTNET_ROOT"] {
+        if let Some(v) = std::env::var_os(var) {
+            cmd.env(var, v);
+        }
+    }
 }
 
 /// A cplt PATH shim (#514) run directly, isolated the way [`cplt_cmd`] is: the
