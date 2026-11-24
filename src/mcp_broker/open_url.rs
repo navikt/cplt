@@ -473,7 +473,9 @@ fn serve_with(
             }
             Some(Err(e)) => {
                 note(format!("FAIL {e}"));
-                "failed: the host opener did not open the URL".to_string()
+                format!(
+                    "failed: the host opener did not open the URL ({e}). Copy the URL into your browser yourself."
+                )
             }
             None => {
                 limiter.busy.store(false, Ordering::Release);
@@ -507,12 +509,31 @@ fn opener_env(
 /// `open` treat the argument as a URL, never a file path; cwd `/` keeps a
 /// relative path from resolving into the project. Frees the slot on return.
 fn run_opener(opener: &Path, url: &str, home: &Path, busy: &AtomicBool) -> std::io::Result<()> {
-    let status = opener_command(opener, url, home).status();
+    let out = opener_command(opener, url, home).output();
     busy.store(false, Ordering::Release);
-    match status? {
-        s if s.success() => Ok(()),
-        s => Err(std::io::Error::other(format!("opener exited with {s}"))),
+    let out = out?;
+    if out.status.success() {
+        return Ok(());
     }
+    // #1158: `open`'s own reason (LaunchServices error) goes into the log and
+    // the one-line reply, without the URL (its query carries OAuth state) and
+    // without control bytes, which would break the line protocol.
+    let why: String = String::from_utf8_lossy(&out.stderr)
+        .replace(url, "<url>")
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect();
+    Err(std::io::Error::other(if why.is_empty() {
+        format!("opener exited with {}", out.status)
+    } else {
+        format!("opener exited with {}: {why}", out.status)
+    }))
 }
 
 fn opener_command(opener: &Path, url: &str, home: &Path) -> Command {
@@ -527,7 +548,7 @@ fn opener_command(opener: &Path, url: &str, home: &Path) -> Command {
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     cmd
 }
 
@@ -541,39 +562,37 @@ pub fn run(url: &str) -> ExitCode {
             .collect();
         return match print_link(url, &hosts) {
             Ok(line) => {
-                eprintln!("{line}");
-                // npm `open` spawns xdg-open with stdio ignored, so stderr is
-                // lost there; the terminal, if the process still has one, is not.
-                if !std::io::stderr().is_terminal()
-                    && let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty")
-                {
-                    let _ = writeln!(tty, "{line}");
-                }
+                show(&line);
                 // Nothing was opened. A nonzero exit lets OpenCode 1.19 report
                 // the open as failed (mcp.browser.open.failed) instead of
                 // waiting on a browser that never appears.
                 ExitCode::FAILURE
             }
             Err(line) => {
-                eprintln!("{line}");
+                show(&line);
                 ExitCode::FAILURE
             }
         };
     }
     let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|s| !s.is_empty()) else {
-        eprintln!("cplt mcp-open-url: {SOCKET_ENV} is not set; run inside a cplt session");
+        show(&format!(
+            "cplt mcp-open-url: {SOCKET_ENV} is not set; run inside a cplt session"
+        ));
         return ExitCode::FAILURE;
     };
     // A newline would end the line protocol early; the broker refuses it too.
     if url.contains(['\n', '\r']) {
-        eprintln!("cplt mcp-open-url: denied: URL must be printable ASCII");
+        show("cplt mcp-open-url: denied: URL must be printable ASCII");
         return ExitCode::FAILURE;
     }
     let Ok(mut stream) = UnixStream::connect(&socket) else {
-        eprintln!("cplt mcp-open-url: cannot reach the broker; open this URL yourself: {url}");
+        show(&format!(
+            "cplt mcp-open-url: cannot reach the broker; open this URL yourself: {url}"
+        ));
         return ExitCode::FAILURE;
     };
     if write!(stream, "{OP_LINE}\n{url}\n").is_err() {
+        show("cplt mcp-open-url: cannot reach the broker; open the URL yourself");
         return ExitCode::FAILURE;
     }
     let mut answer = String::new();
@@ -581,9 +600,23 @@ pub fn run(url: &str) -> ExitCode {
     match answer.trim_end() {
         "ok" => ExitCode::SUCCESS,
         other => {
-            eprintln!("cplt mcp-open-url: {other}");
+            show(&format!("cplt mcp-open-url: {other}"));
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Print to stderr, and to the terminal when stderr is not one: npm `open`
+/// (OpenCode) spawns the opener with stdio ignored and drops its exit status,
+/// so a refusal on stderr alone is never seen (#1158).
+fn show(line: &str) {
+    show_to(line, std::io::stderr().is_terminal(), Path::new("/dev/tty"));
+}
+
+fn show_to(line: &str, stderr_is_tty: bool, tty: &Path) {
+    eprintln!("{line}");
+    if !stderr_is_tty && let Ok(mut t) = std::fs::OpenOptions::new().write(true).open(tty) {
+        let _ = writeln!(t, "{line}");
     }
 }
 
@@ -603,7 +636,8 @@ fn print_link(url: &str, hosts: &[String]) -> Result<String, String> {
     }
 }
 
-/// The shim script. One `https://` argument goes to the broker; anything
+/// The shim script. One `https://` argument, alone or after `-u` or `--`,
+/// goes to the broker; anything
 /// else runs the real opener, if there is one, as before.
 #[must_use]
 pub fn shim_script(cplt: &str, socket: &str, hosts: &[String], real: Option<&str>) -> String {
@@ -613,8 +647,9 @@ pub fn shim_script(cplt: &str, socket: &str, hosts: &[String], real: Option<&str
     };
     format!(
         "#!/bin/sh\n\
-         if [ \"$#\" -eq 1 ]; then case \"$1\" in https://*) \
-         exec env {SOCKET_ENV}={} {HOSTS_ENV}={} {} mcp-open-url \"$1\" ;; esac; fi\n\
+         case \"$#:$1\" in 1:*) u=$1 ;; 2:-u|2:--) u=$2 ;; *) u= ;; esac\n\
+         case \"$u\" in https://*) \
+         exec env {SOCKET_ENV}={} {HOSTS_ENV}={} {} mcp-open-url \"$u\" ;; esac\n\
          {fallback}\n",
         sh_quote(socket),
         sh_quote(&hosts.join(",")),
@@ -1362,7 +1397,7 @@ mod tests {
     #[test]
     fn shim_forwards_one_https_url_and_quotes_paths() {
         let s = shim_script("/opt/c'p", "/tmp/s", &hosts(), Some("/usr/bin/open"));
-        assert!(s.contains("'/opt/c'\\''p' mcp-open-url \"$1\""), "{s}");
+        assert!(s.contains("'/opt/c'\\''p' mcp-open-url \"$u\""), "{s}");
         assert!(s.contains("CPLT_MCP_SOCKET='/tmp/s'"), "{s}");
         assert!(
             s.contains(&format!("CPLT_OPEN_URL_HOSTS='{}'", hosts().join(","))),
@@ -1370,6 +1405,79 @@ mod tests {
         );
         assert!(s.contains("exec '/usr/bin/open' \"$@\""), "{s}");
         assert!(shim_script("c", "s", &[], None).contains("exit 1"));
+    }
+
+    /// #1158: npm `open` passes `-u`/`--` forms too; only one https URL after
+    /// them goes to the broker, every other form reaches the real opener.
+    #[test]
+    fn shim_accepts_dash_u_and_double_dash() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("cplt");
+        let real = dir.path().join("real");
+        std::fs::write(&fake, "#!/bin/sh\necho broker \"$@\"\n").unwrap();
+        std::fs::write(&real, "#!/bin/sh\necho real \"$@\"\n").unwrap();
+        let shim = dir.path().join("open");
+        let script = shim_script(
+            &fake.to_string_lossy(),
+            "/s",
+            &[],
+            Some(&real.to_string_lossy()),
+        );
+        std::fs::write(&shim, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&fake, &real, &shim] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let run = |args: &[&str]| {
+            #[allow(clippy::disallowed_methods)] // test: the shim just written
+            let out = Command::new(&shim).args(args).output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let u = "https://a.example/";
+        for args in [vec![u], vec!["-u", u], vec!["--", u]] {
+            assert_eq!(run(&args), format!("broker mcp-open-url {u}\n"), "{args:?}");
+        }
+        for args in [
+            vec!["-a", u],
+            vec!["-u", "http://a.example/"],
+            vec!["-u", u, "x"],
+            vec!["-n", u],
+            vec!["file.txt"],
+        ] {
+            assert_eq!(run(&args), format!("real {}\n", args.join(" ")), "{args:?}");
+        }
+    }
+
+    /// #1158: a failing opener's own stderr reaches the reply, minus the URL.
+    #[test]
+    fn opener_failure_carries_its_stderr_without_the_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = dir.path().join("o");
+        std::fs::write(
+            &o,
+            "#!/bin/sh\necho \"LSOpen failed -54 for $2\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&o, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let busy = AtomicBool::new(true);
+        let e = run_opener(&o, "https://a.example/?state=s", Path::new("/h"), &busy)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("LSOpen failed -54 for <url>"), "{e}");
+        assert!(!e.contains("state=s") && !e.contains('\n'), "{e}");
+    }
+
+    /// #1158: with stderr not a terminal, the line still reaches the tty.
+    #[test]
+    fn show_writes_the_tty_when_stderr_is_not_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let tty = dir.path().join("tty");
+        std::fs::write(&tty, "").unwrap();
+        show_to("denied: x", true, &tty);
+        assert_eq!(std::fs::read_to_string(&tty).unwrap(), "");
+        show_to("denied: x", false, &tty);
+        assert_eq!(std::fs::read_to_string(&tty).unwrap(), "denied: x\n");
     }
 
     #[test]
