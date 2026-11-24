@@ -327,6 +327,27 @@ pub fn load_managed_from(
         )
     })?;
     let rel = canonical.strip_prefix(&trusted).map_err(|_| under())?;
+    // The post-session check cannot list a dir its owner cannot read, so an
+    // edit below one would go unseen: refuse it rather than trust it.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Some(d) = canonical
+            .ancestors()
+            .skip(1)
+            .take_while(|d| d.starts_with(&trusted))
+            .find(|d| {
+                std::fs::symlink_metadata(d).is_ok_and(|m| m.permissions().mode() & 0o400 == 0)
+            })
+        {
+            return Err(refuse(
+                &format!(
+                    "the directory {} is not readable by you, so cplt cannot check it after a session",
+                    esc(&d.to_string_lossy())
+                ),
+                &format!("Run: chmod u+r {}", q(d)),
+            ));
+        }
+    }
     if rel.iter().any(|c| {
         c.as_encoded_bytes()
             .starts_with(QUARANTINE_PREFIX.as_bytes())
@@ -622,9 +643,11 @@ pub struct ManagedSnapshot {
     held: Vec<(std::fs::File, u32)>,
     /// `lstat` of the path before: an unchanged stow-style link is no news.
     lstat: Option<(u64, u64)>,
-    /// `lstat` of every dir from below home down to `managed.d` before the
-    /// session, so an unopenable dir can be told apart from one it planted.
+    /// `lstat` of every dir from `/` down to `managed.d` before the session,
+    /// so an unopenable dir can be told apart from one it planted.
     chain: BTreeMap<PathBuf, Key>,
+    /// The canonical home: only dirs strictly below it are ever moved aside.
+    home: PathBuf,
 }
 
 /// (dev, ino, mode, mtime ns, ctime ns): a dir with the same key was not
@@ -652,7 +675,6 @@ impl ManagedSnapshot {
         let path = canon.join(TRUSTED_DIR);
         let chain = path
             .ancestors()
-            .take_while(|p| *p != canon && p.starts_with(&canon))
             .filter_map(|p| Some((p.to_path_buf(), key(p)?)))
             .collect();
         let before = open_dir(&path).map(|(_, f, id)| (id, scan(&f)));
@@ -664,6 +686,7 @@ impl ManagedSnapshot {
             held,
             lstat,
             chain,
+            home: canon,
         }
     }
 
@@ -691,6 +714,10 @@ impl ManagedSnapshot {
                         e.raw_os_error(),
                         Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR)
                     )
+                    // Never home or above: those are the user's (or root's),
+                    // not the state dir, and the loader cannot reach through them either.
+                    && at.starts_with(&self.home)
+                    && at != self.home
                 {
                     let now = key(&at);
                     return (now.is_none() || self.chain.get(&at) != now.as_ref())
@@ -713,8 +740,9 @@ impl ManagedSnapshot {
                 };
                 let mut names: Vec<&OsStr> = new
                     .iter()
-                    // A second hard link to a file is a way back in for a later session.
-                    .filter(|(rel, e)| old.get(*rel) != Some(e) || (e.5.is_some() && e.3 > 1))
+                    // A planted hard link changes nlink, so the entry differs. One
+                    // that predates the session is not its doing; the loader refuses it.
+                    .filter(|(rel, e)| old.get(*rel) != Some(e))
                     .filter_map(|(rel, _)| rel.iter().next())
                     .collect();
                 names.dedup();
@@ -899,6 +927,12 @@ fn walk(path: &Path) -> Result<(std::fs::File, std::fs::File, (u64, u64)), Optio
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::MetadataExt as _;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    // A dir the owner may search but not list (0300, or a root-owned 0711
+    // `/home`) is still walked through, so it hides nothing below it.
+    #[cfg(target_os = "linux")]
+    let search = libc::O_PATH | libc::O_DIRECTORY;
+    #[cfg(not(target_os = "linux"))]
+    let search = libc::O_SEARCH;
     let mut parent = None;
     let mut cur = open_nofollow(libc::AT_FDCWD, OsStr::new("/"), flags).map_err(|_| None)?;
     let mut at = PathBuf::from("/");
@@ -909,6 +943,13 @@ fn walk(path: &Path) -> Result<(std::fs::File, std::fs::File, (u64, u64)), Optio
         at.push(name);
         let next = match open_nofollow(cur.as_raw_fd(), name, flags) {
             Ok(n) => n,
+            // Not the last: managed.d itself must be listable for the scan.
+            Err(e) if e.raw_os_error() == Some(libc::EACCES) && at != path => {
+                match open_nofollow(cur.as_raw_fd(), name, search) {
+                    Ok(n) => n,
+                    Err(e) => return Err(Some((std::fs::File::from(cur), at, e))),
+                }
+            }
             Err(e) => return Err(Some((std::fs::File::from(cur), at, e))),
         };
         parent = Some(std::mem::replace(&mut cur, next));
@@ -1851,6 +1892,72 @@ mod tests {
         h.refused(f.as_os_str(), &[], "more than one hard link");
         assert!(snap.finish().is_some());
         assert!(!d.join("nav-pilot.toml").exists());
+    }
+
+    /// Fable on #1126: a dir at or above home that will not open (a 0311 or
+    /// 0711 parent, or one made 000) is never moved aside or chmodded.
+    #[test]
+    fn snapshot_never_touches_home_or_above() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        for (before, after) in [(0o311, 0o311), (0o711, 0o711), (0o755, 0o000)] {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("homes");
+            let home = parent.join("me");
+            std::fs::create_dir_all(home.join(TRUSTED_DIR)).unwrap();
+            write(&home.join(TRUSTED_DIR), "nav-pilot.toml", GOOD);
+            mode(&parent, before).unwrap();
+            let snap = ManagedSnapshot::take(&home);
+            mode(&parent, after).unwrap();
+            let line = snap.finish();
+            mode(&parent, 0o755).unwrap();
+            let names: Vec<_> = std::fs::read_dir(root.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert_eq!(names, ["homes"], "{before:o}->{after:o}: {line:?}");
+            assert!(home.join(TRUSTED_DIR).join("nav-pilot.toml").exists());
+            assert!(
+                !line.is_some_and(|l| l.contains("mv ")),
+                "{before:o}->{after:o}"
+            );
+        }
+    }
+
+    /// Fable on #1126: a pre-existing owner-search-only dir (0300) on the
+    /// chain hides no edit below it, and an unlistable `managed.d` is refused.
+    #[test]
+    fn snapshot_sees_through_a_search_only_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        let h = Home::new();
+        let d = h.managed_d();
+        let cplt = d.parent().unwrap().to_path_buf();
+        let f = write(&d, "nav-pilot.toml", GOOD);
+        mode(&cplt, 0o300).unwrap();
+        let snap = ManagedSnapshot::take(h.path());
+        std::fs::write(&f, GOOD.replace("b.nav.no", "x.nav.no")).unwrap();
+        let line = snap.finish();
+        mode(&cplt, 0o755).unwrap();
+        assert!(!f.exists(), "edit under a 0300 dir left loadable: {line:?}");
+
+        let f = write(&d, "nav-pilot.toml", GOOD);
+        mode(&d, 0o300).unwrap();
+        let e = h.load(f.as_os_str(), &[]);
+        mode(&d, 0o755).unwrap();
+        let e = e.unwrap_err();
+        assert!(e.contains("chmod u+r"), "{e}");
+    }
+
+    /// Fable on #1126: a hard link that predates the session is not blamed on it.
+    #[test]
+    fn snapshot_ignores_a_preexisting_hard_link() {
+        let h = Home::new();
+        let f = write(&h.managed_d(), "nav-pilot.toml", GOOD);
+        std::fs::hard_link(&f, h.path().join("outside.toml")).unwrap();
+        assert!(ManagedSnapshot::take(h.path()).finish().is_none());
+        assert!(f.exists());
     }
 
     /// The session replaces `managed.d` with a symlink: reported, not silent.
