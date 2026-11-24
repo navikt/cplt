@@ -13957,20 +13957,34 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         }
     } else if has_pending && blocked.is_none() {
         println!();
-        println!("{blue}[cplt]{nc}  {yellow}To approve all pending permissions:{nc}");
-        println!("{blue}[cplt]{nc}    cplt trust accept --all");
+        if repo_proposal_refusals(loaded).is_empty() {
+            println!("{blue}[cplt]{nc}  {yellow}To approve all pending permissions:{nc}");
+            println!("{blue}[cplt]{nc}    cplt trust accept --all");
+        } else {
+            println!(
+                "{blue}[cplt]{nc}  {red}Fix or remove the REFUSED entries in .cplt.toml and commit \
+                 before approving those keys.{nc}"
+            );
+        }
         println!();
         println!("{blue}[cplt]{nc}  {yellow}Or approve specific keys:{nc}");
+        // A key with a REFUSED entry cannot be approved: never offer it.
+        let refused: Vec<&str> = repo_proposal_refusals(loaded)
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
         let pending_keys: Vec<&str> = st
             .proposed
             .iter()
-            .filter(|(_, approved)| !approved)
+            .filter(|(key, approved)| !approved && !refused.contains(key))
             .map(|(key, _)| *key)
             .collect();
-        println!(
-            "{blue}[cplt]{nc}    cplt trust accept {}",
-            pending_keys.join(" ")
-        );
+        if !pending_keys.is_empty() {
+            println!(
+                "{blue}[cplt]{nc}    cplt trust accept {}",
+                pending_keys.join(" ")
+            );
+        }
     }
 
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
@@ -14817,13 +14831,19 @@ fn trust_accept(
     // A key holding an entry the launch refuses is not approved (#1116): the
     // same refuse-and-exit as the IP alias below, so an approval on file
     // always means every entry it covers applies.
-    if let Some((key, entry, reason)) = repo_proposal_refusals(loaded)
+    let refused: Vec<_> = repo_proposal_refusals(loaded)
         .into_iter()
-        .find(|(k, _, _)| keys_to_accept.iter().any(|a| a == k))
-    {
+        .filter(|(k, _, _)| keys_to_accept.iter().any(|a| a == k))
+        .collect();
+    if !refused.is_empty() {
+        for (_, _, reason) in &refused {
+            ui::error(reason);
+        }
         ui::error(&format!(
-            "{reason}\n  {key} entry {entry:?} cannot be approved, so nothing was approved. \
-             Fix or remove it in .cplt.toml, commit, and run `cplt trust accept` again."
+            "{} entr{} in .cplt.toml cannot be approved, so nothing was approved. \
+             Fix or remove them, commit, and run `cplt trust accept` again.",
+            refused.len(),
+            if refused.len() == 1 { "y" } else { "ies" }
         ));
         return ExitCode::FAILURE;
     }

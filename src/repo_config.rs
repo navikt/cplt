@@ -614,9 +614,9 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         .chain(config.propose.allow.write.iter())
         .chain(config.propose.allow.socket.iter())
     {
-        if path.chars().any(char::is_control) {
+        if path.chars().any(crate::config::is_display_unsafe) {
             return Err(format!(
-                "propose.allow.read/write/socket entry {path:?} contains control characters"
+                "propose.allow.read/write/socket entry {path:?} contains control or formatting characters"
             ));
         }
         reject_path_traversal(path, "propose.allow.read/write/socket")?;

@@ -5525,7 +5525,9 @@ paths = [
     /// `cplt trust`, and never approved by `cplt trust accept`.
     #[test]
     fn e2e_config_set_repo_refuses_what_launch_refuses() {
-        let home = scratch_home();
+        // Own HOME, so the trust store this test must leave empty is its own.
+        let home_dir = tempfile::tempdir_in(scratch_home()).unwrap();
+        let home = home_dir.path();
         let outside = tempfile::tempdir().unwrap();
         let root_link = outside.path().join("root-link");
         std::os::unix::fs::symlink("/", &root_link).unwrap();
@@ -5552,7 +5554,11 @@ paths = [
         for (key, value, toml) in cases {
             let repo = temp_repo("test-org/refuse");
             std::os::unix::fs::symlink("/", repo.path().join("rel-root")).unwrap();
+            std::fs::create_dir(outside.path().join("a(b")).unwrap_or(());
+            std::os::unix::fs::symlink(outside.path().join("a(b"), repo.path().join("paren"))
+                .unwrap();
             let out = cplt_cmd()
+                .env("HOME", home)
                 .args(["config", "set", "--repo", key, value])
                 .current_dir(repo.path())
                 .output()
@@ -5573,9 +5579,13 @@ paths = [
                 (*toml).to_string()
             };
             std::fs::write(repo.path().join(".cplt.toml"), body).unwrap();
-            assert!(git_ok(repo.path(), &["add", ".cplt.toml", "rel-root"]));
+            assert!(git_ok(
+                repo.path(),
+                &["add", ".cplt.toml", "rel-root", "paren"]
+            ));
             assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
             let show = cplt_cmd()
+                .env("HOME", home)
                 .args(["trust"])
                 .current_dir(repo.path())
                 .output()
@@ -5583,6 +5593,7 @@ paths = [
             let show_out = String::from_utf8_lossy(&show.stdout);
             assert!(show_out.contains("REFUSED"), "{key} {value}: {show_out}");
             let accept = cplt_cmd()
+                .env("HOME", home)
                 .args(["trust", "accept", "--all"])
                 .current_dir(repo.path())
                 .output()
@@ -5591,6 +5602,15 @@ paths = [
                 !accept.status.success(),
                 "{key} {value}: accept must refuse: {}",
                 String::from_utf8_lossy(&accept.stderr)
+            );
+            let trust = home.join(".config/cplt/trust");
+            assert!(
+                std::fs::read_dir(&trust).map_or(true, |mut d| d.next().is_none()),
+                "{key} {value}: a failed accept must record nothing"
+            );
+            assert!(
+                !show_out.contains("cplt trust accept --all"),
+                "{key} {value}: must not offer --all: {show_out}"
             );
         }
     }

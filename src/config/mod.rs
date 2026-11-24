@@ -47,7 +47,8 @@ pub use path::{
     default_config_contents, expand_tilde, xdg_config_root,
 };
 pub use path::{
-    NOFOLLOW_LINK_MESSAGE, canonicalize_deepest, canonicalize_strict, nofollow_names_symlink,
+    NOFOLLOW_LINK_MESSAGE, canonicalize_deepest, canonicalize_strict, is_display_unsafe,
+    nofollow_names_symlink,
 };
 pub use registry::{
     BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,

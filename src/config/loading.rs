@@ -2058,13 +2058,22 @@ fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Opti
 fn repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Result<PathBuf, String> {
     let resolved = resolve_repo_path(path_str, config_dir);
     // A committed symlink chooses the resolved name, and every message below
-    // prints it: escape sequences in it would rewrite the trust display.
-    // Refused here, escaped, so no caller ever renders it raw.
+    // prints it: escape sequences or bidi overrides in it would rewrite the
+    // trust display. Refused here, escaped, so no caller ever renders it raw.
     let shown = resolved.to_string_lossy();
-    if shown.chars().any(char::is_control) {
+    if shown.chars().any(super::is_display_unsafe) {
         return Err(format!(
-            "{key} entry {path_str:?} resolves to a path with control characters (\"{}\"), \
-             so cplt is ignoring it. Rename the target or name a different path.",
+            "{key} entry {path_str:?} resolves to a path with control or formatting characters \
+             (\"{}\"), so cplt is ignoring it. Rename the target or name a different path.",
+            shown.escape_debug()
+        ));
+    }
+    // The macOS profile cannot name such a path and the launch refused it there
+    // only, late and without naming .cplt.toml. Refused on every platform, so no
+    // backend decides whether a team's proposal works.
+    if let Err(e) = crate::sandbox::validate_sbpl_path(&resolved) {
+        return Err(format!(
+            "{key} entry {path_str:?} resolves to {}, which cplt cannot grant. {e}",
             shown.escape_debug()
         ));
     }

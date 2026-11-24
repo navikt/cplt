@@ -532,6 +532,14 @@ pub fn canonicalize_deepest(path: &Path) -> PathBuf {
 /// Other `fs::canonicalize` calls (HOME, cwd, tests) do not go through it.
 /// A rule naming either spelling would otherwise be inert. `/.nofollow` is
 /// macOS-only and a bare `/.nofollow` (the root) is refused.
+/// A character that must never reach the terminal raw from a repo-controlled
+/// string: C0/C1 controls, DEL, and the bidi and zero-width format marks that
+/// reorder or hide text.
+pub fn is_display_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
 pub fn canonicalize_strict(path: &Path) -> std::io::Result<PathBuf> {
     let stripped = strip_nofollow(path);
     // `/.nofollow` alone would become `/`: a spelling that smuggles the root
