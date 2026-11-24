@@ -5928,10 +5928,19 @@ finally:
         )
         .unwrap();
         let dir = project.path().to_string_lossy().into_owned();
-        let grant = h.to_string_lossy().into_owned();
+        // A read grant over the base reaches staging. Not HOME: that holds
+        // cplt's state dir and is refused outright.
+        let wt_base = h.join(".cplt-worktrees");
+        fs::create_dir_all(&wt_base).unwrap();
+        fs::set_permissions(
+            &wt_base,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let grant = wt_base.to_string_lossy().into_owned();
         let mut args: Vec<&str> = vec!["--yes", "--no-validate", "--project-dir", &dir];
         if grant_home {
-            args.extend_from_slice(&["--allow-write", &grant]);
+            args.extend_from_slice(&["--allow-read", &grant]);
         }
         args.extend_from_slice(&["--agent", "shell", "--", "-c", script]);
         let out = cplt_cmd()

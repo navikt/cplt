@@ -226,7 +226,7 @@ pub struct Broker {
     /// the sandbox spawn, where `seal_inherited_fds` keeps it (see
     /// [`INHERITED_FD`]).
     #[cfg(target_os = "linux")]
-    _client_end: OwnedFd,
+    client_end: OwnedFd,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     #[cfg(target_os = "macos")]
@@ -311,7 +311,7 @@ impl Broker {
         INHERITED_FD.store(client.as_raw_fd(), Ordering::Release);
         Ok(Self {
             socket,
-            _client_end: client,
+            client_end: client,
             stop,
             thread: Some(thread),
             landlock: policy_ctx,
@@ -350,7 +350,7 @@ impl Drop for Broker {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         let _ = INHERITED_FD.compare_exchange(
-            self._client_end.as_raw_fd(),
+            self.client_end.as_raw_fd(),
             -1,
             Ordering::AcqRel,
             Ordering::Relaxed,
@@ -432,10 +432,13 @@ fn recv_stream(server: &OwnedFd) -> Option<UnixStream> {
         let mut c = libc::CMSG_FIRSTHDR(&raw const msg);
         while !c.is_null() {
             if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let data = libc::CMSG_DATA(c).cast::<libc::c_int>();
+                let data = libc::CMSG_DATA(c);
+                let size = std::mem::size_of::<libc::c_int>();
                 let len = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                for i in 0..len / std::mem::size_of::<libc::c_int>() {
-                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                for i in 0..len / size {
+                    let mut raw = [0u8; std::mem::size_of::<libc::c_int>()];
+                    std::ptr::copy_nonoverlapping(data.add(i * size), raw.as_mut_ptr(), size);
+                    fds.push(OwnedFd::from_raw_fd(libc::c_int::from_ne_bytes(raw)));
                 }
             }
             c = libc::CMSG_NXTHDR(&raw const msg, c);
@@ -575,9 +578,14 @@ fn add_with_budget(
         validate_reference(branch)
             .map_err(|_| format!("invalid branch name {:?}", truncate(branch, 64)))?;
     }
+    #[cfg(not(target_os = "linux"))]
     ctx.read_policy
         .get()
         .ok_or("worktree broker session read policy is not installed")?;
+    #[cfg(target_os = "linux")]
+    ctx.landlock
+        .get()
+        .ok_or("worktree broker session Landlock policy is not installed")?;
     let _lock = acquire_lock(&ctx.base, budget)?;
     check_identity(&ctx.common, &ctx.common_fd)?;
     check_identity(&ctx.objects, &ctx.objects_fd)?;
@@ -2003,7 +2011,8 @@ fn send_stream(fd: libc::c_int) -> std::io::Result<UnixStream> {
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
         (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>(), theirs.as_raw_fd());
+        let raw = theirs.as_raw_fd().to_ne_bytes();
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), libc::CMSG_DATA(c), raw.len());
         libc::sendmsg(fd, &raw const msg, libc::MSG_NOSIGNAL)
     };
     if rc < 0 {
