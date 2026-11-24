@@ -577,9 +577,10 @@ impl super::types::Resolved {
 /// loader refuses any path with a component carrying it.
 pub const QUARANTINE_PREFIX: &str = ".quarantine-";
 
-/// One `managed.d` entry as the parent saw it: inode, size, mtime in ns, and a
-/// SHA-256 of the content for a regular file.
-type Entry = (u64, u64, i64, Option<[u8; 32]>);
+/// One `managed.d` entry as the parent saw it: inode, size, mtime in ns,
+/// link count, ctime in ns, and a SHA-256 of the content for a regular file.
+/// ctime catches a hardlink or chmod that leaves content and mtime alone.
+type Entry = (u64, u64, i64, u64, i64, Option<[u8; 32]>);
 
 /// The held dir, its (dev, ino), and its entries (`None`: too many to compare).
 type Before = (std::fs::File, (u64, u64), Option<BTreeMap<PathBuf, Entry>>);
@@ -620,21 +621,42 @@ impl ManagedSnapshot {
     pub fn finish(self) -> Option<String> {
         let now = open_dir(&self.path);
         let moved = match (self.before, now) {
-            (_, None) => return None,
+            // Gone, or replaced by (or reached through) a symlink: the loader
+            // refuses that layout, so nothing loads from it. Say so.
+            (before, None) => {
+                return (before.is_some() || std::fs::symlink_metadata(&self.path).is_ok()).then(
+                    || {
+                        format!(
+                            "The session could write cplt's state directory, and {} is no \
+                             longer a plain directory (moved, removed or replaced by a symlink). \
+                             The managed config is refused until it is restored. Review it, and \
+                             remove the grant that covers ~/.config/cplt.",
+                            esc(&self.path.to_string_lossy())
+                        )
+                    },
+                );
+            }
             (Some((_, id, Some(old))), Some((f, now_id))) if id == now_id => {
                 let Some(new) = scan(&f) else {
                     return quarantine_dir(&self.path);
                 };
                 let mut names: Vec<&OsStr> = new
                     .iter()
-                    .filter(|(rel, e)| old.get(*rel) != Some(e))
+                    // A second hard link to a file is a way back in for a later session.
+                    .filter(|(rel, e)| old.get(*rel) != Some(e) || (e.5.is_some() && e.3 > 1))
                     .filter_map(|(rel, _)| rel.iter().next())
                     .collect();
                 names.dedup();
-                names
-                    .into_iter()
-                    .filter_map(|n| quarantine_at(&f, n))
-                    .collect::<Vec<_>>()
+                let mut moved = Vec::new();
+                for n in names {
+                    match quarantine_at(&f, n) {
+                        Some(m) => moved.push(m),
+                        // Nothing that changed may stay where it loads: the
+                        // whole dir goes, or the user is told how.
+                        None => return quarantine_dir(&self.path),
+                    }
+                }
+                moved
             }
             // Created, replaced, or too big to compare: the whole dir goes.
             _ => return quarantine_dir(&self.path),
@@ -660,13 +682,25 @@ fn stamp() -> String {
     format!("{QUARANTINE_PREFIX}{}{:09}-", t.as_secs(), t.subsec_nanos())
 }
 
-/// Move the whole dir aside, next to itself.
+/// Move the whole dir aside, next to itself, through its parent's descriptor.
+/// When even that fails, the line says how to do it by hand: a failure is
+/// never silent, since what changed would load at the next launch.
 fn quarantine_dir(path: &Path) -> Option<String> {
     let name = path.file_name()?;
-    let mut to = std::ffi::OsString::from(stamp());
-    to.push(name);
-    std::fs::rename(path, path.with_file_name(&to)).ok()?;
-    Some(quarantine_line(path, &name.to_string_lossy()))
+    let moved = path
+        .parent()
+        .and_then(open_dir)
+        .and_then(|(parent, _)| quarantine_at(&parent, name));
+    if moved.is_some() {
+        return Some(quarantine_line(path, &name.to_string_lossy()));
+    }
+    let p = esc(&path.to_string_lossy());
+    Some(format!(
+        "The session could write cplt's state directory and changed {p}, and cplt could \
+         not move it aside. The managed config there may now be the session's. Before the \
+         next launch, run: chmod -R u+w '{p}' && mv '{p}' '{p}.quarantined' — then review \
+         it, and remove the grant that covers ~/.config/cplt."
+    ))
 }
 
 /// Rename `name` inside the held dir, never through a path an agent may have
@@ -680,8 +714,18 @@ fn quarantine_at(dir: &std::fs::File, name: &OsStr) -> Option<String> {
     let to = std::ffi::CString::new(to.as_bytes()).ok()?;
     let fd = dir.as_raw_fd();
     // SAFETY: both names are NUL-terminated; `fd` is an open directory.
-    (unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0)
-        .then(|| name.to_string_lossy().into_owned())
+    let rename = || unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0;
+    // The session may have dropped write permission on the dir (`chmod 555`):
+    // restore owner write through the held descriptor and try once more.
+    let ok = rename()
+        || dir.metadata().is_ok_and(|m| {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = (m.permissions().mode() | 0o700) & 0o7777;
+            // SAFETY: `fd` is an open directory; fchmod has no other preconditions.
+            let rc = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
+            rc == 0
+        }) && rename();
+    ok.then(|| name.to_string_lossy().into_owned())
 }
 
 /// Open `path` as a directory when it, and every parent, is no symlink.
@@ -782,6 +826,8 @@ fn scan_into(
                 m.ino(),
                 m.size(),
                 m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+                m.nlink(),
+                m.ctime() * 1_000_000_000 + m.ctime_nsec(),
                 hash,
             )
         };
@@ -799,6 +845,8 @@ fn stat_entry(st: &libc::stat, hash: Option<[u8; 32]>) -> Entry {
         st.st_ino as u64,
         st.st_size as u64,
         st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
+        u64::from(st.st_nlink),
+        st.st_ctime as i64 * 1_000_000_000 + st.st_ctime_nsec as i64,
         hash,
     )
 }
@@ -1402,6 +1450,68 @@ mod tests {
         let q = left.iter().find(|n| n.ends_with("planted.toml")).unwrap();
         h.refused(d.join(q).as_os_str(), &[], "quarantined");
         assert!(h.load(d.join("keep.toml").as_os_str(), &[]).is_ok());
+    }
+
+    /// Fable on #1126: a session that drops write permission on `managed.d`
+    /// must not keep its edit loadable. The parent restores owner write and
+    /// moves the entry aside.
+    #[test]
+    fn snapshot_quarantines_despite_a_read_only_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let h = Home::new();
+        let d = h.managed_d();
+        let f = write(&d, "nav-pilot.toml", GOOD);
+        let snap = ManagedSnapshot::take(h.path());
+        std::fs::write(&f, GOOD.replace("b.nav.no", "x.nav.no")).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let line = snap.finish().expect("reported");
+        assert!(
+            !d.join("nav-pilot.toml").exists(),
+            "edit left loadable: {line}"
+        );
+    }
+
+    /// When nothing can be moved (here: the parent and `managed.d` are both
+    /// read-only to the rename, simulated by a dir the parent cannot open),
+    /// the line gives the manual fix instead of staying silent.
+    #[test]
+    fn quarantine_dir_failure_is_loud() {
+        let h = Home::new();
+        let gone = h.path().join("no/such/managed.d");
+        let line = quarantine_dir(&gone).expect("never silent");
+        assert!(
+            line.contains("could not move it aside") && line.contains("mv '"),
+            "{line}"
+        );
+    }
+
+    /// A hard link planted in `managed.d` changes no content or mtime, only
+    /// nlink and ctime: it must still be quarantined, and the loader refuses it.
+    #[test]
+    fn snapshot_quarantines_a_planted_hard_link() {
+        let h = Home::new();
+        let d = h.managed_d();
+        let f = write(&d, "nav-pilot.toml", GOOD);
+        let snap = ManagedSnapshot::take(h.path());
+        std::fs::hard_link(&f, h.path().join("outside.toml")).unwrap();
+        h.refused(f.as_os_str(), &[], "more than one hard link");
+        assert!(snap.finish().is_some());
+        assert!(!d.join("nav-pilot.toml").exists());
+    }
+
+    /// The session replaces `managed.d` with a symlink: reported, not silent.
+    #[test]
+    fn snapshot_reports_a_symlinked_dir() {
+        let h = Home::new();
+        let d = h.managed_d();
+        let snap = ManagedSnapshot::take(h.path());
+        std::fs::rename(&d, h.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(h.path().join("elsewhere"), &d).unwrap();
+        assert!(
+            snap.finish()
+                .unwrap()
+                .contains("no longer a plain directory")
+        );
     }
 
     /// `managed.d` created, or swapped for a fresh dir, during the session:
