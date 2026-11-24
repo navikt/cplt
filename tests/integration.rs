@@ -7008,7 +7008,9 @@ except Exception as e:
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("GH_CONFIG_DIR", home.join(".config/gh"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            // The trust store sits next to the config: keep both in `home`.
+            .env("CPLT_CONFIG", home.join(".config/cplt/config.toml"));
         cmd
     }
 
