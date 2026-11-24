@@ -21,17 +21,17 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
-    HomeToolDir, OAUTH_CALLBACK_PORT, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
-    Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
-    SSH_PRIVATE_KEY_NAMES, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, YARN_CONFIG_DIR,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
-    current_uid, cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex,
-    first_party_read_target, grant_is_refused, home_config_link_targets,
-    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    pnpm_config_dirs, pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    CLONE_CACHE_DIRS, CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES,
+    DENIED_HOME_SUBPATHS, DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES,
+    HOME_CONFIG_FILES, HomeToolDir, OAUTH_CALLBACK_PORT, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT,
+    PathBinDir, Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS,
+    SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES, SYSTEM_READ_FILES, TOOL_READ_DIRS,
+    XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs, ancestor_alternation, app_dirs,
+    colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
+    cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
+    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
+    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
+    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -2915,6 +2915,16 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // ride along. File clones stay allowed (they check read on the source), and
     // copyfile/`cp -c -R` fall back to per-file clones when this refuses.
     sbpl!(sb, "(deny file-clone (vnode-type DIRECTORY))");
+    // Package managers clone whole directories out of their caches (bun's
+    // default backend has no fallback), so re-allow directory clones whose
+    // source is one of those caches. They hold downloaded packages, never a
+    // read-denied path (`clone_cache_dirs_hold_no_denied_path` pins that).
+    for p in CLONE_CACHE_DIRS.iter().flat_map(|d| spell(d, false)) {
+        sbpl!(
+            sb,
+            "(allow file-clone (require-all (vnode-type DIRECTORY) (subpath \"{p}\")))"
+        );
+    }
     // `bsd.sb` allows `file-read-metadata` everywhere, and that named operation
     // outranks the `file-read*` deny above, so a denied `~/.npmrc` still stats
     // as present. yarn 1 checks existence before it reads every npmrc on the

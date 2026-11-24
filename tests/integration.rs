@@ -2664,7 +2664,11 @@ int main(int argc, char **argv) {
         let allowed = temp.path().join("allowed/nested/deeper");
         fs::create_dir_all(&allowed).unwrap();
         fs::write(allowed.join("file"), "ok\n").unwrap();
-        let home = home_dir();
+        // A package-manager cache stays a valid directory-clone source (bun).
+        let home = temp.path().join("home");
+        let pkg = home.join(".bun/install/cache/pkg@1.0.0");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("index.js"), "cached\n").unwrap();
         let writes = [temp.path().to_path_buf()];
         let mut opts = default_opts(&project, &home);
         opts.extra_write = &writes;
@@ -2672,24 +2676,28 @@ int main(int argc, char **argv) {
         let profile = write_real_profile(&opts);
         let t = temp.path().display();
         let clone = |src: &str, dst: &str| {
+            // The temp HOME hides the developer's python; the system one needs none.
             python_inline_command(&format!(
                 "import ctypes,sys\nc=ctypes.CDLL(None).clonefile\nsys.exit(c({src:?}.encode(),{dst:?}.encode(),0))"
             ))
+            .replacen("python3", "/usr/bin/python3", 1)
         };
         let script = format!(
-            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; {}; cat '{t}/fileclone' 2>/dev/null && echo FILE_OK; {}; cat '{t}/filecopy' 2>/dev/null && echo LEAK; cp -c -R '{t}/allowed' '{t}/allowed-copy' && cat '{t}/allowed-copy/nested/deeper/file' && echo TREE_OK",
+            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; {}; cat '{t}/fileclone' 2>/dev/null && echo FILE_OK; {}; cat '{t}/filecopy' 2>/dev/null && echo LEAK; cp -c -R '{t}/allowed' '{t}/allowed-copy' && cat '{t}/allowed-copy/nested/deeper/file' && echo TREE_OK; {}; cat '{t}/cacheclone/index.js' && echo CACHE_OK",
             clone(&base.display().to_string(), &format!("{t}/dirclone")),
             clone(&format!("{t}/plain"), &format!("{t}/fileclone")),
             clone(
                 &staging.join("private").display().to_string(),
                 &format!("{t}/filecopy")
             ),
+            clone(&pkg.display().to_string(), &format!("{t}/cacheclone")),
         );
         let (output, _) = run_sandboxed(&profile, &script);
         fs::remove_file(profile).unwrap();
         assert!(!output.contains("LEAK"), "{output}");
         assert!(output.contains("FILE_OK"), "{output}");
         assert!(output.contains("ok\nTREE_OK"), "{output}");
+        assert!(output.contains("cached\nCACHE_OK"), "{output}");
     }
 
     #[test]

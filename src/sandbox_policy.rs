@@ -834,6 +834,23 @@ fn denied_entry(
 ///
 /// On Linux (Landlock), this deny is NOT enforceable — Landlock cannot deny
 /// subpaths within allowed directories. See SECURITY.md for details.
+/// Package-manager caches, relative to `$HOME`, that may be the source of a
+/// directory clone on macOS. Downloaded packages only: none may contain, or be
+/// inside, a read-denied path.
+pub const CLONE_CACHE_DIRS: &[&str] = &[
+    ".bun/install/cache",
+    ".cache/.bun/install/cache",
+    "Library/pnpm/store",
+    ".local/share/pnpm/store",
+    "Library/Caches/pnpm",
+    ".cache/pnpm",
+    "Library/Caches/Yarn",
+    ".cache/yarn",
+    ".npm/_cacache",
+    "Library/Caches/uv",
+    ".cache/uv",
+];
+
 pub const DENIED_HOME_SUBPATHS: &[&str] = &[
     ".m2/settings.xml",
     ".m2/settings-security.xml",
