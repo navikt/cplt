@@ -13113,6 +13113,44 @@ mod agent_stubs {
         assert!(pnpm.join("f").exists());
     }
 
+    /// Warn mode (#1096 follow-up): `--allow-write ~/.config` launches again,
+    /// with one warning naming the grant and the fix.
+    #[test]
+    fn e2e_allow_write_over_state_dir_launches_with_a_warning() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-statewarn-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(h.join(".config/cplt")).unwrap();
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let out = cplt_cmd()
+            .arg("--allow-write")
+            .arg(h.join(".config"))
+            .args(["--no-quiet", "exec", "--", "/bin/echo", "ok"])
+            .current_dir(&proj)
+            .env("HOME", &h)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("CPLT_TEST_ACCOUNT_HOME", &h)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the launch should go ahead: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("cplt's state directory"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one warning line: {stderr}");
+        assert!(
+            lines[0].contains("--allow-write"),
+            "names the fix: {}",
+            lines[0]
+        );
+    }
+
     /// `GOCACHE=~/.config` is outside every env tool-dir root (#1104): it is
     /// dropped with a warning naming GOCACHE, and cplt's state dir stays
     /// unwritable (#1095).
@@ -13171,6 +13209,7 @@ mod agent_stubs {
 
     /// A broad allow.write over the state dir names the layer it came from:
     /// `cplt config unset allow.write` cannot remove a local or CLI grant.
+    /// The launch goes ahead with a warning.
     #[test]
     fn e2e_state_dir_grant_names_its_layer() {
         let dir = tempfile::Builder::new()
@@ -13194,19 +13233,22 @@ mod agent_stubs {
                 .output()
                 .expect("binary should run")
         };
+        // Warn mode (#1096 follow-up): the launch goes ahead, and the one
+        // warning line names the layer's own remedy.
         let launch_err = |pre: &[&str]| {
             let mut args = pre.to_vec();
-            args.extend(["exec", "--", "/bin/echo", "ok"]);
+            args.extend(["--no-quiet", "exec", "--", "/bin/echo", "ok"]);
             let out = cplt(&args);
-            assert!(!out.status.success());
-            String::from_utf8_lossy(&out.stderr).into_owned()
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{err}");
+            err
         };
 
         let err = launch_err(&["--allow-write", cfg.to_str().unwrap()]);
         assert!(err.contains("Drop `--allow-write ~/.config`"), "{err}");
 
-        // `config set --local` refuses ~/.config itself, so narrow then widen
-        // the saved line, as a hand edit would.
+        // Narrow then widen the saved line by hand, as an edit outside cplt
+        // would.
         let narrow = cfg.join("gh");
         assert!(
             cplt(&[
@@ -13232,7 +13274,7 @@ mod agent_stubs {
         )
         .unwrap();
         // The same grant in the global file too: both remedies are printed,
-        // and following only the local one would leave launch failing.
+        // and following only the local one would leave the warning.
         let global = cfg.join("cplt/config.toml");
         std::fs::write(
             &global,

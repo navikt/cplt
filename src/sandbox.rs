@@ -129,7 +129,7 @@ pub use policy::{
     TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, XDG_PINNED_MARKER,
     active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
     copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_ancestor_grant, cplt_state_dir,
-    cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
+    cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
     cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
     env_tool_dir_allowed, env_tool_dir_hint_ok, env_tool_path_protected, env_tool_temp_roots,
     exec_write_conflicts, first_party_read_target, grant_is_refused, home_config_link_targets,
@@ -389,6 +389,9 @@ pub struct PreparedSandbox {
     /// `ms-playwright` tree or that subdir, not a pinned browser dir (#742).
     puppeteer_cache_exec: bool,
     proxy_port: Option<u16>,
+    /// A write grant reaches cplt's state dir (warned, not refused). On Linux
+    /// the launcher then quarantines what the session adds to `managed.d`.
+    state_exposed: bool,
     agent: Agent,
     /// Specific localhost ports the user has explicitly opened.
     allow_localhost: Vec<u16>,
@@ -434,6 +437,16 @@ pub struct PreparedSandbox {
 }
 
 impl PreparedSandbox {
+    /// On Linux, when a write grant reaches cplt's state dir, the snapshot of
+    /// `managed.d` to check once the session is over. macOS denies the dir.
+    #[must_use]
+    pub fn guard_managed(&self) -> Option<crate::config::ManagedSnapshot> {
+        (cfg!(target_os = "linux") && self.state_exposed)
+            .then(crate::config::account_home)
+            .flatten()
+            .map(|h| crate::config::ManagedSnapshot::take(&h))
+    }
+
     /// The project directory this sandbox is configured for.
     pub fn project_dir(&self) -> &Path {
         &self.project_dir
@@ -743,15 +756,20 @@ fn prepare_locked(
     }
     // Inspect-only callers (`--print-profile`, `cplt mcp status`) never
     // launch, so nothing can forge the state; they report instead.
+    let mut exposed = None;
     if !inspect_only {
-        keep_cplt_state_out_of_grants(config)?;
+        exposed = keep_cplt_state_out_of_grants(config)?;
     }
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
     let base = std::cell::OnceCell::new();
     if !inspect_only && let Some(home) = crate::config::account_home() {
         let policy = base.get_or_init(|| landlock_mod::generate_policy(config));
-        refuse_policy_write_into_state(config, policy, &home.join(CPLT_STATE_DIR))?;
+        let found = refuse_policy_write_into_state(config, policy, &home.join(CPLT_STATE_DIR))?;
+        exposed = exposed.or(found);
+    }
+    if let Some(line) = &exposed {
+        warn_state_exposed(line);
     }
     // Only now is the state dir known to sit outside every grant.
     if !inspect_only {
@@ -773,14 +791,16 @@ fn prepare_locked(
         ));
     }
     let git_dirs = launch_git_dirs(config)?;
-    prepare_impl(
+    let mut prepared = prepare_impl(
         config,
         &git_dirs,
         pnpm_shadow_dir,
         inspect_only,
         &canonical_grants,
         &base,
-    )
+    )?;
+    prepared.state_exposed = exposed.is_some();
+    Ok(prepared)
 }
 
 /// The cache-exec and Cypress grants a launch would make, validated exactly
@@ -1284,11 +1304,39 @@ fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, home: &Path) -> Stri
             dir.display()
         )
     };
-    format!(
-        "{what} {} would make cplt's state directory {} writable in the sandbox. {remedy}",
-        p.display(),
-        dir.display()
-    )
+    exposure_line(&format!("{what} {}", p.display()), dir, &remedy)
+}
+
+/// The one warning line for a write grant at or above cplt's state dir. Warn,
+/// not refuse (#1096 follow-up): such setups launched before, and must again.
+/// macOS keeps the state dir denied inside the grant (and its ancestors
+/// pinned against rename); Landlock cannot deny below a granted tree, so on
+/// Linux the session ignores the managed layer and the parent quarantines what
+/// it adds to `managed.d` (see [`ManagedSnapshot`]).
+fn exposure_line(grant: &str, dir: &Path, remedy: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!(
+            "{grant} covers cplt's state directory {}. The sandbox still denies writes \
+             there, but narrow the grant. {remedy}",
+            dir.display()
+        )
+    } else {
+        format!(
+            "{grant} makes cplt's state directory {} writable in the sandbox, so this \
+             session ignores the managed config and cplt quarantines anything it adds to \
+             managed.d. {remedy}",
+            dir.display()
+        )
+    }
+}
+
+/// Print the state-exposure warning once per process: the layer-aware line
+/// from `main` and the backstops in `prepare` can all find the same grant.
+pub fn warn_state_exposed(line: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::ui::warn(line);
+    }
 }
 
 /// The config layer an `allow.write` grant came from, so a refusal names the
@@ -1345,10 +1393,10 @@ fn layer_remedy(p: &Path, home: &Path, layer: Option<GrantLayer>) -> String {
 ///
 /// # Errors
 /// The refusal text, ready to print.
-pub fn refuse_state_ancestor_layers(
+pub fn state_ancestor_layers_warning(
     layers: &[(PathBuf, GrantLayer)],
     home: &Path,
-) -> Result<(), String> {
+) -> Option<String> {
     for (p, _) in layers {
         if let Some(dir) = policy::cplt_state_ancestor_grant(home, p)
             && dir.starts_with(p)
@@ -1366,15 +1414,39 @@ pub fn refuse_state_ancestor_layers(
                 })
                 .map(|(_, l)| layer_remedy(p, home, Some(*l)))
                 .collect();
-            return Err(format!(
-                "allow.write {} would make cplt's state directory {} writable in the sandbox. {}",
-                p.display(),
-                dir.display(),
-                remedies.join("\n")
+            return Some(exposure_line(
+                &format!("allow.write {}", p.display()),
+                &dir,
+                &remedies.join(" "),
             ));
         }
     }
-    Ok(())
+    None
+}
+
+/// The warning `cplt config set` prints for a write grant at or above cplt's
+/// state dir. Accepted, like at launch: see [`exposure_line`]. The grant is
+/// already saved in `layer` and array `set` appends, so the remedy is that
+/// layer's unset-then-set; a symlink alias keeps its own advice.
+#[must_use]
+pub fn state_ancestor_warning(
+    key: &str,
+    p: &Path,
+    home_dir: &Path,
+    layer: GrantLayer,
+) -> Option<String> {
+    let dir = (key == "allow.write")
+        .then(|| policy::cplt_state_ancestor_grant(home_dir, p))
+        .flatten()?;
+    Some(if dir.starts_with(p) {
+        exposure_line(
+            &format!("{key} {}", p.display()),
+            &dir,
+            &layer_remedy(p, home_dir, Some(layer)),
+        )
+    } else {
+        state_ancestor_refusal(key, p, &dir, home_dir)
+    })
 }
 
 /// Refuse one grant that no launch can honour, with the reason.
@@ -1392,10 +1464,20 @@ pub fn refuse_state_ancestor_layers(
 /// # Errors
 /// The refusal text, ready to print.
 pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), String> {
-    if key == "allow.write"
+    // A socket grant writes the path itself, outside the writable-tree lists
+    // the managed loader and the macOS state pins draw from, so the
+    // warn-instead-of-refuse treatment for ancestor grants cannot cover it.
+    // A socket is a file; naming a directory above cplt's state is refused.
+    // Here, not only at launch, so `cplt config set` refuses it too.
+    if key == "allow.socket"
         && let Some(dir) = policy::cplt_state_ancestor_grant(home_dir, p)
     {
-        return Err(state_ancestor_refusal(key, p, &dir, home_dir));
+        return Err(format!(
+            "allow.socket names {}, which is cplt's state directory {} or contains it. \
+             Name the socket file itself, outside that directory.",
+            p.display(),
+            dir.display()
+        ));
     }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
@@ -1515,13 +1597,41 @@ pub(crate) fn refuse_policy_write_into_state(
     config: &SandboxConfig,
     policy: &landlock_mod::LandlockPolicy,
     state: &Path,
-) -> Result<(), String> {
-    let Some(rule) = policy
-        .fs_rules
-        .iter()
-        .find(|r| (r.access.write || r.access.create_dirs) && overlaps_state(&r.path, state))
-    else {
-        return Ok(());
+) -> Result<Option<String>, String> {
+    let writes = || {
+        policy
+            .fs_rules
+            .iter()
+            .filter(|r| r.access.write || r.access.create_dirs)
+    };
+    // A rule at or inside the state dir is refused; one above it only warns
+    // (see `exposure_line`), the same split as `keep_cplt_state_out_of_grants`.
+    // The state dir itself counts as inside: only a strict ancestor warns.
+    let below = |p: &Path, s: &Path| p.starts_with(s);
+    let inside = |p: &Path| {
+        below(p, state)
+            || below(
+                &crate::config::canonicalize_deepest(p),
+                &crate::config::canonicalize_deepest(state),
+            )
+    };
+    let Some(rule) = writes().find(|r| inside(&r.path)) else {
+        // Not the system temp dir: a `$HOME` under it (test fakes) is no grant
+        // to warn about, as in `keep_cplt_state_out_of_grants`.
+        let trees = writable_trees(config);
+        let temp = |p: &Path| {
+            trees
+                .iter()
+                .any(|(t, why)| *why == TEMP_DIR_SOURCE && p.starts_with(t))
+        };
+        let found = writes().find(|r| overlaps_state(&r.path, state) && !temp(&r.path));
+        return Ok(found.map(|r| {
+            exposure_line(
+                &format!("The write grant on {}", r.path.display()),
+                state,
+                "Narrow the grant that covers it.",
+            )
+        }));
     };
     let source = writable_trees(config)
         .into_iter()
@@ -1558,7 +1668,22 @@ pub fn overlaps_state(path: &Path, state: &Path) -> bool {
 ///
 /// When the legacy root is exposed too (linked into a granted tree), there is
 /// nowhere safe to keep state, and the launch is refused.
-fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
+fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<Option<String>, String> {
+    let mut warning = None;
+    // macOS pins each name on the way to the state dir; one the profile cannot
+    // spell cannot be pinned, so the dir could be swapped. Refuse that layout.
+    if cfg!(target_os = "macos")
+        && let Some(bad) = state_chain_pins(config)
+            .into_iter()
+            .find(|e| policy::validate_sbpl_path(e).is_err())
+    {
+        return Err(format!(
+            "{} lies on the path to cplt's state directory inside a writable grant, and \
+             the macOS sandbox profile cannot name it (it contains one of \" ( ) ; \\). \
+             Rename it, or narrow the grant so it does not cover it.",
+            bad.display()
+        ));
+    }
     // Every writable tree, env-derived agent and tool dirs included, not just
     // `allow.write`: none may be cplt's state dir or an ancestor of it (#1095).
     // Not the system temp dir: a `$HOME` under it (test fakes) is no grant to
@@ -1568,7 +1693,9 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         .filter(|(_, why)| *why != TEMP_DIR_SOURCE)
     {
         if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, &tree) {
-            return Err(state_ancestor_refusal(why, &tree, &dir, config.home_dir));
+            warning
+                .get_or_insert_with(|| state_ancestor_refusal(why, &tree, &dir, config.home_dir));
+            continue;
         }
         // A writable tree inside the state dir lets the agent plant files there,
         // `$HOME`'s or the passwd home's (which holds the trusted managed.d).
@@ -1616,7 +1743,7 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(warning)
 }
 
 /// Flush the pinned state record and prune launch records. Call only after
@@ -1850,6 +1977,78 @@ pub(crate) fn user_deny_pins(
         }
     }
     (unlink, create)
+}
+
+/// Every directory entry the kernel walks to reach `path`, each spelled as
+/// its canonical parent plus its own name: the lexical hops (`~/.config`,
+/// `~/.config/cplt`) and every symlink hop on the way. A missing tail is
+/// listed lexically. The state dir's deny holds only while each of these names
+/// still leads there, so each one is pinned against unlink, rename and
+/// re-creation when it sits inside a writable tree.
+pub(crate) fn resolution_entries(path: &Path) -> Vec<PathBuf> {
+    use std::path::Component;
+    let mut todo: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_os_string()),
+            Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect();
+    let mut cur = PathBuf::from("/");
+    let mut out = Vec::new();
+    let mut hops = 0;
+    let mut missing = false;
+    while let Some(name) = todo.pop_front() {
+        if name == ".." {
+            cur.pop();
+            continue;
+        }
+        let entry = cur.join(&name);
+        out.push(entry.clone());
+        if !missing
+            && let Ok(m) = std::fs::symlink_metadata(&entry)
+            && m.file_type().is_symlink()
+            && hops < 40
+            && let Ok(link) = std::fs::read_link(&entry)
+        {
+            hops += 1;
+            if link.is_absolute() {
+                cur = PathBuf::from("/");
+            }
+            for c in link.components().rev() {
+                match c {
+                    Component::Normal(n) => todo.push_front(n.to_os_string()),
+                    Component::ParentDir => todo.push_front("..".into()),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        missing = missing || std::fs::symlink_metadata(&entry).is_err();
+        cur = entry;
+    }
+    out
+}
+
+/// The entries on the way to cplt's state dir (`$HOME`'s and the passwd
+/// home's) that sit strictly inside a writable tree: the names the macOS
+/// profile pins so the dir cannot be moved, swapped or re-linked.
+pub(crate) fn state_chain_pins(config: &SandboxConfig) -> Vec<PathBuf> {
+    let trees: Vec<PathBuf> = canonical_writable_trees(config)
+        .into_iter()
+        .filter(|(t, why)| cfg!(target_os = "macos") || !bwrap_private(t, why))
+        .map(|(t, _)| t)
+        .collect();
+    let home = config.home_dir;
+    let mut pins: Vec<PathBuf> = std::iter::once(home.join(CPLT_STATE_DIR))
+        .chain(policy::passwd_state_dir(home))
+        .flat_map(|d| resolution_entries(&d))
+        .filter(|e| trees.iter().any(|t| e.starts_with(t) && e != t))
+        .collect();
+    pins.sort();
+    pins.dedup();
+    pins
 }
 
 /// A writable tree that is not the host's under Bubblewrap: it gives the
@@ -3096,6 +3295,7 @@ fn prepare_impl(
             .iter()
             .any(|e| e == "ms-playwright" || e == "ms-playwright/puppeteer"),
         proxy_port: config.proxy_port,
+        state_exposed: false,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
@@ -4878,6 +5078,7 @@ fn prepare_impl(
             .iter()
             .any(|e| e == "ms-playwright" || e == "ms-playwright/puppeteer"),
         proxy_port: config.proxy_port,
+        state_exposed: false,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
@@ -7281,6 +7482,23 @@ mod tests {
         }
     }
 
+    /// A socket grant on `~/.config` or `$HOME` writes that path itself, which
+    /// neither the managed loader's writable set nor the macOS state pins see,
+    /// so it is refused rather than warned like an ancestor write grant.
+    #[test]
+    fn prepare_rejects_a_socket_grant_over_the_state_dir() {
+        let home = Path::new("/fake/test");
+        for granted in [home.join(".config"), home.to_path_buf()] {
+            let granted = vec![granted];
+            let mut config = test_config(home, &[]);
+            config.extra_socket = &granted;
+            let error = prepare(&config)
+                .err()
+                .expect("allow.socket must be refused");
+            assert!(error.contains("allow.socket"), "{error}");
+        }
+    }
+
     /// A grant naming a `DENIED_DOTFILES` directory is refused on every key and
     /// on both backends (#291).
     ///
@@ -7454,7 +7672,7 @@ mod tests {
         };
         let unset: Vec<(&str, Option<PathBuf>)> =
             vec![("XDG_RUNTIME_DIR", None), ("XDG_DATA_HOME", None)];
-        assert_eq!(refused(&test_config(home, &[]), &unset), Ok(()));
+        assert_eq!(refused(&test_config(home, &[]), &unset), Ok(None));
 
         // XDG_RUNTIME_DIR under managed.d with docker/podman/gpg sockets.
         let mut c = test_config(home, &[]);
@@ -7479,11 +7697,11 @@ mod tests {
         let mut c = test_config(moved, &[]);
         c.agent = Agent::OpenCode;
         assert!(refused(&c, &data).is_err());
-        // --allow-socket ~/.config.
+        // --allow-socket ~/.config: above the state dir, so warned, not refused.
         let sock = [home.join(".config")];
         let mut c = test_config(home, &[]);
         c.extra_socket = &sock;
-        assert!(refused(&c, &unset).is_err());
+        assert!(matches!(refused(&c, &unset), Ok(Some(_))));
         // A named root's git dir inside the state dir.
         let git = [state.join("x.git")];
         let mut c = test_config(home, &[]);
@@ -7499,9 +7717,19 @@ mod tests {
     fn write_grant_on_state_dir_ancestor_is_refused() {
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
-        for p in [h.to_path_buf(), h.join(".config"), h.join(".config/cplt")] {
-            assert!(validate_grant_path("allow.write", &p, h).is_err(), "{p:?}");
+        // At or above: accepted with a warning. Inside: still refused.
+        for p in [h.to_path_buf(), h.join(".config")] {
+            assert!(validate_grant_path("allow.write", &p, h).is_ok(), "{p:?}");
+            assert!(
+                state_ancestor_warning("allow.write", &p, h, GrantLayer::Global).is_some(),
+                "{p:?}"
+            );
         }
+        assert!(validate_grant_path("allow.write", &h.join(".config/cplt"), h).is_err());
+        assert!(
+            state_ancestor_warning("allow.write", &h.join(".config/gh"), h, GrantLayer::Global)
+                .is_none()
+        );
         assert!(validate_grant_path("allow.write", &h.join(".config/gh"), h).is_ok());
         assert!(validate_grant_path("allow.read", &h.join(".config"), h).is_ok());
         // An env-derived writable tree (agent dir) at launch.
@@ -7517,8 +7745,8 @@ mod tests {
         }];
         let mut config = test_config(h, &[]);
         config.agent_dirs = &agent;
-        let err = keep_cplt_state_out_of_grants(&config).unwrap_err();
-        assert!(err.contains("cplt's state directory"), "{err}");
+        let warn = keep_cplt_state_out_of_grants(&config).unwrap().unwrap();
+        assert!(warn.contains("cplt's state directory"), "{warn}");
     }
 
     /// #1095 review: each source of a state-dir ancestor gets its own remedy,
@@ -7532,22 +7760,26 @@ mod tests {
         std::fs::create_dir_all(cfg.join("cplt")).unwrap();
         let refuse = |config: &SandboxConfig| {
             temp_env::with_vars_unset(["XDG_CONFIG_HOME", "GOCACHE"], || {
-                keep_cplt_state_out_of_grants(config).unwrap_err()
+                match keep_cplt_state_out_of_grants(config) {
+                    Err(e) | Ok(Some(e)) => e,
+                    Ok(None) => panic!("neither refused nor warned"),
+                }
             })
         };
 
-        // allow.write at config-set time and at launch.
-        // Nothing is saved at config-set time, so nothing to remove.
-        let err = validate_grant_path("allow.write", &cfg, &h).unwrap_err();
+        // allow.write at config-set time: the grant is saved and `set`
+        // appends, so the remedy unsets it in the layer it went to (OKb5).
+        let err = state_ancestor_warning("allow.write", &cfg, &h, GrantLayer::Global).unwrap();
         assert!(
-            err.contains("`cplt config set allow.write ~/.config/<tool>`"),
-            "{err}"
+            err.contains("`cplt config unset allow.write ~/.config`")
+                && err.contains("`cplt config set allow.write ~/.config/<tool>`"),
+            "global set must name unset-then-set: {err}"
         );
-        assert!(!err.contains("Remove"), "{err}");
-        let err = validate_grant_path("allow.write", &h, &h).unwrap_err();
+        let err = state_ancestor_warning("allow.write", &h, &h, GrantLayer::Local).unwrap();
         assert!(
-            err.contains("`cplt config set allow.write ~/<tool>`"),
-            "{err}"
+            err.contains("`cplt config unset --local allow.write ~`")
+                && err.contains("`cplt config set --local allow.write ~/<tool>`"),
+            "--local set must name the local layer: {err}"
         );
 
         // Each explicit layer names the command that removes the grant there.
@@ -7567,20 +7799,20 @@ mod tests {
             (GrantLayer::Cli, "Drop `--allow-write ~/.config`"),
         ] {
             let err = temp_env::with_vars_unset(["GOCACHE"], || {
-                refuse_state_ancestor_layers(&[(cfg.clone(), layer)], &h).unwrap_err()
+                state_ancestor_layers_warning(&[(cfg.clone(), layer)], &h).unwrap()
             });
             assert!(err.contains(want), "{layer:?}: {err}");
         }
         // The same grant in two layers names both removals.
         let err = temp_env::with_vars_unset(["GOCACHE"], || {
-            refuse_state_ancestor_layers(
+            state_ancestor_layers_warning(
                 &[
                     (cfg.clone(), GrantLayer::Global),
                     (cfg.clone(), GrantLayer::Local),
                 ],
                 &h,
             )
-            .unwrap_err()
+            .unwrap()
         });
         assert!(
             err.contains("`cplt config unset allow.write ~/.config`"),
@@ -7590,7 +7822,9 @@ mod tests {
             err.contains("`cplt config unset --local allow.write ~/.config`"),
             "{err}"
         );
-        assert!(refuse_state_ancestor_layers(&[(cfg.join("gh"), GrantLayer::Local)], &h).is_ok());
+        assert!(
+            state_ancestor_layers_warning(&[(cfg.join("gh"), GrantLayer::Local)], &h).is_none()
+        );
         let writes = [cfg.clone()];
         let mut config = test_config(&h, &[]);
         config.extra_write = &writes;
@@ -7657,7 +7891,9 @@ mod tests {
         let real = crate::config::account_home().unwrap();
         let state = real.join(CPLT_STATE_DIR);
         assert_eq!(policy::passwd_state_dir(fake.path()), Some(state.clone()));
-        assert!(validate_grant_path("allow.write", &real, fake.path()).is_err());
+        assert!(
+            state_ancestor_warning("allow.write", &real, fake.path(), GrantLayer::Global).is_some()
+        );
         assert!(validate_grant_path("allow.write", &state.join("managed.d"), fake.path()).is_err());
         #[cfg(target_os = "macos")]
         {

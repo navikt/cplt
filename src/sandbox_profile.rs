@@ -3046,7 +3046,29 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // And HOME itself when it lies inside a writable tree: `~/.ssh` is denied
     // whether or not it exists, so pin every ancestor of it, HOME included.
     targets.push(crate::config::canonicalize_deepest(Path::new(config.home_dir)).join(".ssh"));
+    // cplt's state dir keeps its path: under `allow.write ~` a renamed or
+    // re-linked `~/.config` would carry `managed.d` out from under its deny, or
+    // point the next launch at a planted one. Pins appear only inside a
+    // writable tree, so a launch without such a grant gets the same profile.
+    // Every name on the way counts, in both spellings: the `$HOME` hops
+    // (`~/.config`) and each symlink hop. Unlink covers rename and removal of
+    // the name; create covers a new dir or link moved or made in its place.
+    // An unnameable entry refuses the launch earlier (`keep_cplt_state_out_of_grants`).
     emit_resolved_deny_pins(sb, config, &targets);
+    let chain = super::state_chain_pins(config);
+    if !chain.is_empty() {
+        sbpl!(
+            sb,
+            ";; Path to cplt's state dir — no rename, unlink or re-create"
+        );
+    }
+    for d in chain {
+        if validate_sbpl_path(&d).is_ok() {
+            let d = d.display();
+            sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
+            sbpl!(sb, "(deny file-write-create (literal \"{d}\"))");
+        }
+    }
     for path in config.extra_deny {
         let p = path.to_string_lossy();
         sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");

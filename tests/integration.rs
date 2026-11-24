@@ -2165,6 +2165,95 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Warn mode (#1096 follow-up): `allow.write ~/.config` and `allow.write ~`
+    /// launch again, so the kernel must keep `managed.d` closed inside them:
+    /// no write into it, no rename of `cplt`, and no rename of `~/.config`
+    /// (which would carry `managed.d` out from under its deny, to be written
+    /// and moved back). A sibling under `~/.config` is the control.
+    #[test]
+    fn state_dir_stays_closed_under_a_grant_that_covers_it() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(tmp.path()).unwrap();
+        let config = home.join(".config");
+        let managed = config.join("cplt/managed.d");
+        fs::create_dir_all(&managed).unwrap();
+        for grant in [config.clone(), home.clone()] {
+            let writes = [grant.clone()];
+            let mut opts = default_opts(&project, &home);
+            opts.extra_write = &writes;
+            let profile = write_real_profile(&opts);
+            let c = config.display();
+            let (ctl_out, ctl_ok) = run_sandboxed(&profile, &format!("echo ok > '{c}/other' 2>&1"));
+            let (w_out, w_ok) = run_sandboxed(
+                &profile,
+                &format!("echo x > '{}/evil.toml' 2>&1", managed.display()),
+            );
+            let (mv_out, mv_ok) = run_sandboxed(&profile, &format!("mv '{c}/cplt' '{c}/c2' 2>&1"));
+            let (up_out, up_ok) = run_sandboxed(&profile, &format!("mv '{c}' '{c}.old' 2>&1"));
+            fs::remove_file(&profile).ok();
+            assert!(ctl_ok, "{grant:?}: ~/.config must stay writable: {ctl_out}");
+            assert!(
+                !w_ok && !managed.join("evil.toml").exists(),
+                "{grant:?}: write into managed.d: {w_out}"
+            );
+            assert!(!mv_ok && managed.exists(), "{grant:?}: mv cplt: {mv_out}");
+            assert!(
+                !up_ok && managed.exists(),
+                "{grant:?}: mv ~/.config: {up_out}"
+            );
+        }
+    }
+
+    /// Fable on #1126: with `allow.write ~` and a stow-linked state path, each
+    /// name on the way (the `$HOME` spelling and every symlink hop) must keep
+    /// pointing at the real state dir. Layout A links `~/.config/cplt`;
+    /// layout B links `~/.config` itself.
+    #[test]
+    fn state_dir_path_cannot_be_swapped_under_a_home_grant() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        for layout in ["cplt-linked", "config-linked"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = fs::canonicalize(tmp.path()).unwrap();
+            if layout == "cplt-linked" {
+                fs::create_dir_all(home.join("dotfiles/cplt/managed.d")).unwrap();
+                fs::create_dir_all(home.join(".config")).unwrap();
+                std::os::unix::fs::symlink("../dotfiles/cplt", home.join(".config/cplt")).unwrap();
+            } else {
+                fs::create_dir_all(home.join("dotfiles/config/cplt/managed.d")).unwrap();
+                std::os::unix::fs::symlink("dotfiles/config", home.join(".config")).unwrap();
+            }
+            let writes = [home.clone()];
+            let mut opts = default_opts(&project, &home);
+            opts.extra_write = &writes;
+            let profile = write_real_profile(&opts);
+            let h = home.display();
+            let attacks = [
+                format!(
+                    "mv '{h}/.config' '{h}/c2' && mkdir -p '{h}/n/cplt' && mv '{h}/n' '{h}/.config'"
+                ),
+                format!("rm '{h}/.config'; ln -s '{h}/evil' '{h}/.config'"),
+                format!("ln -s '{h}/evil' '{h}/lnk' && mv -f '{h}/lnk' '{h}/.config'"),
+                format!("mv '{h}/dotfiles' '{h}/d2'"),
+                format!("rm '{h}/.config/cplt'; mkdir -p '{h}/.config/cplt'"),
+            ];
+            let (ctl_out, ctl_ok) = run_sandboxed(&profile, &format!("echo ok > '{h}/other' 2>&1"));
+            assert!(ctl_ok, "{layout}: home must stay writable: {ctl_out}");
+            for a in &attacks {
+                let (out, _) = run_sandboxed(&profile, &format!("{a} 2>&1"));
+                let real = fs::canonicalize(home.join(".config/cplt/managed.d"));
+                assert!(
+                    real.as_ref()
+                        .is_ok_and(|r| r.starts_with(home.join("dotfiles"))),
+                    "{layout}: `{a}` swapped the state dir ({real:?}): {out}"
+                );
+            }
+            fs::remove_file(&profile).ok();
+        }
+    }
+
     /// Kernel truth for #524: the dotfiles repo IS the project, and
     /// `~/.gitconfig` points into it. The project grant makes the tree
     /// writable; the target must still refuse a write, and the directory
