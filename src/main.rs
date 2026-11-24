@@ -2564,6 +2564,45 @@ fn linux_login_hint(
     })
 }
 
+/// What the child will have that decides whether a git credential helper
+/// answers (#1121): the launch's own env builder, so --pass-env and
+/// --inherit-env count.
+fn push_helper_env(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    keychain: bool,
+    project_dir: &Path,
+    home: &Path,
+) -> cplt::doctor::HelperEnv {
+    let parent: Vec<(String, String)> = std::env::vars().collect();
+    let env = cplt::sandbox::build_sandbox_env(
+        &parent,
+        &resolved.pass_env,
+        resolved.inherit_env,
+        &[],
+        None,
+        None,
+        agent,
+    );
+    let has = |k: &str| {
+        if let Some((_, v)) = env.vars.iter().rev().find(|(n, _)| n == k) {
+            !v.trim().is_empty()
+        } else if env.clear_first || env.remove.iter().any(|n| n == k) {
+            false
+        } else {
+            std::env::var(k).is_ok_and(|v| !v.trim().is_empty())
+        }
+    };
+    cplt::doctor::HelperEnv {
+        keychain,
+        gh_token: has("GH_TOKEN") || has("GITHUB_TOKEN"),
+        askpass: has("GIT_ASKPASS") || has("SSH_ASKPASS"),
+        linux: cfg!(target_os = "linux"),
+        project_dir: project_dir.to_path_buf(),
+        home: home.to_path_buf(),
+    }
+}
+
 /// The agent's own login variable that reaches the child, for doctor's
 /// `auth:` line. Only the agent's own: GH_TOKEN is not Claude's login, and
 /// OpenCode's gh vars feed `OPENCODE_AUTH_CONTENT` instead (#1092).
@@ -5805,9 +5844,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             cplt::doctor::push_remote(
                 &project_dir,
                 cplt::gh_proxy::gh_hosts(),
-                cfg!(target_os = "macos")
-                    && active_agent.needs_keychain()
-                    && prepared.keychain_substitute().is_none(),
+                push_helper_env(
+                    &resolved,
+                    active_agent,
+                    cfg!(target_os = "macos")
+                        && active_agent.needs_keychain()
+                        && prepared.keychain_substitute().is_none(),
+                    &project_dir,
+                    &home_dir,
+                ),
             )
             .as_ref(),
             false,
@@ -10712,7 +10757,13 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let push = doctor::push_remote(
         &project_dir,
         cplt::gh_proxy::gh_hosts(),
-        macos && active_agent.needs_keychain() && keychain_substitute.is_none(),
+        push_helper_env(
+            &resolved,
+            active_agent,
+            macos && active_agent.needs_keychain() && keychain_substitute.is_none(),
+            &project_dir,
+            &home_dir,
+        ),
     );
     println!(
         "push:        {}",

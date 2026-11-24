@@ -1554,15 +1554,24 @@ pub struct PushRemote {
 /// shortcut: ignores `branch.<b>.pushRemote` and `url.*.insteadOf`; upgrade if
 /// a remote rewritten to HTTPS that way needs the hint.
 #[must_use]
-pub fn push_remote(project_dir: &Path, hosts: &[String], keychain: bool) -> Option<PushRemote> {
+pub fn push_remote(
+    project_dir: &Path,
+    hosts: &[String],
+    env: impl Into<HelperEnv>,
+) -> Option<PushRemote> {
     let out = crate::git::output(project_dir, &["config", "--list", "-z", "--show-scope"])?;
     if !out.status.success() {
         return None;
     }
-    parse_push_remote(&String::from_utf8_lossy(&out.stdout), hosts, keychain)
+    parse_push_remote(&String::from_utf8_lossy(&out.stdout), hosts, env)
 }
 
-fn parse_push_remote(list: &str, hosts: &[String], keychain: bool) -> Option<PushRemote> {
+fn parse_push_remote(
+    list: &str,
+    hosts: &[String],
+    env: impl Into<HelperEnv>,
+) -> Option<PushRemote> {
+    let env = env.into();
     let mut fields = list.split('\0');
     let mut entries = Vec::new();
     while let (Some(scope), Some(kv)) = (fields.next(), fields.next()) {
@@ -1617,10 +1626,14 @@ fn parse_push_remote(list: &str, hosts: &[String], keychain: bool) -> Option<Pus
             // An empty value resets the list, as git does.
             if v.is_empty() {
                 usable_helpers.clear();
-            } else if helper_answers_in_sandbox(v, keychain) {
+            } else if helper_answers_in_sandbox(v, &env) {
                 usable_helpers.push(v.clone());
             }
         }
+    }
+    // git asks the askpass program when no helper answered.
+    if https_host.is_some() && env.askpass {
+        usable_helpers.push("GIT_ASKPASS".to_string());
     }
     Some(PushRemote {
         remote,
@@ -1667,23 +1680,78 @@ fn credential_scope_matches(scope: &str, url: &str) -> bool {
     host_ok && user_ok && path_ok
 }
 
-/// Whether a helper can answer inside the sandbox without the gh guard,
-/// measured on macOS (#1121): gh's own reaches its token store only through
-/// the guard; `store` reads `~/.git-credentials`, which the sandbox denies;
-/// `cache` fails with "unable to connect to cache daemon: Operation not
-/// permitted"; `osxkeychain` and GCM (Keychain store by default) answer only
-/// when this session keeps the Keychain grant (`keychain`). Anything else is
-/// assumed to work, so the hint never fires on a guess.
-fn helper_answers_in_sandbox(helper: &str, keychain: bool) -> bool {
+/// What the sandboxed child will have that decides whether a credential helper
+/// can answer: the launch's effective env and paths, never the parent's.
+#[derive(Debug, Clone)]
+pub struct HelperEnv {
+    /// This session keeps the Keychain grant.
+    pub keychain: bool,
+    /// `GH_TOKEN` or `GITHUB_TOKEN` reaches the child (--pass-env, --inherit-env).
+    pub gh_token: bool,
+    /// `GIT_ASKPASS` or `SSH_ASKPASS` reaches the child.
+    pub askpass: bool,
+    pub linux: bool,
+    pub project_dir: PathBuf,
+    pub home: PathBuf,
+}
+
+impl From<bool> for HelperEnv {
+    fn from(keychain: bool) -> Self {
+        Self {
+            keychain,
+            gh_token: false,
+            askpass: false,
+            linux: cfg!(target_os = "linux"),
+            project_dir: PathBuf::new(),
+            home: PathBuf::new(),
+        }
+    }
+}
+
+/// Whether `store --file <path>` can read its file inside the sandbox: the
+/// project is readable, `~/.git-credentials` and the rest of `$HOME` are not,
+/// and a path outside both is assumed readable (never fire on a guess).
+fn store_file_readable(helper: &str, env: &HelperEnv) -> bool {
+    let mut it = helper.split_whitespace().skip(1);
+    let mut file = None;
+    while let Some(t) = it.next() {
+        if t == "--file" {
+            file = it.next();
+        } else if let Some(f) = t.strip_prefix("--file=") {
+            file = Some(f);
+        }
+    }
+    let Some(f) = file else { return false };
+    let path = match f.strip_prefix("~/") {
+        Some(rest) => env.home.join(rest),
+        None => env.project_dir.join(f),
+    };
+    if !env.project_dir.as_os_str().is_empty() && path.starts_with(&env.project_dir) {
+        return true;
+    }
+    env.home.as_os_str().is_empty() || !path.starts_with(&env.home)
+}
+
+/// Whether a helper can answer inside the sandbox without the gh guard.
+/// Measured on macOS (#1121): gh's own reaches its token store only through
+/// the guard, unless a token is passed in; `store` reads `~/.git-credentials`,
+/// which is hard-denied, unless `--file` names a readable path; `cache` fails
+/// with "unable to connect to cache daemon: Operation not permitted" on macOS,
+/// while on Linux its socket under `XDG_RUNTIME_DIR`/`~/.cache/git` may be
+/// reachable, so it counts as usable there; `osxkeychain` and GCM answer only
+/// when this session keeps the Keychain grant. Anything else is assumed to
+/// work, so the hint never fires on a guess.
+fn helper_answers_in_sandbox(helper: &str, env: &HelperEnv) -> bool {
     if helper.contains("gh auth git-credential") {
-        return false;
+        return env.gh_token;
     }
     let name = helper.split_whitespace().next().unwrap_or_default();
     let name = name.rsplit('/').next().unwrap_or(name);
     let name = name.strip_prefix("git-credential-").unwrap_or(name);
     match name {
-        "store" | "cache" => false,
-        "osxkeychain" | "manager" | "manager-core" => keychain,
+        "store" => store_file_readable(helper, env),
+        "cache" => env.linux,
+        "osxkeychain" | "manager" | "manager-core" => env.keychain,
         _ => true,
     }
 }
@@ -2876,7 +2944,7 @@ mod tests {
                     "credential.https://github.com.helper",
                     "!/opt/gh auth git-credential",
                 ),
-                ("global", "credential.helper", "store --file x"),
+                ("global", "credential.helper", "store"),
                 ("local", "remote.origin.url", "git@github.com:o/r.git"),
                 ("local", "remote.fork.url", "https://x@GitHub.com/me/r.git"),
                 ("local", "remote.pushDefault", "fork"),
@@ -3033,9 +3101,50 @@ mod tests {
             ("manager", true, true),
             ("libsecret", false, true),
         ] {
-            assert_eq!(helper_answers_in_sandbox(h, kc), ok, "{h} keychain={kc}");
+            let mut env = HelperEnv::from(kc);
+            env.linux = false;
+            assert_eq!(helper_answers_in_sandbox(h, &env), ok, "{h} keychain={kc}");
         }
         assert!(gh_guard_fix(true).contains("--no-gh-guard"));
         assert_eq!(gh_guard_fix(false), ENABLE_GH_GUARD);
+    }
+
+    #[test]
+    fn helpers_follow_the_effective_child_env_and_platform() {
+        let env = |f: &dyn Fn(&mut HelperEnv)| {
+            let mut e = HelperEnv::from(false);
+            e.linux = false;
+            e.project_dir = PathBuf::from("/home/u/proj");
+            e.home = PathBuf::from("/home/u");
+            f(&mut e);
+            e
+        };
+        let gh = "!/opt/homebrew/bin/gh auth git-credential";
+        assert!(!helper_answers_in_sandbox(gh, &env(&|_| {})));
+        assert!(helper_answers_in_sandbox(gh, &env(&|e| e.gh_token = true)));
+        let e = env(&|_| {});
+        for (h, ok) in [
+            ("store --file /home/u/proj/.creds", true),
+            ("store --file=.creds", true),
+            ("store --file ~/proj/.creds", true),
+            ("store --file ~/.config/git/credentials", false),
+            ("store --file /home/u/other", false),
+            ("store --file /opt/shared/creds", true),
+            ("store", false),
+        ] {
+            assert_eq!(helper_answers_in_sandbox(h, &e), ok, "{h}");
+        }
+        assert!(!helper_answers_in_sandbox("cache", &e));
+        assert!(helper_answers_in_sandbox(
+            "cache",
+            &env(&|e| e.linux = true)
+        ));
+        let p = parse_push_remote(
+            &list(&[("local", "remote.origin.url", "https://github.com/o/r")]),
+            &["github.com".to_string()],
+            env(&|e| e.askpass = true),
+        )
+        .unwrap();
+        assert_eq!(push_hint(Some(&p), false, ENABLE_GH_GUARD), None);
     }
 }
