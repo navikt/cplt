@@ -4504,7 +4504,8 @@ fi
                 "build.gradle.kts",
                 "plugins { java }\nrepositories { mavenCentral() }\n\
                  dependencies { testImplementation(\"junit:junit:4.13.2\") }\n\
-                 tasks.withType<JavaCompile>().configureEach { options.isFork = true }\n",
+                 tasks.withType<JavaCompile>().configureEach { options.isFork = true }\n\
+                 tasks.test { maxParallelForks = 2 }\n",
             );
             p.write_file(
                 "src/main/java/a/A.java",
@@ -4513,6 +4514,11 @@ fi
             p.write_file(
                 "src/test/java/a/ATest.java",
                 "package a; public class ATest { @org.junit.Test public void t() { \
+                 org.junit.Assert.assertEquals(1, A.one()); } }\n",
+            );
+            p.write_file(
+                "src/test/java/a/BTest.java",
+                "package a; public class BTest { @org.junit.Test public void t() { \
                  org.junit.Assert.assertEquals(1, A.one()); } }\n",
             );
             p
@@ -4568,6 +4574,31 @@ fi
             "--allow-read".into(),
             gradle_root.to_string_lossy().into_owned(),
         ]);
+        // Default profile (#1098): loopback stays closed, the daemon and test
+        // workers cannot connect, and the launch names the line that fixes it.
+        let closed = cplt_cmd()
+            .args(["--yes", "--no-validate", "--agent", "shell"])
+            .args(&reads)
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args([
+                "--",
+                "-c",
+                "gradle build test --no-daemon --offline >/dev/null 2>&1 && echo BUILD_OK; true",
+            ])
+            .env("HOME", &home)
+            .env("GRADLE_USER_HOME", &gradle_home)
+            .output()
+            .expect("run cplt");
+        let closed_out = String::from_utf8_lossy(&closed.stdout).to_string();
+        let closed_err = String::from_utf8_lossy(&closed.stderr).to_string();
+        assert!(
+            !closed_out.contains("BUILD_OK"),
+            "loopback must stay closed by default: {closed_out}"
+        );
+        assert!(
+            closed_err.contains("cplt config set sandbox.allow_localhost_any true"),
+            "the Gradle loopback hint must fire at launch:\n{closed_err}"
+        );
         let out = cplt_cmd()
             .args(["--yes", "--no-validate", "--agent", "shell", "--allow-localhost-any"])
             .args(&reads)
