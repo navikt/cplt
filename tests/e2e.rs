@@ -2660,7 +2660,7 @@ mod e2e_tests {
     }
 
     /// #824: a spec under a tree only the final policy makes writable (a
-    /// writable tool dir, here `~/.npm`, not the project or `allow.write`) is
+    /// writable tool dir, here `~/.npm/_cacache`, not the project or `allow.write`) is
     /// rejected; the same spec under `~/.config` is the control.
     #[test]
     fn e2e_mcp_status_rejects_specs_the_policy_makes_writable() {
@@ -2692,10 +2692,13 @@ mod e2e_tests {
         };
         let ok = status(&home_path.join(".config"));
         assert_eq!(ok["servers"][0]["id"], "io.example/fake-mcp", "{ok}");
-        let bad = status(&home_path.join(".npm/xdg"));
+        let bad = status(&home_path.join(".npm/_cacache/xdg"));
         assert!(bad["servers"].as_array().unwrap().is_empty(), "{bad}");
         let reason = bad["rejected"][0]["reason"].as_str().unwrap_or("");
         assert!(reason.contains("writable in the sandbox"), "{bad}");
+        // The rest of `~/.npm` is read-only, so a spec there is accepted.
+        let ro = status(&home_path.join(".npm/xdg"));
+        assert_eq!(ro["servers"][0]["id"], "io.example/fake-mcp", "{ro}");
     }
 
     /// `cplt mcp status` from the home dir, where a launch refuses to run:
