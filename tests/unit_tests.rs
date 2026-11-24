@@ -12358,8 +12358,37 @@ fn config_set_refuses_socket_over_state_dir() {
 fn rust_string_literals(src: &str) -> Vec<String> {
     let c: Vec<char> = src.chars().collect();
     let (mut i, mut out) = (0, Vec::new());
+    // Brace depth in code, and the depth a `#[cfg(test)]` module opened at:
+    // literals inside it are fixtures, not hints.
+    let (mut depth, mut test_pending, mut in_test): (usize, bool, Option<usize>) = (0, false, None);
     while i < c.len() {
+        let at = |w: &str| c[i..].iter().take(w.len()).copied().eq(w.chars());
+        if at("#[cfg(test)]") {
+            test_pending = true;
+            i += "#[cfg(test)]".len();
+            continue;
+        }
         match c[i] {
+            '{' => {
+                if test_pending && in_test.is_none() {
+                    in_test = Some(depth);
+                }
+                test_pending = false;
+                depth += 1;
+                i += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if in_test == Some(depth) {
+                    in_test = None;
+                }
+                i += 1;
+            }
+            ';' => {
+                // `#[cfg(test)] use ...;` or `fn x();`: the attribute is spent.
+                test_pending = false;
+                i += 1;
+            }
             '/' if c.get(i + 1) == Some(&'/') => {
                 while i < c.len() && c[i] != '\n' {
                     i += 1;
@@ -12426,7 +12455,9 @@ fn rust_string_literals(src: &str) -> Vec<String> {
                         }
                         j += 1;
                     }
-                    out.push(c[start..j].iter().collect());
+                    if in_test.is_none() {
+                        out.push(c[start..j].iter().collect());
+                    }
                     i = j + 1 + hashes;
                 } else {
                     i = j; // a plain byte string: let the '"' arm read it
@@ -12459,7 +12490,9 @@ fn rust_string_literals(src: &str) -> Vec<String> {
                     }
                     i += 1;
                 }
-                out.push(lit);
+                if in_test.is_none() {
+                    out.push(lit);
+                }
                 i += 1;
             }
             _ => i += 1,
@@ -12480,7 +12513,6 @@ fn every_hinted_config_command_pastes_and_works() {
         "cplt config set --local {key} {}",
         "cplt config set --local <KEY> <VALUE>",
         "cplt config set --local allow.write {t}/<tool>",
-        "cplt config set --local sandbox.repo_dirs {expected_child}",
         "cplt config set --local sandbox.repo_dirs {first_path}",
         "cplt config set --local sandbox.repo_dirs <dir>",
         "cplt config set --local sandbox.repo_dirs <DIR>",
@@ -12523,8 +12555,7 @@ fn every_hinted_config_command_pastes_and_works() {
     let mut cmds = Vec::new();
     for f in &files {
         let raw = std::fs::read_to_string(f).unwrap();
-        let code = raw.split("#[cfg(test)]\nmod tests").next().unwrap();
-        for lit in rust_string_literals(code) {
+        for lit in rust_string_literals(&raw) {
             for (at, _) in lit.match_indices("cplt config ") {
                 let tail = &lit[at..];
                 if !(tail.starts_with("cplt config set") || tail.starts_with("cplt config unset")) {
@@ -12577,5 +12608,13 @@ fn every_hinted_config_command_pastes_and_works() {
         checked += 1;
     }
     assert!(refused.is_empty(), "{}", refused.join("\n"));
+    let stale: Vec<&&str> = TEMPLATES
+        .iter()
+        .filter(|t| !cmds.iter().any(|(_, c)| c == *t))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "templates no hint prints any more: {stale:?}"
+    );
     assert!(checked >= 20, "only {checked} hinted commands checked");
 }
