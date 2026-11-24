@@ -47,11 +47,14 @@ schema = 1
 
 [proxy]
 allow_private_domains = ["intern.nav.no"]
+allowed_domains = ["api.nav.no"]
 ```
 
 The file must lie under `~/.config/cplt/managed.d/`, after resolving symlinks. nav-pilot writes `~/.config/cplt/managed.d/nav-pilot.toml`. `~` here is your account's home directory from the system user database, not `$HOME`; if `$HOME` points elsewhere, cplt ignores the file. Every sandbox profile denies the agent write access to that directory, so an agent cannot plant or edit a managed file.
 
-The layer sits between the built-in defaults and your config. Its lists are added to yours and never replace them. Only `proxy.allow_private_domains` is accepted, and each entry must be a DNS name with at least one dot (`intern.nav.no`, not `internal` or an IP address). Any other key or table, a bad entry, a missing header or an unknown `schema` makes cplt ignore the whole file with one line naming the reason. cplt also ignores the file when the path is relative, when the file or any directory or symlink on the way to it is somewhere the session can write, when it is a symlink, FIFO or other non-regular file, when it has more than one hard link, or when you do not own it. The launch continues without the layer.
+The layer sits between the built-in defaults and your config. Its lists are added to yours and never replace them. Only `proxy.allow_private_domains` and `proxy.allowed_domains` are accepted, and each entry must be a DNS name with at least one dot (`intern.nav.no`, not `internal` or an IP address). Any other key or table, a bad entry, a missing header or an unknown `schema` makes cplt ignore the whole file with one line naming the reason. cplt also ignores the file when the path is relative, when the file or any directory or symlink on the way to it is somewhere the session can write, when it is a symlink, FIFO or other non-regular file, when it has more than one hard link, or when you do not own it. The launch continues without the layer.
+
+In the managed file, `proxy.allowed_domains` is a list of domains, not a file path. The domains join `allow.domains`: they widen an allowlist that is already in force (the agent's default allowlist, your `proxy.allowed_domains` file or a preset) and never turn one on. Without an allowlist the proxy stays in blocklist mode and the list has no effect. These domains do not get private-network access; that still needs `proxy.allow_private_domains`.
 
 `cplt config show` and `cplt doctor` tag each managed value with `managed:<managed_by>`. To drop the managed entries, unset `CPLT_MANAGED_CONFIG`.
 
