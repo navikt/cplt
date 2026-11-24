@@ -5921,7 +5921,10 @@ finally:
         ));
         let home = crate::common::home_temp_dir("wt965");
         let h = fs::canonicalize(home.path()).unwrap();
-        let cfg = h.join("cplt.toml");
+        // Where cplt looks for it anyway, so the state dir stays ~/.config/cplt
+        // and a grant on ~/.cplt-worktrees is not inside it.
+        fs::create_dir_all(h.join(".config/cplt")).unwrap();
+        let cfg = h.join(".config/cplt/config.toml");
         fs::write(
             &cfg,
             format!("[sandbox]\nallow_git_worktrees = true\nuse_bubblewrap = {bwrap}\n"),

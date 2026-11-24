@@ -1785,13 +1785,8 @@ fn git_gate_refuses_worktree_add_and_warn_mode_passes() {
     let (_, stderr, ok) = git_gate(&["-C", ".", "worktree", "add", "../wt", "main"], true, true);
     assert!(!ok, "git worktree add should be refused");
     assert!(stderr.contains("cplt worktree add"), "{stderr}");
-    if cfg!(target_os = "macos") {
-        assert!(stderr.contains("not enabled for this session"), "{stderr}");
-    } else {
-        assert!(stderr.contains("unsupported on"), "{stderr}");
-        assert!(stderr.contains("macOS-only"), "{stderr}");
-        assert!(stderr.contains("Seatbelt + socket"), "{stderr}");
-    }
+    // macOS and Linux (#965) give the same guidance.
+    assert!(stderr.contains("not enabled for this session"), "{stderr}");
     let (_, _, ok) = git_gate_with_mode(&["worktree", "add", "../wt"], true, true, "warn");
     assert!(ok, "warn mode should pass git worktree add through");
     let (_, _, ok) = git_gate(&["worktree", "list"], true, true);
@@ -1810,13 +1805,8 @@ fn cplt_worktree_add_reports_platform_or_session_requirement() {
         "cplt worktree add without a broker must fail"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if cfg!(target_os = "macos") {
-        assert!(stderr.contains("not available here"), "{stderr}");
-    } else {
-        assert!(stderr.contains("unsupported on"), "{stderr}");
-        assert!(stderr.contains("macOS-only"), "{stderr}");
-        assert!(stderr.contains("Seatbelt + socket"), "{stderr}");
-    }
+    // macOS and Linux (#965) alike.
+    assert!(stderr.contains("not available here"), "{stderr}");
 }
 
 #[test]

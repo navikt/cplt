@@ -8003,6 +8003,7 @@ struct AssembledSandbox {
 /// a session grant that reaches the broker's private staging (#965): the
 /// broker is then turned off for the session with a warning, and the managed
 /// root stays, exactly as when the broker cannot start.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_wraps))] // macOS can refuse
 fn arm_worktree_broker(
     broker: &mut Option<cplt::worktree_broker::Broker>,
     prepared: &mut sandbox::PreparedSandbox,
