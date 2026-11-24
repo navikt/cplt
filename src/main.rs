@@ -8122,6 +8122,14 @@ fn assemble_sandbox(
         cli.observe_domains,
     );
 
+    if let Some(line) = sandbox::gradle_loopback_hint(
+        &probe.project_dir,
+        resolved.allow_localhost_any,
+        resolved.proxy_forced,
+    ) {
+        ui::warn(&line);
+    }
+
     // With wrapper dists read-only, a missing pinned distribution cannot be
     // downloaded in the sandbox: say how to fetch it before the build fails.
     if resolved.readonly_host_tool_paths {
