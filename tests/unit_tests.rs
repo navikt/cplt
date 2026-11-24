@@ -10438,6 +10438,7 @@ allow_jvm_attach = false
 allow_msbuild = false
 gradle_init = false
 deny_nested_git = false
+readonly_host_tool_paths = false
 refuse_cache_exec_links = false
 refuse_unenforced = false
 deny_key_files_by_extension = false
@@ -11893,13 +11894,13 @@ fn env_pass_env_java_tool_options_still_suppresses_proxy_injection() {
 fn an_agent_binary_under_a_writable_tool_dir_is_a_finding() {
     let policy = generate_policy(&base_profile_options());
     let home = std::path::Path::new("/Users/test");
-    // The npx cache: `npx copilot` resolves here, and ~/.npm is granted write
-    // so ordinary installs work.
+    // The npx cache: `npx copilot` resolves here, and ~/.npm/_npx is granted
+    // write because npx needs it even for a cached package.
     let bin = home.join(".npm/_npx/0e9f/node_modules/.bin/copilot");
 
     assert_eq!(
         cplt::check::writable_tree_over(&policy, home, &bin),
-        Some(home.join(".npm")),
+        Some(home.join(".npm/_npx")),
         "a binary under a writable tool dir must name the tree containing it"
     );
 }
@@ -12171,7 +12172,7 @@ fn env_tool_dir_allowed_only_under_safe_roots() {
     let safe = [
         ".cache/go-build-x",
         "Library/Caches/pip",
-        ".npm/x",
+        ".npm/_cacache",
         ".gradle/caches",
         ".m2/repository",
         ".cargo/registry",
