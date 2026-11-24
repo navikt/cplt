@@ -1260,6 +1260,20 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
             validate_grant_path(key, p, config.home_dir)?;
         }
     }
+    // A socket grant writes the path itself, outside the writable-tree lists
+    // the managed loader and the macOS state pins draw from, so the
+    // warn-instead-of-refuse treatment for ancestor grants cannot cover it.
+    // A socket is a file; naming a directory above cplt's state is refused.
+    for p in config.extra_socket {
+        if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, p) {
+            return Err(format!(
+                "allow.socket names {}, which is cplt's state directory {} or contains it. \
+                 Name the socket file itself, outside that directory.",
+                p.display(),
+                dir.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -7459,6 +7473,23 @@ mod tests {
             assert!(error.contains("allow.write"), "{error}");
 
             config.extra_write = &[];
+            config.extra_socket = &granted;
+            let error = prepare(&config)
+                .err()
+                .expect("allow.socket must be refused");
+            assert!(error.contains("allow.socket"), "{error}");
+        }
+    }
+
+    /// A socket grant on `~/.config` or `$HOME` writes that path itself, which
+    /// neither the managed loader's writable set nor the macOS state pins see,
+    /// so it is refused rather than warned like an ancestor write grant.
+    #[test]
+    fn prepare_rejects_a_socket_grant_over_the_state_dir() {
+        let home = Path::new("/fake/test");
+        for granted in [home.join(".config"), home.to_path_buf()] {
+            let granted = vec![granted];
+            let mut config = test_config(home, &[]);
             config.extra_socket = &granted;
             let error = prepare(&config)
                 .err()

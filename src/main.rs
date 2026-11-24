@@ -6152,7 +6152,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         if let Some(line) = guard.finish() {
             ui::warn(&line);
         }
-        if !settled {
+        // Only a probe that ran can say the tree is still alive (#1126).
+        if needs_snapshot && !settled {
             ui::warn(config::UNSETTLED_MANAGED_WARNING);
         }
     }
@@ -8959,7 +8960,8 @@ fn run_exec_command(
         if let Some(line) = guard.finish() {
             ui::warn(&line);
         }
-        if !settled {
+        // Only a probe that ran can say the tree is still alive (#1126).
+        if needs_snapshot && !settled {
             ui::warn(config::UNSETTLED_MANAGED_WARNING);
         }
     }

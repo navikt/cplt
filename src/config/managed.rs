@@ -348,7 +348,7 @@ pub fn load_managed_from(
         .collect();
     #[cfg(target_os = "macos")]
     let writable = kept.as_slice();
-    crate::sandbox::resolve_unwritable(path, &writable).map_err(|()| {
+    crate::sandbox::resolve_unwritable(path, writable).map_err(|()| {
         let tree = writable
             .iter()
             .find(|w| canonical.starts_with(w) || path.starts_with(w) || trusted.starts_with(w));
@@ -615,6 +615,11 @@ const MAX_ENTRIES: usize = 4096;
 pub struct ManagedSnapshot {
     path: PathBuf,
     before: Option<Before>,
+    /// Every dir from home down to `managed.d`, held so a session that makes
+    /// one unsearchable (`chmod 000`) cannot hide its edit from the check.
+    held: Vec<std::fs::File>,
+    /// `lstat` of the path before: an unchanged stow-style link is no news.
+    lstat: Option<(u64, u64)>,
 }
 
 impl ManagedSnapshot {
@@ -626,30 +631,40 @@ impl ManagedSnapshot {
             .unwrap_or_else(|_| home.to_path_buf())
             .join(TRUSTED_DIR);
         let before = open_dir(&path).map(|(_, f, id)| (id, scan(&f)));
-        Self { path, before }
+        let held = hold_chain(home, &path);
+        let lstat = lstat_id(&path);
+        Self {
+            path,
+            before,
+            held,
+            lstat,
+        }
     }
 
     /// Re-scan and quarantine what changed. Returns one warning line, or
     /// `None` when nothing did.
     #[must_use]
     pub fn finish(self) -> Option<String> {
-        let now = open_dir(&self.path);
+        let now = open_dir(&self.path).or_else(|| {
+            restore_search(&self.held);
+            open_dir(&self.path)
+        });
         let parent = now.as_ref().map(|(p, _, _)| p);
+        let mut gone: Vec<String>;
         let moved = match (self.before, now.as_ref()) {
             // Gone, or replaced by (or reached through) a symlink: the loader
-            // refuses that layout, so nothing loads from it. Say so.
+            // refuses that layout, so nothing loads from it. Say so, unless it
+            // was already so before the session (a stow-linked state dir).
             (before, None) => {
-                return (before.is_some() || std::fs::symlink_metadata(&self.path).is_ok()).then(
-                    || {
-                        format!(
-                            "The session could write cplt's state directory, and {} is no \
+                return (before.is_some() || lstat_id(&self.path) != self.lstat).then(|| {
+                    format!(
+                        "The session could write cplt's state directory, and {} is no \
                              longer a plain directory (moved, removed or replaced by a symlink). \
                              The managed config is refused until it is restored. Review it, and \
                              remove the grant that covers ~/.config/cplt.",
-                            esc(&self.path.to_string_lossy())
-                        )
-                    },
-                );
+                        esc(&self.path.to_string_lossy())
+                    )
+                });
             }
             (Some((id, Some(old))), Some((_, f, now_id))) if id == *now_id => {
                 let Some(new) = scan(f) else {
@@ -662,6 +677,14 @@ impl ManagedSnapshot {
                     .filter_map(|(rel, _)| rel.iter().next())
                     .collect();
                 names.dedup();
+                gone = old
+                    .keys()
+                    .filter(|rel| !new.contains_key(*rel))
+                    .filter_map(|rel| rel.iter().next())
+                    .filter(|n| !new.keys().any(|k| k.iter().next() == Some(*n)))
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .collect();
+                gone.dedup();
                 let mut moved = Vec::new();
                 for n in names {
                     match quarantine_at(f, n) {
@@ -676,7 +699,64 @@ impl ManagedSnapshot {
             // Created, replaced, or too big to compare: the whole dir goes.
             _ => return quarantine_dir(parent, &self.path),
         };
-        (!moved.is_empty()).then(|| quarantine_line(&self.path, &moved.join(", ")))
+        let deleted = (!gone.is_empty()).then(|| {
+            format!(
+                "The session deleted {} from {}. Review the managed config.",
+                esc(&gone.join(", ")),
+                esc(&self.path.to_string_lossy())
+            )
+        });
+        let moved = (!moved.is_empty()).then(|| quarantine_line(&self.path, &moved.join(", ")));
+        match (moved, deleted) {
+            (Some(m), Some(d)) => Some(format!("{m} {d}")),
+            (m, d) => m.or(d),
+        }
+    }
+}
+
+fn lstat_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Open each dir from the canonical `home` down to `path`, `O_NOFOLLOW`,
+/// stopping at the first that does not open.
+fn hold_chain(home: &Path, path: &Path) -> Vec<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    let Ok(home) = std::fs::canonicalize(home) else {
+        return Vec::new();
+    };
+    let (Ok(rest), Some((_, mut cur, _))) = (path.strip_prefix(&home), open_dir(&home)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in rest.components() {
+        let Ok(next) = open_nofollow(cur.as_raw_fd(), c.as_os_str(), flags) else {
+            break;
+        };
+        out.push(std::mem::replace(&mut cur, std::fs::File::from(next)));
+    }
+    out.push(cur);
+    out
+}
+
+/// The path walk failed: give back owner search and write on every held dir
+/// that lost them (the session's `chmod 000`), through the descriptors, so
+/// the walk can run again. A dir moved or swapped still fails the walk.
+fn restore_search(held: &[std::fs::File]) {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    for f in held {
+        if let Ok(m) = f.metadata()
+            && m.mode() & 0o700 != 0o700
+        {
+            let mode = ((m.mode() | 0o700) & 0o7777) as libc::mode_t;
+            // SAFETY: `f` is an open directory; fchmod has no other preconditions.
+            unsafe { libc::fchmod(f.as_raw_fd(), mode) };
+        }
     }
 }
 
@@ -1527,6 +1607,53 @@ mod tests {
             !d.join("nav-pilot.toml").exists(),
             "edit left loadable: {line}"
         );
+    }
+
+    /// Copilot on #1126: `chmod 000` on `managed.d` or an ancestor makes the
+    /// path walk fail. The held descriptors still reach it, so the edit is
+    /// quarantined instead of left to load once permissions are restored.
+    #[test]
+    fn snapshot_quarantines_despite_an_unsearchable_dir_or_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        for ancestor in [false, true] {
+            let h = Home::new();
+            let d = h.managed_d();
+            let f = write(&d, "nav-pilot.toml", GOOD);
+            let snap = ManagedSnapshot::take(h.path());
+            std::fs::write(&f, GOOD.replace("b.nav.no", "x.nav.no")).unwrap();
+            let locked = if ancestor {
+                h.path().join(".config")
+            } else {
+                d.clone()
+            };
+            mode(&locked, 0o000).unwrap();
+            let line = snap.finish().expect("reported");
+            mode(&locked, 0o700).unwrap();
+            assert!(
+                !f.exists(),
+                "edit left loadable (ancestor={ancestor}): {line}"
+            );
+        }
+    }
+
+    /// Fable on #1126: an entry the session deleted is reported, and a
+    /// state dir that was a stow-style link before the session is no news.
+    #[test]
+    fn snapshot_reports_deletions_and_ignores_an_unchanged_link() {
+        let h = Home::new();
+        let d = h.managed_d();
+        let f = write(&d, "nav-pilot.toml", GOOD);
+        let snap = ManagedSnapshot::take(h.path());
+        std::fs::remove_file(&f).unwrap();
+        let line = snap.finish().expect("deletion reported");
+        assert!(line.contains("deleted nav-pilot.toml"), "{line}");
+
+        let h = Home::new();
+        let cplt = h.path().join(".config/cplt");
+        std::fs::rename(&cplt, h.path().join("dotfiles")).unwrap();
+        std::os::unix::fs::symlink(h.path().join("dotfiles"), &cplt).unwrap();
+        assert!(ManagedSnapshot::take(h.path()).finish().is_none());
     }
 
     /// When nothing can be moved (here: the parent and `managed.d` are both
