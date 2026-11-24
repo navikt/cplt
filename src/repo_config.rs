@@ -575,6 +575,8 @@ fn reject_path_traversal(path: &str, context: &str) -> Result<(), String> {
 /// is worth supporting when `[deny]` exists to carve out parts of a tree.
 fn reject_root_path(path: &str, context: &str) -> Result<(), String> {
     let normalized = crate::config::lexically_normalized(std::path::Path::new(path));
+    // `/.nofollow` (macOS) is rewritten to `/` when the rule is built.
+    let normalized = crate::config::strip_nofollow(&normalized);
     if normalized.as_os_str().is_empty() {
         return Err(format!(
             "{context} entry {path:?} resolves to the repository root, which would deny \

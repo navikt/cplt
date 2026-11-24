@@ -1593,7 +1593,7 @@ fn validate_repo_dirs(
     for (raw, source) in &named {
         let raw = raw.as_path();
         let named_as = source.describe(raw);
-        let dir = std::fs::canonicalize(raw)
+        let dir = config::canonicalize_strict(raw)
             .map_err(|e| anyhow::anyhow!("Cannot resolve {named_as}: {e}"))?;
 
         // The FINAL component must not be a symlink. The project dir is
@@ -3388,7 +3388,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
     // Resolve project directory
     let project_dir = match &cli.project_dir {
-        Some(p) => std::fs::canonicalize(p)
+        Some(p) => config::canonicalize_strict(p)
             .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
         None => match cplt::git::project_root(Path::new(".")) {
             Ok(root) => std::fs::canonicalize(&root).unwrap_or(root),

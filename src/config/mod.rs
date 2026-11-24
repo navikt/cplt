@@ -40,6 +40,7 @@ pub use managed::{
 };
 pub(crate) use path::MAXSYMLINKS;
 pub(crate) use path::lexically_normalized;
+pub(crate) use path::strip_nofollow;
 pub use path::{
     CustomConfigVerdict, allow_path_credential_hop, approval_dirs, approval_file,
     classify_custom_config, collapse_tilde, config_dir, config_path, credential_hop_message,

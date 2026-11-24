@@ -526,27 +526,40 @@ pub fn canonicalize_deepest(path: &Path) -> PathBuf {
 /// `std::fs::canonicalize`, plus the two macOS spellings `realpath` leaves
 /// alone but Seatbelt never matches: a `/.nofollow/` prefix and the
 /// `/System/Volumes/Data` firmlink. The single choke point for every path a
-/// rule is built from (CLI, user config, repo `.cplt.toml`, credential-link
-/// and overlap checks, via [`canonicalize_deepest`]), so all of them compare
-/// the same form. A rule naming either spelling would otherwise be inert.
+/// rule is built from: `--allow-*`/`--deny-path`, user config, repo
+/// `.cplt.toml`, `--project-dir`, named roots, the MCP broker's temp paths,
+/// and credential-link and overlap checks (via [`canonicalize_deepest`]).
+/// Other `fs::canonicalize` calls (HOME, cwd, tests) do not go through it.
+/// A rule naming either spelling would otherwise be inert. `/.nofollow` is
+/// macOS-only and a bare `/.nofollow` (the root) is refused.
 pub fn canonicalize_strict(path: &Path) -> std::io::Result<PathBuf> {
-    std::fs::canonicalize(strip_nofollow(path)).map(|c| firmlink_canonical(&c))
+    let stripped = strip_nofollow(path);
+    // `/.nofollow` alone would become `/`: a spelling that smuggles the root
+    // past every "too broad" check made on the string.
+    if stripped == Path::new("/") && lexically_normalized(path) != stripped {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "/.nofollow names the filesystem root",
+        ));
+    }
+    std::fs::canonicalize(&stripped).map(|c| firmlink_canonical(&strip_nofollow(&c)))
 }
 
 /// `/.nofollow/<x>` names `/<x>` without following a symlink at `<x>`.
 /// Callers granting access refuse that case ([`nofollow_names_symlink`]);
 /// a deny simply applies to `/<x>`.
-fn strip_nofollow(path: &Path) -> PathBuf {
+pub(crate) fn strip_nofollow(path: &Path) -> PathBuf {
     match path.strip_prefix("/.nofollow") {
-        Ok(rest) => Path::new("/").join(rest),
-        Err(_) => path.to_path_buf(),
+        Ok(rest) if cfg!(target_os = "macos") => Path::new("/").join(rest),
+        _ => path.to_path_buf(),
     }
 }
 
 /// True when `path` is spelled `/.nofollow/<x>` and `<x>` is a symlink: the
 /// spelling asks for the link itself, which a grant cannot honour.
 pub fn nofollow_names_symlink(path: &Path) -> bool {
-    path.starts_with("/.nofollow")
+    cfg!(target_os = "macos")
+        && path.starts_with("/.nofollow")
         && std::fs::symlink_metadata(strip_nofollow(path)).is_ok_and(|m| m.file_type().is_symlink())
 }
 

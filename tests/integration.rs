@@ -7101,6 +7101,75 @@ except Exception as e:
         assert!(!out.contains("/System/Volumes/Data/"), "{out}");
     }
 
+    /// A bare `/.nofollow` spelling of the root, in every layer, must be
+    /// refused like `/`: no deny (or any rule) on `/` may reach the profile.
+    #[test]
+    fn binary_nofollow_root_spellings_never_reach_the_profile() {
+        let (tmp, home, project, _) = firmlink_fixture();
+        let cfg = tmp.path().join("config.toml");
+        for spelling in ["/.nofollow", "/.nofollow/", "/.nofollow/."] {
+            let (out, _) = firmlink_profile(&home, &project, None, &["--deny-path", spelling]);
+            assert!(!out.contains("(subpath \"/\")"), "CLI {spelling}:\n{out}");
+            fs::write(&cfg, format!("[deny]\npaths = [\"{spelling}\"]\n")).unwrap();
+            let (out, _) = firmlink_profile(&home, &project, Some(&cfg), &[]);
+            assert!(
+                !out.contains("(subpath \"/\")"),
+                "config {spelling}:\n{out}"
+            );
+            fs::write(
+                project.join(".cplt.toml"),
+                format!("[deny]\npaths = [\"{spelling}\"]\n"),
+            )
+            .unwrap();
+            let (out, _) = firmlink_profile(&home, &project, None, &[]);
+            assert!(!out.contains("(subpath \"/\")"), "repo {spelling}:\n{out}");
+        }
+    }
+
+    /// A `/.nofollow/<symlink>` grant names the link itself, which a grant
+    /// cannot honour: refused in the CLI, user config and `.cplt.toml`.
+    #[test]
+    fn binary_nofollow_symlink_grants_are_refused() {
+        let (tmp, home, project, _) = firmlink_fixture();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(root.join("docs"), root.join("docs-link")).unwrap();
+        let spelled =
+            Path::new("/.nofollow").join(root.join("docs-link").strip_prefix("/").unwrap());
+        let s = spelled.to_string_lossy().into_owned();
+        let granted = |out: &str| out.contains(&format!("\"{}/docs\"", root.display()));
+        let (out, err) = firmlink_profile(&home, &project, None, &["--allow-read", &s]);
+        assert!(
+            !granted(&out) && err.contains("/.nofollow/"),
+            "CLI:\n{err}\n{out}"
+        );
+        let cfg = tmp.path().join("config.toml");
+        fs::write(&cfg, format!("[allow]\nread = [\"{s}\"]\n")).unwrap();
+        let (out, err) = firmlink_profile(&home, &project, Some(&cfg), &[]);
+        assert!(
+            !granted(&out) && err.contains("/.nofollow/"),
+            "config:\n{err}\n{out}"
+        );
+        fs::write(
+            project.join(".cplt.toml"),
+            format!("[propose.allow]\nread = [\"{s}\"]\n"),
+        )
+        .unwrap();
+        let (out, err) = firmlink_profile(&home, &project, None, &[]);
+        assert!(!granted(&out), "repo:\n{err}\n{out}");
+    }
+
+    /// A firmlink-spelled `--project-dir` yields canonical rules.
+    #[test]
+    fn binary_firmlink_project_dir_is_canonical() {
+        let (_tmp, home, project, _) = firmlink_fixture();
+        let (out, err) = firmlink_profile(&home, &firmlink(&project), None, &[]);
+        assert!(
+            out.contains(&format!("\"{}\"", project.display())),
+            "{err}\n{out}"
+        );
+        assert!(!out.contains("/System/Volumes/Data/"), "{out}");
+    }
+
     /// #653: `proxy.deny_dns` reaches the profile from config, and only
     /// together with `proxy.forced`.
     #[test]
