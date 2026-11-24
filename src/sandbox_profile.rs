@@ -2935,10 +2935,12 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
             .iter()
             .find_map(|p| overlapping_deny(config.extra_deny, Path::new(p)))
         {
-            crate::ui::warn(&format!(
-                "Directory clones out of ~/{rel} are not allowed because of --deny-path {}.",
-                deny.display()
-            ));
+            if clone_cache_exists(home, rel) {
+                crate::ui::warn(&format!(
+                    "Directory clones out of ~/{rel} are not allowed because of --deny-path {}.",
+                    deny.display()
+                ));
+            }
             continue;
         }
         for p in spellings {
@@ -3082,6 +3084,11 @@ fn home_spellings(home: &str, rel: &str) -> Vec<String> {
 /// next launch allow cloning it. A symlink anywhere between `$HOME` and the
 /// cache gets no allow at all. The canonical `$HOME` spelling is kept, since
 /// `$HOME` itself is not the agent's to move.
+/// A cache that is not there has nothing to clone, so dropping its allow needs no warning.
+fn clone_cache_exists(home: &str, rel: &str) -> bool {
+    std::fs::symlink_metadata(Path::new(home).join(rel)).is_ok()
+}
+
 fn clone_cache_spellings(home: &str, rel: &str) -> Result<Vec<String>, PathBuf> {
     let mut walk = PathBuf::from(home);
     for part in Path::new(rel).components() {
@@ -4180,6 +4187,15 @@ mod mcp_child_profile_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clone_cache_exists_only_for_present_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().to_str().unwrap();
+        assert!(!clone_cache_exists(home, ".bun/install/cache"));
+        std::fs::create_dir_all(t.path().join(".bun/install/cache")).unwrap();
+        assert!(clone_cache_exists(home, ".bun/install/cache"));
+    }
+
     use super::*;
 
     #[test]
