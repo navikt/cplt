@@ -129,13 +129,13 @@ pub use policy::{
     SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar,
     ToolPathOverride, ToolRoot, XDG_PINNED_MARKER, active_tool_dirs, app_dirs,
     apply_readonly_host_tool_paths, build_credential_grants, copilot_default_pkg_dir,
-    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_ancestor_grant,
-    cplt_state_dir, cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid,
-    cypress_app_data_dir, cypress_app_data_dir_with_env, cypress_runtime_intent,
-    dir_overlaps_credentials, ensure_split_tool_dirs, env_tool_dir_allowed, env_tool_dir_hint_ok,
-    env_tool_path_protected, env_tool_temp_roots, exec_write_conflicts, first_party_read_target,
-    gradle_loopback_hint, grant_is_refused, home_config_link_targets, home_tool_dirs,
-    host_tool_ro_overlays, linux_docker_socket_paths, linux_rootless_socket_paths,
+    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, cplt_exe_no_exec_dir,
+    cplt_state_ancestor_grant, cplt_state_dir, cplt_state_dir_grant, cplt_state_file,
+    credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
+    cypress_runtime_intent, dir_overlaps_credentials, ensure_split_tool_dirs, env_tool_dir_allowed,
+    env_tool_dir_hint_ok, env_tool_path_protected, env_tool_temp_roots, exec_write_conflicts,
+    first_party_read_target, gradle_loopback_hint, grant_is_refused, home_config_link_targets,
+    home_tool_dirs, host_tool_ro_overlays, linux_docker_socket_paths, linux_rootless_socket_paths,
     linux_runtime_dirs, mise_ro_protect_paths, missing_wrapper_dist_hint, nested_alternation,
     no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
@@ -413,6 +413,9 @@ pub struct PreparedSandbox {
     /// The credential forwarded into the sandbox in place of the Keychain
     /// grant, if any (#242). `None` on every run where the trade did not apply.
     pub(crate) keychain_substitute: Option<crate::agent::KeychainSubstitute>,
+    /// The no-exec dir the cplt binary sits under (#1158): the wrappers that
+    /// would exec it are written as an explanation instead.
+    pub(crate) cplt_exec_denied: Option<PathBuf>,
     /// Exported to the child as `CPLT_WORKTREE_ROOT` (#531). Set by the
     /// launcher with [`Self::set_worktree_root`] after `prepare`; the grant
     /// itself comes from `SandboxConfig::named_roots`.
@@ -3314,6 +3317,18 @@ fn prepare_impl(
         playwright_socket_dir,
     );
 
+    let cplt_exec_denied = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .ok()
+        .and_then(|exe| {
+            policy::cplt_exe_no_exec_dir(
+                &exe,
+                config.home_dir,
+                config.allow_cache_exec,
+                config.allow_cache_exec_any,
+                config.allow_tmp_exec,
+            )
+        });
     Ok(PreparedSandbox {
         project_dir: config.project_dir.to_path_buf(),
         home_dir: config.home_dir.to_path_buf(),
@@ -3337,6 +3352,7 @@ fn prepare_impl(
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         extra_deny: config.extra_deny.to_vec(),
         keychain_substitute: config.keychain_substitute.clone(),
+        cplt_exec_denied,
         worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
@@ -5128,6 +5144,7 @@ fn prepare_impl(
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         extra_deny: config.extra_deny.to_vec(),
         keychain_substitute: config.keychain_substitute.clone(),
+        cplt_exec_denied: None,
         worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,

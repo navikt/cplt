@@ -7894,4 +7894,46 @@ except Exception as e:
             "the refusal must be reported: {stderr}"
         );
     }
+
+    /// #1158: a cplt copied under /var/folders (tempdir) cannot be exec'd by
+    /// its own in-sandbox wrappers. The launch says so, and the git guard
+    /// wrapper names itself instead of failing silently.
+    #[test]
+    fn cplt_in_temp_dir_warns_and_wrapper_explains() {
+        if !sandbox_exec_available() {
+            return;
+        }
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = bin_dir.path().join("cplt");
+        fs::copy(common::binary_path(), &bin).unwrap();
+        let repo = common::temp_repo("navikt/probe");
+        let mut cmd = common::cplt_cmd_at(&bin);
+        cmd.args(["--agent", "shell", "--yes", "--project-dir"])
+            .arg(repo.path())
+            .args(["--", "-c", "git status"])
+            .stdin(Stdio::null());
+        // No controlling tty: the wrapper line must reach stderr on its own.
+        // SAFETY: setsid is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains("where the sandbox denies execute. The gh and git guards are off"),
+            "{all}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cplt: the git guard is off"),
+            "{all}"
+        );
+        assert!(!out.status.success(), "{all}");
+    }
 }

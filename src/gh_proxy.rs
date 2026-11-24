@@ -2830,6 +2830,30 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The wrapper written in place of a guard or the `open` shim when the
+/// sandbox cannot exec cplt at `cplt` (#1158; see `cplt_exe_no_exec_dir`).
+/// It never tries: a failed `exec` would end `sh` with only "Operation not
+/// permitted". It says which `feature` is off and the fix, on stderr so the
+/// agent sees it and on the terminal when stderr is not one, and exits 126.
+#[must_use]
+pub fn cplt_unrunnable_script(cplt: &str, feature: &str) -> String {
+    format!("#!/bin/sh\n{}", cplt_unrunnable_body(cplt, feature))
+}
+
+/// The lines of [`cplt_unrunnable_script`] after the shebang.
+#[must_use]
+pub fn cplt_unrunnable_body(cplt: &str, feature: &str) -> String {
+    let msg = shell_escape(&format!(
+        "cplt: {feature} is off: the sandbox cannot run cplt at {cplt}. \
+         Install cplt outside temp dirs, e.g. brew install navikt/tap/cplt."
+    ));
+    format!(
+        "printf '%s\\n' {msg} >&2\n\
+         [ -t 2 ] || {{ printf '%s\\n' {msg} >/dev/tty; }} 2>/dev/null\n\
+         exit 126\n"
+    )
+}
+
 /// Generate the shell wrapper script content.
 ///
 /// The wrapper intercepts `gh` invocations, calls `cplt gh-gate` for
@@ -6731,6 +6755,52 @@ mod tests {
     /// One object, three renderings: the launch prints the block form, warn
     /// mode the same body under a label that does not say BLOCKED, and the
     /// agent-addressed lines close both. Nothing here is derived from text.
+    /// #1158: with an executable cplt the guard wrappers still `exec` it, so
+    /// signals reach the gate and no `sh` is left in between.
+    #[test]
+    fn git_wrapper_execs_cplt() {
+        let s = generate_git_wrapper_script(
+            "/usr/bin/git",
+            "/opt/cplt",
+            &crate::config::GitGuardPolicy::default(),
+            &RepoFacts::default(),
+        );
+        assert!(
+            s.contains("\nexec '/opt/cplt' git-gate --real-git '/usr/bin/git' "),
+            "{s}"
+        );
+        assert!(s.ends_with(" -- \"$@\"\n"), "{s}");
+    }
+
+    /// #1158: when the sandbox cannot exec cplt, the wrapper never tries. It
+    /// names the feature and the fix on stderr (no tty here) and exits 126.
+    #[test]
+    fn unrunnable_wrapper_explains_and_exits_126() {
+        use std::os::unix::process::CommandExt as _;
+        let line = "cplt: the git guard is off: the sandbox cannot run cplt at /private/tmp/x/cplt. \
+                    Install cplt outside temp dirs, e.g. brew install navikt/tap/cplt.";
+        let s = cplt_unrunnable_script("/private/tmp/x/cplt", "the git guard");
+        assert_eq!(
+            s,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{line}' >&2\n\
+                 [ -t 2 ] || {{ printf '%s\\n' '{line}' >/dev/tty; }} 2>/dev/null\nexit 126\n"
+            )
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", &s]);
+        // SAFETY: setsid is async-signal-safe; no controlling tty for the child.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(126));
+        assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{line}\n"));
+    }
+
     #[test]
     fn a_refusal_renders_from_its_fields() {
         let refusal = Refusal {

@@ -209,6 +209,8 @@ fn configure_command(
     keychain_substitute: Option<&crate::agent::KeychainSubstitute>,
     // An OpenCode v2 session ignores the OPENCODE_AUTH_CONTENT handover (#710).
     opencode_v2: bool,
+    // #1158: cplt cannot be exec'd in the sandbox; wrappers explain instead.
+    cplt_exec_denied: Option<&Path>,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -458,6 +460,7 @@ fn configure_command(
             quiet,
             pnpm_shadow_dir,
             worktree_root,
+            cplt_exec_denied,
         );
         if gh_guard.enabled && scratch.join("bin").join("gh").is_file() {
             route_github_credentials_through_gh_guard(cmd, inherit_env);
@@ -937,6 +940,7 @@ fn install_command_wrappers(
     quiet: bool,
     pnpm_shadow_dir: Option<&Path>,
     worktree_root: Option<&Path>,
+    cplt_exec_denied: Option<&Path>,
 ) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1084,13 +1088,17 @@ fn install_command_wrappers(
         } else {
             None
         };
-        let script = crate::gh_proxy::generate_wrapper_script(
-            &real_gh.to_string_lossy(),
-            &repo_scope,
-            real_git_str.as_deref(),
-            &cplt_str,
-            gh_guard,
-        );
+        let script = if cplt_exec_denied.is_some() {
+            crate::gh_proxy::cplt_unrunnable_script(&cplt_str, "the gh guard")
+        } else {
+            crate::gh_proxy::generate_wrapper_script(
+                &real_gh.to_string_lossy(),
+                &repo_scope,
+                real_git_str.as_deref(),
+                &cplt_str,
+                gh_guard,
+            )
+        };
         let wrapper_path = bin_dir.join("gh");
         if std::fs::write(&wrapper_path, script).is_ok() {
             let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
@@ -1209,12 +1217,16 @@ fn install_command_wrappers(
                 );
             }
         }
-        let script = crate::gh_proxy::generate_git_wrapper_script(
-            &real_git.to_string_lossy(),
-            &cplt_str,
-            &git_guard,
-            &repo_facts,
-        );
+        let script = if cplt_exec_denied.is_some() {
+            crate::gh_proxy::cplt_unrunnable_script(&cplt_str, "the git guard")
+        } else {
+            crate::gh_proxy::generate_git_wrapper_script(
+                &real_git.to_string_lossy(),
+                &cplt_str,
+                &git_guard,
+                &repo_facts,
+            )
+        };
         let wrapper_path = bin_dir.join("git");
         if std::fs::write(&wrapper_path, script).is_ok() {
             let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
@@ -1379,12 +1391,22 @@ fn install_open_url_shims(
     }
     for name in crate::mcp_broker::OPEN_URL_SHIMS {
         let real = which_binary(name);
-        let script = crate::mcp_broker::open_url_shim(
-            &cplt.to_string_lossy(),
-            &socket.to_string_lossy(),
-            &sandbox.open_url_hosts,
-            real.as_deref().map(|p| p.to_string_lossy()).as_deref(),
-        );
+        let script = if sandbox.cplt_exec_denied.is_some() {
+            crate::mcp_broker::open_url_shim_unrunnable(
+                &crate::gh_proxy::cplt_unrunnable_body(
+                    &cplt.to_string_lossy(),
+                    "opening the MCP login link",
+                ),
+                real.as_deref().map(|p| p.to_string_lossy()).as_deref(),
+            )
+        } else {
+            crate::mcp_broker::open_url_shim(
+                &cplt.to_string_lossy(),
+                &socket.to_string_lossy(),
+                &sandbox.open_url_hosts,
+                real.as_deref().map(|p| p.to_string_lossy()).as_deref(),
+            )
+        };
         let path = dir.join(name);
         if std::fs::write(&path, script).is_err()
             || std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).is_err()
@@ -1932,6 +1954,7 @@ pub fn exec(
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
         sandbox.opencode_v2,
+        sandbox.cplt_exec_denied.as_deref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -2085,6 +2108,7 @@ pub fn exec(
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
         sandbox.opencode_v2,
+        sandbox.cplt_exec_denied.as_deref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -2332,6 +2356,7 @@ fn exec_bwrap(
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
         sandbox.opencode_v2,
+        sandbox.cplt_exec_denied.as_deref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
