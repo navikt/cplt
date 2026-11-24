@@ -51,20 +51,25 @@ pub const TRUSTED_DIR: &str = ".config/cplt/managed.d";
 /// Directories at index `check_from` and deeper must be owned by the user or
 /// root and not group/world-writable, checked by `fstat` on the held fd, so
 /// nobody else can swap an entry below them.
-fn open_beneath(dir: &Path, rel: &Path, check_from: usize) -> std::io::Result<std::fs::File> {
-    use std::os::fd::{FromRawFd as _, OwnedFd};
+fn open_nofollow(
+    at: libc::c_int,
+    name: &OsStr,
+    flags: libc::c_int,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
-    let open = |at: libc::c_int, name: &OsStr, flags: libc::c_int| {
-        let c = std::ffi::CString::new(name.as_bytes())?;
-        // SAFETY: `c` is NUL-terminated; `at` is AT_FDCWD or an open fd.
-        let fd =
-            unsafe { libc::openat(at, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: openat returned a fresh fd we now own.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    };
+    let c = std::ffi::CString::new(name.as_bytes())?;
+    // SAFETY: `c` is NUL-terminated; `at` is AT_FDCWD or an open fd.
+    let fd = unsafe { libc::openat(at, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh fd we now own.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_beneath(dir: &Path, rel: &Path, check_from: usize) -> std::io::Result<std::fs::File> {
+    let open = open_nofollow;
     use std::os::fd::AsRawFd as _;
     let mut cur = open(
         libc::AT_FDCWD,
@@ -583,7 +588,7 @@ pub const QUARANTINE_PREFIX: &str = ".quarantine-";
 type Entry = (u64, u64, i64, u64, i64, Option<[u8; 32]>);
 
 /// The held dir, its (dev, ino), and its entries (`None`: too many to compare).
-type Before = (std::fs::File, (u64, u64), Option<BTreeMap<PathBuf, Entry>>);
+type Before = ((u64, u64), Option<BTreeMap<PathBuf, Entry>>);
 
 /// Entries scanned before the whole dir counts as changed: a session must not
 /// be able to stall the parent's check with a million files.
@@ -608,10 +613,7 @@ impl ManagedSnapshot {
         let path = std::fs::canonicalize(home)
             .unwrap_or_else(|_| home.to_path_buf())
             .join(TRUSTED_DIR);
-        let before = open_dir(&path).map(|(f, id)| {
-            let entries = scan(&f);
-            (f, id, entries)
-        });
+        let before = open_dir(&path).map(|(_, f, id)| (id, scan(&f)));
         Self { path, before }
     }
 
@@ -620,7 +622,8 @@ impl ManagedSnapshot {
     #[must_use]
     pub fn finish(self) -> Option<String> {
         let now = open_dir(&self.path);
-        let moved = match (self.before, now) {
+        let parent = now.as_ref().map(|(p, _, _)| p);
+        let moved = match (self.before, now.as_ref()) {
             // Gone, or replaced by (or reached through) a symlink: the loader
             // refuses that layout, so nothing loads from it. Say so.
             (before, None) => {
@@ -636,9 +639,9 @@ impl ManagedSnapshot {
                     },
                 );
             }
-            (Some((_, id, Some(old))), Some((f, now_id))) if id == now_id => {
-                let Some(new) = scan(&f) else {
-                    return quarantine_dir(&self.path);
+            (Some((id, Some(old))), Some((_, f, now_id))) if id == *now_id => {
+                let Some(new) = scan(f) else {
+                    return quarantine_dir(parent, &self.path);
                 };
                 let mut names: Vec<&OsStr> = new
                     .iter()
@@ -649,17 +652,17 @@ impl ManagedSnapshot {
                 names.dedup();
                 let mut moved = Vec::new();
                 for n in names {
-                    match quarantine_at(&f, n) {
+                    match quarantine_at(f, n) {
                         Some(m) => moved.push(m),
                         // Nothing that changed may stay where it loads: the
                         // whole dir goes, or the user is told how.
-                        None => return quarantine_dir(&self.path),
+                        None => return quarantine_dir(parent, &self.path),
                     }
                 }
                 moved
             }
             // Created, replaced, or too big to compare: the whole dir goes.
-            _ => return quarantine_dir(&self.path),
+            _ => return quarantine_dir(parent, &self.path),
         };
         (!moved.is_empty()).then(|| quarantine_line(&self.path, &moved.join(", ")))
     }
@@ -690,15 +693,13 @@ fn stamp() -> String {
     format!("{QUARANTINE_PREFIX}{}{:09}-", t.as_secs(), t.subsec_nanos())
 }
 
-/// Move the whole dir aside, next to itself, through its parent's descriptor.
-/// When even that fails, the line says how to do it by hand: a failure is
-/// never silent, since what changed would load at the next launch.
-fn quarantine_dir(path: &Path) -> Option<String> {
+/// Move the whole dir aside, next to itself, through the parent descriptor
+/// held from the `O_NOFOLLOW` walk: never by re-resolving a path the session
+/// could have re-pointed. When even that fails, the line says how to do it by
+/// hand: a failure is never silent, since what changed would load next launch.
+fn quarantine_dir(parent: Option<&std::fs::File>, path: &Path) -> Option<String> {
     let name = path.file_name()?;
-    let moved = path
-        .parent()
-        .and_then(open_dir)
-        .and_then(|(parent, _)| quarantine_at(&parent, name));
+    let moved = parent.and_then(|p| quarantine_at(p, name));
     if moved.is_some() {
         return Some(quarantine_line(path, &name.to_string_lossy()));
     }
@@ -736,19 +737,26 @@ fn quarantine_at(dir: &std::fs::File, name: &OsStr) -> Option<String> {
     ok.then(|| name.to_string_lossy().into_owned())
 }
 
-/// Open `path` as a directory when it, and every parent, is no symlink.
-fn open_dir(path: &Path) -> Option<(std::fs::File, (u64, u64))> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-    if std::fs::canonicalize(path).ok()? != path {
-        return None;
+/// Open the absolute `path` as a directory by walking from `/` one component
+/// at a time with `O_NOFOLLOW`, so no hop can be a symlink. Returns the held
+/// parent, the dir, and the dir's (dev, ino); every later step works on these
+/// descriptors, never on the path.
+fn open_dir(path: &Path) -> Option<(std::fs::File, std::fs::File, (u64, u64))> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    let mut parent = None;
+    let mut cur = open_nofollow(libc::AT_FDCWD, OsStr::new("/"), flags).ok()?;
+    for c in path.strip_prefix("/").ok()?.components() {
+        let std::path::Component::Normal(name) = c else {
+            return None;
+        };
+        let next = open_nofollow(cur.as_raw_fd(), name, flags).ok()?;
+        parent = Some(std::mem::replace(&mut cur, next));
     }
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-        .ok()?;
-    let m = f.metadata().ok()?;
-    Some((f, (m.dev(), m.ino())))
+    let (parent, dir) = (std::fs::File::from(parent?), std::fs::File::from(cur));
+    let m = dir.metadata().ok()?;
+    Some((parent, dir, (m.dev(), m.ino())))
 }
 
 /// Every entry below `dir`, `None` past [`MAX_ENTRIES`] or on a read error.
@@ -781,6 +789,13 @@ fn scan_into(
         // SAFETY: d_name is NUL-terminated.
         let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
         if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            // Budget while reading: a session must not make the parent allocate
+            // a million names before the cap is checked.
+            if out.len() + names.len() >= MAX_ENTRIES {
+                // SAFETY: `dp` came from fdopendir and is closed once.
+                unsafe { libc::closedir(dp) };
+                return None;
+            }
             names.push(name.to_owned());
         }
     }
@@ -847,13 +862,18 @@ fn scan_into(
     Some(())
 }
 
-#[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+// st_nlink is u16 on macOS, u64 on Linux: one cast for both.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast,
+    clippy::cast_lossless
+)]
 fn stat_entry(st: &libc::stat, hash: Option<[u8; 32]>) -> Entry {
     (
         st.st_ino as u64,
         st.st_size as u64,
         st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
-        u64::from(st.st_nlink),
+        st.st_nlink as u64,
         st.st_ctime as i64 * 1_000_000_000 + st.st_ctime_nsec as i64,
         hash,
     )
@@ -1486,7 +1506,7 @@ mod tests {
     fn quarantine_dir_failure_is_loud() {
         let h = Home::new();
         let gone = h.path().join("no/such/managed.d");
-        let line = quarantine_dir(&gone).expect("never silent");
+        let line = quarantine_dir(None, &gone).expect("never silent");
         assert!(
             line.contains("could not move it aside") && line.contains("mv '"),
             "{line}"
@@ -1544,5 +1564,74 @@ mod tests {
         write(&d, "nav-pilot.toml", GOOD);
         assert!(snap.finish().is_some());
         assert!(!d.exists(), "replaced dir must be moved aside");
+    }
+
+    /// Copilot OKax: the session makes both `managed.d` and its parent `cplt`
+    /// read-only (0500), so neither rename works as is. The parent restores
+    /// owner write on each through its held descriptor and still moves it.
+    #[test]
+    fn snapshot_quarantines_despite_a_read_only_parent() {
+        let h = Home::new();
+        let d = h.managed_d();
+        let cplt = d.parent().unwrap().to_path_buf();
+        std::fs::remove_dir(&d).unwrap();
+        let snap = ManagedSnapshot::take(h.path());
+        std::fs::create_dir(&d).unwrap();
+        write(&d, "planted.toml", GOOD);
+        for p in [&d, &cplt] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let line = snap.finish().expect("a created dir is reported");
+        assert!(
+            !d.exists(),
+            "created dir left loadable under a 0500 parent: {line}"
+        );
+        assert!(
+            names(&cplt)
+                .iter()
+                .any(|n| n.starts_with(QUARANTINE_PREFIX)),
+            "created dir not moved aside under a 0500 parent"
+        );
+    }
+
+    /// Copilot OKa9: a parent of `managed.d` swapped for a symlink is never
+    /// followed: the walk refuses it, so no rename lands in the link's target.
+    #[test]
+    fn snapshot_never_follows_a_symlinked_parent() {
+        let h = Home::new();
+        let d = h.managed_d();
+        let snap = ManagedSnapshot::take(h.path());
+        let cplt = d.parent().unwrap();
+        let evil = h.path().join("evil");
+        std::fs::create_dir_all(evil.join("managed.d")).unwrap();
+        write(&evil.join("managed.d"), "x.toml", GOOD);
+        std::fs::rename(cplt, h.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(&evil, cplt).unwrap();
+        let line = snap.finish().expect("a symlinked parent is reported");
+        assert!(
+            line.contains("no longer a plain directory"),
+            "symlinked parent not reported as such: {line}"
+        );
+        assert_eq!(
+            names(&evil),
+            vec!["managed.d".to_string()],
+            "a rename followed the symlinked parent"
+        );
+    }
+
+    /// Copilot OKbQ: past the entry cap the scan stops while reading and the
+    /// whole dir counts as changed.
+    #[test]
+    fn scan_stops_at_the_entry_cap() {
+        let h = Home::new();
+        let d = h.managed_d();
+        let snap = ManagedSnapshot::take(h.path());
+        for i in 0..=MAX_ENTRIES {
+            std::fs::File::create(d.join(format!("{i}"))).unwrap();
+        }
+        let (_, f, _) = open_dir(&std::fs::canonicalize(&d).unwrap()).expect("dir opens");
+        assert!(scan(&f).is_none(), "scan past the cap must give up");
+        assert!(snap.finish().is_some(), "an over-cap dir must be reported");
+        assert!(!d.exists(), "an over-cap dir must be moved aside");
     }
 }
