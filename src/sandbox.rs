@@ -981,6 +981,15 @@ fn validate_cache_exec_dirs(
     let mut granted = vec![(cache_base.clone(), actual_base.clone())];
     for subdir in config.allow_cache_exec {
         let named = cache_base.join(subdir);
+        if let Some(root) = policy::under_refused_app_root(config.home_dir, &named) {
+            crate::ui::warn(&format!(
+                "Not granting allow_cache_exec path {}: it is inside {}, which resolves \
+                 through a symlink and is not granted. Remove the link to use it.",
+                named.display(),
+                root.display()
+            ));
+            continue;
+        }
         let resolved = crate::config::canonicalize_deepest(&named);
         if resolved != actual_base.join(subdir) {
             if config.refuse_cache_exec_links {
@@ -6338,6 +6347,42 @@ mod tests {
             };
             assert!(error.contains(why), "{error}");
             assert!(error.contains(&project), "{error}");
+        }
+    }
+
+    /// An `allow_cache_exec` entry below a symlinked writable app root
+    /// (`~/.cache/pnpm -> elsewhere`) gets no grant: not in the launch grants,
+    /// not in the Landlock policy, and nothing at the link target.
+    #[test]
+    fn cache_exec_under_a_refused_app_root_is_dropped() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("dlx")).unwrap();
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".cache/pnpm")).unwrap();
+        let allow_cache_exec = ["pnpm/dlx".to_string()];
+        let mut config = test_config(&home, &[]);
+        config.existing_home_tool_dirs = Some(&[]);
+        config.allow_cache_exec = &allow_cache_exec;
+        let named = home.join(".cache/pnpm/dlx");
+        assert!(policy::under_refused_app_root(&home, &named).is_some());
+        let lp = landlock_mod::generate_policy(&config);
+        assert!(!lp.fs_rules.iter().any(|r| r.path == named
+            || r.path.starts_with(&elsewhere)
+            || (r.access.write
+                && r.access.execute
+                && named.starts_with(&r.path)
+                && r.path != home.join(".cache"))));
+        if cfg!(target_os = "linux") {
+            let base = std::cell::OnceCell::from(lp);
+            let grants = validate_cache_exec_dirs(&config, &base).unwrap();
+            assert!(
+                !grants
+                    .iter()
+                    .any(|(n, c)| *n == named || c.starts_with(&elsewhere)),
+                "{grants:?}"
+            );
         }
     }
 

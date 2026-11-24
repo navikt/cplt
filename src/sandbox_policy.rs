@@ -790,6 +790,17 @@ pub fn refused_writable_app_root(home: &Path, path: &Path) -> Option<PathBuf> {
     moved.then_some(target)
 }
 
+/// The refused writable [`APP_DIRS`] root `path` sits in, if any. A grant
+/// derived from such a root (an `allow_cache_exec` entry below
+/// `~/.cache/pnpm`) would follow the same link, so it is dropped too.
+#[must_use]
+pub fn under_refused_app_root(home: &Path, path: &Path) -> Option<PathBuf> {
+    APP_DIRS
+        .iter()
+        .flat_map(|d| d.write_paths(home))
+        .find(|root| path.starts_with(root) && refused_writable_app_root(home, root).is_some())
+}
+
 /// The warning for a root [`refused_writable_app_root`] refuses.
 #[must_use]
 pub fn app_root_warning(path: &Path, target: &Path) -> String {

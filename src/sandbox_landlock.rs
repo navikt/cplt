@@ -815,7 +815,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     } else {
         for subdir in config.allow_cache_exec {
-            if policy::cache_exec_subdir_is_safe(subdir) {
+            if policy::cache_exec_subdir_is_safe(subdir)
+                && policy::under_refused_app_root(home, &cache_base.join(subdir)).is_none()
+            {
                 fs_rules.push(FsRule {
                     nofollow: true,
                     path: cache_base.join(subdir),
