@@ -10657,6 +10657,9 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                     managed.tag()
                 ));
             }
+            for d in &managed.allowed_domains {
+                ok.push(format!("proxy.allowed_domains: {d} [{}]", managed.tag()));
+            }
         }
         // The refusal line carries its own remedy.
         Some(Err(line)) => findings.push(Finding::warning(line, None)),
@@ -11810,6 +11813,9 @@ fn show_managed_config(
             println!("Managed config ({}):", m.display_path());
             for d in &m.allow_private_domains {
                 println!("  proxy.allow_private_domains = {d}  [{}]", m.tag());
+            }
+            for d in &m.allowed_domains {
+                println!("  proxy.allowed_domains = {d}  [{}]", m.tag());
             }
         }
         Some(Err(line)) => ui::warn(&line),

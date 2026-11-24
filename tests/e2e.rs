@@ -11458,6 +11458,60 @@ paths = [
         );
     }
 
+    /// #1097: a trusted managed `proxy.allowed_domains` entry passes a strict
+    /// allowlist while an unlisted host stays blocked, and without an
+    /// allowlist in force the managed list does not start one: the unlisted
+    /// host stays allowed. Same debug-only home seam as above.
+    #[test]
+    fn e2e_managed_allowed_domains_widen_but_never_start_an_allowlist() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let dir = home.join(".config/cplt/managed.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nav.toml");
+        std::fs::write(
+            &file,
+            "managed_by = \"nav-pilot\"\nschema = 1\n[proxy]\nallowed_domains = [\"managed-only.example\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let proj = home.join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let check = |preset: Option<&str>, host: &str| {
+            let mut cmd = cplt_cmd();
+            cmd.env("HOME", &home)
+                .env("CPLT_TEST_ACCOUNT_HOME", &home)
+                .env("CPLT_MANAGED_CONFIG", &file)
+                .arg("--project-dir")
+                .arg(&proj)
+                .args(["--agent", "shell"]);
+            if let Some(p) = preset {
+                cmd.args(["--preset", p]);
+            }
+            let out = cmd
+                .args(["check", "net", host, "--no-connect"])
+                .output()
+                .expect("cplt should run");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let listed = check(Some("strict"), "managed-only.example");
+        assert!(
+            listed.contains("ALLOWED"),
+            "managed entry must pass:\n{listed}"
+        );
+        let other = check(Some("strict"), "unlisted.example");
+        assert!(
+            other.contains("BLOCKED") && other.contains("allowlist"),
+            "unlisted host must stay blocked:\n{other}"
+        );
+        let open = check(None, "unlisted.example");
+        assert!(
+            open.contains("ALLOWED"),
+            "the managed list must not switch on an allowlist:\n{open}"
+        );
+    }
+
     #[test]
     fn e2e_check_net_default_allowed() {
         let proj = check_project();
