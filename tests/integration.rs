@@ -5080,6 +5080,251 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A `--deny-path` inside the project keeps its content denied when the
+    /// agent renames or swaps (`renamex_np` RENAME_SWAP) a writable ancestor.
+    #[test]
+    fn real_profile_deny_path_survives_ancestor_rename_and_swap() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-deny-pins-{}", std::process::id()));
+        let project = tmp.join("proj");
+        let denied = project.join("a/b/secret");
+        fs::create_dir_all(&denied).unwrap();
+        fs::create_dir_all(project.join("other/x")).unwrap();
+        fs::create_dir_all(project.join("swap/b/secret")).unwrap();
+        fs::write(denied.join("data.txt"), "top-secret\n").unwrap();
+        let project = fs::canonicalize(&project).unwrap();
+        let denied = fs::canonicalize(&denied).unwrap();
+        let home = home_dir();
+        let extra_deny = vec![denied.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+        let py = r#"
+import ctypes, os, sys
+os.chdir(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+def swap(a, b):
+    return libc.renamex_np(a.encode(), b.encode(), 2) == 0
+leaked = []
+for src, dst in [("a/b", "moved_b"), ("a", "moved_a")]:
+    try:
+        os.rename(src, dst)
+    except OSError:
+        continue
+    for root, _, files in os.walk(dst):
+        for f in files:
+            try:
+                leaked.append(open(os.path.join(root, f)).read())
+            except OSError:
+                pass
+for src, dst in [("a/b", "swap/b"), ("a", "swap")]:
+    if swap(src, dst):
+        for root, _, files in os.walk(src):
+            for f in files:
+                try:
+                    leaked.append(open(os.path.join(root, f)).read())
+                except OSError:
+                    pass
+        for root, _, files in os.walk(dst):
+            for f in files:
+                try:
+                    leaked.append(open(os.path.join(root, f)).read())
+                except OSError:
+                    pass
+os.rename("other/x", "other/y")
+print("CONTROL_OK" if os.path.isdir("other/y") else "CONTROL_FAIL")
+print("LEAKED" if any("top-secret" in l for l in leaked) else "HELD")
+"#;
+        let script = tmp.join("probe.py");
+        fs::write(&script, py).unwrap();
+        let cmd = format!(
+            "/usr/bin/python3 -I '{}' '{}' 2>&1",
+            script.display(),
+            project.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("CONTROL_OK"),
+            "ordinary rename must work: {output}"
+        );
+        assert!(
+            output.contains("HELD"),
+            "deny-path content leaked: {output}"
+        );
+    }
+
+    /// A `--deny-path` inside a writable tool dir (`~/go/pkg`) holds when the
+    /// agent renames or swaps the tool dir's root or its parent into the
+    /// project, creates the path with O_EXCL, reads it through a symlink in the
+    /// project, or creates a missing ancestor as a symlink elsewhere.
+    #[test]
+    fn real_profile_deny_path_in_tool_dir_survives_root_rename_and_swap() {
+        require_sandbox!();
+        // A HOME outside the temp dirs, which are themselves writable trees.
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cplt-deny-root-{}", std::process::id()));
+        let home = base.join("home");
+        let pkg = home.join("go/pkg");
+        fs::create_dir_all(pkg.join("mod/sec")).unwrap();
+        fs::write(pkg.join("mod/sec/data.txt"), "top-secret\n").unwrap();
+        fs::write(base.join(".metadata_never_index"), "").unwrap();
+        let tmp = std::env::temp_dir().join(format!("cplt-deny-root-p-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("proj/swapdir")).unwrap();
+        let project = fs::canonicalize(tmp.join("proj")).unwrap();
+        let home = fs::canonicalize(&home).unwrap();
+        let pkg = home.join("go/pkg");
+        let extra_deny = vec![pkg.join("mod/sec"), pkg.join("new/sub/sec")];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+        let py = r#"
+import ctypes, os, sys
+home, proj = sys.argv[1], sys.argv[2]
+pkg = home + "/go/pkg"
+libc = ctypes.CDLL(None, use_errno=True)
+def swap(a, b):
+    return libc.renamex_np(a.encode(), b.encode(), 2) == 0
+def grab(d, out):
+    for root, _, files in os.walk(d):
+        for f in files:
+            try:
+                out.append(open(os.path.join(root, f)).read())
+            except OSError:
+                pass
+leaked, broke = [], []
+for src in [pkg + "/mod", pkg, home + "/go"]:
+    try:
+        os.rename(src, proj + "/moved")
+        grab(proj + "/moved", leaked)
+        broke.append("rename " + src)
+    except OSError:
+        pass
+    if swap(src, proj + "/swapdir"):
+        grab(proj + "/swapdir", leaked)
+        broke.append("swap " + src)
+try:
+    os.close(os.open(pkg + "/mod/sec/new.txt", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    broke.append("excl")
+except OSError:
+    pass
+os.symlink(pkg + "/mod/sec", proj + "/link")
+grab(proj + "/link", leaked)
+os.makedirs(proj + "/elsewhere/sub/sec")
+for make in [lambda: os.symlink(proj + "/elsewhere", pkg + "/new"), lambda: os.mkdir(pkg + "/new")]:
+    try:
+        make()
+        broke.append("create ancestor")
+    except OSError:
+        pass
+os.mkdir(pkg + "/ok")
+print("CONTROL_OK" if os.path.isdir(pkg + "/ok") else "CONTROL_FAIL")
+print("BROKE " + ",".join(broke) if broke or leaked else "HELD")
+"#;
+        let script = tmp.join("probe.py");
+        fs::write(&script, py).unwrap();
+        let cmd = format!(
+            "/usr/bin/python3 -I '{}' '{}' '{}' 2>&1",
+            script.display(),
+            home.display(),
+            project.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_dir_all(&base).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("CONTROL_OK"),
+            "tool dir must stay writable: {output}"
+        );
+        assert!(output.contains("HELD"), "deny path escaped: {output}");
+    }
+
+    /// A `--deny-path` inside an app dir (`~/.local/share/mise`) and inside an
+    /// XDG-relocated one (`$XDG_STATE_HOME/mise`) holds when the agent renames
+    /// or swaps the tree root into the project. Those grants come from
+    /// `APP_DIRS`, not the config, so pins must follow the emitted grants.
+    #[test]
+    fn real_profile_deny_path_in_app_dir_survives_root_rename_and_swap() {
+        require_sandbox!();
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cplt-deny-app-{}", std::process::id()));
+        fs::create_dir_all(base.join("home/.local/share/mise/x")).unwrap();
+        fs::create_dir_all(base.join("xdgstate/mise/x")).unwrap();
+        fs::write(
+            base.join("home/.local/share/mise/x/data.txt"),
+            "top-secret\n",
+        )
+        .unwrap();
+        fs::write(base.join("xdgstate/mise/x/data.txt"), "top-secret\n").unwrap();
+        fs::write(base.join(".metadata_never_index"), "").unwrap();
+        let tmp = std::env::temp_dir().join(format!("cplt-deny-app-p-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("proj/swapdir")).unwrap();
+        let project = fs::canonicalize(tmp.join("proj")).unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        let home = base.join("home");
+        let state = base.join("xdgstate");
+        let data = home.join(".local/share/mise");
+        let extra_deny = vec![data.join("x"), state.join("mise/x")];
+        let profile = temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some(state.as_os_str())),
+                ("XDG_DATA_HOME", None),
+            ],
+            || {
+                let mut opts = default_opts(&project, &home);
+                opts.extra_deny = &extra_deny;
+                write_real_profile(&opts)
+            },
+        );
+        let py = r#"
+import ctypes, os, sys
+proj = sys.argv[1]
+libc = ctypes.CDLL(None, use_errno=True)
+def grab(d, out):
+    for root, _, files in os.walk(d):
+        for f in files:
+            try:
+                out.append(open(os.path.join(root, f)).read())
+            except OSError:
+                pass
+broke = []
+for src in sys.argv[2:]:
+    try:
+        os.rename(src, proj + "/moved")
+        grab(proj + "/moved", broke)
+        broke.append("rename " + src)
+    except OSError:
+        pass
+    if libc.renamex_np(src.encode(), (proj + "/swapdir").encode(), 2) == 0:
+        grab(proj + "/swapdir", broke)
+        broke.append("swap " + src)
+os.mkdir(sys.argv[2] + "/ok")
+print("CONTROL_OK" if os.path.isdir(sys.argv[2] + "/ok") else "CONTROL_FAIL")
+print("BROKE " + ",".join(broke) if broke else "HELD")
+"#;
+        let script = tmp.join("probe.py");
+        fs::write(&script, py).unwrap();
+        let cmd = format!(
+            "/usr/bin/python3 -I '{}' '{}' '{}' '{}' '{}' 2>&1",
+            script.display(),
+            project.display(),
+            data.display(),
+            state.join("mise").display(),
+            data.join("x").display(),
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_dir_all(&base).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("CONTROL_OK"),
+            "app dir must stay writable: {output}"
+        );
+        assert!(output.contains("HELD"), "deny path escaped: {output}");
+    }
+
     /// #597: the #477 carve-out re-allows `.env` reads in the Go module cache,
     /// and must not reopen a `--deny-path` inside it. A module outside the
     /// deny keeps the carve-out.

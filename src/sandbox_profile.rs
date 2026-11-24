@@ -320,8 +320,59 @@ fn profile_locked(
     if let Some(root) = config.managed_worktree_root {
         protect_worktree_staging(&mut sb, root);
     }
+    // Reads the grants back from the profile text so no grant can be missed.
+    emit_user_deny_pins(&mut sb, config);
 
     sb
+}
+
+/// Every recursive write grant the profile emits: the subpath of each
+/// `(allow file-write* (subpath ..))` and `(allow file-write-create (subpath ..))`
+/// line. Read back from the text so a new grant anywhere is covered without a
+/// second list to keep in step.
+pub(crate) fn emitted_write_subpaths(sb: &str) -> Vec<PathBuf> {
+    sb.lines()
+        .filter_map(|l| {
+            l.strip_prefix("(allow file-write* (subpath \"")
+                .or_else(|| l.strip_prefix("(allow file-write-create (subpath \""))
+                .and_then(|r| r.strip_suffix("\"))"))
+                .map(PathBuf::from)
+        })
+        .collect()
+}
+
+/// User deny paths: a rename of a writable ancestor, the tree root included,
+/// would move the denied content to a path the deny no longer names. Emitted
+/// last, after every grant, so it covers each one.
+fn emit_user_deny_pins(sb: &mut String, config: &SandboxConfig) {
+    if config.extra_deny.is_empty() {
+        return;
+    }
+    let mut roots = emitted_write_subpaths(sb);
+    let canon: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| crate::config::canonicalize_deepest(r))
+        .collect();
+    roots.extend(canon);
+    let targets: Vec<PathBuf> = config
+        .extra_deny
+        .iter()
+        .flat_map(|p| [p.clone(), crate::config::canonicalize_deepest(p)])
+        .collect();
+    let (mut unlink, mut create) = super::user_deny_pins(&roots, &targets);
+    for (v, op, label) in [
+        (&mut unlink, "file-write-unlink", "no rename"),
+        (&mut create, "file-write-create", "no create"),
+    ] {
+        v.sort();
+        v.dedup();
+        if !v.is_empty() {
+            sbpl!(sb, ";; Ancestors of user deny paths — {label}");
+        }
+        for d in v.iter() {
+            sbpl!(sb, "(deny {op} (literal \"{}\"))", d.display());
+        }
+    }
 }
 
 /// Mach services the MCP child may look up beyond bsd.sb's (#911).
@@ -2942,6 +2993,9 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
             .chain(&files)
             .filter_map(|s| s.get(1).map(PathBuf::from)),
     );
+    // And HOME itself when it lies inside a writable tree: `~/.ssh` is denied
+    // whether or not it exists, so pin every ancestor of it, HOME included.
+    targets.push(crate::config::canonicalize_deepest(Path::new(config.home_dir)).join(".ssh"));
     emit_resolved_deny_pins(sb, config, &targets);
     for path in config.extra_deny {
         let p = path.to_string_lossy();
@@ -7284,5 +7338,66 @@ mod tests {
             );
         }
         // Every named root itself is pinned too, by the writable-root pin (#923).
+    }
+
+    /// Every user deny path inside any recursive write grant the profile
+    /// emits gets the grant root and every ancestor between pinned. The
+    /// grants are parsed from the profile text here, not taken from the
+    /// implementation, so a grant added anywhere is covered.
+    #[test]
+    fn user_deny_paths_are_pinned_under_every_emitted_write_grant() {
+        let project = Path::new("/Users/test/repo");
+        let home = Path::new("/Users/test");
+        let grants = |p: &str| -> Vec<PathBuf> {
+            p.lines()
+                .filter(|l| l.starts_with("(allow file-write") && l.contains("(subpath \""))
+                .map(|l| PathBuf::from(l.split('"').nth(1).unwrap()))
+                .collect()
+        };
+        let xdg = [
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+        ];
+        for relocated in [false, true] {
+            let vars: Vec<(&str, Option<String>)> = xdg
+                .iter()
+                .map(|k| (*k, relocated.then(|| format!("/Users/test/xdg/{k}"))))
+                .collect();
+            temp_env::with_vars(vars, || {
+                for agent in crate::agent::Agent::ALL {
+                    let dirs = agent.config_dirs(home);
+                    let mut opts = test_options(project, home);
+                    opts.agent = *agent;
+                    opts.agent_dirs = &dirs;
+                    let deny: Vec<PathBuf> = grants(&generate_profile(&opts, &[]))
+                        .iter()
+                        .map(|g| g.join("cplt-deny/secret"))
+                        .collect();
+                    assert!(!deny.is_empty());
+                    opts.extra_deny = &deny;
+                    let p = generate_profile(&opts, &[]);
+                    let roots = grants(&p);
+                    for d in &deny {
+                        let root = roots
+                            .iter()
+                            .filter(|r| d.starts_with(r))
+                            .min_by_key(|r| r.components().count())
+                            .unwrap();
+                        for a in d.ancestors().skip(1).take_while(|a| a.starts_with(root)) {
+                            let a = a.display();
+                            assert!(
+                                p.contains(&format!("(deny file-write-unlink (literal \"{a}\"))"))
+                                    || p.contains(&format!(
+                                        "(deny file-write-create (literal \"{a}\"))"
+                                    )),
+                                "{agent:?} relocated={relocated}: {d:?} lacks pin {a}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
     }
 }

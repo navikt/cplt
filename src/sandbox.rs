@@ -1808,6 +1808,50 @@ fn home_config_target_pins(config: &SandboxConfig, targets: &[PathBuf]) -> Vec<P
     pins
 }
 
+/// Pins for the user's own deny paths (macOS), stricter than
+/// [`home_config_target_pins`]: every ancestor up to and including the root of
+/// the outermost writable tree (`trees`, every recursive write grant the
+/// profile emits) holding the path, plus the ancestors that do
+/// not exist yet, to refuse creating.
+///
+/// The root is pinned too. Renaming it, or swapping it with
+/// `RENAME_SWAP`, needs only a writable destination, and any other writable
+/// tree is one, so the denied content would land where the deny no longer
+/// names it. Above the outermost root nothing is writable, so the chain stops
+/// there. Pinning the root means a tree that holds a deny path cannot itself
+/// be moved inside the sandbox.
+///
+/// A missing ancestor (only a repo `.cplt.toml` deny path can have one,
+/// `canonicalize_deepest` keeps its tail) could be created as a symlink to
+/// somewhere else, redirecting the deny; those names get a create deny.
+pub(crate) fn user_deny_pins(
+    trees: &[PathBuf],
+    targets: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (mut unlink, mut create) = (Vec::new(), Vec::new());
+    for target in targets {
+        let Some(root) = trees
+            .iter()
+            .filter(|r| target.starts_with(r))
+            .min_by_key(|r| r.components().count())
+        else {
+            continue;
+        };
+        for a in target
+            .ancestors()
+            .skip(1)
+            .take_while(|a| a.starts_with(root))
+        {
+            if std::fs::symlink_metadata(a).is_ok() {
+                unlink.push(a.to_path_buf());
+            } else {
+                create.push(a.to_path_buf());
+            }
+        }
+    }
+    (unlink, create)
+}
+
 /// A writable tree that is not the host's under Bubblewrap: it gives the
 /// sandbox a private `/tmp` and `/dev/shm`, so nothing of the host's is
 /// reachable there.
