@@ -8649,7 +8649,7 @@ fn run_exec_command(
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
         // Held until the child exits: it serves the host opener (#1091).
-        mcp_broker: _mcp_broker,
+        mcp_broker,
         mcp_refusal: _,
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -8846,6 +8846,13 @@ fn run_exec_command(
             &resolved.git_guard,
             settled,
         );
+    }
+    if let Some(broker) = &mcp_broker {
+        // #1091: same opener record as an agent launch.
+        let opens = broker.open_url_records();
+        if !opens.is_empty() {
+            ui::info(&format!("host opener: {}", opens.join("; ")));
+        }
     }
     warn_worktrees_not_audited(
         audit_enabled,

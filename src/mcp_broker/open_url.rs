@@ -31,8 +31,10 @@ const OAUTH_CREDENTIAL: &str = "oauth";
 
 /// Opens per [`WINDOW`], and the window itself.
 const MAX_OPENS: usize = 3;
-/// Decisions kept for the post-session report.
-const MAX_RECORDS: usize = 200;
+/// Refusals kept for the post-session report; later ones are only counted.
+/// Allowed opens are never dropped: the limiter already bounds them.
+const MAX_REFUSALS: usize = 200;
+const MORE_REFUSALS: &str = "...and ";
 const WINDOW: Duration = Duration::from_secs(60);
 
 /// Hosts a URL may name: each oauth spec's `remote` URL host (the fleet
@@ -385,10 +387,20 @@ pub(crate) fn serve(
     // level or file. Host and reason only, never the URL's query.
     let note = |text: String| {
         log.line("open_url", &text);
-        if let Ok(mut r) = records.lock()
-            && r.len() < MAX_RECORDS
+        let Ok(mut r) = records.lock() else { return };
+        if !text.starts_with("DENIED")
+            || r.iter().filter(|t| t.starts_with("DENIED")).count() < MAX_REFUSALS
         {
             r.push(text);
+        } else if let Some(m) = r.iter_mut().find(|t| t.starts_with(MORE_REFUSALS)) {
+            let n: usize = m[MORE_REFUSALS.len()..]
+                .split(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            *m = format!("{MORE_REFUSALS}{} more refusals", n + 1);
+        } else {
+            r.push(format!("{MORE_REFUSALS}1 more refusals"));
         }
     };
     let Some(url) = super::runtime::read_line(reader, MAX_LEN as u64 + 2) else {
@@ -1403,6 +1415,38 @@ mod tests {
                 "DENIED evil.example host not allowed".to_string(),
                 "DENIED userinfo in URL".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn refusal_flood_never_hides_an_allowed_open() {
+        let records = Mutex::new(Vec::new());
+        let log = super::super::Log {
+            level: crate::proxy::ProxyLogLevel::None,
+            file: None,
+        };
+        let ask = |u: &str| {
+            serve(
+                &mut format!("{u}\n").as_bytes(),
+                &mut Vec::new(),
+                &["gw.example".into()],
+                &Limiter::default(),
+                Path::new("/nonexistent"),
+                &log,
+                &records,
+            );
+        };
+        for _ in 0..300 {
+            ask("https://evil.example/");
+        }
+        ask("https://gw.example/ok");
+        let r = records.into_inner().unwrap();
+        assert_eq!(r.len(), MAX_REFUSALS + 2, "{r:?}");
+        assert!(r.contains(&"...and 100 more refusals".to_string()));
+        assert!(
+            r.iter()
+                .any(|t| !t.starts_with("DENIED") && !t.starts_with("...")),
+            "the open is recorded: {r:?}"
         );
     }
 }
