@@ -2504,14 +2504,14 @@ mod tests {
         let mut s = UnixStream::connect(b.socket()).unwrap();
         write!(
             s,
-            "{}\nhttps://evil.example/\n",
+            "{}\nhttps://evil.local/\n",
             super::super::open_url::OP_LINE
         )
         .unwrap();
         let mut answer = String::new();
         BufReader::new(s).read_line(&mut answer).unwrap();
         assert!(
-            answer.contains("cplt config set proxy.allow_private_domains evil.example"),
+            answer.contains("cplt config set proxy.allow_private_domains evil.local"),
             "{answer}"
         );
     }

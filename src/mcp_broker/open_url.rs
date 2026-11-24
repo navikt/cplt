@@ -118,10 +118,15 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
         Some(_) => return Err("port other than 443"),
     };
     let host = host.to_ascii_lowercase();
+    // One root dot, as DNS allows; `x..` or `.x` has an empty label.
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if host.split('.').any(str::is_empty) {
+        return Err("empty label in host");
+    }
     // An entry with a leading `.` is an `allow_private_domains` domain: the
     // proxy's own matcher (the domain and its subdomains, not siblings).
     let allowed = hosts.iter().any(|h| match h.strip_prefix('.') {
-        Some(d) => crate::proxy::is_domain_match(&host, &[d.to_string()]),
+        Some(d) => crate::proxy::is_domain_match(host, &[d.to_string()]),
         None => *h == host,
     });
     if allowed {
@@ -148,14 +153,36 @@ pub fn private_domain_entries(domains: &[String]) -> Vec<String> {
 
 /// The answer for a refused URL. `host` is set only for a URL that passed
 /// the shape rules and names a plain DNS name, so the copy-paste fix never
-/// carries agent-chosen shell syntax or URL parts.
-fn refusal(host: Option<&str>, why: &str) -> String {
+/// carries agent-chosen shell syntax or URL parts. The config fix is offered
+/// only for a host that looks internal ([`looks_private`]): suggesting
+/// `allow_private_domains` for github.com would teach users to widen the
+/// proxy's private-IP rule for public hosts.
+fn refusal(host: Option<&str>, why: &str, hosts: &[String]) -> String {
     match host.filter(|_| why == HOST_NOT_ALLOWED) {
-        Some(h) => format!(
+        Some(h) if looks_private(h, hosts) => format!(
             "denied: {h} is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains {h}"
+        ),
+        Some(h) => format!(
+            "denied: {h} is not allowed to open in the host browser. If you trust it, copy the URL into your browser yourself."
         ),
         None => format!("denied: {why}"),
     }
+}
+
+/// A `.local`/`.localhost` name, or one sharing its last two labels with an
+/// allow-list entry (`a.intern.nav.no` next to `.ansatt.nav.no`). Errs on
+/// not suggesting.
+fn looks_private(host: &str, hosts: &[String]) -> bool {
+    fn base(h: &str) -> Option<Vec<&str>> {
+        let v: Vec<&str> = h.rsplit('.').take(2).collect();
+        (v.len() == 2).then_some(v)
+    }
+    crate::proxy::is_private_hostname(host)
+        || base(host).is_some_and(|b| {
+            hosts
+                .iter()
+                .any(|e| base(e.trim_start_matches('.')).as_ref() == Some(&b))
+        })
 }
 
 /// The lowercased host of a URL that passed [`check`]'s shape rules, only if
@@ -355,9 +382,9 @@ pub(crate) fn serve(
                 Some(h) => log.line("open_url", &format!("DENIED {h} {why}")),
                 None => log.line("open_url", &format!("DENIED {why}")),
             }
-            refusal(host.as_deref(), why)
+            refusal(host.as_deref(), why, hosts)
         }
-        Ok(busy) => match opener(HOST_OPENER).map(|o| spawn_opener(&o, &url, home, busy)) {
+        Ok(busy) => match opener(HOST_OPENER).map(|o| run_opener(&o, &url, home, &busy)) {
             Some(Ok(())) => {
                 // The host only: the query carries OAuth state and PKCE.
                 log.line(
@@ -367,9 +394,8 @@ pub(crate) fn serve(
                 "ok".to_string()
             }
             Some(Err(e)) => {
-                limiter.busy.store(false, Ordering::Release);
                 log.line("open_url", &format!("FAIL {e}"));
-                "failed: cannot run the opener".to_string()
+                "failed: the host opener did not open the URL".to_string()
             }
             None => {
                 limiter.busy.store(false, Ordering::Release);
@@ -398,12 +424,20 @@ fn opener_env(
     env
 }
 
-fn spawn_opener(
-    opener: &Path,
-    url: &str,
-    home: &Path,
-    busy: Arc<AtomicBool>,
-) -> std::io::Result<()> {
+/// Run the opener and wait for it: `open` returns once LaunchServices has
+/// the URL, so its exit status says whether it was handed off. `-u` makes
+/// `open` treat the argument as a URL, never a file path; cwd `/` keeps a
+/// relative path from resolving into the project. Frees the slot on return.
+fn run_opener(opener: &Path, url: &str, home: &Path, busy: &AtomicBool) -> std::io::Result<()> {
+    let status = opener_command(opener, url, home).status();
+    busy.store(false, Ordering::Release);
+    match status? {
+        s if s.success() => Ok(()),
+        s => Err(std::io::Error::other(format!("opener exited with {s}"))),
+    }
+}
+
+fn opener_command(opener: &Path, url: &str, home: &Path) -> Command {
     // `opener` is an absolute path from `opener()`, never a PATH lookup.
     #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(opener);
@@ -411,18 +445,12 @@ fn spawn_opener(
     for (k, v) in opener_env(home, &|k| std::env::var_os(k)) {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .arg(url)
+    cmd.args(["-u", url])
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // Reap it without holding the connection; the slot frees on exit.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-        busy.store(false, Ordering::Release);
-    });
-    Ok(())
+        .stderr(Stdio::null());
+    cmd
 }
 
 /// `cplt mcp-open-url <url>`, inside the sandbox: ask the broker to open it.
@@ -559,7 +587,6 @@ mod tests {
             ("https://evil.example/", "host not allowed"),
             ("https://fgw.example.evil/", "host not allowed"),
             ("https://sub.fgw.example/", "host not allowed"),
-            ("https://fgw.example./", "host not allowed"),
             (
                 "https://login.microsoftonline.com/t/oauth2/v2.0/authorize?client_id=x",
                 "host not allowed",
@@ -623,14 +650,86 @@ mod tests {
 
     #[test]
     fn refusal_names_the_host_and_the_fix() {
-        let h = dns_host("https://Gh.Example:443/login?x");
+        let list = vec![".intern.example".to_string()];
+        let h = dns_host("https://Gh.Intern.Example:443/login?x");
         assert_eq!(
-            refusal(h.as_deref(), HOST_NOT_ALLOWED),
-            "denied: gh.example is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains gh.example"
+            refusal(h.as_deref(), HOST_NOT_ALLOWED, &list),
+            "denied: gh.intern.example is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains gh.intern.example"
         );
         assert_eq!(
-            refusal(None, "URL must be https"),
+            refusal(None, "URL must be https", &list),
             "denied: URL must be https"
+        );
+    }
+
+    /// Fable on #1124: a public host never gets the `allow_private_domains`
+    /// suggestion; a `.local` name or one next to an allow-list entry does.
+    #[test]
+    fn refusal_suggests_the_config_fix_only_for_internal_looking_hosts() {
+        let list = vec![".ansatt.nav.no".to_string(), "fgw.example".to_string()];
+        for h in ["github.com", "login.microsoftonline.com", "evil.no", "x"] {
+            let r = refusal(Some(h), HOST_NOT_ALLOWED, &list);
+            assert!(!r.contains("config set"), "{r}");
+            assert!(r.contains("copy the URL into your browser yourself"), "{r}");
+        }
+        for h in ["a.intern.nav.no", "printer.local", "login.fgw.example"] {
+            let r = refusal(Some(h), HOST_NOT_ALLOWED, &list);
+            assert!(
+                r.contains(&format!("proxy.allow_private_domains {h}")),
+                "{r}"
+            );
+        }
+    }
+
+    /// Fable on #1124: one root dot is a DNS name; more, or an empty label,
+    /// is refused before any matching.
+    #[test]
+    fn check_trims_one_root_dot_and_refuses_empty_labels() {
+        let list = vec![".intern.example".to_string(), "fgw.example".to_string()];
+        assert_eq!(check("https://gw.intern.example./x", &list), Ok(()));
+        assert_eq!(check("https://fgw.example./x", &list), Ok(()));
+        for u in [
+            "https://gw.intern.example../x",
+            "https://.intern.example/",
+            "https://gw..intern.example/",
+            "https://./",
+            "https:///x",
+        ] {
+            assert_eq!(check(u, &list), Err("empty label in host"), "{u}");
+        }
+    }
+
+    /// Fable on #1124: `open -u <url>` from `/`, and a failing opener is
+    /// reported, not answered `ok`.
+    #[test]
+    fn opener_runs_in_url_mode_and_reports_failure() {
+        let cmd = opener_command(
+            Path::new("/usr/bin/open"),
+            "https://a.example/",
+            Path::new("/h"),
+        );
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-u", "https://a.example/"]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+        let busy = AtomicBool::new(true);
+        assert!(
+            run_opener(
+                Path::new("/usr/bin/false"),
+                "https://a.example/",
+                Path::new("/h"),
+                &busy
+            )
+            .is_err()
+        );
+        assert!(!busy.load(Ordering::Acquire), "slot must free on failure");
+        assert!(
+            run_opener(
+                Path::new("/usr/bin/true"),
+                "https://a.example/",
+                Path::new("/h"),
+                &busy
+            )
+            .is_ok()
         );
     }
 
@@ -653,7 +752,6 @@ mod tests {
             "https://evil.example$(id)/",
             "https://a`b`.example/",
             "https://-bad.example/",
-            "https://a..b/",
             "https://x|y/",
         ] {
             assert_eq!(check(u, none), Err(HOST_NOT_ALLOWED), "{u}");
@@ -1210,7 +1308,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "denied: evil.example is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains evil.example\n"
+            "denied: evil.example is not allowed to open in the host browser. If you trust it, copy the URL into your browser yourself.\n"
         );
     }
 }

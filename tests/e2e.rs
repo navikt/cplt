@@ -6295,6 +6295,73 @@ paths = [
         assert!(!out.status.success(), "{out:?}");
     }
 
+    /// #1091 (Fable on #1124): approving `proxy.allow_private_domains` says the
+    /// domains are also browser-opener hosts, and a launch names the
+    /// teammate's list once per list: silent on the second launch, again once
+    /// the approved list changes.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn e2e_opener_discloses_a_repo_list_once_per_list() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "opener-disclose",
+            "[propose.proxy]\nallow_private_domains = [\"intern.nav.no\"]\n",
+        );
+        let accept = |repo: &Path| {
+            let out = trust_cmd(repo, &config_file)
+                .args(["trust", "accept", "--all"])
+                .output()
+                .expect("accept");
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let stdout = accept(&repo);
+        assert!(
+            stdout.contains("hosts cplt may open in your browser"),
+            "{stdout}"
+        );
+        let launch = || {
+            let out = trust_cmd(&repo, &config_file)
+                .args([
+                    "--yes",
+                    "--no-validate",
+                    "--quiet",
+                    "--agent",
+                    "shell",
+                    "--",
+                    "-c",
+                    "true",
+                ])
+                .output()
+                .expect("launch");
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        let line = "open https links on these domains";
+        let first = launch();
+        assert!(
+            first.contains(line) && first.contains("intern.nav.no (from .cplt.toml)"),
+            "first launch must disclose, even with --quiet: {first}"
+        );
+        let second = launch();
+        assert!(!second.contains(line), "same list twice: {second}");
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose.proxy]\nallow_private_domains = [\"intern.nav.no\", \"ansatt.nav.no\"]\n",
+        )
+        .unwrap();
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "commit", "-qam", "more"])
+            .output()
+            .unwrap();
+        accept(&repo);
+        let third = launch();
+        assert!(
+            third.contains(line)
+                && third.contains("ansatt.nav.no, intern.nav.no (from .cplt.toml)"),
+            "a changed list must disclose again: {third}"
+        );
+    }
+
     /// #635: `trust show --json`, `config show` and the launch agree on every
     /// state, because all three read the launch gate's rule. The changed case
     /// keeps the same keys with a new value: `config show` used to judge by key
@@ -12643,7 +12710,9 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
         let err = String::from_utf8_lossy(&output.stderr);
         assert!(out.contains("rc=0\nrc=1"), "stdout: {out}\nstderr: {err}");
         assert!(
-            err.contains("cplt config set proxy.allow_private_domains evil.example"),
+            err.contains("evil.example is not allowed")
+                && err.contains("copy the URL into your browser yourself")
+                && !err.contains("config set"),
             "stderr: {err}"
         );
         // The opener runs detached; give it a moment to write.
@@ -12654,7 +12723,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let opened = std::fs::read_to_string(&record).unwrap_or_default();
-        assert_eq!(opened, "https://gw.intern.example/authorize?a=1&b=2\n");
+        assert_eq!(opened, "-u\nhttps://gw.intern.example/authorize?a=1&b=2\n");
     }
 
     /// Copilot review on #1124: `cplt exec` gets the host opener too, with no
@@ -12698,7 +12767,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let opened = std::fs::read_to_string(&record).unwrap_or_default();
-        assert_eq!(opened, "https://gw.intern.example/x\n");
+        assert_eq!(opened, "-u\nhttps://gw.intern.example/x\n");
     }
 
     /// Copilot review on #1124: `cplt exec -- open <url>` runs the URL shim,
@@ -12740,7 +12809,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let opened = std::fs::read_to_string(&record).unwrap_or_default();
-        assert_eq!(opened, "https://gw.intern.example/x\n");
+        assert_eq!(opened, "-u\nhttps://gw.intern.example/x\n");
     }
 
     /// Copilot review on #1124: with an MCP spec present, `--allow-browser`

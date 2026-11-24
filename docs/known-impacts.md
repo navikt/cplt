@@ -788,7 +788,7 @@ such bit and is plain ALLOWED
 
 ## Browser login from inside the sandbox (OAuth)
 
-On macOS, cplt opens a login link in your browser when a tool inside the sandbox asks for it (`open <url>`, `$BROWSER`, `gh auth login --web`, a remote MCP server's OAuth flow). It opens only `https://` links whose host is in `proxy.allow_private_domains`, or a subdomain of one. Any other link is refused with the line to fix it:
+On macOS, cplt opens a login link in your browser when a tool inside the sandbox asks for it (`open <url>`, `$BROWSER`, `gh auth login --web`, a remote MCP server's OAuth flow). It opens only `https://` links whose host is in `proxy.allow_private_domains`, or a subdomain of one. Any other link is refused. For a host that looks internal, the refusal gives the line to fix it; for a public host such as `github.com` it tells you to copy the link into your browser yourself:
 
 ```bash
 cplt config set proxy.allow_private_domains intern.dev.nav.no
@@ -797,6 +797,7 @@ cplt config set proxy.allow_private_domains intern.dev.nav.no
 Only the first link needs to be allowed, the authorize URL of the MCP gateway. The redirect to your identity provider (such as `login.microsoftonline.com`) happens in the browser, so you never allow the identity provider's host. The browser then calls the tool's loopback listener (`http://127.0.0.1:<port>/` or `http://localhost:<port>/`) inside the sandbox; that works on macOS and on Linux.
 
 - At most 3 links a minute are opened.
+- Domains a teammate's `.cplt.toml` or the managed layer adds to `proxy.allow_private_domains` are also hosts the agent can open in your browser. `cplt trust` says so when you approve them, and the next launch names them once (again whenever the list changes). `cplt doctor` lists every opener host and where it came from. See [SECURITY.md](../SECURITY.md) for the silent-SSO and cookie gap this leaves.
 - Off with `sandbox.mcp_broker = false`, and not needed with `allow_browser`.
 - Linux has no host opener: the link is printed for you to open, and only during an MCP OAuth flow.
 - Known gap: with `proxy.netns` on (Linux), the browser's callback cannot reach the tool inside the sandbox's network namespace, so the login does not complete.

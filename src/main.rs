@@ -7449,6 +7449,36 @@ fn managed_layer_writable(
     roots
 }
 
+/// The one line naming the domains the host opener may open in the browser
+/// that this user did not write themselves: approved `.cplt.toml` proposals
+/// and the managed layer (#1091). `None` when every entry is the user's own.
+fn opener_disclosure(resolved: &config::Resolved) -> Option<String> {
+    let mut parts = Vec::new();
+    if !resolved.repo_private_domains.is_empty() {
+        parts.push(format!(
+            "{} (from .cplt.toml)",
+            resolved.repo_private_domains.join(", ")
+        ));
+    }
+    if let Some(m) = &resolved.managed {
+        let only: Vec<&str> = m
+            .allow_private_domains
+            .iter()
+            .filter(|d| !resolved.repo_private_domains.contains(d))
+            .map(String::as_str)
+            .collect();
+        if !only.is_empty() {
+            parts.push(format!("{} (from {})", only.join(", "), m.tag()));
+        }
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "The agent can ask cplt to open https links on these domains and their subdomains in your browser: {}",
+            parts.join("; ")
+        )
+    })
+}
+
 /// Load the managed layer (#1095) and, when it is trusted, union it into
 /// `resolved`. Launch, `check` and `doctor` all go through here.
 /// `check` loads the layer for its net snapshot and again in the sandbox
@@ -8223,6 +8253,17 @@ fn assemble_sandbox(
         }
         Some(broker)
     });
+    if !opts.inspect_only
+        && cplt::mcp_broker::OPEN_URL_HOST_OPENER
+        && mcp_broker
+            .as_ref()
+            .is_some_and(cplt::mcp_broker::Broker::open_url_enabled)
+        && let Some(line) = opener_disclosure(resolved)
+        && cplt::trust::first_disclosure(&probe.project_dir, &line)
+    {
+        // Printed under `--quiet` too: a teammate's list must not go unseen.
+        ui::warn(&line);
+    }
     let mcp_refusal = opts
         .mcp_probe
         .then(|| sandbox::mcp_broker_refusal(&sandbox_config))
@@ -10349,6 +10390,21 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         // The refusal line carries its own remedy.
         Some(Err(line)) => findings.push(Finding::warning(line, None)),
         None => {}
+    }
+    // The host opener's allow-list is `proxy.allow_private_domains` (#1091).
+    if cplt::mcp_broker::OPEN_URL_HOST_OPENER && resolved.mcp_broker && !resolved.allow_browser {
+        for d in &resolved.allow_private_domains {
+            let source = if resolved.repo_private_domains.contains(d) {
+                ".cplt.toml".to_string()
+            } else {
+                resolved
+                    .managed_tag(d, &[])
+                    .unwrap_or_else(|| "config".to_string())
+            };
+            ok.push(format!(
+                "browser opener may open: {d} and subdomains [{source}]"
+            ));
+        }
     }
     // ── network: the policy `cplt check net` classifies against (#604) ──
     // Static: the same gate, no connection and no sandbox battery.
@@ -14156,6 +14212,9 @@ fn trust_accept(
             } else {
                 println!("  {yellow}•{nc} {key}");
             }
+            if key == "proxy.allow_private_domains" {
+                println!("    {}", repo_config::PRIVATE_DOMAINS_BROWSER_NOTE);
+            }
         }
         println!();
 
@@ -14298,6 +14357,12 @@ fn trust_accept(
     );
     for key in &keys_to_accept {
         println!("  • {key}");
+    }
+    if keys_to_accept
+        .iter()
+        .any(|k| k == "proxy.allow_private_domains")
+    {
+        println!("  {}", repo_config::PRIVATE_DOMAINS_BROWSER_NOTE);
     }
     if keys_to_accept.iter().any(|k| k == "repos") {
         report_linked_count(loaded.config.propose.repos.len(), &not_linked);
