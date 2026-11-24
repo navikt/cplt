@@ -12351,6 +12351,129 @@ fn config_set_refuses_socket_over_state_dir() {
     );
 }
 
+/// Whether the `#[cfg(test)]` just read applies to an item (a test module,
+/// fn, impl, ...), whose body is then a fixture. On a struct field, enum
+/// variant, match arm or statement it applies to that alone, so the next
+/// braced item is production code and must still be scanned.
+fn cfg_test_item_follows(c: &[char]) -> bool {
+    const ITEMS: &[&str] = &[
+        "mod",
+        "fn",
+        "impl",
+        "struct",
+        "enum",
+        "const",
+        "static",
+        "use",
+        "trait",
+        "type",
+        "macro_rules!",
+        "thread_local!",
+        "async",
+        "unsafe",
+        "extern",
+    ];
+    let mut j = 0;
+    let word = |j: &mut usize| {
+        let start = *j;
+        while *j < c.len() && (c[*j].is_alphanumeric() || c[*j] == '_' || c[*j] == '!') {
+            *j += 1;
+        }
+        c[start..*j].iter().collect::<String>()
+    };
+    let skip_trivia = |j: &mut usize| loop {
+        while *j < c.len() && c[*j].is_whitespace() {
+            *j += 1;
+        }
+        if c[*j..].starts_with(&['/', '/']) {
+            while *j < c.len() && c[*j] != '\n' {
+                *j += 1;
+            }
+        } else if c[*j..].starts_with(&['/', '*']) {
+            while *j + 1 < c.len() && !(c[*j] == '*' && c[*j + 1] == '/') {
+                *j += 1;
+            }
+            *j += 2;
+        } else if c[*j..].starts_with(&['#', '[']) {
+            let mut depth = 0;
+            loop {
+                match c[*j] {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            *j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                *j += 1;
+            }
+        } else {
+            break;
+        }
+    };
+    skip_trivia(&mut j);
+    let mut w = word(&mut j);
+    if w == "pub" {
+        if c.get(j) == Some(&'(') {
+            while c[j] != ')' {
+                j += 1;
+            }
+            j += 1;
+        }
+        skip_trivia(&mut j);
+        w = word(&mut j);
+    }
+    ITEMS.contains(&w.as_str())
+}
+
+#[test]
+fn rust_string_literals_skips_only_cfg_test_items() {
+    let src = r#"
+struct S {
+    #[cfg(test)]
+    field: u8,
+}
+fn real_after_field() { let _ = "HINT_A"; }
+enum E {
+    #[cfg(test)]
+    Variant { x: u8 },
+    Other,
+}
+fn real_after_variant() {
+    match 1 {
+        #[cfg(test)]
+        0 => {}
+        _ => {}
+    }
+    let _ = "HINT_B";
+}
+#[cfg(test)]
+fn only_in_tests() { let _ = "FIXTURE_A"; }
+fn real_after_test_fn() { let _ = "HINT_C"; }
+#[cfg(test)]
+#[allow(clippy::all)]
+// a comment
+pub(crate) mod tests { fn t() { let _ = "FIXTURE_B"; let _ = '}'; } }
+fn real_after_test_mod() { let _ = "HINT_D"; }
+"#;
+    let lits = rust_string_literals(src);
+    for want in ["HINT_A", "HINT_B", "HINT_C", "HINT_D"] {
+        assert!(
+            lits.iter().any(|l| l == want),
+            "{want} not scanned: {lits:?}"
+        );
+    }
+    for fixture in ["FIXTURE_A", "FIXTURE_B"] {
+        assert!(
+            !lits.iter().any(|l| l == fixture),
+            "{fixture} scanned: {lits:?}"
+        );
+    }
+}
+
 /// The contents of every string literal in Rust source, unescaped, with
 /// comments skipped. Handles `\`-newline continuations, raw strings, byte
 /// strings, char literals and lifetimes, so no quote or backtick inside a
@@ -12364,8 +12487,8 @@ fn rust_string_literals(src: &str) -> Vec<String> {
     while i < c.len() {
         let at = |w: &str| c[i..].iter().take(w.len()).copied().eq(w.chars());
         if at("#[cfg(test)]") {
-            test_pending = true;
             i += "#[cfg(test)]".len();
+            test_pending = cfg_test_item_follows(&c[i..]);
             continue;
         }
         match c[i] {
