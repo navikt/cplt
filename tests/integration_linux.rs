@@ -312,6 +312,95 @@ echo AGENT_COMPLETED
     /// [`run_sandboxed_home_with_flags`] with extra environment variables for
     /// cplt. The XDG base directories are cleared first so the fake HOME is
     /// the only home the run sees.
+    /// Copilot OKcf (#1126): the whole Linux lifecycle through the real
+    /// launch paths (agent and `exec`). With `--allow-write ~/.config` the
+    /// session can write cplt's state dir, so the managed layer is refused for
+    /// the session, and whatever the child writes to `managed.d` (even after
+    /// dropping write permission on it and its parent) is moved aside on exit.
+    #[test]
+    fn exposed_state_dir_ignores_managed_layer_and_quarantines_child_writes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        require_landlock!();
+        let good = "managed_by = \"nav-pilot\"\nschema = 1\n\n[proxy]\nallow_private_domains = [\"intern.nav.no\"]\n";
+        for (via_exec, lock) in [(false, false), (false, true), (true, false)] {
+            let case = format!("exec={via_exec} chmod={lock}");
+            let project = create_test_project();
+            let h = tempfile::tempdir().unwrap();
+            let home = fs::canonicalize(h.path()).unwrap();
+            let managed_d = home.join(".config/cplt/managed.d");
+            fs::create_dir_all(&managed_d).unwrap();
+            let managed = managed_d.join("nav-pilot.toml");
+            fs::write(&managed, good).unwrap();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o600)).unwrap();
+            let config_dir = home.join(".config");
+            let script = format!(
+                "echo 'managed_by = \"evil\"' > '{d}/x.toml'{lock}",
+                d = managed_d.display(),
+                lock = if lock {
+                    format!(
+                        " && chmod 0500 '{}' '{}'",
+                        managed_d.display(),
+                        managed_d.parent().unwrap().display()
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            let dir = project.path().to_string_lossy().into_owned();
+            let grant = config_dir.to_string_lossy().into_owned();
+            let mut args: Vec<&str> = vec![
+                "--yes",
+                "--no-validate",
+                "--project-dir",
+                &dir,
+                "--allow-write",
+                &grant,
+            ];
+            if via_exec {
+                args.extend_from_slice(&["exec", "--", "/bin/sh", "-c", &script]);
+            } else {
+                args.extend_from_slice(&["--agent", "shell", "--", "-c", &script]);
+            }
+            let out = cplt_cmd()
+                .args(&args)
+                .env("HOME", &home)
+                .env("CPLT_TEST_ACCOUNT_HOME", &home)
+                .env("CPLT_MANAGED_CONFIG", &managed)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("XDG_STATE_HOME", home.join(".local/state"))
+                .output()
+                .expect("Failed to execute cplt");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "{case}: launch must succeed with a warning: {stderr}"
+            );
+            assert!(
+                stderr.contains("CPLT_MANAGED_CONFIG=") && stderr.contains("ignored"),
+                "{case}: the managed layer must be ignored for the session: {stderr}"
+            );
+            for d in [&managed_d, managed_d.parent().unwrap()] {
+                let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o755));
+            }
+            let left: Vec<String> = fs::read_dir(&managed_d)
+                .map(|r| {
+                    r.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                !left.contains(&"x.toml".to_string()),
+                "{case}: the child's file must not stay loadable: {left:?} {stderr}"
+            );
+            assert!(
+                stderr.contains(".quarantine-") || stderr.contains("Moved aside"),
+                "{case}: the quarantine must be reported: {stderr}"
+            );
+        }
+    }
+
     fn run_sandboxed_home_with_flags_env(
         project_dir: &Path,
         home: &Path,
