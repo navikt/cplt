@@ -1263,7 +1263,11 @@ fn route_github_credentials_through_gh_guard(cmd: &mut Command, inherit_env: boo
         None if inherit_env => std::env::var("GIT_CONFIG_COUNT").ok(),
         None => None,
     };
-    for (k, v) in github_credential_helper_config(current.as_deref(), crate::gh_proxy::gh_hosts()) {
+    for (k, v) in github_credential_helper_config(
+        current.as_deref(),
+        crate::gh_proxy::gh_hosts(),
+        "!gh auth git-credential",
+    ) {
         cmd.env(k, v);
     }
 }
@@ -1275,6 +1279,7 @@ fn route_github_credentials_through_gh_guard(cmd: &mut Command, inherit_env: boo
 fn github_credential_helper_config(
     existing_count: Option<&str>,
     hosts: &[String],
+    helper: &str,
 ) -> Vec<(String, String)> {
     let Ok(n) = existing_count.map_or(Ok(0), |c| c.trim().parse::<usize>()) else {
         return Vec::new();
@@ -1285,16 +1290,72 @@ fn github_credential_helper_config(
             format!("GIT_CONFIG_KEY_{}", n + i),
             format!("credential.https://{host}.helper"),
         ));
-        env.push((
-            format!("GIT_CONFIG_VALUE_{}", n + i),
-            "!gh auth git-credential".to_string(),
-        ));
+        env.push((format!("GIT_CONFIG_VALUE_{}", n + i), helper.to_string()));
     }
     env.push((
         "GIT_CONFIG_COUNT".to_string(),
         (n + hosts.len()).to_string(),
     ));
     env
+}
+
+/// A last-resort git credential helper for an HTTPS GitHub push that nothing
+/// can authenticate (#1144). The launch hint scrolls away; this repeats it on
+/// stderr at the moment git asks, and answers nothing, so git fails as it
+/// would have, now with the fix named. It never returns credentials. Appended
+/// after the user's helpers, so it only speaks once they have all declined.
+/// Lives beside the gh guard wrapper, in `{scratch}/bin`.
+fn install_push_hint_helper(
+    cmd: &mut Command,
+    sandbox: &crate::sandbox::PreparedSandbox,
+    inherit_env: bool,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let (Some(hint), Some(scratch)) =
+        (sandbox.push_hint.as_deref(), sandbox.scratch_dir.as_deref())
+    else {
+        return;
+    };
+    let dir = scratch.join("bin");
+    let path = dir.join("cplt-push-hint-credential");
+    if std::fs::create_dir_all(&dir).is_err()
+        || std::fs::write(&path, push_hint_helper_script(hint)).is_err()
+        || std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).is_err()
+    {
+        return;
+    }
+    let current = match cmd.get_envs().find(|(k, _)| *k == "GIT_CONFIG_COUNT") {
+        Some((_, v)) => v.map(|v| v.to_string_lossy().into_owned()),
+        None if inherit_env => std::env::var("GIT_CONFIG_COUNT").ok(),
+        None => None,
+    };
+    for (k, v) in github_credential_helper_config(
+        current.as_deref(),
+        crate::gh_proxy::gh_hosts(),
+        &git_helper_value(&path),
+    ) {
+        cmd.env(k, v);
+    }
+}
+
+/// A git `credential.helper` value for an absolute script path. Git runs a
+/// bare path through `sh`, so a space in `$HOME` would split it; `!` plus a
+/// single-quoted path is run as a shell command and survives it.
+fn git_helper_value(path: &Path) -> String {
+    format!("!'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// The helper script: on `get`, one stderr line naming the host git passes on
+/// stdin (the helper serves every gh host) and the fix; silence for
+/// `store`/`erase`. The host is agent-controlled, so only host characters
+/// are echoed.
+fn push_hint_helper_script(fix: &str) -> String {
+    let quoted = fix.replace('\'', "'\\''");
+    format!(
+        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nh=\nwhile IFS= read -r l; do case $l in host=*) h=${{l#host=}};; esac; done\n\
+         h=$(printf '%s' \"$h\" | tr -cd 'A-Za-z0-9.:_-')\n\
+         printf '%s\\n' \"cplt: git can't authenticate to https://$h inside the sandbox. \"'{quoted}' >&2\nexit 0\n"
+    )
 }
 
 /// `open`/`xdg-open` shims that hand an https URL to the MCP broker's
@@ -1876,6 +1937,7 @@ pub fn exec(
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox, inherit_env);
+    install_push_hint_helper(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -2028,6 +2090,7 @@ pub fn exec(
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox, inherit_env);
+    install_push_hint_helper(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -2273,6 +2336,7 @@ fn exec_bwrap(
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     install_open_url_shims(&mut cmd, sandbox, inherit_env);
+    install_push_hint_helper(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -3353,7 +3417,7 @@ echo "failed to read keyring" >&2; exit 1"#,
     #[test]
     fn github_credential_helper_appends_after_existing_overrides() {
         let github = vec!["github.com".to_string()];
-        let env = github_credential_helper_config(Some("2"), &github);
+        let env = github_credential_helper_config(Some("2"), &github, "!gh auth git-credential");
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
         assert_eq!(
@@ -3371,13 +3435,79 @@ echo "failed to read keyring" >&2; exit 1"#,
             "existing entries untouched"
         );
 
-        let fresh = github_credential_helper_config(None, &github);
+        let fresh = github_credential_helper_config(None, &github, "!gh auth git-credential");
         assert!(fresh.contains(&("GIT_CONFIG_COUNT".into(), "1".into())));
         assert!(fresh.contains(&(
             "GIT_CONFIG_KEY_0".into(),
             "credential.https://github.com.helper".into()
         )));
-        assert!(github_credential_helper_config(Some("x"), &github).is_empty());
+        assert!(
+            github_credential_helper_config(Some("x"), &github, "!gh auth git-credential")
+                .is_empty()
+        );
+    }
+
+    /// #1144: the push-hint helper names the host from stdin and the fix on
+    /// stderr for `get`, prints nothing on stdout, stays silent for
+    /// `store`/`erase`, survives a quote in the fix and a hostile host.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // /bin/sh by absolute path
+    fn push_hint_helper_speaks_only_on_get_and_never_answers() {
+        use std::io::Write;
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("h");
+        std::fs::write(
+            &script,
+            push_hint_helper_script("it's off; $(touch x) `id`"),
+        )
+        .unwrap();
+        let run = |op: &str, stdin: &str| {
+            let mut c = Command::new("/bin/sh")
+                .arg(&script)
+                .arg(op)
+                .current_dir(dir.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            c.wait_with_output().unwrap()
+        };
+        let get = run("get", "protocol=https\nhost=ghe.example.com\n\n");
+        assert!(get.status.success());
+        assert!(get.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&get.stderr),
+            "cplt: git can't authenticate to https://ghe.example.com inside the sandbox. it's off; $(touch x) `id`\n"
+        );
+        let evil = run("get", "host=a$(touch x)\u{1b}[31m.com\n");
+        assert!(String::from_utf8_lossy(&evil.stderr).contains("https://atouchx31m.com "));
+        assert!(!dir.path().join("x").exists());
+        for op in ["store", "erase"] {
+            let o = run(op, "host=github.com\n");
+            assert!(o.status.success() && o.stdout.is_empty() && o.stderr.is_empty());
+        }
+    }
+
+    /// The helper path survives a space in `$HOME` when git runs it through sh.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // /bin/sh by absolute path
+    fn git_helper_value_survives_spaces_and_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("my h'ome");
+        std::fs::create_dir(&d).unwrap();
+        let p = d.join("h");
+        std::fs::write(&p, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let v = git_helper_value(&p);
+        let o = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(v.strip_prefix('!').unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&o.stdout), "ok\n");
     }
 
     /// Every `gh_guard.hosts` host gets the helper, so a push to a GHE remote
@@ -3385,7 +3515,7 @@ echo "failed to read keyring" >&2; exit 1"#,
     #[test]
     fn github_credential_helper_covers_every_configured_host() {
         let hosts = vec!["github.com".to_string(), "example.ghe.com".to_string()];
-        let env = github_credential_helper_config(Some("1"), &hosts);
+        let env = github_credential_helper_config(Some("1"), &hosts, "!gh auth git-credential");
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
         assert_eq!(
