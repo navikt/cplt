@@ -136,8 +136,11 @@ fn token_withheld_reason_for(
             "GitHub token withheld: cplt could not decode an argument (failing closed)."
         } else if any_templated_host(args) {
             "GitHub token withheld: a placeholder ({owner}, {repo}, {branch}) in the gh api endpoint could choose the host."
-        } else if args.iter().any(|a| non_ascii_host(a, false)) {
-            "GitHub token withheld: a URL names a host with non-ASCII characters."
+        } else if url_withhold_words(args)
+            .iter()
+            .any(|a| non_ascii_host(a, false))
+        {
+            "GitHub token withheld: a URL names a host with non-ASCII characters. Use --body-file for text that contains one."
         } else if repo_flag_non_ascii(args) {
             "GitHub token withheld: a repository (-R/--repo or operand) names a host with non-ASCII characters (HOST/OWNER/REPO or git@HOST:OWNER/REPO)."
         } else if args.iter().any(|a| names_token_tenant(a)) {
@@ -249,9 +252,9 @@ fn decode_stable(s: &str) -> Option<String> {
 #[must_use]
 pub fn arg_names_untrusted_host(args: &[&str]) -> bool {
     args.iter().any(|a| names_token_tenant(a))
-        // Any URL in any word, prose included: gh derives the host from URL
-        // operands no per-command table lists (`gh pr view URL`).
-        || args.iter().any(|a| non_ascii_host(a, false))
+        || url_withhold_words(args)
+            .iter()
+            .any(|a| non_ascii_host(a, false))
         || any_templated_host(args)
         || repo_flag_non_ascii(args)
 }
@@ -321,6 +324,22 @@ fn api_flag_values(args: &[&str]) -> Vec<usize> {
     out
 }
 
+/// Words whose non-ASCII URL host withholds the token. gh attaches the token
+/// by request host, and only the `gh api` endpoint (or `--hostname`, checked
+/// separately) sends it to a raw host, so for other commands a URL in a flag
+/// value (`--body "«https://nav.no»"`) cannot choose where it goes (#1119).
+/// Every `gh api` word, every operand and every repository selector still
+/// counts: gh derives the host from URL operands (`gh pr view URL`). Tenant
+/// names are matched in every word by [`names_token_tenant`].
+fn url_withhold_words<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
+    if is_api(args) {
+        return args.iter().map(|a| (*a).into()).collect();
+    }
+    let mut out = repo_selector_values(args);
+    out.extend(positional_operands(args).into_iter().map(Into::into));
+    out
+}
+
 /// Words gh reads as a host: the `gh api` endpoint and repository selectors.
 /// Prose in a `--body` that merely contains a URL is not one (`«https://nav.no»`).
 fn host_words<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
@@ -340,7 +359,7 @@ fn host_words<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
                 .into_iter()
                 .filter(|a| {
                     a.split_once("://")
-                        .is_some_and(|(s, _)| !s.contains(char::is_whitespace))
+                        .is_some_and(|(s, _)| !s.contains(|c: char| c.is_ascii_whitespace()))
                 })
                 .map(Into::into),
         );
@@ -359,6 +378,10 @@ fn subcommand_long_value_flags(command: &str, subcommand: Option<&str>) -> &'sta
             "--repo",
             "--title",
             "--body",
+            "--notes",
+            "--search",
+            "--subject",
+            "--description",
             "--json",
             "--jq",
             "--template",
@@ -8433,7 +8456,7 @@ mod tests {
         let branch = ["repo", "view", "o/r", "--branch", "\u{e6}rlig/fix/x"];
         assert!(ok(&branch));
         assert!(github_token_allowed_for(&branch, None, None, &hosts));
-        // Prose: a non-ASCII URL is not refused, but costs the token.
+        // Prose: a non-ASCII URL in a flag value is not refused and keeps the token (#1119).
         let prose = [
             "pr",
             "comment",
@@ -8442,7 +8465,7 @@ mod tests {
             "Se https://bl\u{e5}b\u{e6}r.no",
         ];
         assert!(ok(&prose));
-        assert!(!github_token_allowed_for(&prose, None, None, &hosts));
+        assert!(github_token_allowed_for(&prose, None, None, &hosts));
         let ascii = ["pr", "comment", "1", "--body", "Se https://nav.no"];
         assert!(ok(&ascii));
         assert!(github_token_allowed_for(&ascii, None, None, &hosts));
@@ -8549,8 +8572,9 @@ mod tests {
                 "{args:?}"
             );
         }
-        // A URL in prose runs, but a non-ASCII character in what Go would
-        // read as its host (even trailing punctuation) costs the token.
+        // A URL in a flag value runs with the token, even when Go would
+        // read a glued non-ASCII character as part of its host (#1119):
+        // gh attaches the token by request host, not by prose.
         for args in [
             &[
                 "pr",
@@ -8561,16 +8585,38 @@ mod tests {
             ][..],
             &["pr", "comment", "1", "--body", "https://nav.no\u{2014}og"],
             &["issue", "create", "--body", "https://bl\u{e5}b\u{e6}r.no/x"],
+            &["issue", "list", "--search", "https://bl\u{e5}b\u{e6}r.no"],
+            &[
+                "issue",
+                "comment",
+                "1",
+                "--body",
+                "\u{ab}https://nav.no\u{bb}",
+            ],
         ] {
             assert!(
                 gate_with_scope_resolver(args, &off, scope, None).is_ok(),
                 "{args:?}"
             );
             assert!(
-                !github_token_allowed_for(args, None, None, &hosts),
+                github_token_allowed_for(args, None, None, &hosts),
                 "{args:?}"
             );
         }
+        assert_eq!(
+            positional_operands(&["release", "create", "v1", "--notes", "https://x\u{e5}.no"]),
+            ["v1"]
+        );
+        // A tenant name in a flag value still withholds the token.
+        let tenant = ["pr", "comment", "1", "--body", "see https://x.ghe.com/o"];
+        assert!(!github_token_allowed_for(&tenant, None, None, &hosts));
+        // A positional URL with a non-ASCII host is refused and withheld.
+        let positional = ["pr", "view", "https://g\u{130}thub.com/o/r/pull/1"];
+        assert!(gate_with_scope_resolver(&positional, &off, scope, None).is_err());
+        assert!(!github_token_allowed_for(&positional, None, None, &hosts));
+        let api = ["api", "https://g\u{130}thub.com/user"];
+        assert!(gate_with_scope_resolver(&api, &off, scope, None).is_err());
+        assert!(!github_token_allowed_for(&api, None, None, &hosts));
     }
 
     #[test]
