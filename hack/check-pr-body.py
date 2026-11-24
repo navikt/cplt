@@ -25,8 +25,13 @@ exempt_authors = ("dependabot[bot]", "github-actions[bot]")
 REQUIRED_CODE_JOBS = (
     "unit-tests",
     "integration-tests",
-    "opencode-v2-e2e",
-    "opencode-v2-e2e-linux",
+    # Matrix cells of ci.yaml opencode-v2-e2e*; keep in step with its matrix.
+    "opencode-v2-e2e-2.0.24",
+    "opencode-v2-e2e-2.3.2",
+    "opencode-v2-e2e-2.4",
+    "opencode-v2-e2e-linux-2.0.24",
+    "opencode-v2-e2e-linux-2.3.2",
+    "opencode-v2-e2e-linux-2.4",
     "linux-integration-tests",
     "mcp-broker-e2e-ubuntu-22.04",
     "mcp-broker-e2e-ubuntu-24.04",
