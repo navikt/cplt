@@ -124,8 +124,14 @@ pub fn status_json(
         json!({
             "id": id,
             "state": if gh_off.is_some() { "inactive" } else { "off" },
+            // The built-in endpoint serves only on a fallback; with the
+            // GitHub MCP proxy off, GitHub MCP is off entirely.
             "reason": gh_off.map(|(_, why, _)| {
-                format!("disabled by {why}; tools.allow not applied, built-in endpoint serves GitHub MCP")
+                if fallback {
+                    format!("disabled by {why}; tools.allow not applied, built-in endpoint serves GitHub MCP")
+                } else {
+                    why.clone()
+                }
             }),
             "transport": null,
             "credential": null,
@@ -261,11 +267,10 @@ mod tests {
                 .unwrap()
                 .contains("sandbox.mcp_broker = false")
         );
-        // --no-github-mcp-proxy path: same row, other reason.
+        // --no-github-mcp-proxy: GitHub MCP is off, no built-in row, no claim.
         let mut found2 =
             crate::mcp_broker::spec::load_with_gate(dir.path(), &[], &[], |_| None, true);
         found2.disable_remotes();
-        let why2 = crate::mcp_broker::github_spec(&found2, dir.path(), |_| None).unwrap_err();
         let v2 = status_json(
             &found2,
             None,
@@ -274,20 +279,43 @@ mod tests {
             true,
             None,
             &["opencode"],
-            Some(&why2),
+            Some("GitHub MCP proxy is off (sandbox.github_mcp_proxy)"),
         );
-        let spec2 = v2["servers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["id"] != "github-mcp")
-            .unwrap();
+        let rows2 = v2["servers"].as_array().unwrap();
+        assert!(rows2.iter().all(|r| r["id"] != "github-mcp"));
+        let spec2 = &rows2[0];
         assert_eq!(spec2["state"], "inactive");
+        let reason2 = spec2["reason"].as_str().unwrap();
+        assert!(reason2.contains("GitHub MCP proxy is off"));
+        assert!(!reason2.contains("built-in") && !reason2.contains("tools.allow"));
+        // --no-mcp-broker <id>: fallback in effect, claim present.
+        let id = found2.disabled[0].clone();
+        let found3 = crate::mcp_broker::spec::load_with_gate(
+            dir.path(),
+            &[],
+            std::slice::from_ref(&id),
+            |_| None,
+            true,
+        );
+        let why3 = crate::mcp_broker::github_spec(&found3, dir.path(), |_| None).unwrap_err();
+        let v3 = status_json(
+            &found3,
+            None,
+            false,
+            false,
+            true,
+            None,
+            &["opencode"],
+            Some(&why3),
+        );
+        let rows3 = v3["servers"].as_array().unwrap();
+        assert!(rows3.iter().any(|r| r["id"] == "github-mcp"));
+        let spec3 = rows3.iter().find(|r| r["id"] != "github-mcp").unwrap();
         assert!(
-            spec2["reason"]
+            spec3["reason"]
                 .as_str()
                 .unwrap()
-                .contains("GitHub MCP proxy is off")
+                .contains("built-in endpoint serves GitHub MCP")
         );
         // No fallback, no row.
         let v = status_json(
