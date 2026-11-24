@@ -497,12 +497,14 @@ fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
 /// timeout and `tools.allow`. `None` is the built-in endpoint, unchanged.
 /// Why [`github_mcp`] would leave GitHub MCP alone, for `cplt mcp status`
 /// (#909). `reaches` as for [`github_mcp`], so a passed-through
-/// `OPENCODE_CONFIG_CONTENT` counts the same way.
+/// `OPENCODE_CONFIG_CONTENT` counts the same way. `has_token` is the launch's
+/// own cached, no-refresh gh lookup; asked only once an entry exists.
 pub fn github_mcp_inactive(
     home: &Path,
     deny_env: &[String],
     reaches: impl Fn(&str) -> bool,
     proxy_on: bool,
+    has_token: impl FnOnce() -> bool,
 ) -> Option<&'static str> {
     if deny_env.iter().any(|d| d == "GH_TOKEN") {
         return Some("deny.env names GH_TOKEN");
@@ -520,6 +522,9 @@ pub fn github_mcp_inactive(
         .is_empty()
     {
         return Some("no GitHub MCP entry in the OpenCode config");
+    }
+    if !has_token() {
+        return Some("no gh login (run gh auth login)");
     }
     None
 }
@@ -1420,6 +1425,29 @@ mod tests {
                 None
             ));
             assert_eq!(s.env.len(), n);
+        });
+    }
+
+    /// With an entry and the proxy on, status says inactive without a gh login.
+    #[test]
+    fn github_mcp_inactive_names_a_missing_gh_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let oc = tmp.path().join(".config/opencode");
+        std::fs::create_dir_all(&oc).unwrap();
+        std::fs::write(
+            oc.join("opencode.json"),
+            r#"{"mcp":{"gh":{"type":"remote","url":"https://api.githubcopilot.com/mcp"}}}"#,
+        )
+        .unwrap();
+        let vars = [
+            ("XDG_CONFIG_HOME", None::<&str>),
+            ("OPENCODE_CONFIG_DIR", None),
+            ("OPENCODE_CONFIG_CONTENT", None),
+        ];
+        temp_env::with_vars(vars, || {
+            let why = |token: bool| github_mcp_inactive(tmp.path(), &[], |_| false, true, || token);
+            assert_eq!(why(false), Some("no gh login (run gh auth login)"));
+            assert_eq!(why(true), None);
         });
     }
 

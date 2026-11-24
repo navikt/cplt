@@ -5636,6 +5636,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     &resolved.deny_env,
                     reaches,
                     proxy_handle.is_some(),
+                    cplt::discover::stored_gh_token_available,
                 ),
             )
         } else {

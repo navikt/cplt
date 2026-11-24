@@ -56,6 +56,14 @@ pub fn cplt_cmd() -> Command {
     // many CI jobs export it — so without this, colour codes land between
     // `gh guard:` and `on` on exactly the machines least likely to be watched.
     cmd.env_remove("FORCE_COLOR");
+    // A developer's OpenCode overrides would leak their GitHub MCP entry in.
+    for v in [
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG",
+    ] {
+        cmd.env_remove(v);
+    }
     cmd
 }
 
