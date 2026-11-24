@@ -1622,6 +1622,40 @@ mod e2e_tests {
         assert_eq!(v["agent_exit_reason"], "exit");
     }
 
+    /// #1164: a tree only the macOS profile grants (a relocated pnpm store
+    /// under a non-default `XDG_DATA_HOME`) is refused too: the check reads
+    /// the profile's own write grants, not only the policy model.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn e2e_session_summary_refuses_a_profile_only_write_grant() {
+        require_sandbox!();
+        let fake = fake_agent("copilot", "exit 0\n");
+        let data = home_temp_dir("summary-xdg-data");
+        let store = data.path().join("pnpm/store");
+        std::fs::create_dir_all(&store).unwrap();
+        let path = store.join("summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("XDG_DATA_HOME", data.path())
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not writing the session summary"),
+            "{stderr}"
+        );
+        assert!(!path.exists());
+    }
+
     /// #1157: a launch that fails before the path check (no agent binary)
     /// writes no summary.
     #[test]

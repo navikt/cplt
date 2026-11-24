@@ -447,17 +447,50 @@ pub struct PreparedSandbox {
     bwrap_wrapper: Option<bubblewrap::BubblewrapWrapper>,
 }
 
+/// Every path a `(allow file-write…)` line names with `(subpath "…")` or
+/// `(literal "…")`, whatever the write kind (`file-write-data` included).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn write_grant_paths(sbpl: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in sbpl.lines().filter(|l| l.starts_with("(allow file-write")) {
+        for kind in ["(subpath \"", "(literal \""] {
+            for rest in line.split(kind).skip(1) {
+                if let Some(path) = rest.split('"').next() {
+                    out.push(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    out
+}
+
 impl PreparedSandbox {
     /// Every recursive write grant the macOS profile emits, read back from
     /// its text: grants the Landlock policy model does not carry (a relocated
     /// pnpm store, `/private/tmp`). Empty on Linux, where the policy is the
     /// profile.
+    ///
+    /// Read from the final grants, so late ones (OpenCode v2's prompt
+    /// history) count: macOS every `(allow file-write…` subpath and literal,
+    /// any write kind; Linux the wrapper's rules, which `add_opencode_v2`
+    /// extends after assembly. Regex grants are not modelled.
     pub fn emitted_write_roots(&self) -> Vec<PathBuf> {
-        if cfg!(target_os = "macos") {
-            profile::emitted_write_subpaths(&self.profile_text)
-        } else {
-            Vec::new()
+        #[cfg(target_os = "macos")]
+        {
+            write_grant_paths(&self.profile_text)
         }
+        #[cfg(target_os = "linux")]
+        {
+            self.bwrap_wrapper
+                .iter()
+                .flat_map(|w| w.fs_rules.iter())
+                .chain(self.policy.fs_rules.iter())
+                .filter(|r| r.access.write)
+                .map(|r| r.path.clone())
+                .collect()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        Vec::new()
     }
 }
 
@@ -5361,6 +5394,24 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    /// #1164: literal and data-only write grants count, not only subpaths.
+    #[test]
+    fn write_grant_paths_reads_literals_and_every_write_kind() {
+        let sbpl = "(allow file-write* (subpath \"/a\"))\n\
+                    (allow file-write-data (literal \"/h/.konan/dependencies/cache/.lock\"))\n\
+                    (allow file-write* (literal \"/h/.local/state/opencode/prompt-history.jsonl\"))\n\
+                    (deny file-write* (subpath \"/b\"))\n\
+                    (allow file-read* (subpath \"/c\"))";
+        assert_eq!(
+            write_grant_paths(sbpl),
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/h/.konan/dependencies/cache/.lock"),
+                PathBuf::from("/h/.local/state/opencode/prompt-history.jsonl"),
+            ]
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

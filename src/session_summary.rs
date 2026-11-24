@@ -384,10 +384,34 @@ impl Target {
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Self {
+        let target = Self {
             dir: unsafe { OwnedFd::from_raw_fd(fd) },
             name: cstr(name.as_bytes())?,
-        })
+        };
+        // Refused now, not only at exit: the launch should say so up front.
+        target.refuse_non_file()?;
+        Ok(target)
+    }
+
+    /// Err when the name exists and is not a regular file (no follow).
+    fn refuse_non_file(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstatat on a live fd and a NUL-terminated name.
+        let r = unsafe {
+            libc::fstatat(
+                self.dir.as_raw_fd(),
+                self.name.as_ptr(),
+                &raw mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if r == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(std::io::Error::other(
+                "the path exists and is not a regular file",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -455,12 +479,8 @@ pub fn write_file(target: &Target, contents: &[u8]) -> std::io::Result<()> {
         std::process::id()
     ))
     .map_err(|_| refuse("NUL in path"))?;
+    target.refuse_non_file()?;
     // SAFETY: plain syscalls on NUL-terminated strings and a live fd.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::fstatat(dfd, name_c.as_ptr(), &raw mut st, libc::AT_SYMLINK_NOFOLLOW) };
-    if r == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-        return Err(refuse("the path exists and is not a regular file"));
-    }
     let fd = unsafe {
         libc::openat(
             dfd,
@@ -696,7 +716,7 @@ mod tests {
         std::fs::write(&target, "keep").unwrap();
         let link = dir.join("link.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(write_file(&Target::open(&link).unwrap(), b"{}").is_err());
+        assert!(Target::open(&link).is_err(), "refused at check time");
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()
@@ -707,7 +727,12 @@ mod tests {
         let fifo = dir.join("fifo.json");
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert!(write_file(&Target::open(&fifo).unwrap(), b"{}").is_err());
+        assert!(Target::open(&fifo).is_err(), "refused at check time");
+        // And again at exit, for one planted after the check.
+        let later = dir.join("later.json");
+        let target = Target::open(&later).unwrap();
+        std::os::unix::fs::symlink(dir.join("target"), &later).unwrap();
+        assert!(write_file(&target, b"{}").is_err());
     }
 
     /// A parent re-aimed after launch (a symlink swapped into the chain) is
