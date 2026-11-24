@@ -13079,6 +13079,20 @@ paths = [
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
+            // The footer draws while the background server still connects
+            // MCP (#1175): wait for the stub to see it before quitting.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !std::fs::read_to_string(&s.log)
+                .unwrap_or_default()
+                .contains("POST /mcp")
+            {
+                if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    let log = std::fs::read_to_string(&s.log).unwrap_or_default();
+                    panic!("stub never saw POST /mcp: {log}\n{}", text());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
             let deadline = Instant::now() + Duration::from_secs(20);
             let status = loop {
                 master.write_all(b"\x03").unwrap();
