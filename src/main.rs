@@ -1976,7 +1976,7 @@ fn merge_tool_path_env_overrides(
             continue;
         }
         // Second layer: never open a protected path.
-        if let Some(prot) = cplt::sandbox::protected {
+        if let Some(prot) = protected {
             ui::warn(&format!(
                 "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
              added and writes there stay denied. Point {} at a directory outside it.",
