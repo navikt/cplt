@@ -1640,6 +1640,20 @@ pub fn overlaps_state(path: &Path, state: &Path) -> bool {
 /// nowhere safe to keep state, and the launch is refused.
 fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<Option<String>, String> {
     let mut warning = None;
+    // macOS pins each name on the way to the state dir; one the profile cannot
+    // spell cannot be pinned, so the dir could be swapped. Refuse that layout.
+    if cfg!(target_os = "macos")
+        && let Some(bad) = state_chain_pins(config)
+            .into_iter()
+            .find(|e| policy::validate_sbpl_path(e).is_err())
+    {
+        return Err(format!(
+            "{} lies on the path to cplt's state directory inside a writable grant, and \
+             the macOS sandbox profile cannot name it (it contains one of \" ( ) ; \\). \
+             Rename it, or narrow the grant so it does not cover it.",
+            bad.display()
+        ));
+    }
     // Every writable tree, env-derived agent and tool dirs included, not just
     // `allow.write`: none may be cplt's state dir or an ancestor of it (#1095).
     // Not the system temp dir: a `$HOME` under it (test fakes) is no grant to
@@ -1933,6 +1947,78 @@ pub(crate) fn user_deny_pins(
         }
     }
     (unlink, create)
+}
+
+/// Every directory entry the kernel walks to reach `path`, each spelled as
+/// its canonical parent plus its own name: the lexical hops (`~/.config`,
+/// `~/.config/cplt`) and every symlink hop on the way. A missing tail is
+/// listed lexically. The state dir's deny holds only while each of these names
+/// still leads there, so each one is pinned against unlink, rename and
+/// re-creation when it sits inside a writable tree.
+pub(crate) fn resolution_entries(path: &Path) -> Vec<PathBuf> {
+    use std::path::Component;
+    let mut todo: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_os_string()),
+            Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect();
+    let mut cur = PathBuf::from("/");
+    let mut out = Vec::new();
+    let mut hops = 0;
+    let mut missing = false;
+    while let Some(name) = todo.pop_front() {
+        if name == ".." {
+            cur.pop();
+            continue;
+        }
+        let entry = cur.join(&name);
+        out.push(entry.clone());
+        if !missing
+            && let Ok(m) = std::fs::symlink_metadata(&entry)
+            && m.file_type().is_symlink()
+            && hops < 40
+            && let Ok(link) = std::fs::read_link(&entry)
+        {
+            hops += 1;
+            if link.is_absolute() {
+                cur = PathBuf::from("/");
+            }
+            for c in link.components().rev() {
+                match c {
+                    Component::Normal(n) => todo.push_front(n.to_os_string()),
+                    Component::ParentDir => todo.push_front("..".into()),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        missing = missing || std::fs::symlink_metadata(&entry).is_err();
+        cur = entry;
+    }
+    out
+}
+
+/// The entries on the way to cplt's state dir (`$HOME`'s and the passwd
+/// home's) that sit strictly inside a writable tree: the names the macOS
+/// profile pins so the dir cannot be moved, swapped or re-linked.
+pub(crate) fn state_chain_pins(config: &SandboxConfig) -> Vec<PathBuf> {
+    let trees: Vec<PathBuf> = canonical_writable_trees(config)
+        .into_iter()
+        .filter(|(t, why)| cfg!(target_os = "macos") || !bwrap_private(t, why))
+        .map(|(t, _)| t)
+        .collect();
+    let home = config.home_dir;
+    let mut pins: Vec<PathBuf> = std::iter::once(home.join(CPLT_STATE_DIR))
+        .chain(policy::passwd_state_dir(home))
+        .flat_map(|d| resolution_entries(&d))
+        .filter(|e| trees.iter().any(|t| e.starts_with(t) && e != t))
+        .collect();
+    pins.sort();
+    pins.dedup();
+    pins
 }
 
 /// A writable tree that is not the host's under Bubblewrap: it gives the
