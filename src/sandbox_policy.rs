@@ -4066,6 +4066,7 @@ impl ResolvedToolDir {
     ///   for a symlinked `~/.m2`) is not refused: that is the subpath deny the
     ///   list exists for, emitted at the resolved path on macOS and documented
     ///   as unenforceable on Linux, as for an unsymlinked `~/.m2`;
+    /// - any target of a writable entry (see the body: never followed);
     /// - on macOS, a target the profile cannot name ([`validate_sbpl_path`]).
     ///   Seatbelt matches the resolved path, so the `$HOME` spelling alone
     ///   would grant nothing;
@@ -4089,6 +4090,19 @@ impl ResolvedToolDir {
             && canon(home).join(rel) == target
         {
             return None;
+        }
+        // A writable root is never followed through a symlink, at its own name
+        // or any component below `$HOME`: a session could have planted it
+        // (remove the root, link its name elsewhere), and following it would
+        // grant write at the target. Recovery: point the tool's `*_HOME` at
+        // the target, or grant it with `--allow-write`.
+        // Outside `$HOME` (a relocated `*_HOME`) only the root's own name is
+        // checked: the user chose that path, spelled however the system does.
+        if self.dir.write
+            && (self.path.starts_with(home)
+                || self.path.symlink_metadata().is_ok_and(|m| m.is_symlink()))
+        {
+            return Some(target);
         }
         (overlaps_credential_entry(home, target, &self.path)
             || grant_is_refused(home, target)

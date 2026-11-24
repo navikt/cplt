@@ -1467,47 +1467,6 @@ fn symlinked_tool_dir_onto_a_sensitive_path_is_not_granted() {
     }
 }
 
-/// Containment has to hold when `$HOME` itself is reached through a symlink
-/// and the protected entry does not exist yet: `~/.cache -> ~/dotfiles`, with
-/// `~/.gem -> ~/dotfiles/gem` and no `credentials` in it, or with `CPLT_CONFIG`
-/// moving cplt's state directory into `~/dotfiles`. Granting the target would
-/// grant the file the moment it is created.
-#[test]
-fn symlinked_tool_dir_containing_a_protected_path_under_a_symlinked_home_is_refused() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
-    let real_home = root.join("real-home");
-    let dotfiles = real_home.join("dotfiles");
-    std::fs::create_dir_all(&dotfiles).expect("mkdir dotfiles");
-    let home_dir = root.join("home");
-    std::os::unix::fs::symlink(&real_home, &home_dir).expect("symlink home");
-    std::os::unix::fs::symlink(&dotfiles, home_dir.join(".cache")).expect("symlink cache");
-    let cache_granted = || {
-        cplt::sandbox::active_tool_dirs(&home_dir, None)
-            .iter()
-            .any(|d| d.dir.path == ".cache")
-    };
-
-    assert!(cache_granted(), "nothing protected is inside yet");
-
-    std::fs::create_dir_all(dotfiles.join("gem")).expect("mkdir gem");
-    std::os::unix::fs::symlink(dotfiles.join("gem"), home_dir.join(".gem")).expect("symlink gem");
-    assert!(
-        !cache_granted(),
-        "~/.gem/credentials would land inside the ~/.cache target"
-    );
-    std::fs::remove_file(home_dir.join(".gem")).expect("unlink gem");
-    assert!(cache_granted(), "only the credential link refused it");
-
-    let config = home_dir.join("dotfiles/cplt/config.toml");
-    temp_env::with_var("CPLT_CONFIG", Some(&config), || {
-        assert!(
-            !cache_granted(),
-            "the relocated cplt state directory is inside the ~/.cache target"
-        );
-    });
-}
-
 /// `~/.cache -> ~/dotfiles` with `~/.npmrc -> ~/dotfiles/npmrc`. The credential
 /// file's `$HOME` spelling is outside `~/.cache`, but its target is inside the
 /// one granted for it. Landlock cannot deny a file inside a granted tree, and
@@ -1577,14 +1536,14 @@ fn tool_dirs_resolving_onto_one_tree_do_not_combine_write_and_exec() {
     let root = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(root.path()).expect("canonicalize");
     let home_dir = root.join("home");
-    let shared = root.join("opt/shared");
+    // The writable registry is a real dir: a symlinked writable root is
+    // refused outright (never followed), so only the exec side can alias.
+    let shared = home_dir.join(".cargo/registry");
     std::fs::create_dir_all(shared.join("bin")).expect("mkdir shared");
-    std::fs::create_dir_all(home_dir.join(".cargo")).expect("mkdir .cargo");
     let bin_at = |target: &Path| {
         let _ = std::fs::remove_file(home_dir.join(".cargo/bin"));
         std::os::unix::fs::symlink(target, home_dir.join(".cargo/bin")).expect("symlink bin");
     };
-    std::os::unix::fs::symlink(&shared, home_dir.join(".cargo/registry")).expect("symlink reg");
     let granted = |rel: &str| {
         cplt::sandbox::active_tool_dirs(&home_dir, None)
             .iter()
@@ -1618,48 +1577,58 @@ fn tool_dirs_resolving_onto_one_tree_do_not_combine_write_and_exec() {
     assert!(granted(".cargo/bin"), "separate trees do not conflict");
 }
 
-/// `~/.cargo -> /opt/cargo` before cargo has created `registry`. The target is
-/// resolved through the deepest existing ancestor, or the profile names only
-/// `~/.cargo/registry`, which Seatbelt never matches, and the cache is denied
-/// until created from outside. A missing tail is vetted like any other target:
-/// `~/.cargo -> ~/.ssh` must not grant `~/.ssh/registry`.
+/// A writable tool dir is never granted through a symlink, at its own name or
+/// a component below `$HOME`: a session could have removed the root and linked
+/// its name to a read-only sibling or a host autostart dir, and the next launch
+/// would grant write there. Exec-only dirs keep their vetted symlink support.
 #[test]
-fn symlinked_parent_of_a_missing_tool_dir_is_granted_at_its_target() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
-    let home_dir = root.join("home");
-    let cargo = root.join("opt/cargo");
-    std::fs::create_dir_all(&cargo).expect("mkdir cargo");
-    std::fs::create_dir_all(&home_dir).expect("mkdir home");
-    std::os::unix::fs::symlink(&cargo, home_dir.join(".cargo")).expect("symlink cargo");
-
-    let registry = home_tool_dirs()
-        .iter()
-        .find(|d| d.path == ".cargo/registry")
-        .expect("registry entry")
-        .resolve(&home_dir, &[]);
-    assert_eq!(registry.target, Some(cargo.join("registry")));
-    let p = generate_profile(
-        &SandboxConfig {
-            home_dir: &home_dir,
-            ..base_profile_options()
-        },
-        &[],
-    );
-    let reg = cargo.join("registry");
-    for rule in ["allow file-write*", "deny process-exec"] {
-        let r = format!("({rule} (subpath \"{}\"))", reg.display());
-        assert!(p.contains(&r), "missing {r}\n{p}");
+fn symlinked_writable_tool_dir_is_never_followed() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    for (root, target) in [
+        (".gradle/.tmp", ".gradle/init.d"),
+        (".yarn/berry", ".yarn/bin"),
+        (".npm/_logs", "Library/LaunchAgents"),
+        (".cargo/registry", ".cargo/bin"),
+    ] {
+        let granted = || {
+            cplt::sandbox::active_tool_dirs(&home_dir, None)
+                .iter()
+                .any(|d| d.dir.path == root)
+        };
+        std::fs::create_dir_all(home_dir.join(target)).expect("mkdir target");
+        std::fs::create_dir_all(home_dir.join(root)).expect("mkdir root");
+        assert!(granted(), "{root} granted as a real dir");
+        std::fs::remove_dir(home_dir.join(root)).expect("rmdir root");
+        std::os::unix::fs::symlink(home_dir.join(target), home_dir.join(root)).expect("symlink");
+        assert!(!granted(), "{root} -> {target} must not be granted");
+        let p = generate_profile(
+            &SandboxConfig {
+                home_dir: &home_dir,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        let t = home_dir.join(target);
+        assert!(
+            !p.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                t.display()
+            )),
+            "write granted at {}",
+            t.display()
+        );
     }
-
-    std::fs::remove_file(home_dir.join(".cargo")).expect("unlink cargo");
-    std::fs::create_dir_all(home_dir.join(".ssh")).expect("mkdir ssh");
-    std::os::unix::fs::symlink(home_dir.join(".ssh"), home_dir.join(".cargo")).expect("symlink");
+    // A symlinked ancestor below $HOME counts too.
+    let real = home_dir.join("elsewhere/gradle");
+    std::fs::create_dir_all(real.join("caches")).expect("mkdir real");
+    std::fs::rename(home_dir.join(".gradle"), home_dir.join("old-gradle")).expect("mv");
+    std::os::unix::fs::symlink(&real, home_dir.join(".gradle")).expect("symlink gradle");
     assert!(
         !cplt::sandbox::active_tool_dirs(&home_dir, None)
             .iter()
-            .any(|d| d.dir.path == ".cargo/registry"),
-        "~/.ssh/registry does not exist yet but is still inside ~/.ssh"
+            .any(|d| d.dir.path == ".gradle/caches"),
+        "~/.gradle -> elsewhere must not grant write through it"
     );
 }
 
@@ -2701,7 +2670,7 @@ fn the_managed_worktree_root_section_is_emitted_only_when_set() {
     };
     let off = profile(None);
     assert!(!off.contains("Managed worktree root"), "{off}");
-    assert!(!off.contains("file-write-create"), "{off}");
+    assert!(!off.contains("file-write-create (regex"), "{off}");
     let on = profile(Some(&root));
     for rule in [
         "(deny file-write-unlink (regex #\"^/Users/test/\\.cplt-worktrees/ab$\"))",
@@ -10277,7 +10246,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
 fn deny_nested_git_emits_create_deny_only_when_set() {
     let off = generate_profile(&base_profile_options(), &[]);
     assert!(
-        !off.contains("file-write-create"),
+        !off.contains("file-write-create (regex"),
         "rule emitted with the key off"
     );
     let on = generate_profile(

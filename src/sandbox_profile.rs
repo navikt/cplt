@@ -324,8 +324,40 @@ fn profile_locked(
     }
     // Reads the grants back from the profile text so no grant can be missed.
     emit_user_deny_pins(&mut sb, config);
+    emit_grant_root_pins(&mut sb);
 
     sb
+}
+
+/// A `subpath` write grant also covers the root's own name, so inside a
+/// read-only parent the agent could remove the root and put a symlink there;
+/// the next launch would then grant write wherever the link points (a
+/// read-only sibling such as `~/.gradle/init.d`, or a host autostart dir).
+/// Pin every root whose parent is not itself writable: no unlink or rename,
+/// no create (for roots that exist). Both spellings, as Seatbelt matches the resolved path. Reads
+/// the grants back from the text, so a new grant anywhere is covered.
+fn emit_grant_root_pins(sb: &mut String) {
+    let roots = emitted_write_subpaths(sb);
+    let mut pins: Vec<PathBuf> = roots
+        .iter()
+        .filter(|r| r.parent().is_some_and(|p| p.parent().is_some()))
+        .filter(|r| !roots.iter().any(|o| o != *r && r.starts_with(o)))
+        // A missing root stays creatable (tools make their caches on first
+        // use); a symlink planted there is refused at the next launch.
+        .filter(|r| r.symlink_metadata().is_ok())
+        .flat_map(|r| [r.clone(), crate::config::canonicalize_deepest(r)])
+        .filter(|r| validate_sbpl_path(r).is_ok())
+        .collect();
+    pins.sort();
+    pins.dedup();
+    if pins.is_empty() {
+        return;
+    }
+    sbpl!(sb, ";; Write-grant roots in read-only parents — no replace");
+    for p in &pins {
+        sbpl!(sb, "(deny file-write-unlink (literal \"{}\"))", p.display());
+        sbpl!(sb, "(deny file-write-create (literal \"{}\"))", p.display());
+    }
 }
 
 /// Every recursive write grant the profile emits: the subpath of each
@@ -4509,6 +4541,8 @@ mod tests {
             let project = std::path::Path::new("/projects/app");
             let local = home.join(".local");
             let shims = home.join(".local/share/cplt/bin");
+            // Exists up front: an existing write root gains its replace pins.
+            std::fs::create_dir_all(&local).expect("mkdir local");
             let extra_write = [local.clone()];
             let mut opts = test_options(project, &home);
             opts.extra_write = &extra_write;
