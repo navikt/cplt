@@ -64,6 +64,9 @@ pub fn cplt_cmd() -> Command {
     ] {
         cmd.env_remove(v);
     }
+    // Ambient NO_PROXY merges into proxy.upstream_no_proxy, so a developer's
+    // value would decide which hosts skip a test's upstream.
+    cmd.env_remove("NO_PROXY").env_remove("no_proxy");
     cmd
 }
 

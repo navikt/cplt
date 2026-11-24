@@ -9087,8 +9087,14 @@ fn split_host_port(target: &str) -> (String, u16) {
 /// Best-effort outbound reachability check (cplt runs outside the sandbox).
 /// Only used for an ALLOWED target to confirm "cplt is not blocking this";
 /// never affects the decision.
-fn probe_reachable(host: &str, port: u16, upstream: Option<&proxy::UpstreamProxy>) -> String {
-    match proxy::probe_dial(host, port, upstream, std::time::Duration::from_secs(4)) {
+fn probe_reachable(
+    net_policy: &proxy::NetPolicy,
+    host: &str,
+    port: u16,
+    (upstream, no_proxy): (Option<&proxy::UpstreamProxy>, &[String]),
+) -> String {
+    let budget = std::time::Duration::from_secs(4);
+    match proxy::probe_dial(net_policy, host, port, upstream, no_proxy, budget) {
         Ok(sa) => format!("reachable, connected to {sa} then closed"),
         Err(hint) => format!("policy allows it, but upstream is unreachable: {hint}"),
     }
@@ -9253,7 +9259,10 @@ fn run_check_command(
             resolved.proxy_forced,
             &dom,
             no_connect,
-            resolved.proxy_upstream.as_ref(),
+            (
+                resolved.proxy_upstream.as_ref(),
+                &resolved.proxy_upstream_no_proxy,
+            ),
             agent_name,
             preset_name,
         ),
@@ -9875,7 +9884,7 @@ fn build_net_check(
     proxy_forced: bool,
     target: &str,
     no_connect: bool,
-    upstream: Option<&proxy::UpstreamProxy>,
+    upstream: (Option<&proxy::UpstreamProxy>, &[String]),
     agent_name: String,
     preset_name: Option<String>,
 ) -> check::Report {
@@ -9903,7 +9912,7 @@ fn build_net_check(
     }
 
     let mut note = if !no_connect && expl.decision == check::Decision::Allowed && proxy_enabled {
-        Some(probe_reachable(&host, port, upstream))
+        Some(probe_reachable(net_policy, &host, port, upstream))
     } else {
         None
     };
@@ -10342,11 +10351,16 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // ── network: can the proxy dial out at all (#1130)? Doctor may use the
     // network; a launch never runs this. A local firewall that has not seen
     // this binary path fails every CONNECT with a bare 502 otherwise.
-    if resolved.with_proxy {
+    // A policy that fails to build is reported by the policy check below.
+    if resolved.with_proxy
+        && let Ok(net) = build_net_policy(&resolved, active_agent)
+    {
         match proxy::probe_dial(
+            &net,
             "api.github.com",
             443,
             resolved.proxy_upstream.as_ref(),
+            &resolved.proxy_upstream_no_proxy,
             std::time::Duration::from_secs(4),
         ) {
             Ok(_) => ok.push("proxy upstream: api.github.com reachable".to_string()),
@@ -17990,7 +18004,7 @@ mod tests {
             false,
             "github.com",
             true, // no_connect
-            None,
+            (None, &[]),
             "copilot".to_string(),
             None,
         );

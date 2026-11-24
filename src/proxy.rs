@@ -1569,28 +1569,111 @@ fn dial_failure_response(host: &str, class: DialFailure) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Dial `host:port` the way the proxy would (through the upstream proxy when
-/// one is set), for `cplt doctor` and `cplt check net`. `Err` is the hint.
+/// Dial `host:port` the way the live proxy would, for `cplt doctor` and
+/// `cplt check net`. `Err` is the hint.
+///
+/// It takes the live proxy's own route: the loopback carve-out and `no_proxy`
+/// (`proxy.upstream_no_proxy` merged with ambient `NO_PROXY`) go direct, and
+/// [`classify_resolved`] decides which addresses may be dialled, so the probe
+/// never reaches an address the proxy would refuse. Through an upstream it
+/// sends the real (authenticated, if configured) CONNECT and needs a 2xx.
 pub fn probe_dial(
+    policy: &NetPolicy,
     host: &str,
     port: u16,
     upstream: Option<&UpstreamProxy>,
+    no_proxy: &[String],
     budget: Duration,
 ) -> Result<std::net::SocketAddr, String> {
-    let (dial_host, dial_port) = upstream.map_or((host, port), |u| (u.host.as_str(), u.port));
-    let addrs = resolve_socket_addrs(dial_host, dial_port);
-    if addrs.is_empty() {
-        return Err(format!(
-            "{} did not resolve here",
-            dial_host.escape_default()
-        ));
+    let host = normalize_hostname(host);
+    let localhost_opt_in =
+        policy.allow_localhost_any || policy.allow_localhost_ports.contains(&port);
+    let localhost_allowed = localhost_connect_allowed(&host, localhost_opt_in);
+    let upstream =
+        upstream.filter(|_| !localhost_allowed && !host_matches_no_proxy(&host, no_proxy));
+    let resolved = resolve_socket_addrs(&host, port);
+    let route = classify_resolved(
+        &resolved,
+        upstream.is_some(),
+        localhost_allowed,
+        localhost_opt_in,
+        !resolved.is_empty() && is_domain_match(&host, &policy.private_domains),
+    );
+    let shown = host.escape_default();
+    match (route, upstream) {
+        (ConnectRoute::Refuse(Refusal::DnsFail), _) => Err(format!("{shown} did not resolve here")),
+        (ConnectRoute::Refuse(r), _) => Err(format!(
+            "the proxy refuses {shown} after DNS ({}), so it was not dialled",
+            r.status()
+        )),
+        (ConnectRoute::Direct(addrs), _) => connect_any_within(&addrs, budget)
+            .map(|(_, addr, _)| addr)
+            .map_err(|(_, class)| probe_hint(&host, class)),
+        (ConnectRoute::Upstream, Some(u)) => probe_upstream(&host, port, u, budget),
+        // classify_resolved returns Upstream only when asked to.
+        (ConnectRoute::Upstream, None) => Err(format!("{shown} has no route")),
     }
-    connect_any_within(&addrs, budget)
-        .map(|(_, addr, _)| addr)
-        // The caller is doctor or check, so drop the advice to run doctor.
-        .map_err(|(_, class)| {
-            dial_failure_hint(dial_host, class).replace(", or run `cplt doctor`", "")
-        })
+}
+
+/// [`dial_failure_hint`] without the advice to run doctor: the caller is
+/// doctor or check.
+fn probe_hint(host: &str, class: DialFailure) -> String {
+    dial_failure_hint(host, class).replace(", or run `cplt doctor`", "")
+}
+
+/// The upstream leg of [`probe_dial`]: dial the upstream, send the CONNECT the
+/// live proxy would send and require a 2xx, all within `budget`.
+fn probe_upstream(
+    host: &str,
+    port: u16,
+    upstream: &UpstreamProxy,
+    budget: Duration,
+) -> Result<std::net::SocketAddr, String> {
+    let deadline = Instant::now() + budget;
+    let proxy = upstream.host.escape_default();
+    let target = host.escape_default();
+    let addrs = resolve_socket_addrs(&upstream.host, upstream.port);
+    if addrs.is_empty() {
+        return Err(format!("the upstream proxy {proxy} did not resolve here"));
+    }
+    let (mut stream, addr, _) = connect_any_within(&addrs, budget)
+        .map_err(|(_, class)| probe_hint(&upstream.host, class))?;
+    let left = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1));
+    stream.set_read_timeout(Some(left)).ok();
+    stream.set_write_timeout(Some(left)).ok();
+    let status = stream
+        .write_all(upstream.connect_request(host, port).as_bytes())
+        .and_then(|()| read_upstream_connect_status(&mut stream));
+    match status {
+        Ok(Some(c)) if (200..300).contains(&c) => Ok(addr),
+        Ok(Some(407)) => Err(format!(
+            "the upstream proxy {proxy} wants credentials (407) for {target}: \
+             put user:pass in proxy.upstream (http://user:pass@host:port)"
+        )),
+        Ok(Some(c)) => Err(format!(
+            "the upstream proxy {proxy} refused CONNECT {target}:{port} with status {c}"
+        )),
+        Ok(None) => Err(format!(
+            "the upstream proxy {proxy} sent no HTTP status for CONNECT {target}:{port}"
+        )),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(format!(
+                "the upstream proxy {proxy} did not answer CONNECT {target}:{port} within {}s",
+                budget.as_secs()
+            ))
+        }
+        Err(e) => Err(format!(
+            "the upstream proxy {proxy} failed CONNECT {target}:{port}: {}",
+            e.to_string().escape_default()
+        )),
+    }
 }
 
 /// The verdict of the proxy's pre-DNS CONNECT policy gates.
@@ -2084,8 +2167,8 @@ fn connect_via_upstream(
     // Read the upstream's CONNECT response. Anything other than 2xx means the
     // upstream refused — fail the client's CONNECT cleanly instead of splicing.
     match read_upstream_connect_status(&mut remote) {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(Some(c)) if (200..300).contains(&c) => {}
+        Ok(_) => {
             log_connection(
                 state,
                 Some(classification),
@@ -2145,12 +2228,13 @@ fn relay_or_intercept(
 
 /// Read and interpret the upstream proxy's response to our CONNECT request.
 ///
-/// Returns `Ok(true)` for a 2xx status (tunnel established), `Ok(false)` for any
-/// other status (upstream refused), or `Err` on an I/O/protocol error. Reads
+/// Returns `Ok(Some(code))` with the status code (2xx: tunnel established, the
+/// rest of the header consumed), `Ok(None)` for an unparseable status line, or
+/// `Err` on an I/O/protocol error. Reads
 /// byte-by-byte only up to the end of the status line, so the tunnelled TLS
 /// bytes that may follow the header block are not consumed here — the relay
 /// loop reads them from the same socket afterward.
-fn read_upstream_connect_status(remote: &mut TcpStream) -> std::io::Result<bool> {
+fn read_upstream_connect_status(remote: &mut TcpStream) -> std::io::Result<Option<u16>> {
     // Read the first line (HTTP status line), terminated by \n. Cap the length
     // to avoid an unbounded read from a hostile/broken upstream.
     let mut line = Vec::with_capacity(64);
@@ -2182,15 +2266,13 @@ fn read_upstream_connect_status(remote: &mut TcpStream) -> std::io::Result<bool>
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse::<u16>().ok());
-    let ok = matches!(code, Some(c) if (200..300).contains(&c));
-
-    if ok {
+    if matches!(code, Some(c) if (200..300).contains(&c)) {
         // Consume the remaining response headers up to the blank line so the
         // relay starts cleanly at the tunnelled payload. A well-behaved proxy
         // sends CRLFCRLF right after the status line for a 200.
         consume_until_header_end(remote)?;
     }
-    Ok(ok)
+    Ok(code)
 }
 
 /// Consume bytes from `remote` until the end of the HTTP header block
@@ -6441,15 +6523,17 @@ mod tests {
         let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{dead_port}")).unwrap();
 
         let err = probe_dial(
+            &NetPolicy::default(),
             "api.github.com",
             443,
             Some(&upstream),
+            &[],
             Duration::from_secs(2),
         )
         .unwrap_err();
         assert!(
             err.contains("connection refused") && err.contains("Little Snitch"),
-            "{err}"
+            "probe must name the refused dial and the firewall hint"
         );
 
         let proxy = make_proxy_with_upstream_opts(
@@ -6471,11 +6555,166 @@ mod tests {
             let _ = conn.read_to_string(&mut resp);
             resp
         };
-        assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
-        assert!(resp.contains("could not reach 127.0.0.1"), "{resp}");
+        assert!(resp.starts_with("HTTP/1.1 502"), "expected a 502");
+        assert!(
+            resp.contains("could not reach 127.0.0.1"),
+            "502 must name the upstream"
+        );
         assert!(
             resp.contains("connection refused") && resp.contains("allow "),
-            "{resp}"
+            "502 must name the cause and the fix"
+        );
+    }
+
+    /// One-shot fake upstream: answers the first CONNECT with `reply` and
+    /// returns the request it read.
+    fn canned_upstream(reply: &'static str) -> (UpstreamProxy, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req = String::new();
+            while reader.read_line(&mut req).unwrap_or(0) > 2 {}
+            let _ = (&stream).write_all(reply.as_bytes());
+            req
+        });
+        let url = format!("http://user:pw@127.0.0.1:{port}");
+        (UpstreamProxy::parse(&url).unwrap(), handle)
+    }
+
+    /// Review of #1132: through an upstream the probe sends the live proxy's
+    /// authenticated CONNECT and needs a 2xx; 407 and other statuses are named
+    /// apart and carry no firewall hint.
+    #[test]
+    fn probe_sends_real_connect_through_upstream() {
+        require_localhost_tcp!();
+        let policy = NetPolicy::default();
+        let probe = |u: &UpstreamProxy| {
+            probe_dial(
+                &policy,
+                "probe.invalid",
+                443,
+                Some(u),
+                &[],
+                Duration::from_secs(2),
+            )
+        };
+
+        let (u, h) = canned_upstream("HTTP/1.1 200 Connection established\r\n\r\n");
+        assert!(probe(&u).is_ok(), "2xx from the upstream must pass");
+        let req = h.join().unwrap();
+        assert!(
+            req.starts_with("CONNECT probe.invalid:443 "),
+            "wrong CONNECT line"
+        );
+        assert!(
+            req.contains("Proxy-Authorization: Basic "),
+            "probe must authenticate like the live proxy"
+        );
+
+        let (u, _h) = canned_upstream("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
+        let err = probe(&u).unwrap_err();
+        assert!(err.contains("407"), "407 must be named");
+        assert!(
+            !err.contains("Little Snitch"),
+            "407 is not a firewall problem"
+        );
+
+        let (u, _h) = canned_upstream("HTTP/1.1 403 Forbidden\r\n\r\n");
+        let err = probe(&u).unwrap_err();
+        assert!(err.contains("status 403"), "other statuses must be named");
+
+        // Accepts but never answers: a timeout, not a pass.
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", silent.local_addr().unwrap().port());
+        let err = probe_dial(
+            &policy,
+            "probe.invalid",
+            443,
+            Some(&UpstreamProxy::parse(&url).unwrap()),
+            &[],
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("did not answer"),
+            "silent upstream must time out"
+        );
+    }
+
+    /// Review of #1132: the probe classifies the resolved address like the
+    /// live proxy and never dials one it would refuse; the loopback carve-out
+    /// and `no_proxy` skip the upstream as they do live.
+    #[test]
+    fn probe_follows_live_route_and_address_policy() {
+        require_localhost_tcp!();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_url = format!("http://127.0.0.1:{}", dead.local_addr().unwrap().port());
+        drop(dead);
+        let dead_upstream = UpstreamProxy::parse(&dead_url).unwrap();
+        let budget = Duration::from_secs(2);
+
+        // Loopback without an opt-in: refused after DNS, never dialled.
+        let err =
+            probe_dial(&NetPolicy::default(), "127.0.0.1", port, None, &[], budget).unwrap_err();
+        assert!(err.contains("BLOCKED-PRIVATE"), "loopback must be refused");
+        assert!(
+            listener.accept().is_err(),
+            "a refused address must not be dialled"
+        );
+
+        // With the opt-in it goes direct, past a dead upstream.
+        let opt_in = NetPolicy {
+            allow_localhost_ports: vec![port],
+            ..Default::default()
+        };
+        assert!(
+            probe_dial(
+                &opt_in,
+                "127.0.0.1",
+                port,
+                Some(&dead_upstream),
+                &[],
+                budget
+            )
+            .is_ok(),
+            "loopback carve-out must bypass the upstream"
+        );
+
+        // A no_proxy host skips the upstream: it fails DNS locally instead of
+        // failing on the dead upstream.
+        let policy = NetPolicy::default();
+        let no_proxy = vec!["probe.invalid".to_string()];
+        let err = probe_dial(
+            &policy,
+            "probe.invalid",
+            443,
+            Some(&dead_upstream),
+            &no_proxy,
+            budget,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("did not resolve"),
+            "no_proxy host must go direct"
+        );
+        let err = probe_dial(
+            &policy,
+            "probe.invalid",
+            443,
+            Some(&dead_upstream),
+            &[],
+            budget,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("connection refused"),
+            "other hosts use the upstream"
         );
     }
 
