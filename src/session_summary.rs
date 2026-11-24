@@ -132,12 +132,18 @@ fn since_start() -> std::time::Duration {
 }
 
 /// The launch path was entered with `path` from the environment.
-pub fn begin(path: Option<PathBuf>, agent: &str) {
+/// No path yet: [`set_path`] stores one only after [`path_refusal`] cleared it,
+/// so a launch that fails before the check writes nothing.
+pub fn begin(agent: &str) {
     with(|s| {
         s.launched = true;
-        s.path = path;
         s.agent = Some(agent.to_string());
     });
+}
+
+/// Store the path [`path_refusal`] returned.
+pub fn set_path(path: PathBuf) {
+    with(|s| s.path = Some(path));
 }
 
 /// The path from [`ENV`], if set and non-empty. Read only by the parent.
@@ -148,12 +154,8 @@ pub fn path_from_env() -> Option<PathBuf> {
 }
 
 /// Drop the path (it was refused). Nothing is written afterwards.
-pub fn disable() {
-    with(|s| s.path = None);
-}
-
-pub fn enabled() -> bool {
-    with(|s| s.launched && s.path.is_some())
+pub fn launched() -> bool {
+    with(|s| s.launched)
 }
 
 pub fn set_backend(backend: &'static str) {
@@ -243,11 +245,25 @@ pub fn record_net(status: &str, host: &str) {
     };
     with(|s| {
         *s.net.entry(reason).or_insert(0) += 1;
-        if reason != "upstream-fail" && s.blocked_hosts.len() < MAX_BLOCKED_HOSTS {
-            s.blocked_hosts
-                .insert(host.trim_end_matches('.').to_ascii_lowercase());
+        if let Some(host) = dns_host(host)
+            && reason != "upstream-fail"
+            && s.blocked_hosts.len() < MAX_BLOCKED_HOSTS
+        {
+            s.blocked_hosts.insert(host);
         }
     });
+}
+
+/// The host normalised, if it is a DNS name (letters, digits, `-`, `.`, at
+/// most 253 bytes). The host comes from the agent's CONNECT line.
+fn dns_host(host: &str) -> Option<String> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'))
+    .then_some(host)
 }
 
 /// Parse `CPLT_SESSION_SUMMARY_HOSTS`: comma-separated DNS suffixes. Returns
@@ -292,32 +308,37 @@ pub fn host_matches(host: &str, suffixes: &[String]) -> bool {
     })
 }
 
-/// Why `path` must not be used, given the session's write grants.
+/// Clear `path` for the summary, or say why not. Returns the path with its
+/// parent canonicalised, which is what gets written at exit.
 ///
-/// `writable` answers whether a path lies inside a tree the sandbox can write
-/// (`check::writable_tree_over` against the emitted policy). The parent dir is
-/// also checked after resolving symlinks, so a link out of a grant into a
-/// writable tree cannot launder it.
-pub fn path_refusal(path: &Path, writable: impl Fn(&Path) -> Option<PathBuf>) -> Option<String> {
+/// `on_path` is `check::writable_tree_on_path` against the emitted policy: it
+/// walks every component and every symlink hop, so a link chain through a
+/// write grant (`out/l1 -> proj/l2 -> victim`) is refused even though both
+/// ends lie outside it. The parent must exist now; one that does not resolve
+/// cannot be checked.
+pub fn path_refusal(
+    path: &Path,
+    on_path: impl Fn(&Path) -> Option<(PathBuf, PathBuf)>,
+) -> Result<PathBuf, String> {
     if !path.is_absolute() {
-        return Some("it is not an absolute path".into());
+        return Err("it is not an absolute path".into());
     }
-    let Some(name) = path.file_name() else {
-        return Some("it names no file".into());
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err("it names no file".into());
     };
-    let resolved = path
-        .parent()
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .map(|p| p.join(name));
-    for candidate in std::iter::once(path.to_path_buf()).chain(resolved) {
-        if let Some(tree) = writable(&candidate) {
-            return Some(format!(
-                "it lies inside {}, which the sandbox can write",
+    let canonical = std::fs::canonicalize(parent)
+        .map_err(|e| format!("its directory cannot be resolved ({e})"))?
+        .join(name);
+    for candidate in [path, canonical.as_path()] {
+        if let Some((entry, tree)) = on_path(candidate) {
+            return Err(format!(
+                "{} lies inside {}, which the sandbox can write",
+                entry.display(),
                 tree.display()
             ));
         }
     }
-    None
+    Ok(canonical)
 }
 
 /// Render the summary. `suffixes` filters `net_blocked_hosts`.
@@ -368,39 +389,81 @@ fn render(s: &State, suffixes: &[String]) -> serde_json::Value {
     Value::Object(m)
 }
 
-/// Write `contents` to `path`: a fresh 0600 temp file in the same directory,
-/// opened `O_EXCL | O_NOFOLLOW`, then renamed over the target. A symlink or
-/// anything but a regular file at `path` is refused, never replaced.
+/// Write `contents` to `path` (parent already canonical, from
+/// [`path_refusal`]). The parent is resolved again and must not have moved,
+/// then opened `O_DIRECTORY | O_NOFOLLOW`; everything after is relative to
+/// that fd: a fresh 0600 temp file (`O_EXCL | O_NOFOLLOW`) renamed over the
+/// target. A symlink or anything but a regular file at `path` is refused.
 pub fn write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::ffi::CString;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     let refuse = |why: &str| std::io::Error::other(why.to_string());
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if !m.file_type().is_file() => {
-            return Err(refuse("the path exists and is not a regular file"));
-        }
-        _ => {}
-    }
     let dir = path.parent().ok_or_else(|| refuse("no parent dir"))?;
     let name = path.file_name().ok_or_else(|| refuse("no file name"))?;
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
+    if std::fs::canonicalize(dir)? != dir {
+        return Err(refuse("its directory changed since launch"));
+    }
+    let cstr = |b: &[u8]| CString::new(b).map_err(|_| refuse("NUL in path"));
+    let dir_c = cstr(dir.as_os_str().as_bytes())?;
+    let name_c = cstr(name.as_bytes())?;
+    let tmp_c = cstr(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()).as_bytes())?;
+    // SAFETY: plain syscalls on NUL-terminated strings; fds are owned below.
+    let dfd = unsafe {
+        libc::open(
+            dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let dfd = unsafe { OwnedFd::from_raw_fd(dfd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::fstatat(
+            dfd.as_raw_fd(),
+            name_c.as_ptr(),
+            &raw mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(refuse("the path exists and is not a regular file"));
+    }
+    let fd = unsafe {
+        libc::openat(
+            dfd.as_raw_fd(),
+            tmp_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let result = f
+        .write_all(contents)
+        .and_then(|()| f.sync_all())
+        .and_then(|()| {
+            let r = unsafe {
+                libc::renameat(
+                    dfd.as_raw_fd(),
+                    tmp_c.as_ptr(),
+                    dfd.as_raw_fd(),
+                    name_c.as_ptr(),
+                )
+            };
+            if r == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        unsafe { libc::unlinkat(dfd.as_raw_fd(), tmp_c.as_ptr(), 0) };
     }
     result
 }
@@ -584,11 +647,17 @@ mod tests {
         assert_eq!(net_reason("DNS-FAIL"), None);
     }
 
+    fn canon_tmp() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, c)
+    }
+
     #[test]
     fn writes_0600_and_replaces() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("s.json");
+        let (_d, dir) = canon_tmp();
+        let p = dir.join("s.json");
         std::fs::write(&p, "old").unwrap();
         write_file(&p, b"{}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}");
@@ -596,15 +665,15 @@ mod tests {
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 
     #[test]
     fn refuses_symlink_and_fifo() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
+        let (_d, dir) = canon_tmp();
+        let target = dir.join("target");
         std::fs::write(&target, "keep").unwrap();
-        let link = dir.path().join("link.json");
+        let link = dir.join("link.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(write_file(&link, b"{}").is_err());
         assert!(
@@ -614,30 +683,87 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
-        let fifo = dir.path().join("fifo.json");
+        let fifo = dir.join("fifo.json");
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert!(write_file(&fifo, b"{}").is_err());
     }
 
+    /// A parent re-aimed after launch (a symlink swapped into the chain) is
+    /// refused at write time, not followed.
+    #[test]
+    fn write_refuses_a_parent_that_moved() {
+        let (_d, dir) = canon_tmp();
+        let real = dir.join("real");
+        let victim = dir.join("victim");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        let checked = real.join("s.json");
+        std::fs::remove_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&victim, &real).unwrap();
+        assert!(write_file(&checked, b"{}").is_err());
+        assert!(!victim.join("s.json").exists());
+    }
+
+    fn grant_policy(dir: &Path) -> crate::sandbox::LandlockPolicy {
+        crate::sandbox::LandlockPolicy {
+            fs_rules: vec![crate::sandbox::FsRule {
+                nofollow: false,
+                path: dir.to_path_buf(),
+                access: crate::sandbox::FsAccess {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            }],
+            net_rules: Vec::new(),
+            bind_rules: Vec::new(),
+            restrict_net_connect: true,
+            restrict_net_bind: false,
+            proxy_forced: false,
+            home_dir: PathBuf::from("/home/u"),
+            precreate_dirs: vec![],
+            plain_file: None,
+        }
+    }
+
     #[test]
     fn path_inside_write_grant_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let grant = std::fs::canonicalize(dir.path()).unwrap();
-        let writable = |p: &Path| p.starts_with(&grant).then(|| grant.clone());
-        let inside = grant.join("s.json");
+        let (_d, t) = canon_tmp();
+        let (proj, out, victim) = (t.join("proj"), t.join("out"), t.join("victim"));
+        for d in [&proj, &out, &victim] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let policy = grant_policy(&proj);
+        let home = t.join("home");
+        let ask = |p: &Path| {
+            path_refusal(p, |q| {
+                crate::check::writable_tree_on_path(&policy, &home, q)
+            })
+        };
+        assert!(ask(&proj.join("s.json")).unwrap_err().contains("can write"));
+        assert!(ask(Path::new("rel.json")).is_err());
+        // Missing parent: cannot be checked, so refused.
+        assert!(ask(&out.join("missing/s.json")).is_err());
+        // Two hops: out/l1 -> proj/l2 -> victim. Both ends lie outside the
+        // grant, but the agent can re-aim proj/l2.
+        std::os::unix::fs::symlink(proj.join("l2"), out.join("l1")).unwrap();
+        std::os::unix::fs::symlink(&victim, proj.join("l2")).unwrap();
         assert!(
-            path_refusal(&inside, writable)
-                .unwrap()
-                .contains("can write")
+            ask(&out.join("l1/s.json")).is_err(),
+            "two-hop link through a grant"
         );
-        assert!(path_refusal(Path::new("rel.json"), writable).is_some());
-        // A link from outside into the grant is resolved and refused.
-        let outside = tempfile::tempdir().unwrap();
-        let link = outside.path().join("l");
-        std::os::unix::fs::symlink(&grant, &link).unwrap();
-        assert!(path_refusal(&link.join("s.json"), writable).is_some());
-        assert!(path_refusal(&outside.path().join("s.json"), writable).is_none());
+        assert_eq!(ask(&out.join("s.json")).unwrap(), out.join("s.json"));
+    }
+
+    #[test]
+    fn stored_hosts_are_dns_names_only() {
+        assert_eq!(dns_host("Evil.Example.").as_deref(), Some("evil.example"));
+        assert_eq!(dns_host("a b\u{1b}[2K"), None);
+        assert_eq!(dns_host(&"a".repeat(254)), None);
+        assert_eq!(dns_host(""), None);
     }
 
     #[test]

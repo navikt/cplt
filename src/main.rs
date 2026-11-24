@@ -5527,7 +5527,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // #1157: only a real launch writes a summary, never an inspection.
     if !cli.print_profile && mcp_status.is_none() {
         let summary_path = cplt::session_summary::path_from_env();
-        cplt::session_summary::begin(summary_path.clone(), active_agent.binary_name());
+        cplt::session_summary::begin(active_agent.binary_name());
         cplt::session_summary::set_repo_config(if !project_dir.join(".cplt.toml").is_file() {
             "none"
         } else if repo_trusted {
@@ -6020,21 +6020,22 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // #1157: the parent writes the summary after the session, so a path the
     // sandbox can write would let the agent plant a link or a file there first.
     if let Some(path) = cplt::session_summary::path_from_env()
-        && cplt::session_summary::enabled()
-        && let Some(why) = cplt::session_summary::path_refusal(&path, |p| {
-            cplt::check::writable_tree_over(&policy, &home_dir, p)
-        })
+        && cplt::session_summary::launched()
     {
-        cplt::session_summary::disable();
-        ui::warn_id(
-            "warn.session-summary-path-refused",
-            &format!(
-                "not writing the session summary to {}: {why}. Point {} outside the \
-                 project and every write grant.",
-                path.display(),
-                cplt::session_summary::ENV
+        match cplt::session_summary::path_refusal(&path, |p| {
+            cplt::check::writable_tree_on_path(&policy, &home_dir, p)
+        }) {
+            Ok(checked) => cplt::session_summary::set_path(checked),
+            Err(why) => ui::warn_id(
+                "warn.session-summary-path-refused",
+                &format!(
+                    "not writing the session summary to {}: {why}. Point {} outside the \
+                     project and every write grant.",
+                    path.display(),
+                    cplt::session_summary::ENV
+                ),
             ),
-        );
+        }
     }
 
     // Preflight: verify the sandbox mechanism works on this system

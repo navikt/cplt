@@ -62,7 +62,7 @@ Paths in `[allow]` and `[deny]` support `~/` expansion and resolve relative to t
 cplt sends nothing anywhere. A wrapper such as nav-pilot can ask for a local summary of each session by setting `CPLT_SESSION_SUMMARY` to an absolute file path. When the session ends, cplt (outside the sandbox) writes one JSON object there. Without the variable, nothing is written.
 
 - The file is created with mode 0600 through a temp file and a rename in the same directory. A symlink or anything but a regular file at the path is refused, not replaced.
-- The path must lie outside the project and every write grant. Otherwise cplt warns and writes nothing.
+- The path must be absolute, its directory must exist at launch, and no component of the path or of any symlink it passes through may lie in the project or a write grant. Otherwise cplt warns and writes nothing. A launch that fails before this check writes no summary.
 - `CPLT_SESSION_SUMMARY` and `CPLT_SESSION_SUMMARY_HOSTS` are never passed into the sandbox, even with `--pass-env` or `--inherit-env`.
 - `schema` is `1`. Fields are only ever added: ignore fields you do not know, and drop a file you cannot parse.
 

@@ -1552,6 +1552,28 @@ mod e2e_tests {
         );
     }
 
+    /// #1157: a launch that fails before the path check (no agent binary)
+    /// writes no summary.
+    #[test]
+    fn e2e_session_summary_not_written_on_early_setup_failure() {
+        require_sandbox!();
+        let out_dir = home_temp_dir("summary-fail");
+        let path = out_dir.path().join("summary.json");
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", "/usr/bin:/bin")
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        assert!(!output.status.success());
+        assert!(
+            !path.exists(),
+            "summary written before the path was checked"
+        );
+    }
+
     /// #1157: a summary path inside the project (a write grant) is refused,
     /// and nothing is written without the env var.
     #[test]
