@@ -5080,6 +5080,81 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A `--deny-path` inside the project keeps its content denied when the
+    /// agent renames or swaps (`renamex_np` RENAME_SWAP) a writable ancestor.
+    #[test]
+    fn real_profile_deny_path_survives_ancestor_rename_and_swap() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-deny-pins-{}", std::process::id()));
+        let project = tmp.join("proj");
+        let denied = project.join("a/b/secret");
+        fs::create_dir_all(&denied).unwrap();
+        fs::create_dir_all(project.join("other/x")).unwrap();
+        fs::create_dir_all(project.join("swap/b/secret")).unwrap();
+        fs::write(denied.join("data.txt"), "top-secret\n").unwrap();
+        let project = fs::canonicalize(&project).unwrap();
+        let denied = fs::canonicalize(&denied).unwrap();
+        let home = home_dir();
+        let extra_deny = vec![denied.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+        let py = r#"
+import ctypes, os, sys
+os.chdir(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+def swap(a, b):
+    return libc.renamex_np(a.encode(), b.encode(), 2) == 0
+leaked = []
+for src, dst in [("a/b", "moved_b"), ("a", "moved_a")]:
+    try:
+        os.rename(src, dst)
+    except OSError:
+        continue
+    for root, _, files in os.walk(dst):
+        for f in files:
+            try:
+                leaked.append(open(os.path.join(root, f)).read())
+            except OSError:
+                pass
+for src, dst in [("a/b", "swap/b"), ("a", "swap")]:
+    if swap(src, dst):
+        for root, _, files in os.walk(src):
+            for f in files:
+                try:
+                    leaked.append(open(os.path.join(root, f)).read())
+                except OSError:
+                    pass
+        for root, _, files in os.walk(dst):
+            for f in files:
+                try:
+                    leaked.append(open(os.path.join(root, f)).read())
+                except OSError:
+                    pass
+os.rename("other/x", "other/y")
+print("CONTROL_OK" if os.path.isdir("other/y") else "CONTROL_FAIL")
+print("LEAKED" if any("top-secret" in l for l in leaked) else "HELD")
+"#;
+        let script = tmp.join("probe.py");
+        fs::write(&script, py).unwrap();
+        let cmd = format!(
+            "/usr/bin/python3 -I '{}' '{}' 2>&1",
+            script.display(),
+            project.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("CONTROL_OK"),
+            "ordinary rename must work: {output}"
+        );
+        assert!(
+            output.contains("HELD"),
+            "deny-path content leaked: {output}"
+        );
+    }
+
     /// #597: the #477 carve-out re-allows `.env` reads in the Go module cache,
     /// and must not reopen a `--deny-path` inside it. A module outside the
     /// deny keeps the carve-out.

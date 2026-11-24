@@ -2942,6 +2942,17 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
             .chain(&files)
             .filter_map(|s| s.get(1).map(PathBuf::from)),
     );
+    // User deny paths too: a rename of a writable ancestor would move the
+    // denied content to a path the deny no longer names.
+    targets.extend(
+        config
+            .extra_deny
+            .iter()
+            .map(|p| crate::config::canonicalize_deepest(p)),
+    );
+    // And HOME itself when it lies inside a writable tree: `~/.ssh` is denied
+    // whether or not it exists, so pin every ancestor of it, HOME included.
+    targets.push(crate::config::canonicalize_deepest(Path::new(config.home_dir)).join(".ssh"));
     emit_resolved_deny_pins(sb, config, &targets);
     for path in config.extra_deny {
         let p = path.to_string_lossy();
