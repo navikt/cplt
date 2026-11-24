@@ -336,7 +336,17 @@ pub fn load_managed_from(
             "Review the quarantined file, then have the wrapper rewrite it under its original name.",
         ));
     }
-    crate::sandbox::resolve_unwritable(path, writable).map_err(|()| {
+    // macOS denies the state dir inside a grant above it and pins its
+    // ancestors, so such a grant leaves the file out of reach. Exempted here,
+    // at the one boundary launch, `check`, `doctor` and `config show` share,
+    // so they agree. Linux has no such deny: the grant still refuses.
+    #[cfg(target_os = "macos")]
+    let writable: Vec<PathBuf> = writable
+        .iter()
+        .filter(|r| crate::sandbox::cplt_state_ancestor_grant(&home, r).is_none())
+        .cloned()
+        .collect();
+    crate::sandbox::resolve_unwritable(path, &writable).map_err(|()| {
         let tree = writable
             .iter()
             .find(|w| canonical.starts_with(w) || path.starts_with(w) || trusted.starts_with(w));
@@ -1213,6 +1223,24 @@ mod tests {
         let p = write(&h.managed_d(), "managed.toml", GOOD);
         h.refused(p.as_os_str(), &[h.managed_d()], "can write");
         h.refused(p.as_os_str(), std::slice::from_ref(&p), "can write");
+    }
+
+    /// Copilot OKbk: a grant above the state dir (`~/.config`, `~`) is
+    /// exempted in the loader itself on macOS, where the state dir stays
+    /// denied, and refused on Linux, so every caller agrees.
+    #[test]
+    fn ancestor_grant_of_the_state_dir_is_exempt_only_on_macos() {
+        let h = Home::new();
+        let p = write(&h.managed_d(), "managed.toml", GOOD);
+        let home = std::fs::canonicalize(h.path()).unwrap();
+        for grant in [home.join(".config"), home.clone()] {
+            let got = h.load(p.as_os_str(), std::slice::from_ref(&grant));
+            if cfg!(target_os = "macos") {
+                assert!(got.is_ok(), "macOS must exempt an ancestor grant: {got:?}");
+            } else {
+                assert!(got.is_err(), "Linux must refuse under an ancestor grant");
+            }
+        }
     }
 
     #[test]

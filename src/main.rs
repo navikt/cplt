@@ -7516,10 +7516,7 @@ fn managed_layer_writable(
     // launch refuses the roots anyway.
     roots.extend(sandbox::named_root_git_dirs(repos).unwrap_or_default());
     roots.extend(cplt::sandbox::home_and_temp_writable_roots(home, &[], None));
-    // macOS denies the state dir inside such a grant and pins its ancestors
-    // against rename, so the managed file stays out of the agent's reach.
-    #[cfg(target_os = "macos")]
-    roots.retain(|r| sandbox::cplt_state_ancestor_grant(home, r).is_none());
+    // The macOS state-dir exemption lives in the loader, shared with launch.
     roots
 }
 
