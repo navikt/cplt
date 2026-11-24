@@ -45,7 +45,9 @@ pub use path::{
     classify_custom_config, collapse_tilde, config_dir, config_path, credential_hop_message,
     default_config_contents, expand_tilde, xdg_config_root,
 };
-pub use path::{canonicalize_deepest, firmlink_canonical};
+pub use path::{
+    NOFOLLOW_LINK_MESSAGE, canonicalize_deepest, canonicalize_strict, nofollow_names_symlink,
+};
 pub use registry::{
     BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,
     layer_only_flag, lookup_key,

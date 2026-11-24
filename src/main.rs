@@ -1823,9 +1823,14 @@ fn prompt_confirm(auto_yes: bool, quiet: bool, agent: cplt::agent::Agent) -> Res
 fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
     paths
         .iter()
-        .filter_map(|p| match std::fs::canonicalize(p) {
+        .filter_map(|p| match config::canonicalize_strict(p) {
             Ok(c) => {
                 let spelled = std::path::absolute(p).unwrap_or_default();
+                if config::nofollow_names_symlink(&spelled) {
+                    let why = config::NOFOLLOW_LINK_MESSAGE;
+                    ui::warn(&format!("{flag_name} path {} {why}", p.display()));
+                    return None;
+                }
                 if let Some(target) = config::allow_path_credential_hop(&spelled) {
                     let why = config::credential_hop_message(&target);
                     ui::warn(&format!("{flag_name} path {} {why}", p.display()));
@@ -1846,15 +1851,13 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     paths
         .iter()
         .map(|p| {
-            std::fs::canonicalize(p)
-                .map(|c| config::firmlink_canonical(&c))
-                .with_context(|| {
-                    format!(
-                        "--deny-path {} cannot be resolved.\n\
+            config::canonicalize_strict(p).with_context(|| {
+                format!(
+                    "--deny-path {} cannot be resolved.\n\
                      Silently dropping deny rules is a security risk.",
-                        p.display()
-                    )
-                })
+                    p.display()
+                )
+            })
         })
         .collect()
 }

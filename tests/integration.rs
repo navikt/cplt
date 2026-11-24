@@ -5321,7 +5321,7 @@ int main(int argc, char **argv) {
         let denied = fs::canonicalize(&denied).unwrap();
         let spelled = Path::new("/System/Volumes/Data").join(denied.strip_prefix("/").unwrap());
         assert!(spelled.exists(), "firmlink spelling must resolve");
-        let normalised = cplt::config::firmlink_canonical(&fs::canonicalize(&spelled).unwrap());
+        let normalised = cplt::config::canonicalize_strict(&spelled).unwrap();
         assert_eq!(normalised, denied);
         let home = home_dir();
         let extra_deny = vec![normalised];
@@ -6964,6 +6964,141 @@ except Exception as e:
             !stdout.contains("\"*:443\""),
             "`--proxy-forced --print-profile` must not allow direct *:443 egress, got:\n{stdout}"
         );
+    }
+
+    /// The `/System/Volumes/Data` spelling of `p`.
+    fn firmlink(p: &Path) -> PathBuf {
+        Path::new("/System/Volumes/Data").join(p.strip_prefix("/").unwrap())
+    }
+
+    /// `--print-profile` with a scratch HOME, an optional user config and the
+    /// given extra args. Returns (stdout, stderr).
+    fn firmlink_profile(
+        home: &Path,
+        project: &Path,
+        cfg: Option<&Path>,
+        args: &[&str],
+    ) -> (String, String) {
+        let mut cmd = cplt_cmd();
+        cmd.env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("GH_CONFIG_DIR", home.join(".config/gh"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        if let Some(cfg) = cfg {
+            cmd.env("CPLT_CONFIG", cfg);
+        }
+        let out = cmd
+            .args([
+                "--print-profile",
+                "--project-dir",
+                &project.to_string_lossy(),
+            ])
+            .args(args)
+            .output()
+            .expect("Failed to run cplt --print-profile");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Scratch (home, project, secret dir), all canonical.
+    fn firmlink_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (home, project) = (root.join("home"), root.join("proj"));
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/id_ed25519"), "FAKE KEY\n").unwrap();
+        fs::create_dir_all(project.join("secret")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        assert!(firmlink(&root).exists(), "firmlink spelling must resolve");
+        let secret = project.join("secret");
+        (tmp, home, project, secret)
+    }
+
+    /// CLI `--deny-path` / `--allow-read` in firmlink spelling reach the
+    /// profile in the canonical form Seatbelt matches; `/.nofollow/` too.
+    #[test]
+    fn binary_cli_firmlink_and_nofollow_spellings_are_canonical() {
+        let (tmp, home, project, secret) = firmlink_fixture();
+        let docs = fs::canonicalize(tmp.path()).unwrap().join("docs");
+        let nofollow = Path::new("/.nofollow").join(secret.strip_prefix("/").unwrap());
+        for (deny, allow) in [
+            (firmlink(&secret), firmlink(&docs)),
+            (nofollow, docs.clone()),
+        ] {
+            let (out, err) = firmlink_profile(
+                &home,
+                &project,
+                None,
+                &[
+                    "--deny-path",
+                    &deny.to_string_lossy(),
+                    "--allow-read",
+                    &allow.to_string_lossy(),
+                ],
+            );
+            for p in [&secret, &docs] {
+                assert!(
+                    out.contains(&format!("\"{}\"", p.display())),
+                    "{} missing:\n{err}\n{out}",
+                    p.display()
+                );
+            }
+            assert!(
+                !out.contains("/System/Volumes/Data/") && !out.contains("/.nofollow/"),
+                "{out}"
+            );
+        }
+    }
+
+    /// Config `allow.read` in firmlink spelling through a symlink into
+    /// `~/.ssh` is refused with the #551 warning; no grant names the key.
+    #[test]
+    fn binary_config_firmlink_allow_into_credential_is_refused() {
+        let (tmp, home, project, _) = firmlink_fixture();
+        let docs = fs::canonicalize(tmp.path()).unwrap().join("docs");
+        std::os::unix::fs::symlink("../home/.ssh/id_ed25519", docs.join("hosts")).unwrap();
+        let cfg = tmp.path().join("config.toml");
+        fs::write(
+            &cfg,
+            format!(
+                "[allow]\nread = [\"{}\"]\n",
+                firmlink(&docs.join("hosts")).display()
+            ),
+        )
+        .unwrap();
+        let (out, err) = firmlink_profile(&home, &project, Some(&cfg), &[]);
+        assert!(
+            err.contains("reaches the credential"),
+            "missing #551 warning:\n{err}"
+        );
+        assert!(
+            !out.lines()
+                .any(|l| l.contains("allow") && l.contains("id_ed25519")),
+            "key granted:\n{out}"
+        );
+    }
+
+    /// `.cplt.toml` `[deny] paths` in firmlink spelling is canonical in the profile.
+    #[test]
+    fn binary_repo_config_firmlink_deny_is_canonical() {
+        let (_tmp, home, project, secret) = firmlink_fixture();
+        fs::write(
+            project.join(".cplt.toml"),
+            format!("[deny]\npaths = [\"{}\"]\n", firmlink(&secret).display()),
+        )
+        .unwrap();
+        let (out, err) = firmlink_profile(&home, &project, None, &[]);
+        assert!(
+            out.contains(&format!("\"{}\"", secret.display())),
+            "{err}\n{out}"
+        );
+        assert!(!out.contains("/System/Volumes/Data/"), "{out}");
     }
 
     /// #653: `proxy.deny_dns` reaches the profile from config, and only

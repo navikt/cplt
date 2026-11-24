@@ -520,7 +520,34 @@ pub(crate) fn lexically_normalized(path: &Path) -> PathBuf {
 /// Linux), keeping the lexical form from there.
 pub fn canonicalize_deepest(path: &Path) -> PathBuf {
     let mut hops = MAXSYMLINKS;
-    deepest(path, &mut hops)
+    deepest(&strip_nofollow(path), &mut hops)
+}
+
+/// `std::fs::canonicalize`, plus the two macOS spellings `realpath` leaves
+/// alone but Seatbelt never matches: a `/.nofollow/` prefix and the
+/// `/System/Volumes/Data` firmlink. The single choke point for every path a
+/// rule is built from (CLI, user config, repo `.cplt.toml`, credential-link
+/// and overlap checks, via [`canonicalize_deepest`]), so all of them compare
+/// the same form. A rule naming either spelling would otherwise be inert.
+pub fn canonicalize_strict(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(strip_nofollow(path)).map(|c| firmlink_canonical(&c))
+}
+
+/// `/.nofollow/<x>` names `/<x>` without following a symlink at `<x>`.
+/// Callers granting access refuse that case ([`nofollow_names_symlink`]);
+/// a deny simply applies to `/<x>`.
+fn strip_nofollow(path: &Path) -> PathBuf {
+    match path.strip_prefix("/.nofollow") {
+        Ok(rest) => Path::new("/").join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// True when `path` is spelled `/.nofollow/<x>` and `<x>` is a symlink: the
+/// spelling asks for the link itself, which a grant cannot honour.
+pub fn nofollow_names_symlink(path: &Path) -> bool {
+    path.starts_with("/.nofollow")
+        && std::fs::symlink_metadata(strip_nofollow(path)).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// The kernel's symlink-hop limit: `MAXSYMLINKS`, 32 on macOS and 40 on Linux.
@@ -530,7 +557,7 @@ fn deepest(path: &Path, hops: &mut u32) -> PathBuf {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(base) = cur.canonicalize() {
+        if let Ok(base) = canonicalize_strict(cur) {
             // Only the first missing name can be a dangling link: everything
             // below it sits under a name that does not exist. One `readlink`
             // there, not one per level — each lookup of a missing name under
@@ -687,8 +714,12 @@ pub fn classify_custom_config(path: &Path, home: &Path, project_dir: &Path) -> C
 /// canonicalized at load, so this is checked before the spelling is lost.
 pub fn allow_path_credential_hop(spelled: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    crate::sandbox::credential_link_hop(Path::new(&home), spelled)
+    crate::sandbox::credential_link_hop(Path::new(&home), &strip_nofollow(spelled))
 }
+
+/// The refusal for an allow entry [`nofollow_names_symlink`] flags.
+pub const NOFOLLOW_LINK_MESSAGE: &str = "names a symlink through /.nofollow/, which a grant cannot \
+     honour without following it. Name the link's target instead.";
 
 /// The refusal for [`allow_path_credential_hop`], after the entry's name.
 pub fn credential_hop_message(target: &Path) -> String {
@@ -708,6 +739,9 @@ pub(super) fn resolve_allow_path(
 ) -> Result<PathBuf, ConfigError> {
     let resolved = resolve_config_path(path, config_dir)?;
     let spelled = std::path::absolute(anchored(path, config_dir)).unwrap_or_default();
+    if nofollow_names_symlink(&spelled) {
+        return Err(ConfigError::Validation(NOFOLLOW_LINK_MESSAGE.into()));
+    }
     match allow_path_credential_hop(&spelled) {
         Some(target) => Err(ConfigError::Validation(credential_hop_message(&target))),
         None => Ok(resolved),
@@ -729,14 +763,12 @@ pub(super) fn resolve_config_path(
     config_dir: Option<&PathBuf>,
 ) -> Result<PathBuf, ConfigError> {
     let full = anchored(path, config_dir);
-    std::fs::canonicalize(&full)
-        .map(|c| firmlink_canonical(&c))
-        .map_err(|_| {
-            ConfigError::Validation(format!(
-                "path does not exist or is inaccessible: {}",
-                full.display()
-            ))
-        })
+    canonicalize_strict(&full).map_err(|_| {
+        ConfigError::Validation(format!(
+            "path does not exist or is inaccessible: {}",
+            full.display()
+        ))
+    })
 }
 
 /// Map `/System/Volumes/Data/<x>` to `/<x>` when both name the same file.
@@ -746,7 +778,7 @@ pub(super) fn resolve_config_path(
 /// firmlink form matches nothing. A deny written that way would be silently
 /// inert; every overlap check would miss it too. Identity (dev, ino) decides,
 /// never the string alone. No-op off macOS and for any other path.
-pub fn firmlink_canonical(path: &Path) -> PathBuf {
+fn firmlink_canonical(path: &Path) -> PathBuf {
     #[cfg(unix)]
     if let Ok(rest) = path.strip_prefix("/System/Volumes/Data") {
         use std::os::unix::fs::MetadataExt;
