@@ -3998,6 +3998,9 @@ pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_ascii_lowercase());
     let me = lower(path);
     let my_id = id(path);
+    // A dangling entry (`~/bin -> ~/tools/future-bin`) has no identity; its
+    // resolved target still names what the sandbox would create.
+    let me_real = lower(&config::canonicalize_deepest(path));
     let homes = std::iter::once(home.to_path_buf()).chain(config::account_home());
     !homes
         .flat_map(|h| {
@@ -4007,10 +4010,13 @@ pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
         .flat_map(|h| ENV_TOOL_NO_HINT_SUBPATHS.iter().map(move |rel| h.join(rel)))
         .any(|d| {
             let ld = lower(&d);
+            let ld_real = lower(&config::canonicalize_deepest(&d));
             // Spelling covers entries that do not exist yet; identity covers a
             // symlinked entry (`~/bin -> ~/tools`) reached by its target.
             me.starts_with(&ld)
                 || ld.starts_with(&me)
+                || me_real.starts_with(&ld_real)
+                || ld_real.starts_with(&me_real)
                 || id(&d).is_some_and(|did| {
                     path.ancestors().any(|a| id(a) == Some(did))
                         || std::fs::canonicalize(&d)
@@ -4953,6 +4959,18 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn env_tool_dir_hint_refuses_dangling_persistence_link() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(h.join("tools")).unwrap();
+        std::os::unix::fs::symlink(h.join("tools/future-bin"), h.join("bin")).unwrap();
+        assert!(!env_tool_dir_hint_ok(&h, &h.join("tools")));
+        assert!(!env_tool_dir_hint_ok(&h, &h.join("tools/future-bin")));
+        assert!(env_tool_dir_hint_ok(&h, &h.join("elsewhere")));
+    }
+
     /// The pinned-state line touches no state file before validation: a
     /// planted symlink or FIFO there must not be written to or block.
     #[test]
