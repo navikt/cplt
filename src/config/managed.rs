@@ -13,7 +13,7 @@
 //! tool dirs) inside the tree, and any writable tree (`allow.write`, the
 //! project, named repos, agent and tool dirs) that is the tree or an ancestor
 //! of it, such as `~/.config` or `$HOME`. The file is
-//! opened beneath the trusted dir one component at a time with `O_NOFOLLOW`,
+//! opened by walking from `/` one component at a time with `O_NOFOLLOW`,
 //! so the file read is the one trust was decided on. The denies are spelled
 //! from `$HOME`, so the file is also refused when `$HOME` does not resolve to
 //! the passwd home. As extra refusals, the file is refused when it
@@ -80,6 +80,16 @@ fn open_beneath(dir: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
         cur = open(cur.as_raw_fd(), name, flags)?;
     }
     Ok(std::fs::File::from(cur))
+}
+
+/// Open `rel` under the canonical `trusted` dir by walking from `/`, so no
+/// component of the chain (home, `.config`, `cplt`, `managed.d`) can be
+/// swapped for a symlink between the canonicalize check and the open.
+fn open_managed(trusted: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    let chain = trusted
+        .strip_prefix("/")
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    open_beneath(Path::new("/"), &chain.join(rel))
 }
 
 /// A managed file that passed every check.
@@ -205,7 +215,7 @@ pub fn load_managed_from(
     }
     // Open what is read relative to the trusted dir, never following a link,
     // so a hop flipped after the canonicalize above cannot swap the file.
-    let file = open_beneath(&trusted, rel).map_err(|e| {
+    let file = open_managed(&trusted, rel).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
             refuse("a component changed into a symlink while it was opened")
         } else {
@@ -381,6 +391,33 @@ mod tests {
     }
 
     /// A fake account home with the trusted dir; it stands for the passwd home.
+    /// A parent of `managed.d` swapped for a symlink after the path checks
+    /// (Copilot PRRT_kwDOR-ZXjs67IKT9): the open must refuse it.
+    #[test]
+    fn open_managed_refuses_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+        for swap in [".config", ".config/cplt", ".config/cplt/managed.d"] {
+            let d = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(d.path()).unwrap();
+            let home = root.join("home");
+            let evil = root.join("evil");
+            std::fs::create_dir_all(home.join(TRUSTED_DIR)).unwrap();
+            std::fs::write(home.join(TRUSTED_DIR).join("x.toml"), "ok").unwrap();
+            assert!(open_managed(&home.join(TRUSTED_DIR), Path::new("x.toml")).is_ok());
+            // Attacker tree mirroring what lies below the swapped component.
+            let below = Path::new(TRUSTED_DIR).strip_prefix(swap).unwrap();
+            std::fs::create_dir_all(evil.join(below)).unwrap();
+            std::fs::write(evil.join(below).join("x.toml"), "evil").unwrap();
+            std::fs::rename(home.join(swap), root.join("old")).unwrap();
+            symlink(&evil, home.join(swap)).unwrap();
+            let e = open_managed(&home.join(TRUSTED_DIR), Path::new("x.toml")).expect_err(swap);
+            assert!(
+                matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+                "{swap}: {e}"
+            );
+        }
+    }
+
     struct Home(tempfile::TempDir);
 
     impl Home {
