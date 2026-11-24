@@ -3972,6 +3972,9 @@ const ENV_TOOL_HINT_DENIED_TOP: &[&str] = &[
     "public",
     "dropbox",
     "icloud drive",
+    "onedrive",
+    "google drive",
+    "sites",
 ];
 
 /// Path components that mark an exec, hook or autoload point anywhere below.
@@ -3986,6 +3989,9 @@ const ENV_TOOL_HINT_DENIED_COMPONENTS: &[&str] = &[
     "startup",
     "autostart",
     "extensions",
+    "plugins",
+    "functions",
+    "completions",
 ];
 
 /// Whether an env-set tool dir that failed only the positive rule may be
@@ -4001,7 +4007,35 @@ const ENV_TOOL_HINT_DENIED_COMPONENTS: &[&str] = &[
 #[must_use]
 pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
+    // The launch dir is the project: a grant over it or its parent is no tool dir.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|c| config::canonicalize_deepest(&c));
     env_tool_dir_hint_ok_with(home, path, &path_var)
+        && !cwd.is_some_and(|c| c.starts_with(config::canonicalize_deepest(path)))
+}
+
+/// A repo, a bare repo, or a dir holding repos: a write grant there reaches
+/// hooks and config of code the sandbox was not asked to touch.
+fn looks_like_repo_area(dir: &Path) -> bool {
+    let has_git = |d: &Path| d.join(".git").symlink_metadata().is_ok();
+    if has_git(dir)
+        || (dir.join("HEAD").exists() && dir.join("objects").is_dir() && dir.join("refs").is_dir())
+    {
+        return true;
+    }
+    // Fail closed on an unreadable or huge dir.
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut n = 0;
+    for e in rd.flatten() {
+        n += 1;
+        if n > 2000 || has_git(&e.path()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn env_tool_dir_hint_ok_with(home: &Path, path: &Path, path_var: &std::ffi::OsStr) -> bool {
@@ -4036,11 +4070,13 @@ fn env_tool_dir_hint_ok_with(home: &Path, path: &Path, path_var: &std::ffi::OsSt
         let Some(first) = comps.first() else {
             return false; // `$HOME` itself
         };
-        !first.starts_with('.')
+        !first.starts_with("onedrive - ")
             && !ENV_TOOL_HINT_DENIED_TOP.contains(&first.as_str())
-            && comps
-                .iter()
-                .all(|c| c != ".." && !ENV_TOOL_HINT_DENIED_COMPONENTS.contains(&c.as_str()))
+            && comps.iter().all(|c| {
+                c != ".."
+                    && !c.starts_with('.')
+                    && !ENV_TOOL_HINT_DENIED_COMPONENTS.contains(&c.as_str())
+            })
     };
     if !rel_ok(&real, &home_real) {
         return false;
@@ -4061,6 +4097,15 @@ fn env_tool_dir_hint_ok_with(home: &Path, path: &Path, path_var: &std::ffi::OsSt
         .map(|p| config::canonicalize_deepest(&p))
         .collect();
     let ids: Vec<_> = on_path.iter().filter_map(|p| id(p)).collect();
+    // Inside a work tree, or a repo area itself.
+    if looks_like_repo_area(&real)
+        || real
+            .ancestors()
+            .take_while(|a| *a != home_real)
+            .any(|a| a.join(".git").symlink_metadata().is_ok())
+    {
+        return false;
+    }
     // A PATH dir inside the grant is as bad as the grant inside a PATH dir.
     !on_path.iter().any(|p| p.starts_with(&real))
         && !real
@@ -5077,8 +5122,33 @@ mod tests {
             ".config/x",
             "tools/autostart",
             "src/repo/.git",
+            "Projects/x/.husky",
+            "src/repo/.githooks",
+            "code/node_modules/.bin",
+            "work/.vscode",
+            "src/repo/.github/workflows",
+            "src/repo/.devcontainer",
+            "tools/plugins",
+            "tools/functions",
+            "tools/completions",
+            "OneDrive",
+            "OneDrive - Nav/x",
+            "Google Drive/x",
+            "Sites",
+            "src/repo",
+            "src/repo/sub",
+            "src/bare.git",
+            "src",
             "",
         ] {
+            if rel.starts_with("src/") || rel == "src" {
+                std::fs::create_dir_all(h.join("src/repo/sub")).unwrap();
+                std::fs::create_dir_all(h.join("src/repo/.git")).unwrap();
+                let b = h.join("src/bare.git");
+                std::fs::create_dir_all(b.join("objects")).unwrap();
+                std::fs::create_dir_all(b.join("refs")).unwrap();
+                std::fs::write(b.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            }
             assert!(
                 !env_tool_dir_hint_ok_with(&h, &h.join(rel), &none),
                 "~/{rel}"
