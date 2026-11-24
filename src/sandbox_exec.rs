@@ -1392,9 +1392,12 @@ fn install_open_url_shims(
     for name in crate::mcp_broker::OPEN_URL_SHIMS {
         let real = which_binary(name);
         let script = if sandbox.cplt_exec_denied.is_some() {
-            crate::gh_proxy::cplt_unrunnable_script(
-                &cplt.to_string_lossy(),
-                "opening the MCP login link",
+            crate::mcp_broker::open_url_shim_unrunnable(
+                &crate::gh_proxy::cplt_unrunnable_body(
+                    &cplt.to_string_lossy(),
+                    "opening the MCP login link",
+                ),
+                real.as_deref().map(|p| p.to_string_lossy()).as_deref(),
             )
         } else {
             crate::mcp_broker::open_url_shim(

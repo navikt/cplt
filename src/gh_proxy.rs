@@ -2837,13 +2837,18 @@ fn shell_escape(s: &str) -> String {
 /// agent sees it and on the terminal when stderr is not one, and exits 126.
 #[must_use]
 pub fn cplt_unrunnable_script(cplt: &str, feature: &str) -> String {
+    format!("#!/bin/sh\n{}", cplt_unrunnable_body(cplt, feature))
+}
+
+/// The lines of [`cplt_unrunnable_script`] after the shebang.
+#[must_use]
+pub fn cplt_unrunnable_body(cplt: &str, feature: &str) -> String {
     let msg = shell_escape(&format!(
         "cplt: {feature} is off: the sandbox cannot run cplt at {cplt}. \
          Install cplt outside temp dirs, e.g. brew install navikt/tap/cplt."
     ));
     format!(
-        "#!/bin/sh\n\
-         printf '%s\\n' {msg} >&2\n\
+        "printf '%s\\n' {msg} >&2\n\
          [ -t 2 ] || {{ printf '%s\\n' {msg} >/dev/tty; }} 2>/dev/null\n\
          exit 126\n"
     )

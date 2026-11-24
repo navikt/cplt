@@ -641,6 +641,24 @@ fn print_link(url: &str, hosts: &[String]) -> Result<String, String> {
 /// else runs the real opener, if there is one, as before.
 #[must_use]
 pub fn shim_script(cplt: &str, socket: &str, hosts: &[String], real: Option<&str>) -> String {
+    let broker = format!(
+        "exec env {SOCKET_ENV}={} {HOSTS_ENV}={} {} mcp-open-url \"$u\"",
+        sh_quote(socket),
+        sh_quote(&hosts.join(",")),
+        sh_quote(cplt),
+    );
+    shim_with(&broker, real)
+}
+
+/// [`shim_script`] for a cplt the sandbox cannot exec (#1158): an https URL
+/// gets `explain` (a script body that prints why and exits), every other call
+/// still reaches the real opener.
+#[must_use]
+pub fn shim_script_unrunnable(explain: &str, real: Option<&str>) -> String {
+    shim_with(&format!("{{\n{explain}}}"), real)
+}
+
+fn shim_with(broker: &str, real: Option<&str>) -> String {
     let fallback = match real {
         Some(r) => format!("exec {} \"$@\"", sh_quote(r)),
         None => "echo \"cplt: only https URLs are opened in this session\" >&2; exit 1".into(),
@@ -649,11 +667,8 @@ pub fn shim_script(cplt: &str, socket: &str, hosts: &[String], real: Option<&str
         "#!/bin/sh\n\
          case \"$#:$1\" in 1:*) u=$1 ;; 2:-u|2:--) u=$2 ;; *) u= ;; esac\n\
          case \"$u\" in https://*) \
-         exec env {SOCKET_ENV}={} {HOSTS_ENV}={} {} mcp-open-url \"$u\" ;; esac\n\
-         {fallback}\n",
-        sh_quote(socket),
-        sh_quote(&hosts.join(",")),
-        sh_quote(cplt),
+         {broker} ;; esac\n\
+         {fallback}\n"
     )
 }
 
@@ -1407,6 +1422,47 @@ mod tests {
         );
         assert!(s.contains("exec '/usr/bin/open' \"$@\""), "{s}");
         assert!(shim_script("c", "s", &[], None).contains("exit 1"));
+    }
+
+    /// #1158: with a cplt the sandbox cannot exec, an https URL gets the
+    /// explanation and 126; anything else still reaches the real opener.
+    #[test]
+    fn unrunnable_shim_explains_https_and_keeps_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, "#!/bin/sh\necho real \"$@\"\n").unwrap();
+        let shim = dir.path().join("open");
+        let body =
+            crate::gh_proxy::cplt_unrunnable_body("/private/tmp/c", "opening the MCP login link");
+        std::fs::write(
+            &shim,
+            shim_script_unrunnable(&body, Some(&real.to_string_lossy())),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt as _;
+        for p in [&real, &shim] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let run = |args: &[&str]| {
+            #[allow(clippy::disallowed_methods)] // test: the shim just written
+            let mut cmd = Command::new(&shim);
+            cmd.args(args);
+            // SAFETY: setsid is async-signal-safe; no tty, so the line goes to stderr.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.output().unwrap()
+        };
+        let out = run(&["https://a.example/"]);
+        assert_eq!(out.status.code(), Some(126));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("opening the MCP login link is off"));
+        let out = run(&["notes.txt"]);
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "real notes.txt\n");
     }
 
     /// #1158: npm `open` passes `-u`/`--` forms too; only one https URL after

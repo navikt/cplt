@@ -20,6 +20,7 @@ macro_rules! sbpl {
 }
 
 use super::SandboxConfig;
+use super::policy::PROVISIONED_TOOLCHAINS;
 use super::policy::{
     CLONE_CACHE_DIRS, CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES,
     DENIED_HOME_SUBPATHS, DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES,
@@ -2300,14 +2301,6 @@ fn emit_java_home(sb: &mut String, java_home: Option<&Path>) {
         sbpl!(sb);
     }
 }
-
-/// Toolchains a build tool downloads into its own writable, exec-denied store
-/// and then execs. Each gets `process-exec` back and loses `file-write*`.
-///
-/// - `~/.gradle/jdks`: JDKs provisioned by Gradle's toolchain support (#191).
-/// - `~/.konan/dependencies`: the LLVM toolchain Kotlin/Native downloads on
-///   first use; a native link execs `clang++` from it (#323).
-const PROVISIONED_TOOLCHAINS: &[&str] = &[".gradle/jdks", ".konan/dependencies"];
 
 /// Allow executing the [`PROVISIONED_TOOLCHAINS`].
 ///

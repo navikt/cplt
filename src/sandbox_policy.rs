@@ -3777,6 +3777,14 @@ pub fn no_exec_temp_dir_over(root: &Path, allow_tmp_exec: bool) -> Option<PathBu
         .find(|dir| root.starts_with(dir))
 }
 
+/// Toolchains a build tool downloads into its own writable, exec-denied store
+/// and then execs. Each gets `process-exec` back and loses `file-write*`.
+///
+/// - `~/.gradle/jdks`: JDKs provisioned by Gradle's toolchain support (#191).
+/// - `~/.konan/dependencies`: the LLVM toolchain Kotlin/Native downloads on
+///   first use; a native link execs `clang++` from it (#323).
+pub const PROVISIONED_TOOLCHAINS: &[&str] = &[".gradle/jdks", ".konan/dependencies"];
+
 /// The no-exec dir `exe` (the cplt binary) sits under, if any (#1158). The
 /// gh/git guard wrappers and the `open` shim exec it from inside the sandbox,
 /// so under such a dir they would die in `exec`. Same data as the checkout
@@ -3788,6 +3796,15 @@ pub fn cplt_exe_no_exec_dir(
     allow_cache_exec_any: bool,
     allow_tmp_exec: bool,
 ) -> Option<PathBuf> {
+    // The profile re-allows exec in these subtrees of exec-denied tool dirs.
+    // shortcut: other narrow carve-outs (DOTNET_ROOT, pnpm store) are not
+    // mirrored; a cplt there gets the explaining wrapper. Upgrade if one is reported.
+    if PROVISIONED_TOOLCHAINS
+        .iter()
+        .any(|d| exe.starts_with(home.join(d)))
+    {
+        return None;
+    }
     no_exec_tool_dir_over(exe, home, allow_cache_exec, allow_cache_exec_any)
         .or_else(|| no_exec_temp_dir_over(exe, allow_tmp_exec))
 }

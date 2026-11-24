@@ -19825,6 +19825,12 @@ mod tests {
                 .is_some()
         );
         assert!(cplt_exe_no_exec_message(&r, home, Path::new("/opt/homebrew/bin/cplt")).is_none());
+        // The profile re-allows exec under the provisioned toolchains.
+        assert!(cplt_exe_no_exec_message(&r, home, Path::new("/Users/u/.konan/x/cplt")).is_some());
+        assert!(
+            cplt_exe_no_exec_message(&r, home, Path::new("/Users/u/.konan/dependencies/x/cplt"))
+                .is_none()
+        );
         assert!(
             cplt_exe_no_exec_message(&r, home, Path::new("/Users/u/.local/bin/cplt")).is_none()
         );
