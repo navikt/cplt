@@ -12137,8 +12137,8 @@ paths = [
         /// #1138: v2.2+ `run` never starts the service and falls back to a
         /// private server on a random loopback port, which the profile denies.
         /// cplt starts the session service first, inside the sandbox, then
-        /// execs into `run`, whose exit code survives. It does not stop the
-        /// service: that shuts itself down once cplt removes its registration.
+        /// execs into `run`, whose exit code survives. cplt stops the service
+        /// from outside after the session (#1141).
         #[test]
         fn run_starts_the_session_service_first() {
             require_sandbox!();
@@ -12156,6 +12156,75 @@ paths = [
             assert_eq!(o.status.code(), Some(7), "{err}");
             let calls = std::fs::read_to_string(home.proj.join("calls")).unwrap();
             assert_eq!(calls, "start\nrun\n", "{err}");
+        }
+
+        /// #1141: the service `service start` leaves behind is stopped when
+        /// the session ends. A pid of a process outside the session, planted
+        /// in the session registration, is left alone.
+        fn service_stub(home: &Home, pid_of: &str) {
+            let stub = home.bin.join("opencode");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n--version) echo opencode v2.3.2;;\n\
+                     service) sleep 300 </dev/null >/dev/null 2>&1 & echo $! > daemon.pid\n\
+                     echo \"{{\\\"pid\\\":$({pid_of})}}\" > \"$XDG_STATE_HOME/opencode/service.json\";;\n\
+                     run) exit 0;;\nesac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn alive(pid: i32) -> bool {
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        #[test]
+        fn session_service_is_stopped_at_exit() {
+            require_sandbox!();
+            let home = home();
+            service_stub(&home, "cat daemon.pid");
+            let o = home.cmd(&["--", "run", "hi"]).output().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert_eq!(o.status.code(), Some(0), "{err}");
+            let pid: i32 = std::fs::read_to_string(home.proj.join("daemon.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let gone = !alive(pid);
+            if !gone {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(gone, "session service {pid} outlived the session\n{err}");
+        }
+
+        #[test]
+        fn service_outside_the_session_survives() {
+            require_sandbox!();
+            let home = home();
+            #[allow(clippy::disallowed_methods)] // absolute path
+            let mut user = std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .spawn()
+                .unwrap();
+            std::fs::write(home.proj.join("user.pid"), user.id().to_string()).unwrap();
+            service_stub(&home, "cat user.pid");
+            let o = home.cmd(&["--", "run", "hi"]).output().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            // try_wait, not kill(0): a killed child stays a zombie until reaped.
+            let survived = user.try_wait().unwrap().is_none();
+            let _ = user.kill();
+            let _ = user.wait();
+            let daemon: i32 = std::fs::read_to_string(home.proj.join("daemon.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            unsafe { libc::kill(daemon, libc::SIGKILL) };
+            assert_eq!(o.status.code(), Some(0), "{err}");
+            assert!(survived, "cplt killed a process it did not start\n{err}");
         }
 
         #[test]
