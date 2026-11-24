@@ -7376,6 +7376,9 @@ fn managed_layer_writable(
 ) -> Vec<PathBuf> {
     let scratch = scratch::ScratchDir::base(home);
     let mut roots = sandbox::session_writable_roots(project, repos, allow_write, Some(&scratch));
+    // Named roots' separate git dirs are granted write too; on error the
+    // launch refuses the roots anyway.
+    roots.extend(sandbox::named_root_git_dirs(repos).unwrap_or_default());
     roots.extend(cplt::sandbox::home_and_temp_writable_roots(home, &[], None));
     roots
 }

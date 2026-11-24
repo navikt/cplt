@@ -1229,6 +1229,8 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
+const NAMED_GIT_DIR_SOURCE: &str = "the named repository's git directory";
+
 /// The refusal for a writable tree that holds cplt's state dir, with a remedy
 /// that fits where the tree came from: telling someone to narrow `allow.write`
 /// when the tree is their project sends them looking for a grant they never
@@ -1248,6 +1250,9 @@ fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, home: &Path) -> Stri
             "the writable agent directory" | "the writable agent file" => "The agent's \
                 directory comes from its environment (XDG_CONFIG_HOME, XDG_DATA_HOME or the \
                 agent's own config-dir variable). Point that variable elsewhere."
+                .to_string(),
+            NAMED_GIT_DIR_SOURCE => "Point that repository's git dir outside ~/.config \
+                and $HOME's top level, or remove the named root."
                 .to_string(),
             "the writable tool directory" => "Tool directories follow their environment \
                 variables (XDG_CACHE_HOME and friends). Point that variable elsewhere."
@@ -1499,6 +1504,16 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
     {
         if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, &tree) {
             return Err(state_ancestor_refusal(why, &tree, &dir, config.home_dir));
+        }
+        // A writable tree inside the state dir lets the agent plant files there.
+        let state = crate::config::canonicalize_deepest(&config.home_dir.join(CPLT_STATE_DIR));
+        if crate::config::canonicalize_deepest(&tree).starts_with(&state) {
+            return Err(format!(
+                "{why} {} lies inside cplt's state directory {}, so the sandbox could \
+                 write there. Move it out of that directory.",
+                tree.display(),
+                state.display()
+            ));
         }
     }
     let trees: Vec<PathBuf> = canonical_writable_trees(config)
@@ -2033,6 +2048,14 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
     if let Some(p) = config.git_common_dir {
         trees.push((p.to_path_buf(), "the git common directory"));
     }
+    // Both backends grant a named root's separate git dir recursive write
+    // (`emit_git_worktree`, `generate_policy`), so it is a writable tree too.
+    trees.extend(
+        config
+            .named_root_git_dirs
+            .iter()
+            .map(|p| (p.clone(), NAMED_GIT_DIR_SOURCE)),
+    );
     // The system temp dirs are made writable by the backends themselves, not by
     // config, which is why they were missing here (#299). An exec grant under
     // one is the same writable-plus-executable staging pair as a grant under
@@ -7406,6 +7429,21 @@ mod tests {
         assert!(err.contains("the writable tool directory"), "{err}");
         assert!(err.contains("Point that variable elsewhere"), "{err}");
         assert!(!err.contains("allow.write"), "{err}");
+
+        // A named root whose separate git dir is ~/.config, or inside the
+        // state dir: both backends grant it recursive write.
+        let inside = cfg.join("cplt").join("x");
+        for git_dir in [cfg.clone(), inside] {
+            let dirs = [git_dir];
+            let mut config = test_config(&h, &[]);
+            config.named_root_git_dirs = &dirs;
+            let err = refuse(&config);
+            assert!(err.contains(NAMED_GIT_DIR_SOURCE), "{err}");
+        }
+        let dirs = [cfg.clone()];
+        let mut config = test_config(&h, &[]);
+        config.named_root_git_dirs = &dirs;
+        assert!(refuse(&config).contains("remove the named root"));
 
         // A stow-style ~/.config/cplt link into the project.
         let home2 = tempfile::tempdir().unwrap();

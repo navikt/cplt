@@ -4096,6 +4096,29 @@ mod tests {
     /// The carve-outs are a table with a stated reason each, not an absence:
     /// every one of them keeps EXECUTE, and `.gradle/jdks` gets its own rule
     /// because it is not a `HOME_TOOL_DIRS` entry.
+    /// A named root's git dir is granted write here, so the state-dir refusal
+    /// (`writable_trees`) must list it too (#1095).
+    #[test]
+    fn named_root_git_dir_write_is_in_writable_trees() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let dirs = [home.join(".config")];
+        let mut config = test_config(&project, &home);
+        config.named_root_git_dirs = &dirs;
+        let policy = generate_policy(&config);
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == dirs[0] && r.access.write)
+        );
+        assert!(
+            super::super::writable_trees(&config)
+                .iter()
+                .any(|(t, _)| *t == dirs[0])
+        );
+    }
+
     #[test]
     fn exec_in_writable_trees_keep_execute() {
         let project = PathBuf::from("/fake/user/project");
