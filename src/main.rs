@@ -10355,19 +10355,22 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     if resolved.with_proxy
         && let Ok(net) = build_net_policy(&resolved, active_agent)
     {
-        match proxy::probe_dial(
-            &net,
-            "api.github.com",
-            443,
-            resolved.proxy_upstream.as_ref(),
-            &resolved.proxy_upstream_no_proxy,
-            std::time::Duration::from_secs(4),
-        ) {
-            Ok(_) => ok.push("proxy upstream: api.github.com reachable".to_string()),
-            Err(hint) => findings.push(Finding::blocking(
-                hint.trim_start_matches("[cplt] ").to_string(),
-                "allow this cplt binary in the host firewall, or launch with --no-proxy as a stopgap",
-            )),
+        match proxy::probe_target(&net) {
+            Err(reason) => ok.push(format!("proxy upstream: reachability not checked: {reason}")),
+            Ok(host) => match proxy::probe_dial(
+                &net,
+                &host,
+                443,
+                resolved.proxy_upstream.as_ref(),
+                &resolved.proxy_upstream_no_proxy,
+                std::time::Duration::from_secs(4),
+            ) {
+                Ok(_) => ok.push(format!("proxy upstream: {host} reachable")),
+                Err(hint) => findings.push(Finding::blocking(
+                    hint.trim_start_matches("[cplt] ").to_string(),
+                    "allow this cplt binary in the host firewall, or launch with --no-proxy as a stopgap",
+                )),
+            },
         }
     }
     // ── network: the policy `cplt check net` classifies against (#604) ──

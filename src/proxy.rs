@@ -1615,6 +1615,28 @@ pub fn probe_dial(
     }
 }
 
+/// The host doctor probes reachability with: `api.github.com` when the
+/// pre-DNS policy permits it, else the first allowlisted domain that does,
+/// else `Err(reason)` so the caller skips the probe instead of dialling
+/// something the user's policy excludes.
+pub fn probe_target(policy: &NetPolicy) -> Result<String, String> {
+    let verdict = classify_connect(policy, "api.github.com", 443);
+    if verdict.is_allowed() {
+        return Ok("api.github.com".to_string());
+    }
+    policy
+        .allowed_domains
+        .iter()
+        .find(|d| classify_connect(policy, d, 443).is_allowed())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "api.github.com is {} by the proxy policy and no allowlisted host is probeable",
+                verdict.status()
+            )
+        })
+}
+
 /// [`dial_failure_hint`] without the advice to run doctor: the caller is
 /// doctor or check.
 fn probe_hint(host: &str, class: DialFailure) -> String {
@@ -1645,7 +1667,7 @@ fn probe_upstream(
     stream.set_write_timeout(Some(left)).ok();
     let status = stream
         .write_all(upstream.connect_request(host, port).as_bytes())
-        .and_then(|()| read_upstream_connect_status(&mut stream));
+        .and_then(|()| read_upstream_connect_status(&mut stream, Some(deadline)));
     match status {
         Ok(Some(c)) if (200..300).contains(&c) => Ok(addr),
         Ok(Some(407)) => Err(format!(
@@ -2166,7 +2188,7 @@ fn connect_via_upstream(
 
     // Read the upstream's CONNECT response. Anything other than 2xx means the
     // upstream refused — fail the client's CONNECT cleanly instead of splicing.
-    match read_upstream_connect_status(&mut remote) {
+    match read_upstream_connect_status(&mut remote, None) {
         Ok(Some(c)) if (200..300).contains(&c) => {}
         Ok(_) => {
             log_connection(
@@ -2234,12 +2256,16 @@ fn relay_or_intercept(
 /// byte-by-byte only up to the end of the status line, so the tunnelled TLS
 /// bytes that may follow the header block are not consumed here — the relay
 /// loop reads them from the same socket afterward.
-fn read_upstream_connect_status(remote: &mut TcpStream) -> std::io::Result<Option<u16>> {
+fn read_upstream_connect_status(
+    remote: &mut TcpStream,
+    deadline: Option<Instant>,
+) -> std::io::Result<Option<u16>> {
     // Read the first line (HTTP status line), terminated by \n. Cap the length
     // to avoid an unbounded read from a hostile/broken upstream.
     let mut line = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
+        arm_deadline(remote, deadline)?;
         if remote.read(&mut byte)? == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -2270,15 +2296,30 @@ fn read_upstream_connect_status(remote: &mut TcpStream) -> std::io::Result<Optio
         // Consume the remaining response headers up to the blank line so the
         // relay starts cleanly at the tunnelled payload. A well-behaved proxy
         // sends CRLFCRLF right after the status line for a 200.
-        consume_until_header_end(remote)?;
+        consume_until_header_end(remote, deadline)?;
     }
     Ok(code)
+}
+
+/// Bound the next read by the time left to an absolute `deadline`, so a
+/// slow-drip peer cannot stretch a per-read timeout into an unbounded
+/// exchange. `None` leaves the socket's own timeout alone (the live proxy).
+fn arm_deadline(remote: &TcpStream, deadline: Option<Instant>) -> std::io::Result<()> {
+    let Some(d) = deadline else { return Ok(()) };
+    let left = d.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    remote.set_read_timeout(Some(left))
 }
 
 /// Consume bytes from `remote` until the end of the HTTP header block
 /// (`\r\n\r\n`). Used after a successful upstream CONNECT so the relay begins at
 /// the tunnelled data rather than mid-header.
-fn consume_until_header_end(remote: &mut TcpStream) -> std::io::Result<()> {
+fn consume_until_header_end(
+    remote: &mut TcpStream,
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
     // We already consumed the status line's trailing \n, so we are sitting at a
     // line boundary — start the newline counter at 1. If the very next line is
     // empty (the common `200\r\n\r\n` case with no extra headers), the next \n
@@ -2291,6 +2332,7 @@ fn consume_until_header_end(remote: &mut TcpStream) -> std::io::Result<()> {
     let mut consecutive_newlines = 1usize;
     let mut total = 0usize;
     loop {
+        arm_deadline(remote, deadline)?;
         if remote.read(&mut byte)? == 0 {
             return Ok(());
         }
@@ -6100,7 +6142,7 @@ mod tests {
         });
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let res = consume_until_header_end(&mut client);
+        let res = consume_until_header_end(&mut client, None);
         assert!(res.is_ok(), "expected clean handling, got {res:?}");
         writer.join().ok();
     }
@@ -6121,7 +6163,7 @@ mod tests {
         });
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let err = consume_until_header_end(&mut client)
+        let err = consume_until_header_end(&mut client, None)
             .expect_err("oversized header block should be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         writer.join().ok();
@@ -6641,6 +6683,78 @@ mod tests {
         assert!(
             err.contains("did not answer"),
             "silent upstream must time out"
+        );
+    }
+
+    /// Review of #1132: a slow-drip upstream (one byte a second) must not keep
+    /// the probe past its budget; the deadline covers the whole exchange.
+    #[test]
+    fn probe_upstream_slow_drip_is_bounded_by_budget() {
+        require_localhost_tcp!();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+            for b in b"HTTP/1.1 200 OK\r\nX-Slow: 1\r\n\r\n" {
+                if s.write_all(&[*b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let u = UpstreamProxy::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let start = Instant::now();
+        let err = probe_dial(
+            &NetPolicy::default(),
+            "probe.invalid",
+            443,
+            Some(&u),
+            &[],
+            Duration::from_millis(1500),
+        )
+        .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_millis(2800),
+            "slow-drip upstream must be cut off at the budget, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            err.contains("did not answer"),
+            "slow drip is a timeout: {err}"
+        );
+    }
+
+    /// Review of #1132: doctor's probe target obeys the pre-DNS policy.
+    #[test]
+    fn probe_target_respects_policy() {
+        let open = NetPolicy {
+            allowed_ports: vec![443],
+            ..Default::default()
+        };
+        assert_eq!(probe_target(&open).unwrap(), "api.github.com");
+        let blocked = NetPolicy {
+            allowed_ports: vec![443],
+            blocked_domains: vec!["api.github.com".into()],
+            allowed_domains: vec!["example.org".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            probe_target(&blocked).unwrap(),
+            "example.org",
+            "must fall back to an allowed host"
+        );
+        let none = NetPolicy {
+            allowed_ports: vec![443],
+            allowlist_active: true,
+            ..Default::default()
+        };
+        assert!(
+            probe_target(&none)
+                .unwrap_err()
+                .contains("BLOCKED-ALLOWLIST"),
+            "no probeable host must skip with the reason"
         );
     }
 
