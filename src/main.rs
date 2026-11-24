@@ -8207,7 +8207,11 @@ fn assemble_sandbox(
         )
         .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
         .ok()?;
-        if cplt::mcp_broker::OPEN_URL_HOST_OPENER
+        if resolved.allow_browser {
+            // `--allow-browser`: the system opener handles every host, as
+            // before the shim existed; the broker stays for its MCP services.
+            broker.disable_open_url();
+        } else if cplt::mcp_broker::OPEN_URL_HOST_OPENER
             && broker.open_url_enabled()
             && let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir)
         {
@@ -8596,7 +8600,8 @@ fn run_exec_command(
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
-        mcp_broker: _,
+        // Held until the child exits: it serves the host opener (#1091).
+        mcp_broker: _mcp_broker,
         mcp_refusal: _,
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -8622,7 +8627,9 @@ fn run_exec_command(
                 launch_dir: Some(&launch_dir),
                 inspect_only: cli.print_profile,
                 opencode_v2: false,
-                mcp: None,
+                // No MCP discovery for `exec`; an empty set still starts the
+                // host opener on macOS (#1091).
+                mcp: Some(&cplt::mcp_broker::Detected::default()),
                 mcp_probe: false,
             },
         )?

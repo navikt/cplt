@@ -12656,6 +12656,100 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
         let opened = std::fs::read_to_string(&record).unwrap_or_default();
         assert_eq!(opened, "https://gw.intern.example/authorize?a=1&b=2\n");
     }
+
+    /// Copilot review on #1124: `cplt exec` gets the host opener too, with no
+    /// MCP discovery, and the broker lives until the child exits.
+    #[test]
+    fn e2e_exec_open_url_reaches_host_opener() {
+        if !sandbox_usable() {
+            return;
+        }
+        let work = home_temp_dir("exec-open-url");
+        let project = work.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let record = work.path().join("opened");
+        let opener = work.path().join("fake-open");
+        std::fs::write(
+            &opener,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = cplt_cmd()
+            .args(["--no-validate", "--allow-private-domain", "intern.example"])
+            .arg("--project-dir")
+            .arg(&project)
+            .args(["exec", "--", "/bin/sh", "-c"])
+            .arg("sleep 1; open https://gw.intern.example/x; echo rc=$?; open https://evil.example/; echo rc=$?")
+            .env("CPLT_TEST_OPENER", &opener)
+            .output()
+            .expect("binary should run");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(out.contains("rc=0\nrc=1"), "stdout: {out}\nstderr: {err}");
+        for _ in 0..50 {
+            if record.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let opened = std::fs::read_to_string(&record).unwrap_or_default();
+        assert_eq!(opened, "https://gw.intern.example/x\n");
+    }
+
+    /// Copilot review on #1124: with an MCP spec present, `--allow-browser`
+    /// keeps the system opener: no shim on PATH, no BROWSER override. The
+    /// same launch without the flag is the control that the broker runs.
+    #[test]
+    fn e2e_allow_browser_keeps_system_opener_with_mcp_specs() {
+        if !sandbox_usable() {
+            return;
+        }
+        let home = home_temp_dir("allow-browser-mcp");
+        let home_path = std::fs::canonicalize(home.path()).unwrap();
+        let dir = home_path.join(".config/cplt/mcp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = serde_json::json!({
+            "name": "io.example/fake-mcp",
+            "_meta": {"io.github.navikt/broker": {
+                "v": 1, "credential": "none", "command": ["python3", "x.py"],
+                "tools": {"allow": ["echo"]}
+            }}
+        });
+        std::fs::write(dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
+        let project = home_path.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let launch = |extra: &[&str]| {
+            let out = cplt_cmd()
+                .args(["--yes", "--no-validate", "--quiet", "--agent", "shell"])
+                .args(extra)
+                .arg("--project-dir")
+                .arg(&project)
+                .args(["--", "-c", "echo B=${BROWSER-unset}; command -v open"])
+                .env("HOME", &home_path)
+                .env("XDG_CONFIG_HOME", home_path.join(".config"))
+                .env("XDG_CACHE_HOME", home_path.join(".cache"))
+                .env("XDG_DATA_HOME", home_path.join(".local/share"))
+                .env("XDG_STATE_HOME", home_path.join(".local/state"))
+                .env_remove("BROWSER")
+                .env_remove("GH_BROWSER")
+                .output()
+                .expect("binary should run");
+            format!(
+                "{}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+        let control = launch(&[]);
+        assert!(control.contains("open-url-bin/open"), "{control}");
+        let allowed = launch(&["--allow-browser"]);
+        assert!(allowed.contains("B=unset\n/usr/bin/open"), "{allowed}");
+    }
 }
 
 /// #728 One stub per agent, end to end through the real sandbox. The stub

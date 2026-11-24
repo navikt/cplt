@@ -375,7 +375,11 @@ impl Broker {
             servers.insert(server.spec.id.clone(), server);
         }
         let mut open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
-        open_hosts.extend(super::open_url::private_domain_entries(open_domains));
+        // Linux: only alongside an OAuth host, so a session without one keeps
+        // the real `xdg-open` exactly as before (#1091).
+        if super::open_url::HOST_OPENER || !open_hosts.is_empty() {
+            open_hosts.extend(super::open_url::private_domain_entries(open_domains));
+        }
         // A crashed broker's children left their temp dirs behind (#1072).
         #[cfg(target_os = "macos")]
         sweep_child_temp_dirs(home);
@@ -2533,6 +2537,28 @@ mod tests {
             !answer.starts_with("denied") && !answer.starts_with("ok"),
             "{answer}"
         );
+    }
+
+    /// Copilot review on #1124: on Linux, `allow_private_domains` alone must
+    /// not turn on the print-only shim; the real `xdg-open` stays.
+    #[test]
+    fn private_domains_alone_enable_the_opener_only_on_macos() {
+        let mut spec = check(base()).unwrap();
+        spec.command = vec!["cat".into()];
+        spec.program = "/bin/cat".into();
+        let b = Broker::start(
+            vec![spec],
+            Path::new("/tmp"),
+            Log {
+                level: crate::proxy::ProxyLogLevel::None,
+                file: None,
+            },
+            &["intern.example".into()],
+        )
+        .unwrap();
+        let host_opener = super::super::open_url::HOST_OPENER;
+        assert_eq!(b.open_url_enabled(), host_opener);
+        assert_eq!(b.open_url_hosts().is_empty(), !host_opener);
     }
 
     /// #930: the macOS probe's command is the child's: sandbox-exec with

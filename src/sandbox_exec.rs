@@ -1300,7 +1300,11 @@ fn github_credential_helper_config(
 /// `open`/`xdg-open` shims that hand an https URL to the MCP broker's
 /// `open_url` op (#910). Only when the broker runs: without it nothing on the
 /// host would answer.
-fn install_open_url_shims(cmd: &mut Command, sandbox: &crate::sandbox::PreparedSandbox) {
+fn install_open_url_shims(
+    cmd: &mut Command,
+    sandbox: &crate::sandbox::PreparedSandbox,
+    inherit_env: bool,
+) {
     use std::os::unix::fs::PermissionsExt;
     let (Some(socket), Some(scratch)) = (
         sandbox.mcp_socket.as_deref(),
@@ -1330,17 +1334,35 @@ fn install_open_url_shims(cmd: &mut Command, sandbox: &crate::sandbox::PreparedS
             return;
         }
     }
-    // gh reads GH_BROWSER then BROWSER, Python's webbrowser reads BROWSER;
-    // point them at the shim unless the session already set them (#1091).
-    if let Some(shim) = crate::mcp_broker::OPEN_URL_SHIMS.first() {
+    if crate::mcp_broker::OPEN_URL_HOST_OPENER
+        && let Some(shim) = crate::mcp_broker::OPEN_URL_SHIMS.first()
+    {
         let shim = dir.join(shim);
-        for key in ["BROWSER", "GH_BROWSER"] {
-            if !cmd.get_envs().any(|(k, _)| k == key) {
-                cmd.env(key, &shim);
-            }
-        }
+        default_browser_env(cmd, &shim, &|k| std::env::var(k).ok(), inherit_env);
     }
     prepend_path(cmd, &[&dir]);
+}
+
+/// gh reads GH_BROWSER then BROWSER, Python's webbrowser reads BROWSER: point
+/// both at the shim (macOS, #1091), but only when the session chose neither.
+/// An explicit BROWSER alone must still reach gh, an inherited one counts
+/// (`--inherit-env`), and an explicit removal (`[deny].env`) stays removed.
+/// `parent` is the parent's environment, consulted only under inheritance.
+fn default_browser_env(
+    cmd: &mut Command,
+    shim: &Path,
+    parent: &dyn Fn(&str) -> Option<String>,
+    inherit_env: bool,
+) {
+    const KEYS: [&str; 2] = ["BROWSER", "GH_BROWSER"];
+    let chosen = KEYS
+        .iter()
+        .any(|k| cmd.get_envs().any(|(n, _)| n == *k) || (inherit_env && parent(k).is_some()));
+    if !chosen {
+        for k in KEYS {
+            cmd.env(k, shim);
+        }
+    }
 }
 
 fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
@@ -1856,7 +1878,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
-    install_open_url_shims(&mut cmd, sandbox);
+    install_open_url_shims(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -2008,7 +2030,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
-    install_open_url_shims(&mut cmd, sandbox);
+    install_open_url_shims(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -2253,7 +2275,7 @@ fn exec_bwrap(
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
-    install_open_url_shims(&mut cmd, sandbox);
+    install_open_url_shims(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
@@ -4219,5 +4241,77 @@ mod token_file_tests {
             assert_eq!(std::fs::read_to_string(dir.path().join(n)).unwrap(), "tok");
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod browser_env_tests {
+    use super::default_browser_env;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// `None`: untouched; `Some("")`: removed; else the value.
+    fn env(cmd: &Command, k: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| v.map_or(String::new(), |v| v.to_string_lossy().into_owned()))
+    }
+
+    fn run(cmd: &mut Command, parent: &[(&str, &str)], inherit: bool) {
+        let lookup = |k: &str| {
+            parent
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| (*v).to_string())
+        };
+        default_browser_env(cmd, Path::new("/s/open"), &lookup, inherit);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn defaults_only_when_neither_is_chosen() {
+        let mut c = Command::new("x");
+        run(&mut c, &[], false);
+        assert_eq!(env(&c, "BROWSER").as_deref(), Some("/s/open"));
+        assert_eq!(env(&c, "GH_BROWSER").as_deref(), Some("/s/open"));
+
+        // Sanitized mode: the parent's BROWSER is not the child's.
+        let mut c = Command::new("x");
+        run(&mut c, &[("BROWSER", "firefox")], false);
+        assert_eq!(env(&c, "BROWSER").as_deref(), Some("/s/open"));
+    }
+
+    /// `--pass-env BROWSER`: gh must fall back to it, so no GH_BROWSER.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn pass_env_browser_is_kept_and_gh_browser_not_set() {
+        let mut c = Command::new("x");
+        c.env("BROWSER", "firefox");
+        run(&mut c, &[], false);
+        assert_eq!(env(&c, "BROWSER").as_deref(), Some("firefox"));
+        assert_eq!(env(&c, "GH_BROWSER"), None);
+    }
+
+    /// `--inherit-env`: a BROWSER or GH_BROWSER the parent has is the session's.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn inherited_choice_is_not_overwritten() {
+        for k in ["BROWSER", "GH_BROWSER"] {
+            let mut c = Command::new("x");
+            run(&mut c, &[(k, "firefox")], true);
+            assert_eq!(env(&c, "BROWSER"), None, "{k}");
+            assert_eq!(env(&c, "GH_BROWSER"), None, "{k}");
+        }
+    }
+
+    /// `[deny].env = ["BROWSER"]` stays removed.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // inert Command, never spawned
+    fn explicit_removal_stays_removed() {
+        let mut c = Command::new("x");
+        c.env_remove("BROWSER");
+        run(&mut c, &[("BROWSER", "firefox")], true);
+        assert_eq!(env(&c, "BROWSER").as_deref(), Some(""));
+        assert_eq!(env(&c, "GH_BROWSER"), None);
     }
 }
