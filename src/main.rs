@@ -5716,7 +5716,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
-        worktree_broker,
+        mut worktree_broker,
         mcp_broker,
         mcp_refusal,
         ..
@@ -6176,14 +6176,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &mut prepared,
         probe.root_agents_md.as_deref(),
     );
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(broker) = &worktree_broker {
-        broker
-            .set_sandbox(&mut prepared)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = &worktree_broker;
+    arm_worktree_broker(&mut worktree_broker, &mut prepared)?;
 
     // Compute hardening categories for environment sanitization
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -8004,6 +7997,35 @@ struct AssembledSandbox {
     mcp_refusal: Option<String>,
 }
 
+/// Hand the broker the final session policy, after every amendment.
+///
+/// macOS refuses the launch on failure, as before. On Linux the one refusal is
+/// a session grant that reaches the broker's private staging (#965): the
+/// broker is then turned off for the session with a warning, and the managed
+/// root stays, exactly as when the broker cannot start.
+fn arm_worktree_broker(
+    broker: &mut Option<cplt::worktree_broker::Broker>,
+    prepared: &mut sandbox::PreparedSandbox,
+) -> anyhow::Result<()> {
+    let Some(b) = broker.as_ref() else {
+        return Ok(());
+    };
+    #[cfg(target_os = "macos")]
+    b.set_sandbox(prepared)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    #[cfg(target_os = "linux")]
+    if let Err(error) = b.set_sandbox(prepared) {
+        ui::warn(&format!(
+            "managed-worktree broker unavailable: {error}. CPLT_WORKTREE_SOCKET is not set; the managed root remains available. Prepare worktrees outside cplt."
+        ));
+        prepared.set_worktree_socket(None);
+        *broker = None;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (b, prepared);
+    Ok(())
+}
+
 /// Start the managed-worktree broker for a launch (#531), or `None` when the
 /// root is off. Failure disables only the broker convenience, with a warning;
 /// the existing managed-root grant remains available under its usual denies.
@@ -8999,7 +9021,7 @@ fn run_exec_command(
         pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
-        worktree_broker,
+        mut worktree_broker,
         // Held until the child exits: it serves the host opener (#1091).
         mcp_broker,
         mcp_refusal: _,
@@ -9099,14 +9121,7 @@ fn run_exec_command(
 
     // Preflight: verify the sandbox mechanism works on this system.
     // Respects --no-validate (same as the main agent flow).
-    #[cfg(target_os = "macos")]
-    if let Some(broker) = &worktree_broker {
-        broker
-            .set_sandbox(&mut prepared)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = &worktree_broker;
+    arm_worktree_broker(&mut worktree_broker, &mut prepared)?;
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
             Ok(()) => {}
