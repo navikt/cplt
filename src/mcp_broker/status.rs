@@ -118,10 +118,15 @@ pub fn status_json(
         }));
     }
     servers.extend(found.disabled.iter().map(|id| {
-        // Skipped before loading: nothing else is known about it.
+        // Skipped before loading: nothing else is known about it. A disabled
+        // gh-token spec is inactive, not off: the built-in endpoint serves.
+        let gh_off = found.remote_disabled.as_ref().filter(|(g, _, _)| g == id);
         json!({
             "id": id,
-            "state": "off",
+            "state": if gh_off.is_some() { "inactive" } else { "off" },
+            "reason": gh_off.map(|(_, why, _)| {
+                format!("disabled by {why}; tools.allow not applied, built-in endpoint serves GitHub MCP")
+            }),
             "transport": null,
             "credential": null,
             "credential_ok": null,
@@ -248,6 +253,42 @@ mod tests {
         assert_eq!(gh["state"], "built-in");
         assert!(gh["reason"].as_str().unwrap().contains("NOT applied"));
         assert_eq!(gh["clients"], json!(["opencode"]));
+        let spec = rows.iter().find(|r| r["id"] != "github-mcp").unwrap();
+        assert_eq!(spec["state"], "inactive");
+        assert!(
+            spec["reason"]
+                .as_str()
+                .unwrap()
+                .contains("sandbox.mcp_broker = false")
+        );
+        // --no-github-mcp-proxy path: same row, other reason.
+        let mut found2 =
+            crate::mcp_broker::spec::load_with_gate(dir.path(), &[], &[], |_| None, true);
+        found2.disable_remotes();
+        let why2 = crate::mcp_broker::github_spec(&found2, dir.path(), |_| None).unwrap_err();
+        let v2 = status_json(
+            &found2,
+            None,
+            false,
+            false,
+            true,
+            None,
+            &["opencode"],
+            Some(&why2),
+        );
+        let spec2 = v2["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] != "github-mcp")
+            .unwrap();
+        assert_eq!(spec2["state"], "inactive");
+        assert!(
+            spec2["reason"]
+                .as_str()
+                .unwrap()
+                .contains("GitHub MCP proxy is off")
+        );
         // No fallback, no row.
         let v = status_json(
             &found,
