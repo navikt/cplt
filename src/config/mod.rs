@@ -28,7 +28,7 @@ pub use editing::{
     validate_global_document, write_document_atomically, write_repo_document_atomically,
 };
 pub use error::{ConfigError, IN_SANDBOX_HINT, is_absent};
-pub use loading::exec_tool_dir_warning;
+pub use loading::{exec_tool_dir_warning, repo_proposal_refusals};
 pub use local::{
     is_local_path_key, linked_identities, list_local, load_local, local_dir, local_path,
     local_write_path, parse_local_doc, resolve_path_entry, resolve_path_entry_for_removal,
@@ -47,7 +47,8 @@ pub use path::{
     default_config_contents, expand_tilde, xdg_config_root,
 };
 pub use path::{
-    NOFOLLOW_LINK_MESSAGE, canonicalize_deepest, canonicalize_strict, nofollow_names_symlink,
+    NOFOLLOW_LINK_MESSAGE, canonicalize_deepest, canonicalize_strict, is_display_unsafe,
+    nofollow_names_symlink,
 };
 pub use registry::{
     BOOL_KEYS, BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,

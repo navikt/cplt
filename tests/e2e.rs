@@ -5728,6 +5728,200 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// #1116: every `[propose]` entry a launch refuses is refused by
+    /// `config set --repo` (rc != 0, nothing written), marked REFUSED by
+    /// `cplt trust`, and never approved by `cplt trust accept`.
+    #[test]
+    fn e2e_config_set_repo_refuses_what_launch_refuses() {
+        // Own HOME, so the trust store this test must leave empty is its own.
+        let home_dir = tempfile::tempdir_in(scratch_home()).unwrap();
+        let home = home_dir.path();
+        let outside = tempfile::tempdir().unwrap();
+        let root_link = outside.path().join("root-link");
+        std::os::unix::fs::symlink("/", &root_link).unwrap();
+        let root_link = root_link.to_str().unwrap().to_string();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        // Absolute, so only the SBPL check (not "outside the repository") can refuse it.
+        std::fs::create_dir(outside.path().join("a(b")).unwrap();
+        let paren_link = outside.path().join("paren-link");
+        std::os::unix::fs::symlink(outside.path().join("a(b"), &paren_link).unwrap();
+        let paren_link = paren_link.to_str().unwrap().to_string();
+        // (key, value, .cplt.toml body when the file can express it)
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("allow.read", "/", None),
+            (
+                "allow.read",
+                "rel-root",
+                Some("[propose.allow]\nread = [\"rel-root\"]\n"),
+            ),
+            ("allow.read", &root_link, Some("")),
+            // SBPL-unsafe target: refused on every platform, not only macOS.
+            ("allow.read", &paren_link, Some("paren")),
+            (
+                "allow.write",
+                "~/.ssh",
+                Some("[propose.allow]\nwrite = [\"~/.ssh\"]\n"),
+            ),
+            ("proxy.allow_private_domains", "10.0.0.1", None),
+            ("no.such_key", "x", None),
+            ("proxy.upstream", "http://p:1", None),
+        ];
+        for (key, value, toml) in cases {
+            let repo = temp_repo("test-org/refuse");
+            std::os::unix::fs::symlink("/", repo.path().join("rel-root")).unwrap();
+            let out = cplt_cmd()
+                .env("HOME", home)
+                .args(["config", "set", "--repo", key, value])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success(),
+                "{key} {value} must be refused: {stderr}"
+            );
+            assert!(
+                !repo.path().join(".cplt.toml").exists(),
+                "{key} {value}: nothing may be written"
+            );
+            let Some(toml) = toml else { continue };
+            let body = if toml.is_empty() {
+                format!("[propose.allow]\nread = [{root_link:?}]\n")
+            } else if *toml == "paren" {
+                format!("[propose.allow]\nread = [{paren_link:?}]\n")
+            } else {
+                (*toml).to_string()
+            };
+            std::fs::write(repo.path().join(".cplt.toml"), body).unwrap();
+            assert!(git_ok(repo.path(), &["add", ".cplt.toml", "rel-root"]));
+            assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
+            let show = cplt_cmd()
+                .env("HOME", home)
+                .args(["trust"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            let show_out = String::from_utf8_lossy(&show.stdout);
+            assert!(show_out.contains("REFUSED"), "{key} {value}: {show_out}");
+            let accept = cplt_cmd()
+                .env("HOME", home)
+                .args(["trust", "accept", "--all"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                !accept.status.success(),
+                "{key} {value}: accept must refuse: {}",
+                String::from_utf8_lossy(&accept.stderr)
+            );
+            let trust = home.join(".config/cplt/trust");
+            assert!(
+                std::fs::read_dir(&trust).map_or(true, |mut d| d.next().is_none()),
+                "{key} {value}: a failed accept must record nothing"
+            );
+            assert!(
+                !show_out.contains("cplt trust accept --all"),
+                "{key} {value}: must not offer --all: {show_out}"
+            );
+        }
+    }
+
+    /// A symlink target can carry terminal escapes; neither `config set
+    /// --repo` nor `cplt trust` may print them raw.
+    #[test]
+    fn e2e_repo_refusal_escapes_a_hostile_symlink_target() {
+        let outside = tempfile::tempdir().unwrap();
+        let evil = outside.path().join("x\x1b[2J\ry");
+        std::fs::create_dir(&evil).unwrap();
+        let repo = temp_repo("test-org/escape");
+        std::os::unix::fs::symlink(&evil, repo.path().join("link")).unwrap();
+        let out = cplt_cmd()
+            .args(["config", "set", "--repo", "allow.read", "link"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            !stderr.contains('\x1b') && !stderr.contains('\r'),
+            "{stderr:?}"
+        );
+        assert!(stderr.contains("\\u{1b}[2J\\r"), "{stderr:?}");
+        std::fs::write(
+            repo.path().join(".cplt.toml"),
+            "[propose.allow]\nread = [\"link\"]\n[deny]\npaths = [\"link\"]\n",
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", ".cplt.toml", "link"]));
+        assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
+        let show = cplt_cmd()
+            .args(["trust"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&show.stdout),
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(all.contains("REFUSED"), "{all:?}");
+        assert!(!all.contains('\x1b') && !all.contains('\r'), "{all:?}");
+    }
+
+    /// Bidi overrides reorder what the reader sees: refused in an entry and
+    /// in a symlink target, and printed escaped.
+    #[test]
+    fn e2e_repo_refusal_escapes_bidi_marks() {
+        let repo = temp_repo("test-org/bidi");
+        let out = cplt_cmd()
+            .args(["config", "set", "--repo", "allow.read", "a\u{202e}b"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
+        assert!(!repo.path().join(".cplt.toml").exists());
+
+        let outside = tempfile::tempdir().unwrap();
+        let evil = outside.path().join("x\u{202e}y");
+        std::fs::create_dir(&evil).unwrap();
+        let link = outside.path().join("bidi-link");
+        std::os::unix::fs::symlink(&evil, &link).unwrap();
+        let link = link.to_str().unwrap();
+        let out = cplt_cmd()
+            .args(["config", "set", "--repo", "allow.read", link])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
+        assert!(stderr.contains("\\u{202e}"), "{stderr:?}");
+        std::fs::write(
+            repo.path().join(".cplt.toml"),
+            format!("[propose.allow]\nread = [{link:?}]\n"),
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", ".cplt.toml"]));
+        assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
+        let show = cplt_cmd()
+            .args(["trust"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&show.stdout),
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(
+            all.contains("REFUSED") && all.contains("\\u{202e}"),
+            "{all:?}"
+        );
+        assert!(!all.contains('\u{202e}'), "{all:?}");
+    }
+
     #[test]
     fn e2e_config_set_repo_deny_paths() {
         let repo = make_repo_dir("set-repo-deny");
