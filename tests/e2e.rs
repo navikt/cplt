@@ -12729,24 +12729,44 @@ mod agent_stubs {
             let w = warning("PNPM_HOME", &h.join(rel)).expect("the refusal should be reported");
             assert!(!w.contains("config set"), "no grant hint for ~/{rel}: {w}");
         }
+        // The hint is shell-quoted (HOME may hold spaces), so split it with sh.
+        let split = |hint: &str| -> Vec<String> {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("for a in {hint}; do printf '%s\\0' \"$a\"; done"))
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(str::to_string)
+                .collect()
+        };
+        let hint_of = |w: &str| {
+            w.split_once("in one step: cplt ")
+                .map(|(_, rest)| rest.trim().to_string())
+                .expect("the warning should end with a one-step hint")
+        };
         // JAVA_HOME gets the same one-step hint, read-only.
         std::fs::create_dir_all(h.join("jdk")).unwrap();
         let w = warning("JAVA_HOME", &h.join("jdk")).expect("JAVA_HOME=~/jdk should be refused");
-        assert!(
-            w.contains(&format!(
-                "cplt config set allow.read {}",
-                h.join("jdk").display()
-            )),
+        assert_eq!(
+            split(&hint_of(&w)),
+            [
+                "config",
+                "set",
+                "allow.read",
+                h.join("jdk").to_str().unwrap()
+            ],
             "JAVA_HOME hint: {w}"
         );
         let pnpm = h.join("pnpm");
         let w = warning("PNPM_HOME", &pnpm).expect("PNPM_HOME=~/pnpm should be refused");
-        let hint = w
-            .split_once("in one step: cplt ")
-            .map(|(_, rest)| rest.trim().to_string())
-            .expect("PNPM_HOME=~/pnpm should end with a one-step hint");
-        assert_eq!(hint, format!("config set allow.write {}", pnpm.display()));
-        let args: Vec<&str> = hint.split(' ').collect();
+        let args = split(&hint_of(&w));
+        assert_eq!(
+            args,
+            ["config", "set", "allow.write", pnpm.to_str().unwrap()]
+        );
         assert!(
             cmd("PNPM_HOME", &pnpm)
                 .args(&args)

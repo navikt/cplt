@@ -3982,7 +3982,10 @@ const ENV_TOOL_NO_HINT_SUBPATHS: &[&str] = &[
 /// when its text would need escaping to print.
 #[must_use]
 pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
-    let text = path.to_string_lossy();
+    // Lossy conversion would print a different path than the one refused.
+    let Some(text) = path.to_str() else {
+        return false;
+    };
     // The printed command must survive `Config::merge`, which refuses these.
     if text.escape_debug().to_string() != text
         || validate_sbpl_path(path).is_err()
@@ -4969,6 +4972,15 @@ mod tests {
         assert!(!env_tool_dir_hint_ok(&h, &h.join("tools")));
         assert!(!env_tool_dir_hint_ok(&h, &h.join("tools/future-bin")));
         assert!(env_tool_dir_hint_ok(&h, &h.join("elsewhere")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_tool_dir_hint_refuses_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let h = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let bad = h.join(std::ffi::OsStr::from_bytes(b"t\xffools"));
+        assert!(!env_tool_dir_hint_ok(&h, &bad));
     }
 
     /// The pinned-state line touches no state file before validation: a
