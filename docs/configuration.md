@@ -57,6 +57,46 @@ The layer sits between the built-in defaults and your config. Its lists are adde
 
 Paths in `[allow]` and `[deny]` support `~/` expansion and resolve relative to the config file's directory. `proxy.blocked_domains` supports `~/` expansion only.
 
+### Session summary for a wrapper (`CPLT_SESSION_SUMMARY`)
+
+cplt sends nothing anywhere. A wrapper such as nav-pilot can ask for a local summary of each session by setting `CPLT_SESSION_SUMMARY` to an absolute file path. When the session ends, cplt (outside the sandbox) writes one JSON object there. Without the variable, nothing is written.
+
+- The file is created with mode 0600 through a temp file and a rename in the same directory. A symlink or anything but a regular file at the path is refused, not replaced.
+- The path must lie outside the project and every write grant. Otherwise cplt warns and writes nothing.
+- `CPLT_SESSION_SUMMARY` and `CPLT_SESSION_SUMMARY_HOSTS` are never passed into the sandbox, even with `--pass-env` or `--inherit-env`.
+- `schema` is `1`. Fields are only ever added: ignore fields you do not know, and drop a file you cannot parse.
+
+Fields: `cplt_version`, `agent`, `backend` (`seatbelt`, `landlock` or `bwrap`), `os`, `startup_ms` (process start to agent spawn, absent if the agent never started), `duration_s`, `exit_code`, `agent_exit_reason` (`exit`, `signal` or `sandbox-setup-failed`), `net_blocked` (counts by `blocklist`, `not-allowed`, `private`, `upstream-fail`), `net_blocked_hosts`, `hints_shown` and `warnings_shown` (ids from the table below), `settings_in_effect` (names of boolean settings not at their default, never values), `managed_layer_used`, and `repo_config` (`none`, `untrusted`, `trusted` or `changed`).
+
+There is no session id and no timestamp, and no paths, repository names, arguments or env values. `net_blocked_hosts` lists blocked hostnames only when they match a suffix in `CPLT_SESSION_SUMMARY_HOSTS`, a comma-separated list such as `nav.no,nais.io`. A suffix matches the host itself or any subdomain on a label boundary: `nav.no` matches `api.nav.no` but not `evilnav.no`. Malformed entries are dropped with a warning.
+
+`agent_version`, `fs_denied` and `exec_denied` are not written yet.
+
+When the agent exits non-zero, cplt prints one line after the session (`agent exited with code 1`, `agent killed by signal 9`), with the last hint shown that session. If the post-session report already gave the exit code, only the hint is added.
+
+#### Message ids
+
+Ids are stable and add-only. A warning without its own id is reported as `warn.unclassified`.
+
+| Id | Meaning |
+|----|---------|
+| `hint.push-gh-guard` | HTTPS push to GitHub has no credential helper while the gh guard is off |
+| `hint.otlp-vendor-auth` | OTLP vendor auth header is redacted from the sandbox |
+| `hint.untrusted-repo-config` | the repository's .cplt.toml has proposals nobody approved |
+| `hint.opencode-v2-auth-content` | OPENCODE_AUTH_CONTENT handling for OpenCode v2 |
+| `warn.doctor-flag-deprecated` | --doctor is deprecated in favour of `cplt doctor` |
+| `warn.opencode-v2-host` | OpenCode v2 host setup warning |
+| `warn.opencode-v2-first-run` | OpenCode v2 first-run gate |
+| `warn.agent-binary-writable` | the agent binary sits in a tree the sandbox makes writable |
+| `warn.claude-brief` | the Claude Code brief could not be written |
+| `warn.managed-guard` | managed config guard reported a finding at exit |
+| `warn.managed-unsettled` | the managed-config check could not settle at exit |
+| `warn.copilot-trusted-folder` | the session added a Copilot trustedFolders entry |
+| `warn.bubblewrap-unavailable` | bubblewrap unavailable, Landlock + seccomp only |
+| `warn.session-summary-path-refused` | CPLT_SESSION_SUMMARY path refused |
+| `warn.session-summary-hosts-malformed` | CPLT_SESSION_SUMMARY_HOSTS had malformed entries |
+| `warn.unclassified` | a warning that has no stable id yet |
+
 ## Per-repo user config (`config set --local`)
 
 Your own settings for one checkout, kept out of the repository:

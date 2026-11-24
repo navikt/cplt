@@ -980,6 +980,27 @@ mod tests {
         assert_eq!(yarn_major_is_1(&huge), None, "oversize must not be read");
     }
 
+    /// #1157: the summary path and host list never reach the sandbox, not
+    /// even when named in `--pass-env` or under `--inherit-env`.
+    #[test]
+    fn session_summary_env_is_parent_only() {
+        let parent = vec![
+            ("CPLT_SESSION_SUMMARY".to_string(), "/x/s.json".to_string()),
+            (
+                "CPLT_SESSION_SUMMARY_HOSTS".to_string(),
+                "nav.no".to_string(),
+            ),
+        ];
+        let pass: Vec<String> = parent.iter().map(|(k, _)| k.clone()).collect();
+        for inherit in [false, true] {
+            let env = build_sandbox_env(&parent, &pass, inherit, &[], None, None, Agent::Shell);
+            for (k, _) in &parent {
+                assert!(!env.vars.iter().any(|(v, _)| v == k), "{k} passed");
+                assert!(env.remove.contains(k), "{k} not removed");
+            }
+        }
+    }
+
     /// #307: `--inherit-env` silently cancelled `--pass-env`. The inherit
     /// branch stripped every `ENV_ALWAYS_DENY` entry without consulting the
     /// list the user had named, so `--pass-env SSH_AUTH_SOCK` — the supported

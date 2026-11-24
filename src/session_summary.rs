@@ -102,6 +102,8 @@ struct State {
     exit_code: Option<u8>,
     exit_reason: Option<&'static str>,
     signal: Option<i32>,
+    /// The audit's "Session ended (exit N)" line already said the code.
+    exit_reported: bool,
     net: BTreeMap<&'static str, u64>,
     blocked_hosts: BTreeSet<String>,
     messages: Vec<&'static str>,
@@ -180,6 +182,11 @@ pub fn mark_started() {
     with(|s| {
         s.startup_ms.get_or_insert(ms);
     });
+}
+
+/// The post-session report printed the exit code itself.
+pub fn mark_exit_reported() {
+    with(|s| s.exit_reported = true);
 }
 
 /// The child was killed by `signal` (recorded by the wait loop).
@@ -434,14 +441,17 @@ fn exit_line_for(s: &State) -> Option<String> {
         }
         let what = match (s.exit_reason?, s.exit_code?, s.signal) {
             (_, 0, _) | ("sandbox-setup-failed", ..) => return None,
-            ("signal", _, Some(sig)) => format!("agent killed by signal {sig}"),
-            (_, code, _) => format!("agent exited with code {code}"),
+            ("signal", _, Some(sig)) => Some(format!("agent killed by signal {sig}")),
+            // Already said by the audit's "Session ended (exit N)" line.
+            _ if s.exit_reported => None,
+            (_, code, _) => Some(format!("agent exited with code {code}")),
         };
         let hint = s.messages.iter().rev().find(|id| id.starts_with("hint."));
-        Some(match hint {
-            Some(id) => format!("{what} (hint shown this session: {id})"),
-            None => what,
-        })
+        match (what, hint) {
+            (Some(what), Some(id)) => Some(format!("{what} (hint shown this session: {id})")),
+            (None, Some(id)) => Some(format!("hint shown this session: {id}")),
+            (what, None) => what,
+        }
     }
 }
 
@@ -641,6 +651,13 @@ mod tests {
         assert_eq!(exit_line_for(&s), None);
         s.exit_reason = Some("exit");
         assert_eq!(exit_line_for(&s).unwrap(), "agent exited with code 1");
+        s.exit_reported = true;
+        assert_eq!(exit_line_for(&s), None);
+        s.messages = vec!["hint.push-gh-guard"];
+        assert_eq!(
+            exit_line_for(&s).unwrap(),
+            "hint shown this session: hint.push-gh-guard"
+        );
         s.exit_code = Some(137);
         s.exit_reason = Some("signal");
         s.signal = Some(9);
