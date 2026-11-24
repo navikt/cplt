@@ -1804,7 +1804,8 @@ fn home_config_target_pins(config: &SandboxConfig, targets: &[PathBuf]) -> Vec<P
 
 /// Pins for the user's own deny paths (macOS), stricter than
 /// [`home_config_target_pins`]: every ancestor up to and including the root of
-/// the outermost writable tree holding the path, plus the ancestors that do
+/// the outermost writable tree (`trees`, every recursive write grant the
+/// profile emits) holding the path, plus the ancestors that do
 /// not exist yet, to refuse creating.
 ///
 /// The root is pinned too. Renaming it, or swapping it with
@@ -1818,13 +1819,9 @@ fn home_config_target_pins(config: &SandboxConfig, targets: &[PathBuf]) -> Vec<P
 /// `canonicalize_deepest` keeps its tail) could be created as a symlink to
 /// somewhere else, redirecting the deny; those names get a create deny.
 pub(crate) fn user_deny_pins(
-    config: &SandboxConfig,
+    trees: &[PathBuf],
     targets: &[PathBuf],
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let trees: Vec<PathBuf> = canonical_writable_trees(config)
-        .into_iter()
-        .map(|(t, _)| t)
-        .collect();
     let (mut unlink, mut create) = (Vec::new(), Vec::new());
     for target in targets {
         let Some(root) = trees
