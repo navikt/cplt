@@ -29,9 +29,10 @@ use super::policy::{
     XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs, ancestor_alternation, app_dirs,
     colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
     cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
-    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
+    home_config_link_targets, host_tool_ro_overlays, missing_home_config_link_targets,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
+    pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -243,6 +244,7 @@ fn profile_locked(
     // The pnpm rule re-allows its two writable stores, so all security denies
     // below must remain later in the last-match-wins profile.
     emit_path_bin_denies(&mut sb, config.home_dir, config.extra_deny);
+    emit_host_tool_ro_overlays(&mut sb, config);
     emit_shim_dir_denies(&mut sb, config);
     // Keeps the exec-allowed toolchain dirs non-writable even when a user
     // allow.write covers ~/.gradle or ~/.konan (write-then-exec): after every
@@ -322,8 +324,40 @@ fn profile_locked(
     }
     // Reads the grants back from the profile text so no grant can be missed.
     emit_user_deny_pins(&mut sb, config);
+    emit_grant_root_pins(&mut sb);
 
     sb
+}
+
+/// A `subpath` write grant also covers the root's own name, so inside a
+/// read-only parent the agent could remove the root and put a symlink there;
+/// the next launch would then grant write wherever the link points (a
+/// read-only sibling such as `~/.gradle/init.d`, or a host autostart dir).
+/// Pin every root whose parent is not itself writable: no unlink or rename,
+/// no create (for roots that exist). Both spellings, as Seatbelt matches the resolved path. Reads
+/// the grants back from the text, so a new grant anywhere is covered.
+fn emit_grant_root_pins(sb: &mut String) {
+    let roots = emitted_write_subpaths(sb);
+    let mut pins: Vec<PathBuf> = roots
+        .iter()
+        .filter(|r| r.parent().is_some_and(|p| p.parent().is_some()))
+        .filter(|r| !roots.iter().any(|o| o != *r && r.starts_with(o)))
+        // A missing root stays creatable (tools make their caches on first
+        // use); a symlink planted there is refused at the next launch.
+        .filter(|r| r.symlink_metadata().is_ok())
+        .flat_map(|r| [r.clone(), crate::config::canonicalize_deepest(r)])
+        .filter(|r| validate_sbpl_path(r).is_ok())
+        .collect();
+    pins.sort();
+    pins.dedup();
+    if pins.is_empty() {
+        return;
+    }
+    sbpl!(sb, ";; Write-grant roots in read-only parents — no replace");
+    for p in &pins {
+        sbpl!(sb, "(deny file-write-unlink (literal \"{}\"))", p.display());
+        sbpl!(sb, "(deny file-write-create (literal \"{}\"))", p.display());
+    }
 }
 
 /// Every recursive write grant the profile emits: the subpath of each
@@ -2461,6 +2495,26 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path, extra_deny: &[PathBuf]
     sbpl!(sb);
 }
 
+/// `sandbox.readonly_host_tool_paths`: subtrees of writable tool dirs that
+/// host tools run or obey (pre-commit envs, .NET global tools, NuGet config
+/// and plugins). Emitted after the tool-dir grants, so the deny wins.
+fn emit_host_tool_ro_overlays(sb: &mut String, config: &SandboxConfig) {
+    let paths = host_tool_ro_overlays(config.home_dir, config.readonly_host_tool_paths);
+    if paths.is_empty() {
+        return;
+    }
+    sbpl!(
+        sb,
+        ";; sandbox.readonly_host_tool_paths: host-run tool paths stay read-only"
+    );
+    for path in paths {
+        if validate_sbpl_path(&path).is_ok() {
+            sbpl!(sb, "(deny file-write* (subpath \"{}\"))", path.display());
+        }
+    }
+    sbpl!(sb);
+}
+
 /// cplt's own PATH shims stay read-only (#514).
 ///
 /// A shim is what the user's next `copilot` runs, outside any sandbox; an agent
@@ -4487,6 +4541,8 @@ mod tests {
             let project = std::path::Path::new("/projects/app");
             let local = home.join(".local");
             let shims = home.join(".local/share/cplt/bin");
+            // Exists up front: an existing write root gains its replace pins.
+            std::fs::create_dir_all(&local).expect("mkdir local");
             let extra_write = [local.clone()];
             let mut opts = test_options(project, &home);
             opts.extra_write = &extra_write;
@@ -5221,6 +5277,7 @@ mod tests {
             deny_dns: false,
             netns: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             proxy_enabled: false,

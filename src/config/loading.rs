@@ -519,6 +519,7 @@ impl Config {
         let gradle_init = bools.gradle_init;
 
         let deny_nested_git = bools.deny_nested_git;
+        let readonly_host_tool_paths = bools.readonly_host_tool_paths;
         let refuse_cache_exec_links = bools.refuse_cache_exec_links;
         let refuse_unenforced = bools.refuse_unenforced;
         let deny_key_files_by_extension = bools.deny_key_files_by_extension;
@@ -728,6 +729,7 @@ impl Config {
             allow_msbuild,
             gradle_init,
             deny_nested_git,
+            readonly_host_tool_paths,
             refuse_cache_exec_links,
             refuse_unenforced,
             deny_key_files_by_extension,
@@ -4566,6 +4568,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.deny_nested_git,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.readonly_host_tool_paths",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.readonly_host_tool_paths,
                 default: false,
                 preset: None,
             },

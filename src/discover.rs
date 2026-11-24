@@ -675,7 +675,14 @@ pub fn discover_tools(home_dir: &Path, tool_roots: &[ToolRoot]) -> ToolDiscovery
                 let (link, to) = (d.path.display(), target.display());
                 let unnameable = cfg!(target_os = "macos")
                     && crate::sandbox::validate_sbpl_path(target).is_err();
-                ui::warn(&if unnameable {
+                ui::warn(&if d.dir.write {
+                    format!(
+                        "Not granting {link}: it resolves through a symlink to {to}, and a \
+                         writable tool dir is never granted through a symlink (a sandboxed \
+                         session could have planted it). If you made the link, point the \
+                         tool's *_HOME variable at {to}, or pass --allow-write {to}."
+                    )
+                } else if unnameable {
                     format!(
                         "Not granting {link}: it is a symlink to {to}, which the macOS sandbox \
                          profile cannot name. Re-point the symlink, or set the tool's *_HOME, \

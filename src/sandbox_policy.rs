@@ -511,9 +511,9 @@ fn read_target(home: &Path, path: &Path, own: Option<&str>) -> Option<PathBuf> {
 /// grant is the ordinary per-file `allow.read` override of that deny.
 ///
 /// Read-only holds on macOS only. On Linux, `.m2/settings.xml` and
-/// `.gradle/gradle.properties` sit inside the `~/.m2` and `~/.gradle`
-/// [`HOME_TOOL_DIRS`] grants, which are read/write, and Landlock cannot deny
-/// a file inside a granted directory. Those two stay readable and writable
+/// `.gradle/gradle.properties` sit inside the read-only `~/.m2` and
+/// `~/.gradle` [`HOME_TOOL_DIRS`] grants, and Landlock cannot deny a file
+/// inside a granted directory. Those two stay readable (never writable)
 /// whether this grant is made, omitted, or denied, unless Bubblewrap masks a
 /// user deny on them. Only `.npmrc` is governed by this grant there.
 pub const BUILD_CREDENTIAL_FILES: &[&str] =
@@ -521,7 +521,7 @@ pub const BUILD_CREDENTIAL_FILES: &[&str] =
 
 /// The [`BUILD_CREDENTIAL_FILES`] a user deny (`deny`, canonical) covers
 /// that Landlock cannot withhold, for the Linux launch warning when
-/// Bubblewrap is not active: a read/write [`HOME_TOOL_DIRS`] grant covers
+/// Bubblewrap is not active: a read [`HOME_TOOL_DIRS`] grant covers
 /// their directory, so the deny does nothing for them.
 #[must_use]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -2574,14 +2574,76 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     // write during dependency resolution. Write is required; map-exec is needed
     // for JNI/cgo native libraries. No process-exec (deps aren't standalone bins).
     // Sensitive files within these dirs are blocked via DENIED_HOME_SUBPATHS.
+    // ~/.gradle and ~/.m2 also hold files the *host* build obeys or runs on
+    // every later invocation (init.d, init.gradle*, gradle.properties, jdks;
+    // settings.xml, toolchains.xml, extensions.xml). So the roots are
+    // read-only and only the download/state subdirs a sandboxed build writes
+    // are writable (see HOST_EXEC_TOOL_PATHS). Children must follow their
+    // root: SBPL is last-match-wins and Landlock unions ancestors.
     HomeToolDir {
         path: ".gradle",
+        process_exec: false,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".gradle/caches",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".gradle/wrapper",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".gradle/native",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".gradle/daemon",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".gradle/.tmp",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    // Measured with Gradle 8.14.8, `gradle build test` with forked javac and
+    // test workers in a fresh GRADLE_USER_HOME: these two plus the five above.
+    HomeToolDir {
+        path: ".gradle/notifications",
+        process_exec: false,
+        map_exec: false,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".gradle/workers",
         process_exec: false,
         map_exec: true,
         write: true,
     },
     HomeToolDir {
         path: ".m2",
+        process_exec: false,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".m2/repository",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".m2/wrapper",
         process_exec: false,
         map_exec: true,
         write: true,
@@ -2623,16 +2685,46 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         // modules and update the sum DB cache here.
         write: true,
     },
-    // Yarn Berry global cache: packages only, no executables
+    // Yarn Berry global folder (cache + metadata) is ~/.yarn/berry. The rest
+    // of ~/.yarn is read-only: Yarn classic's `yarn global add` links
+    // binaries into ~/.yarn/bin, which is on the host PATH.
     HomeToolDir {
         path: ".yarn",
         process_exec: false,
         map_exec: false,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".yarn/berry",
+        process_exec: false,
+        map_exec: false,
         write: true,
     },
-    // npm global cache: packages only, no executables
+    // npm global cache: packages only, no executables. The root is read-only
+    // and only the subdirs npm writes are writable: `_npx` holds packages the
+    // host's next `npx` runs, but npx needs it writable even for a cached
+    // package (see HOST_EXEC_TOOL_PATHS). npm ignores a failed write of
+    // `_update-notifier-last-checked` in the root.
     HomeToolDir {
         path: ".npm",
+        process_exec: false,
+        map_exec: false,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".npm/_cacache",
+        process_exec: false,
+        map_exec: false,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".npm/_logs",
+        process_exec: false,
+        map_exec: false,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".npm/_npx",
         process_exec: false,
         map_exec: false,
         write: true,
@@ -2721,6 +2813,482 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         process_exec: false,
         map_exec: false,
         write: true,
+    },
+];
+
+/// Create the read-only [`HOME_TOOL_DIRS`] roots that have writable children
+/// (`~/.gradle`, `~/.m2`, `~/.npm`, ...) and those children.
+///
+/// Runs in the parent before launch. A sandboxed build cannot create them
+/// itself any more, and the backends skip grants for missing paths. Only
+/// one level is created, and `create_dir` does not follow a final symlink.
+///
+/// With `sandbox.readonly_host_tool_paths` on, the [`HOST_TOOL_RO_OVERLAYS`]
+/// are created the same way, because Bubblewrap can only bind a path that
+/// exists.
+pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
+    let overlays = HOST_TOOL_RO_OVERLAYS
+        .iter()
+        .filter(|_| readonly_host_tool_paths);
+    for child in HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.write)
+        .map(|d| d.path)
+        .chain(overlays.copied())
+    {
+        let Some((parent, _)) = child.rsplit_once('/') else {
+            continue;
+        };
+        let Some(root) = HOME_TOOL_DIRS.iter().find(|d| d.path == parent) else {
+            continue;
+        };
+        // A read-only root is created too: the sandbox can no longer create
+        // it, and a first `npm install` on a fresh machine would fail.
+        if !root.write {
+            let _ = std::fs::create_dir(home.join(parent));
+        }
+        if home.join(parent).is_dir() {
+            let _ = std::fs::create_dir(home.join(child));
+        }
+    }
+}
+
+/// Read-only twins of the writable [`HOME_TOOL_DIRS`] entries that
+/// `sandbox.readonly_host_tool_paths` (default off, #264) takes write from.
+/// Each holds a tool or distribution a sandboxed command downloads and the
+/// host runs later: `./gradlew` and `./mvnw` distributions and Kotlin/Native
+/// toolchains. With the key on, a sandboxed first download
+/// fails; running the command once outside cplt fills the cache.
+pub const READONLY_HOST_TOOL_TWINS: &[HomeToolDir] = &[
+    HomeToolDir {
+        path: ".gradle/wrapper",
+        process_exec: false,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".m2/wrapper",
+        process_exec: false,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".konan",
+        process_exec: false,
+        map_exec: true,
+        write: false,
+    },
+];
+
+/// Subtrees of writable tool dirs that host tools run or obey, made read-only
+/// by `sandbox.readonly_host_tool_paths`: pre-commit hook environments (run by
+/// the host's `git commit`), .NET global tools (on PATH), the NuGet user
+/// config and credential-provider plugins.
+///
+/// Their parent must stay writable, so this is a deny, not a narrower grant:
+/// an SBPL write-deny on macOS and a Bubblewrap read-only bind on Linux.
+/// Landlock alone cannot subtract from a granted tree, so without Bubblewrap
+/// they stay writable on Linux, like every other `ro_protect` entry.
+pub const HOST_TOOL_RO_OVERLAYS: &[&str] = &[
+    ".cache/pre-commit",
+    ".dotnet/tools",
+    ".nuget/NuGet",
+    ".nuget/plugins",
+];
+
+/// Swap the [`READONLY_HOST_TOOL_TWINS`] in for their writable entries.
+pub fn apply_readonly_host_tool_paths(dirs: &mut [ResolvedToolDir]) {
+    for d in dirs {
+        if let Some(twin) = READONLY_HOST_TOOL_TWINS
+            .iter()
+            .find(|t| t.path == d.dir.path)
+        {
+            d.dir = twin;
+        }
+    }
+}
+
+/// The existing `<dists>/<name>/<hash>/*.lck` files of a read-only wrapper
+/// tree. `./gradlew` opens its distribution's lock file for writing on every
+/// run, even when the distribution is unpacked, so with
+/// `sandbox.readonly_host_tool_paths` on each one gets a per-file write grant.
+/// A lock file holds nothing that runs. The tree was writable in earlier
+/// sessions, so only plain files count: `symlink_metadata`, never `is_file`.
+#[must_use]
+pub fn wrapper_lock_files(dists: &Path) -> Vec<PathBuf> {
+    let dirs = |p: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for hash_dir in dirs(dists).iter().flat_map(|d| dirs(d)) {
+        for entry in std::fs::read_dir(&hash_dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "lck")
+                && path.symlink_metadata().is_ok_and(|m| m.is_file())
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The [`HOST_TOOL_RO_OVERLAYS`] under `home`, or none with the key off.
+#[must_use]
+pub fn host_tool_ro_overlays(home: &Path, readonly_host_tool_paths: bool) -> Vec<PathBuf> {
+    HOST_TOOL_RO_OVERLAYS
+        .iter()
+        .filter(|_| readonly_host_tool_paths)
+        .map(|p| home.join(p))
+        .collect()
+}
+
+/// A wrapper distribution the project pins but the Gradle or Maven user home
+/// lacks, as the line to print at launch: with `sandbox.readonly_host_tool_paths`
+/// on, a sandboxed `./gradlew` or `./mvnw` cannot download it.
+///
+/// The properties file is in the project, which the agent can write, so it is
+/// read with [`crate::untrusted::read_untrusted`].
+#[must_use]
+pub fn missing_wrapper_dist_hint(project: &Path, gradle_home: &Path, m2: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for (props, dists, cmd, tool) in [
+        (
+            "gradle/wrapper/gradle-wrapper.properties",
+            gradle_home.join("wrapper/dists"),
+            "./gradlew",
+            "Gradle",
+        ),
+        (
+            ".mvn/wrapper/maven-wrapper.properties",
+            m2.join("wrapper/dists"),
+            "./mvnw",
+            "Maven",
+        ),
+    ] {
+        let Ok(Some(text)) = crate::untrusted::read_untrusted(&project.join(props), 64 * 1024)
+        else {
+            continue;
+        };
+        let Some(url) = text.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("distributionUrl")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+        }) else {
+            continue;
+        };
+        // `.../gradle-8.14-bin.zip` unpacks to `dists/gradle-8.14-bin/<hash>`.
+        let file = url.trim().rsplit(['/', '\\']).next().unwrap_or("");
+        let Some(name) = file.strip_suffix(".zip") else {
+            continue;
+        };
+        if name.is_empty() || name.contains("..") || dists.join(name).is_dir() {
+            continue;
+        }
+        let version = name
+            .trim_start_matches("gradle-")
+            .trim_start_matches("apache-maven-")
+            .trim_end_matches("-bin")
+            .trim_end_matches("-all");
+        out.push(format!(
+            "run {cmd} --version once outside cplt to download {tool} {version}"
+        ));
+    }
+    out
+}
+
+/// How cplt handles a path under a tool dir that a host tool obeys or runs
+/// later, outside the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostExec {
+    /// Not under any writable [`HOME_TOOL_DIRS`] entry, so read-only on every
+    /// backend (SBPL, Landlock, bubblewrap) by construction.
+    ReadOnly,
+    /// Writable because a sandboxed build needs it. The payload says why, so
+    /// the gap is reviewable here rather than an absence.
+    Gap(&'static str),
+    /// Writable by default; read-only with `sandbox.readonly_host_tool_paths`
+    /// (default off, #264) because it breaks a sandboxed first download. The
+    /// payload says what breaks.
+    Keyed(&'static str),
+}
+
+/// A home-relative path a host tool executes or obeys on a later, unsandboxed
+/// run. See [`HOST_EXEC_TOOL_PATHS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostExecPath {
+    pub path: &'static str,
+    /// What the host does with it.
+    pub host_use: &'static str,
+    pub handling: HostExec,
+}
+
+/// Paths inside writable [`HOME_TOOL_DIRS`] trees that host tools execute or
+/// obey later. Agent-config dirs have the same class in
+/// `Agent::host_persistence_denies`; this is the tool-dir half.
+///
+/// Running a build in the sandbox keeps *that* build sandboxed, but a file the
+/// agent leaves in a tool dir outlives the session, and the next build is a
+/// host build. Landlock cannot deny inside a granted tree, so the fix is to
+/// narrow the grant: every [`HostExec::ReadOnly`] row must sit outside every
+/// writable entry (enforced by a unit test), and every writable entry must be
+/// covered by at least one row, even if only to record a gap.
+pub const HOST_EXEC_TOOL_PATHS: &[HostExecPath] = &[
+    // ── Gradle ── docs.gradle.org: init scripts, build environment, toolchains
+    HostExecPath {
+        path: ".gradle/init.d",
+        host_use: "every *.gradle(.kts) runs on every host build",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".gradle/init.gradle",
+        host_use: "runs on every host build",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".gradle/init.gradle.kts",
+        host_use: "runs on every host build",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".gradle/gradle.properties",
+        host_use: "org.gradle.java.home, jvmargs and proxy settings obeyed",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".gradle/jdks",
+        host_use: "toolchain JDKs Gradle selects and runs",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".gradle/caches",
+        host_use: "plugin and dependency jars loaded by host builds, unverified unless dependency verification is on",
+        handling: HostExec::Gap("the dependency cache every build writes"),
+    },
+    HostExecPath {
+        path: ".gradle/wrapper",
+        host_use: "host ./gradlew runs the unpacked distribution",
+        handling: HostExec::Keyed("a sandboxed ./gradlew cannot download a missing distribution"),
+    },
+    HostExecPath {
+        path: ".gradle/native",
+        host_use: "native-platform libraries Gradle loads",
+        handling: HostExec::Gap("Gradle extracts them on first run"),
+    },
+    HostExecPath {
+        path: ".gradle/daemon",
+        host_use: "daemon registry and logs; a host client only talks to a daemon it can reach",
+        handling: HostExec::Gap("every build writes daemon state"),
+    },
+    HostExecPath {
+        path: ".gradle/.tmp",
+        host_use: "scratch only",
+        handling: HostExec::Gap("Gradle's temp dir"),
+    },
+    HostExecPath {
+        path: ".gradle/notifications",
+        host_use: "per-version welcome-message marker",
+        handling: HostExec::Gap("every Gradle version writes its marker on first run"),
+    },
+    HostExecPath {
+        path: ".gradle/workers",
+        host_use: "worker process scratch for forked compile and test",
+        handling: HostExec::Gap("forked workers write here on every build"),
+    },
+    // ── Maven ── maven.apache.org: settings, toolchains, core extensions, wrapper
+    HostExecPath {
+        path: ".m2/settings.xml",
+        host_use: "mirrors, proxies, profiles obeyed",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".m2/settings-security.xml",
+        host_use: "master password",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".m2/toolchains.xml",
+        host_use: "JDK paths maven-toolchains runs",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".m2/extensions.xml",
+        host_use: "user-level core extensions loaded (Maven 4)",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".m2/repository",
+        host_use: "plugin and dependency jars loaded by host builds",
+        handling: HostExec::Gap("the local repository every build writes"),
+    },
+    HostExecPath {
+        path: ".m2/wrapper",
+        host_use: "host ./mvnw runs the unpacked distribution",
+        handling: HostExec::Keyed("a sandboxed ./mvnw cannot download a missing distribution"),
+    },
+    // ── Cargo ── doc.rust-lang.org/cargo: config, registry
+    HostExecPath {
+        path: ".cargo/config.toml",
+        host_use: "build.rustc-wrapper, target runners obeyed",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".cargo/bin",
+        host_use: "on PATH",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".cargo/registry",
+        host_use: "extracted sources (build.rs) compiled and run by host builds without re-verification",
+        handling: HostExec::Gap("cargo build downloads and extracts crates here"),
+    },
+    HostExecPath {
+        path: ".cargo/git",
+        host_use: "git dependency checkouts built by host builds",
+        handling: HostExec::Gap("cargo build clones git deps here"),
+    },
+    // ── Go ── go.dev/ref/mod: module cache
+    HostExecPath {
+        path: "go/pkg",
+        host_use: "module sources built by host builds; checked against go.sum at download, not on use",
+        handling: HostExec::Gap("go build downloads modules here"),
+    },
+    // ── Bun ──
+    HostExecPath {
+        path: ".bun/bin",
+        host_use: "on PATH",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".bun/install",
+        host_use: "host bunx runs cached packages",
+        handling: HostExec::Gap("bun install and bunx write the global cache"),
+    },
+    // ── npm / Yarn / pnpm ──
+    HostExecPath {
+        path: ".npm/_npx",
+        host_use: "host npx reuses the packages installed here",
+        handling: HostExec::Gap(
+            "npx writes here even for a cached package: read-only, a cached `npx cowsay` spun until node ran out of heap (npm 11, node 24), and MCP servers start through npx",
+        ),
+    },
+    HostExecPath {
+        path: ".npm/_cacache",
+        host_use: "tarball cache; integrity-checked on read only when a lockfile pins the hash",
+        handling: HostExec::Gap("npm install writes the cache"),
+    },
+    HostExecPath {
+        path: ".npm/_logs",
+        host_use: "debug logs only",
+        handling: HostExec::Gap("every npm command writes a log"),
+    },
+    HostExecPath {
+        path: ".yarn/bin",
+        host_use: "Yarn classic global binaries, on PATH",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecPath {
+        path: ".yarn/berry",
+        host_use: "content-addressed cache, checksum-verified against yarn.lock",
+        handling: HostExec::Gap("yarn install writes the global cache"),
+    },
+    HostExecPath {
+        path: "Library/pnpm/store",
+        host_use: "content-addressed store, hardlinked into node_modules",
+        handling: HostExec::Gap("pnpm install writes the store"),
+    },
+    HostExecPath {
+        path: "Library/pnpm/package-manager-store",
+        host_use: "host pnpm runs packageManager-pinned versions",
+        handling: HostExec::Gap("pnpm self-management downloads here"),
+    },
+    HostExecPath {
+        path: ".local/share/pnpm/store",
+        host_use: "as Library/pnpm/store",
+        handling: HostExec::Gap("pnpm install writes the store"),
+    },
+    HostExecPath {
+        path: ".local/share/pnpm/package-manager-store",
+        host_use: "as Library/pnpm/package-manager-store",
+        handling: HostExec::Gap("pnpm self-management downloads here"),
+    },
+    // ── Kotlin/Native ──
+    HostExecPath {
+        path: ".konan",
+        host_use: "prebuilt compilers and dependencies host Kotlin/Native builds run",
+        handling: HostExec::Keyed(
+            "a sandboxed first Kotlin/Native build cannot download its toolchain; not measured with a real Kotlin/Native build",
+        ),
+    },
+    // ── .NET ── learn.microsoft.com: NuGet config, credential providers, global tools
+    HostExecPath {
+        path: ".nuget",
+        host_use: "packages/: restored packages, hash-checked on extract",
+        handling: HostExec::Gap("restore writes packages/; NuGet/ and plugins/ are keyed below"),
+    },
+    HostExecPath {
+        path: ".nuget/NuGet",
+        host_use: "NuGet.Config package sources obeyed by host restores",
+        handling: HostExec::Keyed(
+            "a sandboxed first restore cannot create the default NuGet.Config; not measured with a real dotnet",
+        ),
+    },
+    HostExecPath {
+        path: ".nuget/plugins",
+        host_use: "credential providers run by host restores",
+        handling: HostExec::Keyed("a sandboxed credential-provider install fails"),
+    },
+    HostExecPath {
+        path: ".dotnet",
+        host_use: "first-run sentinels and telemetry state",
+        handling: HostExec::Gap(
+            "dotnet writes first-run sentinels in the root on every invocation",
+        ),
+    },
+    HostExecPath {
+        path: ".dotnet/tools",
+        host_use: "global tools, on PATH",
+        handling: HostExec::Keyed("a sandboxed `dotnet tool install -g` fails"),
+    },
+    // ── Generic caches ──
+    HostExecPath {
+        path: "Library/Caches",
+        host_use: "per-tool caches, data only",
+        handling: HostExec::Gap("every build tool caches here"),
+    },
+    HostExecPath {
+        path: ".cache",
+        host_use: "pip, go-build, node-gyp caches: data only",
+        handling: HostExec::Gap("every build tool caches here"),
+    },
+    HostExecPath {
+        path: ".cache/pre-commit",
+        host_use: "hook environments the host's git commit runs",
+        handling: HostExec::Keyed(
+            "pre-commit takes a lock here on every run, so a sandboxed git commit with pre-commit hooks fails",
+        ),
+    },
+    HostExecPath {
+        path: ".local/share/kotlin",
+        host_use: "daemon run files",
+        handling: HostExec::Gap("the Kotlin daemon client writes them"),
+    },
+    HostExecPath {
+        path: "Library/Application Support/kotlin",
+        host_use: "daemon run files",
+        handling: HostExec::Gap("the Kotlin daemon client writes them"),
+    },
+    HostExecPath {
+        path: "Library/Application Support/rtk",
+        host_use: "tracking database only; nothing executed",
+        handling: HostExec::Gap("rtk records usage here"),
     },
 ];
 
@@ -3522,6 +4090,7 @@ impl ResolvedToolDir {
     ///   for a symlinked `~/.m2`) is not refused: that is the subpath deny the
     ///   list exists for, emitted at the resolved path on macOS and documented
     ///   as unenforceable on Linux, as for an unsymlinked `~/.m2`;
+    /// - any target of a writable entry (see the body: never followed);
     /// - on macOS, a target the profile cannot name ([`validate_sbpl_path`]).
     ///   Seatbelt matches the resolved path, so the `$HOME` spelling alone
     ///   would grant nothing;
@@ -3545,6 +4114,19 @@ impl ResolvedToolDir {
             && canon(home).join(rel) == target
         {
             return None;
+        }
+        // A writable root is never followed through a symlink, at its own name
+        // or any component below `$HOME`: a session could have planted it
+        // (remove the root, link its name elsewhere), and following it would
+        // grant write at the target. Recovery: point the tool's `*_HOME` at
+        // the target, or grant it with `--allow-write`.
+        // Outside `$HOME` (a relocated `*_HOME`) only the root's own name is
+        // checked: the user chose that path, spelled however the system does.
+        if self.dir.write
+            && (self.path.starts_with(home)
+                || self.path.symlink_metadata().is_ok_and(|m| m.is_symlink()))
+        {
+            return Some(target);
         }
         (overlaps_credential_entry(home, target, &self.path)
             || grant_is_refused(home, target)
@@ -4802,10 +5384,9 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
         macos: true,
         why: "Gradle toolchain JDKs — auto-provisioned and exec'd by the daemon",
         linux: LinuxCoverage::Gap(
-            "Landlock cannot subtract the ~/.gradle write grant from this subtree, and \
-             the bubblewrap read-only bind that could is absent on hosts without user \
-             namespaces — so the control would be silently missing exactly where it is \
-             needed. macOS denies the write at the tail of the profile instead.",
+            "none for write any more: ~/.gradle itself is read-only and only its cache \
+             subdirs are writable (HOST_EXEC_TOOL_PATHS), so Landlock never grants write \
+             here. Kept for the EXECUTE carve-out.",
         ),
     },
     // `bunx` resolves and runs packages straight out of the global install
@@ -5296,6 +5877,179 @@ mod tests {
         assert!(!env_tool_dir_hint_ok(&h, &bad, &[]));
     }
 
+    #[test]
+    fn host_exec_tool_paths_cover_every_writable_tool_dir() {
+        let under = |p: &str, root: &str| p == root || p.starts_with(&format!("{root}/"));
+        let writable: Vec<&str> = HOME_TOOL_DIRS
+            .iter()
+            .filter(|d| d.write)
+            .map(|d| d.path)
+            .collect();
+        for w in &writable {
+            assert!(
+                HOST_EXEC_TOOL_PATHS
+                    .iter()
+                    .any(|r| under(r.path, w) || under(w, r.path)),
+                "writable tool dir {w} has no HOST_EXEC_TOOL_PATHS row"
+            );
+        }
+        for r in HOST_EXEC_TOOL_PATHS {
+            let granted = writable.iter().any(|w| under(r.path, w));
+            match r.handling {
+                HostExec::ReadOnly => assert!(!granted, "{} is host-executed but writable", r.path),
+                HostExec::Gap(_) => assert!(granted, "{} is a stale gap: not writable", r.path),
+                HostExec::Keyed(_) => {
+                    assert!(granted, "{} is keyed but not writable", r.path);
+                    let twin = READONLY_HOST_TOOL_TWINS.iter().any(|t| t.path == r.path);
+                    let overlay = HOST_TOOL_RO_OVERLAYS.contains(&r.path);
+                    assert!(
+                        twin ^ overlay,
+                        "{} keyed but the key does not cover it",
+                        r.path
+                    );
+                }
+            }
+        }
+        for t in READONLY_HOST_TOOL_TWINS {
+            let orig = HOME_TOOL_DIRS.iter().find(|d| d.path == t.path).unwrap();
+            assert!(orig.write && !t.write, "{}", t.path);
+            assert_eq!(
+                (orig.map_exec, orig.process_exec),
+                (t.map_exec, t.process_exec)
+            );
+        }
+        for o in HOST_TOOL_RO_OVERLAYS {
+            assert!(
+                HOST_EXEC_TOOL_PATHS
+                    .iter()
+                    .any(|r| r.path == *o && matches!(r.handling, HostExec::Keyed(_))),
+                "{o} has no Keyed row"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_host_tool_paths_swaps_only_the_twins() {
+        let home = Path::new("/h");
+        let mut dirs: Vec<ResolvedToolDir> = HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(home, &[]))
+            .collect();
+        apply_readonly_host_tool_paths(&mut dirs);
+        for (d, orig) in dirs.iter().zip(HOME_TOOL_DIRS) {
+            let twin = READONLY_HOST_TOOL_TWINS.iter().any(|t| t.path == orig.path);
+            assert_eq!(d.dir.write, orig.write && !twin, "{}", orig.path);
+        }
+        assert!(host_tool_ro_overlays(home, false).is_empty());
+        assert_eq!(
+            host_tool_ro_overlays(home, true),
+            HOST_TOOL_RO_OVERLAYS
+                .iter()
+                .map(|p| home.join(p))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrapper_lock_files_takes_plain_lck_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("gradle-8.14-bin/abc");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("gradle-8.14-bin.zip.lck"), "").unwrap();
+        std::fs::write(d.join("gradle-8.14-bin.zip.ok"), "").unwrap();
+        std::fs::write(tmp.path().join("x"), "").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("x"), d.join("link.lck")).unwrap();
+        crate::untrusted::tests::mkfifo(&d.join("fifo.lck"));
+        assert_eq!(
+            wrapper_lock_files(tmp.path()),
+            [d.join("gradle-8.14-bin.zip.lck")]
+        );
+    }
+
+    #[test]
+    fn missing_wrapper_dist_hint_names_the_version_only_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (p, g, m) = (
+            tmp.path().join("p"),
+            tmp.path().join("g"),
+            tmp.path().join("m"),
+        );
+        std::fs::create_dir_all(p.join("gradle/wrapper")).unwrap();
+        std::fs::create_dir_all(p.join(".mvn/wrapper")).unwrap();
+        std::fs::write(
+            p.join("gradle/wrapper/gradle-wrapper.properties"),
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip\n",
+        )
+        .unwrap();
+        // A FIFO must not block the launch.
+        let fifo = p.join(".mvn/wrapper/maven-wrapper.properties");
+        crate::untrusted::tests::mkfifo(&fifo);
+        assert_eq!(
+            missing_wrapper_dist_hint(&p, &g, &m),
+            ["run ./gradlew --version once outside cplt to download Gradle 8.14"]
+        );
+        std::fs::remove_file(&fifo).unwrap();
+        std::fs::write(
+            &fifo,
+            "distributionUrl = https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.9/apache-maven-3.9.9-bin.zip",
+        )
+        .unwrap();
+        std::fs::create_dir_all(g.join("wrapper/dists/gradle-8.14-bin")).unwrap();
+        assert_eq!(
+            missing_wrapper_dist_hint(&p, &g, &m),
+            ["run ./mvnw --version once outside cplt to download Maven 3.9.9"]
+        );
+        // A symlinked properties file is not followed.
+        std::fs::remove_file(&fifo).unwrap();
+        std::os::unix::fs::symlink(p.join("gradle/wrapper/gradle-wrapper.properties"), &fifo)
+            .unwrap();
+        assert!(missing_wrapper_dist_hint(&p, &g, &m).is_empty());
+    }
+
+    #[test]
+    fn gradle_and_maven_write_grants_are_cache_subdirs_only() {
+        let writable = |prefix: &str| -> Vec<&str> {
+            HOME_TOOL_DIRS
+                .iter()
+                .filter(|d| {
+                    d.write && (d.path == prefix || d.path.starts_with(&format!("{prefix}/")))
+                })
+                .map(|d| d.path)
+                .collect()
+        };
+        assert_eq!(
+            writable(".gradle"),
+            [
+                ".gradle/caches",
+                ".gradle/wrapper",
+                ".gradle/native",
+                ".gradle/daemon",
+                ".gradle/.tmp",
+                ".gradle/notifications",
+                ".gradle/workers"
+            ]
+        );
+        assert_eq!(writable(".m2"), [".m2/repository", ".m2/wrapper"]);
+        assert_eq!(writable(".yarn"), [".yarn/berry"]);
+    }
+
+    #[test]
+    fn ensure_split_tool_dirs_creates_children_of_existing_roots_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        std::fs::create_dir(h.join(".gradle")).unwrap();
+        // A symlink planted where a child goes is left alone, not followed.
+        std::fs::create_dir(h.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(h.join("elsewhere/x"), h.join(".gradle/daemon")).unwrap();
+        ensure_split_tool_dirs(h, false);
+        assert!(h.join(".gradle/caches").is_dir());
+        assert!(h.join(".gradle/wrapper").is_dir());
+        assert!(!h.join("elsewhere/x").exists());
+        // A read-only root with writable children is created; a writable
+        // root without them is not.
+        assert!(h.join(".m2/repository").is_dir());
+        assert!(!h.join(".nuget").exists());
+    }
     /// The pinned-state line touches no state file before validation: a
     /// planted symlink or FIFO there must not be written to or block.
     #[test]

@@ -4010,6 +4010,35 @@ mod tests {
         assert_eq!(key_off, baseline);
     }
 
+    /// Bubblewrap binds writable only what Landlock grants write: the Gradle
+    /// and Maven cache subdirs, never their roots, where host-run init
+    /// scripts and settings live.
+    #[test]
+    fn bwrap_binds_only_gradle_and_maven_cache_subdirs_writable() {
+        let base = non_tmp_tempdir();
+        let home = base.path().canonicalize().unwrap();
+        for d in [".gradle/caches", ".gradle/init.d", ".m2/repository"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        let config = crate::sandbox::tests::test_config(&home, &[]);
+        let policy = crate::sandbox::landlock_mod::generate_policy(&config);
+        let args = build_bwrap_args(&policy.fs_rules, Overlays::default(), &DenyMasks::default());
+        let binds: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--bind")
+            .map(|w| w[1].as_str())
+            .collect();
+        let s = |rel: &str| home.join(rel).to_string_lossy().into_owned();
+        assert!(binds.contains(&s(".gradle/caches").as_str()), "{binds:?}");
+        assert!(binds.contains(&s(".m2/repository").as_str()), "{binds:?}");
+        for root in [".gradle", ".gradle/init.d", ".m2"] {
+            assert!(
+                !binds.contains(&s(root).as_str()),
+                "{root} bound writable: {binds:?}"
+            );
+        }
+    }
+
     #[test]
     fn mask_missing_worktree_config_binds_dev_null_when_enabled() {
         let base = non_tmp_tempdir();

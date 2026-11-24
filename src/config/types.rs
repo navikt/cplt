@@ -732,6 +732,9 @@ pub struct SandboxConfig {
     /// Deny creating a `.git` entry below a writable root (default: false,
     /// macOS only). See `sandbox_profile::emit_nested_gitdir_denies` (#576).
     pub deny_nested_git: Option<bool>,
+    /// Keep host-run tool downloads and settings read-only in the sandbox
+    /// (default: false, #264). See `sandbox_policy::READONLY_HOST_TOOL_TWINS`.
+    pub readonly_host_tool_paths: Option<bool>,
     pub refuse_cache_exec_links: Option<bool>,
     /// Refuse a launch whose configured controls cannot be enforced here
     /// (#386). `config init` writes `true`; unset keeps the warning.
@@ -1076,6 +1079,7 @@ pub struct Resolved {
     pub allow_msbuild: bool,
     pub gradle_init: bool,
     pub deny_nested_git: bool,
+    pub readonly_host_tool_paths: bool,
     pub refuse_cache_exec_links: bool,
     pub refuse_unenforced: bool,
     pub deny_key_files_by_extension: bool,

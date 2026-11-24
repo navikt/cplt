@@ -3284,6 +3284,7 @@ mod tests {
             deny_dns: false,
             netns: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             proxy_enabled: false,
@@ -4067,8 +4068,8 @@ mod tests {
         for rel in [
             ".cargo/registry",
             ".cargo/git",
-            ".gradle",
-            ".m2",
+            ".gradle/caches",
+            ".m2/repository",
             ".nuget",
             "go/pkg",
         ] {
@@ -4090,6 +4091,100 @@ mod tests {
                 !rule.access.execute,
                 "{rel} is writable, so it must not also be executable"
             );
+        }
+    }
+
+    /// `~/.gradle` and `~/.m2` hold files host builds run or obey later, so
+    /// Landlock grants write only to their cache subdirs: it cannot deny
+    /// inside a granted tree, so the root rule itself must be read-only.
+    #[test]
+    fn gradle_and_maven_roots_are_read_only_rules() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let policy = generate_policy(&test_config(&project, &home));
+        let write = |rel: &str| {
+            policy
+                .fs_rules
+                .iter()
+                .filter(|r| r.path == home.join(rel))
+                .any(|r| r.access.write)
+        };
+        for rel in [".gradle", ".m2", ".yarn"] {
+            assert!(!write(rel), "{rel} root must not be writable");
+        }
+        for rel in [
+            ".gradle/caches",
+            ".gradle/wrapper",
+            ".m2/repository",
+            ".yarn/berry",
+        ] {
+            assert!(write(rel), "{rel} must stay writable");
+        }
+        for rule in policy.fs_rules.iter().filter(|r| r.access.write) {
+            for host in [
+                ".gradle/init.d",
+                ".gradle/gradle.properties",
+                ".m2/settings.xml",
+            ] {
+                assert!(
+                    !home.join(host).starts_with(&rule.path),
+                    "{host} under {:?}",
+                    rule.path
+                );
+            }
+        }
+        // Landlock checks rmdir, rename and symlink creation against the
+        // parent: with no RemoveDir/RemoveFile/MakeSym/Refer on a read-only
+        // parent, a writable child root cannot be swapped for a symlink.
+        #[cfg(target_os = "linux")]
+        for rule in policy.fs_rules.iter().filter(|r| {
+            [".gradle", ".m2", ".yarn", ".npm", ".cargo"]
+                .iter()
+                .any(|p| r.path == home.join(p))
+        }) {
+            use landlock::AccessFs;
+            let flags = access_to_flags(&rule.access);
+            for bit in [
+                AccessFs::RemoveDir,
+                AccessFs::RemoveFile,
+                AccessFs::MakeSym,
+                AccessFs::Refer,
+            ] {
+                assert!(!flags.contains(bit), "{:?} grants {bit:?}", rule.path);
+            }
+        }
+    }
+
+    /// `sandbox.readonly_host_tool_paths`: with the twins applied, the wrapper
+    /// distributions and `~/.konan` get no write rule; their sibling caches
+    /// keep theirs. Landlock needs no deny for these: the grant itself shrinks.
+    #[test]
+    fn readonly_host_tool_twins_drop_the_write_rule() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        for key in [false, true] {
+            let mut dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+                .iter()
+                .map(|d| d.resolve(&home, &[]))
+                .collect();
+            if key {
+                crate::sandbox::apply_readonly_host_tool_paths(&mut dirs);
+            }
+            let mut config = test_config(&project, &home);
+            config.existing_home_tool_dirs = Some(&dirs);
+            let policy = generate_policy(&config);
+            let write = |rel: &str| {
+                policy
+                    .fs_rules
+                    .iter()
+                    .any(|r| r.path == home.join(rel) && r.access.write)
+            };
+            for rel in [".gradle/wrapper", ".m2/wrapper", ".konan"] {
+                assert_eq!(write(rel), !key, "key={key} {rel}");
+            }
+            for rel in [".gradle/caches", ".m2/repository", ".npm/_npx"] {
+                assert!(write(rel), "key={key} {rel}");
+            }
         }
     }
 

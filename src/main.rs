@@ -5529,6 +5529,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     warn_inject_token_without_guard(&resolved);
 
+    // Read-only tool roots and their writable cache dirs must exist before
+    // discovery; the sandbox cannot create them. Real launches only: an
+    // inspection (`--print-profile`, `doctor`) leaves the home untouched.
+    if !cli.print_profile && !cli.doctor {
+        cplt::sandbox::ensure_split_tool_dirs(&home_dir, resolved.readonly_host_tool_paths);
+    }
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir, &repo_paths);
     // After the probe, which adds env-relocated tool grants (GOCACHE, ...) to
@@ -7640,7 +7646,24 @@ impl HostProbe {
         if resolved.allow_build_credentials {
             merge_build_credentials(resolved, home_dir);
         }
-        let tool_discovery = discover::discover_tools(home_dir, &tool_roots);
+        let mut tool_discovery = discover::discover_tools(home_dir, &tool_roots);
+        if resolved.readonly_host_tool_paths {
+            cplt::sandbox::apply_readonly_host_tool_paths(
+                &mut tool_discovery.existing_home_tool_dirs,
+            );
+            // `./gradlew` locks its distribution for writing on every run.
+            for d in tool_discovery
+                .existing_home_tool_dirs
+                .iter()
+                .filter(|d| matches!(d.dir.path, ".gradle/wrapper" | ".m2/wrapper"))
+            {
+                for lock in cplt::sandbox::wrapper_lock_files(&d.path.join("dists")) {
+                    if !resolved.allow_write.contains(&lock) {
+                        resolved.allow_write.push(lock);
+                    }
+                }
+            }
+        }
         // Git worktree common directory (shared .git for worktrees).
         let (git_common_dir, git_common_dir_problem) =
             discover::git_common_dir(home_dir, project_dir, &resolved.allow_write);
@@ -8086,6 +8109,23 @@ fn assemble_sandbox(
         opts.repos.worktree_root,
         cli.observe_domains,
     );
+
+    // With wrapper dists read-only, a missing pinned distribution cannot be
+    // downloaded in the sandbox: say how to fetch it before the build fails.
+    if resolved.readonly_host_tool_paths {
+        let root = |rel: &str| {
+            probe
+                .existing_home_tool_dirs
+                .iter()
+                .find(|d| d.dir.path == rel)
+                .map_or_else(|| home_dir.join(rel), |d| d.path.clone())
+        };
+        for line in
+            sandbox::missing_wrapper_dist_hint(&probe.project_dir, &root(".gradle"), &root(".m2"))
+        {
+            ui::warn(&line);
+        }
+    }
 
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
     // init script so sandboxed builds keep the preferIPv4Stack workaround for
@@ -8572,6 +8612,7 @@ fn build_sandbox_config<'a>(
         deny_dns: resolved.deny_dns && resolved.proxy_forced,
         netns: resolved.netns,
         deny_nested_git: resolved.deny_nested_git,
+        readonly_host_tool_paths: resolved.readonly_host_tool_paths,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
         refuse_unenforced: resolved.refuse_unenforced,
         proxy_enabled: resolved.with_proxy,
@@ -8604,6 +8645,9 @@ fn prepare_shell_sandbox(
     project_dir: &Path,
     repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
+    if !cli.print_profile {
+        cplt::sandbox::ensure_split_tool_dirs(home_dir, resolved.readonly_host_tool_paths);
+    }
     let mut probe = HostProbe::probe(resolved, home_dir, project_dir, repos.dirs);
     // Like `exec`, `check` never writes the managed block, so it probes
     // without the root AGENTS.md read (#252).
@@ -8781,6 +8825,9 @@ fn run_exec_command(
         mcp_broker,
         mcp_refusal: _,
     } = {
+        if !cli.print_profile {
+            cplt::sandbox::ensure_split_tool_dirs(&home_dir, resolved.readonly_host_tool_paths);
+        }
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir, &repo_paths);
         // `exec` never writes the managed block, so it gets no read on a root
         // AGENTS.md cplt did not write (#252).
@@ -16418,6 +16465,7 @@ mod tests {
             deny_dns: false,
             netns: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             proxy_enabled: false,

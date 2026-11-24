@@ -15,6 +15,70 @@ standalone install over editor launchers, even when the editor appears first
 in PATH. Check the selected path with `cplt doctor --verbose`, then launch
 `cplt`. Keep `sandbox.keychain_substitute` enabled.
 
+## Gradle, Maven and Yarn homes are read-only outside their caches
+
+Inside cplt, `~/.gradle` and `~/.m2` are read-only except for the
+directories a build fills: `caches/`, `wrapper/`, `native/`, `daemon/` and
+`.tmp/` under `~/.gradle`, and `repository/` and `wrapper/` under `~/.m2`.
+`~/.yarn` is read-only except `berry/`. Host builds run or obey the other
+files there (`init.d/`, `init.gradle`, `gradle.properties`, `settings.xml`,
+`toolchains.xml`, Yarn classic's global `bin/`), so a sandboxed session must
+not be able to change them.
+
+A build or command inside cplt that writes one of those files now fails with a
+permission error (`Operation not permitted`, `Permission denied`, or
+`Read-only file system` under bubblewrap).
+Typical cases are `yarn global add`, a Gradle toolchain download into
+`~/.gradle/jdks` (already blocked before), or a script that edits
+`~/.gradle/gradle.properties`. Make that change outside cplt. If a build
+needs to write another cache directory under one of these homes, create it
+outside cplt and grant that directory alone (the sandbox cannot create it in
+the read-only parent):
+
+```sh
+mkdir -p ~/.gradle/<dir>
+cplt --allow-write ~/.gradle/<dir>
+```
+
+Or put it in `allow.write` in the config, and open an issue so it can become
+a default.
+
+A writable tool directory reached through a symlink (at its own name, or
+because `~/.gradle` itself is a link) is no longer granted: cplt warns and
+skips it, since a sandboxed session could have planted that link. If you made
+the link, point the tool's `*_HOME` variable (for example `GRADLE_USER_HOME`)
+at the real directory, or grant the target with `--allow-write`.
+
+
+`~/.npm` is read-only too, except `_cacache/`, `_logs/` and `_npx/`. npm
+ignores the failed write of `_update-notifier-last-checked` in the root, so
+`npm install` and `npx` work as before. cplt creates `~/.npm`, `~/.gradle`,
+`~/.m2` and `~/.yarn` and their writable subdirectories before launch, since
+the sandbox cannot.
+
+## `sandbox.readonly_host_tool_paths` (off by default)
+
+With this key on, tool downloads and settings the host runs later are
+read-only in the sandbox: `~/.gradle/wrapper`, `~/.m2/wrapper`, `~/.konan`,
+`~/.cache/pre-commit`, `~/.dotnet/tools`, `~/.nuget/NuGet` and
+`~/.nuget/plugins`. The last four need bubblewrap on Linux. What breaks, and
+the fix:
+
+- `./gradlew` or `./mvnw` when the pinned distribution is not downloaded yet.
+  cplt prints the fix at launch, such as `run ./gradlew --version once outside
+  cplt to download Gradle 8.14`. Once it is downloaded, `./gradlew` works in
+  the sandbox.
+- A first Kotlin/Native build, which downloads its toolchain to `~/.konan`.
+  Run it once outside cplt.
+- `git commit` with pre-commit hooks inside the sandbox: pre-commit takes a
+  lock in `~/.cache/pre-commit` on every run. Commit outside cplt.
+- `dotnet tool install -g`, and a first `dotnet restore` on a machine without
+  `~/.nuget/NuGet/NuGet.Config`. Run them once outside cplt.
+
+`npx` is not covered: it writes `~/.npm/_npx` even for a package it has
+cached, so a read-only `_npx` would break every `npx` call, MCP servers
+included.
+
 ## Branch tracking is silently dropped
 
 `.git/config` is write-denied on macOS (it is a `core.hooksPath` and

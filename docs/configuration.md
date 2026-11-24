@@ -873,6 +873,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
+| `sandbox.readonly_host_tool_paths` | a staged hardening switch, see [Read-only tool downloads](#read-only-tool-downloads-sandboxreadonly_host_tool_paths) |
 | `sandbox.refuse_unenforced` | depends on what the machine can enforce, see [Refusing deny paths this host cannot enforce](#refusing-deny-paths-this-host-cannot-enforce-sandboxrefuse_unenforced) |
 | `sandbox.refuse_cache_exec_links` | a staged hardening switch, see [Symlinked cache-exec entries](#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links) |
 | `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |
@@ -1024,6 +1025,24 @@ cplt config set sandbox.refuse_cache_exec_links true
 With the key on, any such link stops the launch. The sandbox can write `~/.cache`, so an earlier session could have planted the link or re-pointed it at a directory the checks above do not know about, such as a project checkout's build output or a tool prefix no rule names. The key is off by default because turning it on breaks a cache you moved on purpose with a symlink, which works without it.
 
 Either way, cplt opens the directory it checked without following any symlink when the launch applies the sandbox. A link swapped in after the check, at any level, stops the launch instead of moving the grant. A symlinked `~/.cache` itself (which only you can create, since the sandbox cannot write `$HOME`) is checked the same way and refused under the key; the scratch directory, on by default, refuses it regardless, so it only works with `--no-scratch-dir`. macOS is unaffected: Seatbelt checks the resolved path against rules on the literal cache path, so a link there grants nothing extra.
+
+## Read-only tool downloads (`sandbox.readonly_host_tool_paths`)
+
+Some tool directories hold programs that a sandboxed command downloads and your host runs later, outside the sandbox: the distribution `./gradlew` and `./mvnw` unpack, Kotlin/Native toolchains, pre-commit hook environments, .NET global tools, and NuGet's user config and credential providers. With this key on, the sandbox can read and run them but not write them:
+
+- `~/.gradle/wrapper`, `~/.m2/wrapper` and `~/.konan`, on macOS and Linux
+- `~/.cache/pre-commit`, `~/.dotnet/tools`, `~/.nuget/NuGet` and `~/.nuget/plugins`, on macOS, and on Linux only when Bubblewrap is active
+
+```bash
+cplt config set sandbox.readonly_host_tool_paths true
+```
+
+Off by default, because it breaks a first download inside the sandbox:
+
+- `./gradlew` or `./mvnw` when the pinned distribution is missing. cplt prints the fix at launch, such as `run ./gradlew --version once outside cplt to download Gradle 8.14`.
+- a first Kotlin/Native build. Run it once outside cplt.
+- `git commit` with pre-commit hooks inside the sandbox: pre-commit takes a lock in `~/.cache/pre-commit` on every run. Commit outside cplt.
+- `dotnet tool install -g`, and a first `dotnet restore` on a machine with no `~/.nuget/NuGet/NuGet.Config`. Run them once outside cplt.
 
 ## Blocking new nested `.git` entries (`sandbox.deny_nested_git`)
 
