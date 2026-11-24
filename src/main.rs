@@ -1216,7 +1216,8 @@ enum ConfigAction {
         key: String,
 
         /// Emit one JSON object: {"schema":1,"key":...,"value":...,"source":
-        /// "default|cli|local|user|managed|repo","set":bool}. Unknown key: exit 2.
+        /// "default|cli|local|user|managed|repo","set":bool}. Booleans and lists
+        /// only (other keys: exit 3). Unknown key: exit 2.
         #[arg(long)]
         json: bool,
     },
@@ -12337,10 +12338,15 @@ fn run_config_get_json(key: &str) -> ExitCode {
         layer.as_ref(),
         managed.as_ref(),
     ) {
-        Ok(v) => {
+        Ok(Some(v)) => {
             println!("{v}");
             ExitCode::SUCCESS
         }
+        Ok(None) => fail(
+            3,
+            &format!("{key}: --json supports booleans and lists only; use `cplt config get {key}`"),
+            "unsupported key type for --json",
+        ),
         Err(e) => fail(1, &e, "cannot resolve config"),
     }
 }

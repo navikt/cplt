@@ -1859,13 +1859,12 @@ fn config_get_json_names_the_layer_that_set_the_key() {
     assert_eq!(v["value"], json!(["local.example", "user.example"]));
     assert_eq!(v["source"], "local");
 
-    // baseline arrays are parsed, not split with their TOML quotes; booleans are bools
-    let (_, v) = get_json(&home, repo.path(), "gh_guard.hosts", None);
-    assert!(
-        v["value"].as_array().is_some_and(|a| a
-            .iter()
-            .all(|h| h.as_str().is_some_and(|h| !h.contains('"')))),
-        "no TOML quotes in values: {v}"
+    // a scalar is declined, never guessed from the files
+    let (code, v) = get_json(&home, repo.path(), "proxy.port", None);
+    assert_eq!(code, 3);
+    assert_eq!(
+        v,
+        json!({"schema":1,"error":"unsupported key type for --json","key":"proxy.port"})
     );
     let (_, v) = get_json(&home, repo.path(), "sandbox.mask_missing_deny_paths", None);
     assert!(v["value"].is_boolean(), "a bool key must be a bool: {v}");

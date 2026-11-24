@@ -213,26 +213,29 @@ pub struct RepoLayer<'a> {
 /// `cplt config get --json KEY`: the typed effective value, the layer that
 /// supplied it and whether any layer set it (nav-pilot contract, add-only).
 ///
-/// The value is what the launch resolves, not what a file says. Booleans and
-/// every list the resolver holds are read off a [`Resolved`] built by the
-/// launch's own merge, with the managed layer and `apply_repo_config` on top
-/// (so an unapproved proposal sets nothing, a repo `[deny]` applies without
-/// approval, and an entry launch drops is not reported). The source comes from
-/// re-resolving with layers added one at a time (default, user, local,
-/// managed, repo): the last layer that changes the value names it; booleans use
-/// the resolver's own provenance. Scalars the resolver turns into other types
-/// (ports, enums, durations) still come from the files with the overlay's
-/// rule: local over user, except for the global-only lists.
-/// `Err` is a config the launch refuses.
+/// Only keys whose value can be read off the [`Resolved`] the launch builds
+/// are supported: the registry booleans and the lists the resolver holds.
+/// Everything else is `Ok(None)`, because a value guessed from the files can
+/// differ from launch, which is worse for a launcher than no value. The value
+/// comes from the launch's own merge with the managed layer and
+/// `apply_repo_config` on top (an unapproved proposal sets nothing, a repo
+/// `[deny]` applies without approval, an entry launch drops is not reported).
+/// The source comes from re-resolving with layers added one at a time
+/// (default, user, local, managed, repo); booleans use the resolver's own
+/// provenance. `Err` is a config the launch refuses.
 pub fn key_json(
     key_info: &ConfigKeyInfo,
     loaded: Option<&LoadedConfig>,
     local: Option<&LoadedConfig>,
     repo: Option<&RepoLayer<'_>>,
     managed: Option<&super::managed::ManagedConfig>,
-) -> Result<serde_json::Value, String> {
+) -> Result<Option<serde_json::Value>, String> {
     use serde_json::{Value, json};
     let dotted = format!("{}.{}", key_info.section, key_info.key);
+    let bool_row = super::registry::bool_key(key_info.section, key_info.key);
+    if bool_row.is_none() && !is_json_list(&dotted) {
+        return Ok(None);
+    }
     let resolve = |user: bool, loc: bool, mg: bool, rp: bool| {
         let global = if user {
             loaded.map(|l| l.config.clone()).unwrap_or_default()
@@ -260,97 +263,85 @@ pub fn key_json(
         ConfigLayer::Global => "user",
         ConfigLayer::Baseline => "default",
     };
-    // The files, with the layers the launch ignores for this key left out.
-    let global_only = matches!(dotted.as_str(), "gh_guard.hosts" | "shell.skip");
-    let file_user = if dotted == "sandbox.repo_dirs" {
-        None
-    } else {
-        loaded
-    };
-    let file_local = if global_only { None } else { local };
-    let file = file_value(key_info, file_user, file_local);
     let mut managed_by = None;
 
-    let full = resolve(true, true, true, true)?;
-    let (value, source, set): (Value, &str, bool) =
-        if let Some(row) = super::registry::bool_key(key_info.section, key_info.key) {
-            let layer = full
-                .bool_layer(key_info.section, key_info.key)
-                .filter(|l| *l != ConfigLayer::Baseline);
-            (
-                Value::Bool((row.resolved)(&full)),
-                layer.map_or("default", layer_name),
-                layer.is_some(),
-            )
-        } else if let Some(final_list) = list_of(&full, &dotted) {
-            let stages = [
+    // The per-layer passes only compare; the final one may warn, once.
+    use std::sync::atomic::Ordering::Relaxed;
+    let stages = if bool_row.is_some() {
+        None
+    } else {
+        ui::MUTE_WARN.store(true, Relaxed);
+        let st = (|| {
+            Ok::<_, String>([
                 (resolve(false, false, false, false)?, "default"),
                 (resolve(true, false, false, false)?, "user"),
                 (resolve(true, true, false, false)?, "local"),
                 (resolve(true, true, true, false)?, "managed"),
-            ];
-            let mut source = "default";
-            let mut prev = list_of(&stages[0].0, &dotted);
-            for (r, name) in &stages[1..] {
-                let cur = list_of(r, &dotted);
-                if cur != prev {
-                    source = name;
-                }
-                prev = cur;
-            }
-            if prev.as_ref() != Some(&final_list) {
-                source = "repo";
-            }
-            if source == "managed" {
-                managed_by = managed.map(|m| m.managed_by.clone());
-            }
-            // An explicit file entry that changes nothing is still a set key.
-            let from_file = file.as_ref().map(|(_, l)| match l {
-                ConfigLayer::Local => "local",
-                _ => "user",
-            });
-            let set = source != "default" || from_file.is_some();
-            if source == "default" {
-                source = from_file.unwrap_or("default");
-            }
-            (Value::Array(final_list), source, set)
-        } else if let Some((v, layer)) = &file {
-            let mut v = toml_to_json(v);
-            if let Some(files) = file_list(key_info, file_user, file_local) {
-                v = Value::Array(files);
-            }
-            (v, layer_name(*layer), true)
-        } else {
-            let (shown, _) = get_config_value(key_info, loaded, local);
-            // A preset that moves the baseline counts as set, by the layer that chose it.
-            let moved = active_preset(loaded, local)
-                .baseline()
-                .value_for_key(key_info.section, key_info.key)
-                != Preset::Standard
-                    .baseline()
-                    .value_for_key(key_info.section, key_info.key);
-            let by = if local.is_some_and(|l| l.config.sandbox.preset.is_some()) {
-                "local"
-            } else {
-                "user"
-            };
-            (
-                typed_from_display(&shown, key_info.value_type),
-                if moved { by } else { "default" },
-                moved,
-            )
-        };
-    // The upstream URL may carry `user:pass@`; a machine reader gets it redacted.
-    let value = match (&dotted[..], value) {
-        ("proxy.upstream", Value::String(u)) => json!(crate::proxy::redact_upstream_url(&u)),
-        (_, v) => v,
+            ])
+        })();
+        ui::MUTE_WARN.store(false, Relaxed);
+        Some(st?)
     };
-
+    let full = resolve(true, true, true, true)?;
+    let (value, source, set): (Value, &str, bool) = if let Some(row) = bool_row {
+        let layer = full
+            .bool_layer(key_info.section, key_info.key)
+            .filter(|l| *l != ConfigLayer::Baseline);
+        (
+            Value::Bool((row.resolved)(&full)),
+            layer.map_or("default", layer_name),
+            layer.is_some(),
+        )
+    } else {
+        let final_list = list_of(&full, &dotted).unwrap_or_default();
+        let mut source = "default";
+        let mut prev = None;
+        for (r, name) in stages.iter().flatten() {
+            let cur = list_of(r, &dotted);
+            if prev.is_some() && cur != prev {
+                source = name;
+            }
+            prev = cur;
+        }
+        if prev.as_ref() != Some(&final_list) {
+            source = "repo";
+        }
+        if source == "managed" {
+            managed_by = managed.map(|m| m.managed_by.clone());
+        }
+        // An explicit file entry that changes nothing is still a set key.
+        let from_file = file_value(key_info, loaded, local).map(|(_, l)| layer_name(l));
+        let set = source != "default" || from_file.is_some();
+        if source == "default" {
+            source = from_file.unwrap_or("default");
+        }
+        (Value::Array(final_list), source, set)
+    };
     let mut out = json!({"schema": 1, "key": dotted, "value": value, "source": source, "set": set});
     if let Some(name) = managed_by {
         out["managed_by"] = json!(name);
     }
-    Ok(out)
+    Ok(Some(out))
+}
+
+/// The lists [`list_of`] reads off the resolved config.
+fn is_json_list(dotted: &str) -> bool {
+    matches!(
+        dotted,
+        "allow.read"
+            | "allow.write"
+            | "allow.socket"
+            | "allow.exec"
+            | "allow.domains"
+            | "allow.ports"
+            | "allow.localhost"
+            | "deny.paths"
+            | "deny.env"
+            | "sandbox.pass_env"
+            | "sandbox.allow_cache_exec"
+            | "proxy.upstream_no_proxy"
+            | "proxy.allow_private_domains"
+    )
 }
 
 /// The resolved list a managed or repo layer can extend, as JSON.
@@ -375,68 +366,6 @@ fn list_of(r: &super::types::Resolved, dotted: &str) -> Option<Vec<serde_json::V
         "allow.localhost" => ports(&r.allow_localhost),
         _ => return None,
     })
-}
-
-/// A list key's value across both config files, as the launch's overlay merges
-/// them: local entries join the user's, except `proxy.allow_private_domains`
-/// where a local list (even empty) replaces. `None` when no file sets it.
-fn file_list(
-    key_info: &ConfigKeyInfo,
-    loaded: Option<&LoadedConfig>,
-    local: Option<&LoadedConfig>,
-) -> Option<Vec<serde_json::Value>> {
-    let mut out: Vec<serde_json::Value> = Vec::new();
-    let mut any = false;
-    for file in [loaded, local] {
-        // One file at a time: `file_value` would return local over user.
-        if let Some((v, _)) = file_value(key_info, file, None)
-            && let Some(items) = toml_array(&v)
-        {
-            any = true;
-            for i in items {
-                if !out.contains(&i) {
-                    out.push(i);
-                }
-            }
-        }
-    }
-    any.then_some(out)
-}
-
-fn toml_array(v: &toml::Value) -> Option<Vec<serde_json::Value>> {
-    match toml_to_json(v) {
-        serde_json::Value::Array(a) => Some(a),
-        _ => None,
-    }
-}
-
-fn toml_to_json(v: &toml::Value) -> serde_json::Value {
-    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
-}
-
-/// A baseline value, which only exists as display text, as typed JSON. The text
-/// is TOML for arrays, so it is parsed as TOML, not split (quotes would stay).
-fn typed_from_display(shown: &str, ty: ConfigValueType) -> serde_json::Value {
-    use serde_json::json;
-    if ty.is_array() {
-        return toml::from_str::<toml::Table>(&format!("v = {}", shown.trim()))
-            .ok()
-            .and_then(|t| t.get("v").map(toml_to_json))
-            .filter(serde_json::Value::is_array)
-            .unwrap_or_else(|| json!([]));
-    }
-    // Some defaults carry a note, e.g. "false (true in new configs)".
-    let word = shown.split_whitespace().next().unwrap_or("");
-    match ty {
-        // A tri-state default such as "auto-detect" is not a bool: null, not a string.
-        ConfigValueType::Bool => word
-            .parse::<bool>()
-            .map_or(serde_json::Value::Null, serde_json::Value::Bool),
-        ConfigValueType::U16 | ConfigValueType::U64 => word
-            .parse::<u64>()
-            .map_or_else(|_| json!(shown), |n| json!(n)),
-        _ => json!(shown),
-    }
 }
 
 fn format_toml_value(val: &toml::Value) -> String {
@@ -1270,11 +1199,11 @@ mod tests {
         }
     }
 
-    /// `config get --json` reads the launch's resolved config: for every
-    /// registry key it must answer, with the declared type, and where raw files
-    /// and the launch differ it must say what the launch does.
+    /// `config get --json` answers from the launch's resolved config, or says
+    /// the key is unsupported: for every registry key, a bool is a bool, a
+    /// supported list is a list, anything else is `None`, never a guess.
     #[test]
-    fn get_json_reports_the_launch_value_for_every_key() {
+    fn get_json_reports_the_launch_value_or_declines_for_every_key() {
         let user = loaded(
             "[sandbox]\nbrief = false\nagents_md = true\npass_env = [\"A\"]\n\
              allow_cache_exec = [\"c1\"]\n[allow]\nexec = [\"/usr/bin/true\"]\n\
@@ -1285,18 +1214,27 @@ mod tests {
             "[sandbox]\npass_env = [\"B\"]\nallow_cache_exec = [\"c2\"]\n\
              [allow]\nexec = [\"/usr/bin/false\"]\n",
         );
+        let full = user
+            .config
+            .clone()
+            .merge_with_local(Some(&local.config), CliFlags::default())
+            .unwrap();
         for key in crate::config::all_config_keys() {
-            let v = key_json(key, Some(&user), Some(&local), None, None).unwrap();
             let name = format!("{}.{}", key.section, key.key);
-            assert_eq!(v["key"], name);
-            if key.value_type == ConfigValueType::Bool {
-                assert!(
-                    v["value"].is_boolean() || v["value"].is_null(),
-                    "{name}: {v}"
+            let v = key_json(key, Some(&user), Some(&local), None, None).unwrap();
+            if let Some(row) = crate::config::bool_key(key.section, key.key) {
+                assert_eq!(v.unwrap()["value"], (row.resolved)(&full), "{name}");
+            } else if let Some(want) = list_of(&full, &name) {
+                assert_eq!(
+                    v.unwrap()["value"],
+                    serde_json::Value::Array(want),
+                    "{name}"
                 );
-            }
-            if key.value_type.is_array() {
-                assert!(v["value"].is_array(), "{name}: {v}");
+            } else {
+                assert!(
+                    v.is_none(),
+                    "{name} has no resolved source and must decline"
+                );
             }
         }
         let get = |k: &str| {
@@ -1308,8 +1246,8 @@ mod tests {
                 None,
             )
             .unwrap()
+            .unwrap()
         };
-        // lists the launch unions across both files (they were missing from the table)
         assert_eq!(get("allow.exec")["value"].as_array().unwrap().len(), 2);
         assert_eq!(
             get("sandbox.allow_cache_exec")["value"],
@@ -1323,14 +1261,21 @@ mod tests {
         );
         // brief = false beats agents_md = true, as the resolver says
         assert_eq!(get("sandbox.agents_md")["value"], false);
-        // global-only list: a local value would be ignored; the user's stands
-        assert_eq!(
-            get("gh_guard.hosts")["value"],
-            serde_json::json!(["ghe.example"])
-        );
-        // credentials in the upstream URL never reach a launcher
-        let up = get("proxy.upstream")["value"].to_string();
-        assert!(!up.contains("pw"), "{up}");
+        // scalars, tri-state bools and global-only lists are declined
+        for k in [
+            "proxy.upstream",
+            "proxy.port",
+            "sandbox.use_bubblewrap",
+            "gh_guard.hosts",
+        ] {
+            let info = crate::config::lookup_key(k).unwrap();
+            assert!(
+                key_json(info, Some(&user), Some(&local), None, None)
+                    .unwrap()
+                    .is_none(),
+                "{k}"
+            );
+        }
     }
 
     /// Every key's `explain` hint must work: a `cplt config set` line is one
