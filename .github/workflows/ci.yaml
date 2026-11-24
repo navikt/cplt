@@ -288,11 +288,21 @@ jobs:
           fi
           echo "Working tree clean — no test artifacts leaked"
 
-  # OpenCode v2 (#710) through cplt with the real, pinned binary and no
-  # credentials. The integration job covers the same ground with a stub; this
-  # checks the real client finds and reaches its own per-session service.
+  # OpenCode v2 (#710) through cplt with each real release in the supported
+  # window and no credentials. The integration job covers the same ground with
+  # a stub; this checks the real client finds and reaches its own per-session
+  # service, and smoke-tests `run` against a stub model, the TUI in a PTY and a
+  # remote MCP stub, with no service left afterwards (#1141).
   opencode-v2-e2e:
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
+    name: opencode-v2-e2e-${{ matrix.opencode }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported window cplt doctor reports: agent::OPENCODE_V2_TESTED
+        # (a unit test keeps the two bounds in step). A bare minor resolves
+        # to its latest patch at run time; a minor not published yet skips.
+        opencode: ["2.0.24", "2.3.2", "2.4"]
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -313,19 +323,27 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Install pinned OpenCode v2
+      - name: Install OpenCode v2
         shell: bash
         run: |
           set -euo pipefail
           # The platform package carries the binary; the @opencode/cli shim
           # only links it from a postinstall script, which stays off.
           prefix="$RUNNER_TEMP/opencode-v2"
-          npm install --ignore-scripts --no-save --prefix "$prefix" "@opencode/cli-darwin-arm64@2.0.24"
-          bin="$prefix/node_modules/@opencode/cli-darwin-arm64/bin/opencode"
+          pkg="@opencode/cli-darwin-arm64"
+          ver=$(npm view "$pkg@${{ matrix.opencode }}" version --json 2>/dev/null | jq -r 'if type == "array" then .[-1] elif type == "string" then . else empty end' || true)
+          if [ -z "$ver" ]; then
+            echo "::notice::OpenCode ${{ matrix.opencode }} is not published; skipping this cell"
+            echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          npm install --ignore-scripts --no-save --prefix "$prefix" "$pkg@$ver"
+          bin="$prefix/node_modules/$pkg/bin/opencode"
           "$bin" --version
           echo "CPLT_E2E_OPENCODE_V2=$bin" >> "$GITHUB_ENV"
 
       - name: Run OpenCode v2 e2e tests
+        if: env.OPENCODE_SKIP != '1'
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
         shell: bash
@@ -340,6 +358,14 @@ jobs:
   # The same on Linux (#719): v2 needs bubblewrap, and is refused without it.
   opencode-v2-e2e-linux:
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
+    name: opencode-v2-e2e-linux-${{ matrix.opencode }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported window cplt doctor reports: agent::OPENCODE_V2_TESTED
+        # (a unit test keeps the two bounds in step). A bare minor resolves
+        # to its latest patch at run time; a minor not published yet skips.
+        opencode: ["2.0.24", "2.3.2", "2.4"]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -369,17 +395,25 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp /bin/true
 
-      - name: Install pinned OpenCode v2
+      - name: Install OpenCode v2
         shell: bash
         run: |
           set -euo pipefail
           prefix="$RUNNER_TEMP/opencode-v2"
-          npm install --ignore-scripts --no-save --prefix "$prefix" "@opencode/cli-linux-x64@2.0.24"
-          bin="$prefix/node_modules/@opencode/cli-linux-x64/bin/opencode"
+          pkg="@opencode/cli-linux-x64"
+          ver=$(npm view "$pkg@${{ matrix.opencode }}" version --json 2>/dev/null | jq -r 'if type == "array" then .[-1] elif type == "string" then . else empty end' || true)
+          if [ -z "$ver" ]; then
+            echo "::notice::OpenCode ${{ matrix.opencode }} is not published; skipping this cell"
+            echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          npm install --ignore-scripts --no-save --prefix "$prefix" "$pkg@$ver"
+          bin="$prefix/node_modules/$pkg/bin/opencode"
           "$bin" --version
           echo "CPLT_E2E_OPENCODE_V2=$bin" >> "$GITHUB_ENV"
 
       - name: Run OpenCode v2 e2e tests
+        if: env.OPENCODE_SKIP != '1'
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
         shell: bash

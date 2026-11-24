@@ -12714,7 +12714,7 @@ paths = [
         }
 
         /// No process of the session left (found by its fake HOME in the
-        /// environment), allowing the service its 5 s shutdown.
+        /// environment).
         fn processes(home: &Home) -> Vec<String> {
             let tag = format!("HOME={} ", home.h.display());
             processes_with_env()
@@ -12734,6 +12734,213 @@ paths = [
                 assert!(Instant::now() < deadline, "left running: {left:#?}");
                 std::thread::sleep(Duration::from_millis(250));
             }
+        }
+
+        /// A smoke session (#1141): the binary copied into the fake HOME, so
+        /// its path names this test's processes only, and a stub model and MCP
+        /// server on loopback, configured as the user's global config.
+        struct Smoke {
+            home: Home,
+            bin: PathBuf,
+            port: u16,
+            log: PathBuf,
+            stub: std::process::Child,
+        }
+
+        impl Drop for Smoke {
+            fn drop(&mut self) {
+                let _ = self.stub.kill();
+                let _ = self.stub.wait();
+            }
+        }
+
+        fn smoke() -> Option<Smoke> {
+            let Some(src) = std::env::var_os("CPLT_E2E_OPENCODE_V2") else {
+                eprintln!("SKIPPED (opencode v2): CPLT_E2E_OPENCODE_V2 unset");
+                return None;
+            };
+            let home = home();
+            let bin = home.bin.join("opencode");
+            std::fs::copy(std::fs::canonicalize(src).unwrap(), &bin).unwrap();
+            let log = home.h.join("stub.log");
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/opencode_stub.py");
+            #[allow(clippy::disallowed_methods)] // absolute path
+            let mut stub = std::process::Command::new("/usr/bin/python3")
+                .arg("-I")
+                .arg(script)
+                .arg(&log)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(stub.stdout.take().unwrap()),
+                &mut line,
+            )
+            .unwrap();
+            let port: u16 = line.trim().parse().expect("stub port");
+            let cfg = serde_json::json!({
+                "model": "stub/stub",
+                "provider": {"stub": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "Stub",
+                    "options": {"baseURL": format!("http://127.0.0.1:{port}/v1"), "apiKey": "stub"},
+                    "models": {"stub": {"name": "Stub"}},
+                }},
+                "mcp": {"stub": {"type": "remote", "url": format!("http://127.0.0.1:{port}/mcp"), "enabled": true}},
+            });
+            std::fs::write(
+                home.h.join(".config/opencode/opencode.json"),
+                cfg.to_string(),
+            )
+            .unwrap();
+            Some(Smoke {
+                home,
+                bin,
+                port,
+                log,
+                stub,
+            })
+        }
+
+        impl Smoke {
+            fn cmd(&self, args: &[&str]) -> Command {
+                let port = self.port.to_string();
+                self.home
+                    .cmd(&[&["--quiet", "--allow-localhost", &port, "--"], args].concat())
+            }
+
+            /// Exit 0, no EPERM, the stub reached, and no process of this
+            /// binary (the session service included) left once cplt returned.
+            fn check(&self, code: Option<i32>, out: &str, reached: &[&str]) {
+                assert_eq!(code, Some(0), "{out}");
+                assert!(!out.contains("EPERM"), "{out}");
+                let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+                for r in reached {
+                    assert!(log.contains(r), "stub never saw {r}: {log}\n{out}");
+                }
+                let tag = self.bin.display().to_string();
+                let left: Vec<_> = processes_with_env()
+                    .into_iter()
+                    .filter(|l| l.contains(&tag))
+                    .collect();
+                assert!(left.is_empty(), "left running: {left:#?}");
+            }
+        }
+
+        #[test]
+        fn smoke_run_with_stub_model_and_remote_mcp() {
+            require_sandbox!();
+            let Some(s) = smoke() else {
+                return;
+            };
+            let o = s
+                .cmd(&["run", "say hi"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let out = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            assert!(out.contains("STUB-REPLY"), "{out}");
+            s.check(
+                o.status.code(),
+                &out,
+                &["/v1/chat/completions", "POST /mcp"],
+            );
+        }
+
+        /// The TUI in a PTY: wait for its footer, send Ctrl-C until it quits.
+        #[test]
+        fn smoke_tui_starts_and_quits() {
+            require_sandbox!();
+            let Some(s) = smoke() else {
+                return;
+            };
+            use std::io::{Read, Write};
+            use std::os::fd::FromRawFd;
+            use std::os::unix::process::CommandExt;
+            let (mut master, slave) = {
+                let (mut m, mut sl) = (-1, -1);
+                // SAFETY: valid out-params; the optional arguments may be null.
+                let rc = unsafe {
+                    libc::openpty(
+                        &raw mut m,
+                        &raw mut sl,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(rc, 0, "openpty");
+                // SAFETY: fresh fds owned from here on.
+                unsafe {
+                    (
+                        std::fs::File::from_raw_fd(m),
+                        std::fs::File::from_raw_fd(sl),
+                    )
+                }
+            };
+            let mut c = s.cmd(&[]);
+            c.env("TERM", "xterm-256color")
+                .stdin(slave.try_clone().unwrap())
+                .stdout(slave.try_clone().unwrap())
+                .stderr(slave);
+            // SAFETY: async-signal-safe calls only, between fork and exec.
+            unsafe {
+                c.pre_exec(|| {
+                    libc::setsid();
+                    libc::ioctl(0, libc::TIOCSCTTY.into(), 0);
+                    Ok(())
+                });
+            }
+            let mut child = c.spawn().unwrap();
+            drop(c);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let reader = {
+                let seen = seen.clone();
+                let mut m = master.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = m.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        // The TUI asks where the cursor is before it draws.
+                        if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                            let _ = m.write_all(b"\x1b[1;1R");
+                        }
+                        seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                })
+            };
+            let text = || String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !text().contains("ctrl+p") {
+                if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    panic!("TUI never became ready: {}", text());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                master.write_all(b"\x03").unwrap();
+                std::thread::sleep(Duration::from_secs(2));
+                if let Some(st) = child.try_wait().unwrap() {
+                    break st;
+                }
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!("TUI did not quit on Ctrl-C: {}", text());
+                }
+            };
+            drop(master);
+            let _ = reader.join();
+            s.check(status.code(), &text(), &["POST /mcp"]);
         }
 
         fn scratch_dirs(home: &Home) -> Vec<PathBuf> {

@@ -18,8 +18,9 @@
 //!   `sandbox_landlock::hide_files`).
 //!
 //! Both dirs live in the session scratch dir. The service does not exit when
-//! its registration goes (#1141), so [`ServiceGuard`] stops it when the
-//! session ends; a crashed session's dir goes with the scratch GC.
+//! its registration goes (#1141): on macOS [`ServiceGuard`] stops it when the
+//! session ends, on Linux the bubblewrap pid namespace ends with the session.
+//! A crashed session's dir goes with the scratch GC.
 //! The database (`$XDG_DATA_HOME/opencode/opencode.db`) stays shared with the
 //! host. So are the TUI's favourite models and prompt history (#793): the
 //! host `model.json` is copied in and, when the session changed it, back out
@@ -837,11 +838,15 @@ pub fn host_warnings(home: &Path) -> Vec<String> {
 /// session starts daemonizes, so it is no child of cplt and outlives the
 /// session otherwise. Hold it until the agent has exited; drop it before the
 /// scratch dir is removed. Covers normal exit, forwarded signals (cplt waits
-/// for the child, then returns) and error returns.
+/// for the child, then returns) and error returns. macOS only: on Linux v2
+/// runs only under bubblewrap, whose pid namespace takes the service with it
+/// (and whose pids the registration would name, not the host's).
+#[cfg(target_os = "macos")]
 pub struct ServiceGuard {
     state: PathBuf,
 }
 
+#[cfg(target_os = "macos")]
 impl ServiceGuard {
     pub fn new(scratch: &Path) -> Self {
         Self {
@@ -850,6 +855,7 @@ impl ServiceGuard {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for ServiceGuard {
     fn drop(&mut self) {
         let Some(pid) = host_service_pid(&self.state.join("opencode/service.json")) else {
@@ -865,6 +871,7 @@ impl Drop for ServiceGuard {
 }
 
 /// SIGTERM, then SIGKILL if it is still there after 3 s.
+#[cfg(target_os = "macos")]
 fn stop(pid: i32) {
     // SAFETY: plain signals to a pid checked by the caller.
     unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -905,17 +912,6 @@ fn in_session(pid: i32, state: &Path) -> bool {
                 path.as_ptr(),
             ) == 0
     }
-}
-
-/// Linux: the environment names this session's private state dir.
-#[cfg(not(target_os = "macos"))]
-fn in_session(pid: i32, state: &Path) -> bool {
-    use std::io::Read;
-    let entry = format!("XDG_STATE_HOME={}", state.display());
-    let mut buf = Vec::new();
-    std::fs::File::open(format!("/proc/{pid}/environ"))
-        .and_then(|f| f.take(1 << 20).read_to_end(&mut buf))
-        .is_ok_and(|_| buf.split(|b| *b == 0).any(|e| e == entry.as_bytes()))
 }
 
 /// The pid in a service registration, if that process is alive.
