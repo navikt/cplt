@@ -171,6 +171,23 @@ pub fn get_config_value(
     loaded: Option<&LoadedConfig>,
     local: Option<&LoadedConfig>,
 ) -> (String, ConfigLayer) {
+    if let Some((val, layer)) = file_value(key_info, loaded, local) {
+        return (format_toml_value(&val), layer);
+    }
+
+    let baseline = active_preset(loaded, local)
+        .baseline()
+        .value_for_key(key_info.section, key_info.key)
+        .unwrap_or_else(|| key_info.default_display.to_string());
+    (baseline, ConfigLayer::Baseline)
+}
+
+/// The value a config FILE sets for the key, local above global.
+fn file_value(
+    key_info: &ConfigKeyInfo,
+    loaded: Option<&LoadedConfig>,
+    local: Option<&LoadedConfig>,
+) -> Option<(toml::Value, ConfigLayer)> {
     for (file, layer) in [(local, ConfigLayer::Local), (loaded, ConfigLayer::Global)] {
         if let Some(file) = file
             && let Ok(root) = file.raw.parse::<toml::Table>()
@@ -179,15 +196,200 @@ pub fn get_config_value(
                 .and_then(|section| section.get(key_info.key))
                 .or_else(|| legacy_guard_alias(&root, key_info))
         {
-            return (format_toml_value(val), layer);
+            return Some((val.clone(), layer));
         }
     }
+    None
+}
 
-    let baseline = active_preset(loaded, local)
-        .baseline()
-        .value_for_key(key_info.section, key_info.key)
-        .unwrap_or_else(|| key_info.default_display.to_string());
-    (baseline, ConfigLayer::Baseline)
+/// An approved-or-not `.cplt.toml` as `config get --json` needs it: the
+/// proposal plus the keys the launch gate (`trust::granted_keys`) approved.
+pub struct RepoLayer<'a> {
+    pub config: &'a crate::repo_config::RepoConfig,
+    pub dir: &'a std::path::Path,
+    pub approved: &'a [&'a str],
+}
+
+/// `cplt config get --json KEY`: the typed effective value, the layer that
+/// supplied it and whether any layer set it (nav-pilot contract, add-only).
+///
+/// Only keys whose value can be read off the [`Resolved`] the launch builds
+/// are supported: the registry booleans and the lists the resolver holds.
+/// Everything else is `Ok(None)`, because a value guessed from the files can
+/// differ from launch, which is worse for a launcher than no value. The value
+/// comes from the launch's own merge with the managed layer and
+/// `apply_repo_config` on top (an unapproved proposal sets nothing, a repo
+/// `[deny]` applies without approval, an entry launch drops is not reported).
+/// The source comes from re-resolving with layers added one at a time
+/// (default, user, local, managed, repo); booleans use the resolver's own
+/// provenance. `Err` is a config the launch refuses.
+pub fn key_json(
+    key_info: &ConfigKeyInfo,
+    loaded: Option<&LoadedConfig>,
+    local: Option<&LoadedConfig>,
+    repo: Option<&RepoLayer<'_>>,
+    managed: Option<&super::managed::ManagedConfig>,
+) -> Result<Option<serde_json::Value>, String> {
+    use serde_json::{Value, json};
+    let dotted = format!("{}.{}", key_info.section, key_info.key);
+    let bool_row = super::registry::bool_key(key_info.section, key_info.key);
+    if bool_row.is_none() && !is_json_list(&dotted) {
+        return Ok(None);
+    }
+    let resolve = |user: bool, loc: bool, mg: bool, rp: bool| {
+        let global = if user {
+            loaded.map(|l| l.config.clone()).unwrap_or_default()
+        } else {
+            Config::default()
+        };
+        let mut r = global
+            .merge_with_local(
+                local.filter(|_| loc).map(|l| &l.config),
+                CliFlags::default(),
+            )
+            .map_err(|e| e.to_string())?;
+        // Launch order: the repo's proposal, then the managed layer.
+        if let Some(x) = repo.filter(|_| rp) {
+            r.apply_repo_config(x.config, x.dir, x.approved);
+        }
+        if let Some(m) = managed.filter(|_| mg) {
+            r.apply_managed(m);
+        }
+        Ok::<_, String>(r)
+    };
+    let layer_name = |l: ConfigLayer| match l {
+        ConfigLayer::Local => "local",
+        ConfigLayer::Cli => "cli",
+        ConfigLayer::Repo => "repo",
+        ConfigLayer::Global => "user",
+        ConfigLayer::Baseline => "default",
+    };
+    let mut managed_by = None;
+    let mut via_preset = None;
+
+    // The per-layer passes only compare; the final one may warn, once.
+    use std::sync::atomic::Ordering::Relaxed;
+    let stages = if bool_row.is_some() {
+        None
+    } else {
+        ui::MUTE_WARN.store(true, Relaxed);
+        let st = (|| {
+            Ok::<_, String>([
+                (resolve(false, false, false, false)?, "default"),
+                (resolve(true, false, false, false)?, "user"),
+                (resolve(true, true, false, false)?, "local"),
+                (resolve(true, true, false, true)?, "repo"),
+            ])
+        })();
+        ui::MUTE_WARN.store(false, Relaxed);
+        Some(st?)
+    };
+    let full = resolve(true, true, true, true)?;
+    let (value, source, set): (Value, &str, bool) = if let Some(row) = bool_row {
+        let layer = full
+            .bool_layer(key_info.section, key_info.key)
+            .filter(|l| *l != ConfigLayer::Baseline);
+        // A preset moves the baseline: the value is decided, by the layer that
+        // chose the preset, so `set` is true and `preset` names it.
+        let preset = active_preset(loaded, local);
+        let moved = preset
+            .baseline()
+            .value_for_key(key_info.section, key_info.key)
+            != Preset::Standard
+                .baseline()
+                .value_for_key(key_info.section, key_info.key);
+        if layer.is_none() && moved {
+            via_preset = Some(preset.to_string());
+            let by = if local.is_some_and(|l| l.config.sandbox.preset.is_some()) {
+                "local"
+            } else {
+                "user"
+            };
+            (Value::Bool((row.resolved)(&full)), by, true)
+        } else {
+            (
+                Value::Bool((row.resolved)(&full)),
+                layer.map_or("default", layer_name),
+                layer.is_some(),
+            )
+        }
+    } else {
+        let final_list = list_of(&full, &dotted).unwrap_or_default();
+        let mut source = "default";
+        let mut prev = None;
+        for (r, name) in stages.iter().flatten() {
+            let cur = list_of(r, &dotted);
+            if prev.is_some() && cur != prev {
+                source = name;
+            }
+            prev = cur;
+        }
+        if prev.as_ref() != Some(&final_list) {
+            source = "managed";
+        }
+        if source == "managed" {
+            managed_by = managed.map(|m| m.managed_by.clone());
+        }
+        // An explicit file entry that changes nothing is still a set key.
+        let from_file = file_value(key_info, loaded, local).map(|(_, l)| layer_name(l));
+        let set = source != "default" || from_file.is_some();
+        if source == "default" {
+            source = from_file.unwrap_or("default");
+        }
+        (Value::Array(final_list), source, set)
+    };
+    let mut out = json!({"schema": 1, "key": dotted, "value": value, "source": source, "set": set});
+    if let Some(name) = managed_by {
+        out["managed_by"] = json!(name);
+    }
+    if let Some(name) = via_preset {
+        out["preset"] = json!(name);
+    }
+    Ok(Some(out))
+}
+
+/// The lists [`list_of`] reads off the resolved config.
+fn is_json_list(dotted: &str) -> bool {
+    matches!(
+        dotted,
+        "allow.read"
+            | "allow.write"
+            | "allow.socket"
+            | "allow.exec"
+            | "allow.domains"
+            | "allow.ports"
+            | "allow.localhost"
+            | "deny.paths"
+            | "deny.env"
+            | "sandbox.pass_env"
+            | "sandbox.allow_cache_exec"
+            | "proxy.upstream_no_proxy"
+            | "proxy.allow_private_domains"
+    )
+}
+
+/// The resolved list a managed or repo layer can extend, as JSON.
+fn list_of(r: &super::types::Resolved, dotted: &str) -> Option<Vec<serde_json::Value>> {
+    use serde_json::json;
+    let paths = |v: &[std::path::PathBuf]| v.iter().map(|p| json!(p.to_string_lossy())).collect();
+    let strs = |v: &[String]| v.iter().map(|s| json!(s)).collect();
+    let ports = |v: &[u16]| v.iter().map(|p| json!(p)).collect();
+    Some(match dotted {
+        "allow.read" => paths(&r.allow_read),
+        "allow.write" => paths(&r.allow_write),
+        "allow.socket" => paths(&r.allow_socket),
+        "allow.exec" => paths(&r.allow_exec),
+        "sandbox.allow_cache_exec" => strs(&r.allow_cache_exec),
+        "proxy.upstream_no_proxy" => strs(&r.proxy_upstream_no_proxy),
+        "deny.paths" => paths(&r.deny_paths),
+        "deny.env" => strs(&r.deny_env),
+        "allow.domains" => strs(&r.allow_domains),
+        "sandbox.pass_env" => strs(&r.pass_env),
+        "proxy.allow_private_domains" => strs(&r.allow_private_domains),
+        "allow.ports" => ports(&r.allow_ports),
+        "allow.localhost" => ports(&r.allow_localhost),
+        _ => return None,
+    })
 }
 
 fn format_toml_value(val: &toml::Value) -> String {
@@ -1012,6 +1214,120 @@ fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loaded(raw: &str) -> LoadedConfig {
+        LoadedConfig {
+            config: toml::from_str(raw).unwrap(),
+            path: "/dev/null/cfg".into(),
+            raw: raw.to_string(),
+        }
+    }
+
+    /// `config get --json` answers from the launch's resolved config, or says
+    /// the key is unsupported: for every registry key, a bool is a bool, a
+    /// supported list is a list, anything else is `None`, never a guess.
+    #[test]
+    fn get_json_reports_the_launch_value_or_declines_for_every_key() {
+        let user = loaded(
+            "[sandbox]\nbrief = false\nagents_md = true\npass_env = [\"A\"]\n\
+             allow_cache_exec = [\"c1\"]\n[allow]\nexec = [\"/usr/bin/true\"]\n\
+             domains = [\"user.example\"]\n[proxy]\nallow_private_domains = [\"10.1\"]\n\
+             upstream = \"http://u:pw@proxy.example:3128\"\n[gh_guard]\nhosts = [\"ghe.example\"]\n",
+        );
+        let local = loaded(
+            "[sandbox]\npass_env = [\"B\"]\nallow_cache_exec = [\"c2\"]\n\
+             [allow]\nexec = [\"/usr/bin/false\"]\n",
+        );
+        let full = user
+            .config
+            .clone()
+            .merge_with_local(Some(&local.config), CliFlags::default())
+            .unwrap();
+        for key in crate::config::all_config_keys() {
+            let name = format!("{}.{}", key.section, key.key);
+            let v = key_json(key, Some(&user), Some(&local), None, None).unwrap();
+            if let Some(row) = crate::config::bool_key(key.section, key.key) {
+                assert_eq!(v.unwrap()["value"], (row.resolved)(&full), "{name}");
+            } else if let Some(want) = list_of(&full, &name) {
+                assert_eq!(
+                    v.unwrap()["value"],
+                    serde_json::Value::Array(want),
+                    "{name}"
+                );
+            } else {
+                assert!(
+                    v.is_none(),
+                    "{name} has no resolved source and must decline"
+                );
+            }
+        }
+        let get = |k: &str| {
+            key_json(
+                crate::config::lookup_key(k).unwrap(),
+                Some(&user),
+                Some(&local),
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(get("allow.exec")["value"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            get("sandbox.allow_cache_exec")["value"],
+            serde_json::json!(["c1", "c2"])
+        );
+        assert_eq!(get("sandbox.pass_env")["source"], "local");
+        // an entry the launch drops (an IP alias) is not reported
+        assert_eq!(
+            get("proxy.allow_private_domains")["value"],
+            serde_json::json!([])
+        );
+        // brief = false beats agents_md = true, as the resolver says
+        assert_eq!(get("sandbox.agents_md")["value"], false);
+        // a bool a preset moved is decided: set, attributed to the layer that chose it
+        for (preset, key, want) in [
+            ("strict", "proxy.forced", true),
+            ("permissive", "sandbox.allow_tmp_exec", true),
+            ("permissive", "gh_guard.enabled", false),
+        ] {
+            let u = loaded(&format!("[sandbox]\npreset = \"{preset}\"\n"));
+            let v = key_json(
+                crate::config::lookup_key(key).unwrap(),
+                Some(&u),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                (&v["value"], &v["source"], &v["set"], &v["preset"]),
+                (
+                    &serde_json::json!(want),
+                    &serde_json::json!("user"),
+                    &serde_json::json!(true),
+                    &serde_json::json!(preset)
+                ),
+                "{preset} {key}: {v}"
+            );
+        }
+        // scalars, tri-state bools and global-only lists are declined
+        for k in [
+            "proxy.upstream",
+            "proxy.port",
+            "sandbox.use_bubblewrap",
+            "gh_guard.hosts",
+        ] {
+            let info = crate::config::lookup_key(k).unwrap();
+            assert!(
+                key_json(info, Some(&user), Some(&local), None, None)
+                    .unwrap()
+                    .is_none(),
+                "{k}"
+            );
+        }
+    }
 
     /// Every key's `explain` hint must work: a `cplt config set` line is one
     /// that `config set` accepts at the layer it names, and anything else is

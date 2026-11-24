@@ -1729,3 +1729,202 @@ fn golden_doctor_local_only_config_still_points_to_config_init() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ════════════════════════════════════════════════════════════════════
+// `config get --json`: the launcher contract (nav-pilot)
+// ════════════════════════════════════════════════════════════════════
+
+/// One `config get --json KEY` run as `(exit code, stdout JSON)`.
+fn get_json(
+    home: &Path,
+    repo: &Path,
+    key: &str,
+    managed: Option<&Path>,
+) -> (i32, serde_json::Value) {
+    let mut cmd = common::cplt_local(home, repo);
+    cmd.env("CPLT_TEST_ACCOUNT_HOME", home);
+    if let Some(m) = managed {
+        cmd.env("CPLT_MANAGED_CONFIG", m);
+    }
+    let out = cmd
+        .args(["config", "get", "--json", key])
+        .output()
+        .expect("cplt should run");
+    let json = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be one JSON object ({e}):\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().unwrap_or(-1), json)
+}
+
+/// Every layer `config get --json` can name, one source at a time, and the
+/// untrusted proposal that must name none.
+#[test]
+fn config_get_json_names_the_layer_that_set_the_key() {
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt as _;
+    // Under the checkout: the managed file must sit under the (seamed) account home.
+    let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let home = std::fs::canonicalize(home.path()).unwrap();
+    let repo = temp_repo("navikt/spleis");
+    let key = "sandbox.allow_localhost_any";
+    let cfg = home.join(".config/cplt");
+    std::fs::create_dir_all(&cfg).unwrap();
+
+    // default
+    let (code, v) = get_json(&home, repo.path(), key, None);
+    assert_eq!(code, 0);
+    assert_eq!(
+        v,
+        json!({"schema":1,"key":key,"value":false,"source":"default","set":false})
+    );
+
+    // untrusted proposal sets nothing
+    std::fs::write(
+        repo.path().join(".cplt.toml"),
+        "[propose]\nallow_localhost_any = true\n",
+    )
+    .unwrap();
+    for args in [
+        &["add", ".cplt.toml"][..],
+        &["commit", "--quiet", "-m", "cplt config"][..],
+    ] {
+        assert!(
+            common::git_cmd(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let (_, v) = get_json(&home, repo.path(), key, None);
+    assert_eq!(
+        (&v["value"], &v["source"], &v["set"]),
+        (&json!(false), &json!("default"), &json!(false))
+    );
+
+    // trusted proposal is source repo
+    let (so, se, st) = launch(&home, repo.path(), &["trust", "accept", "--all"]);
+    assert!(st.success(), "trust accept:\n{so}{se}");
+    let (_, v) = get_json(&home, repo.path(), key, None);
+    assert_eq!(
+        (&v["value"], &v["source"], &v["set"]),
+        (&json!(true), &json!("repo"), &json!(true))
+    );
+
+    // user layer beats nothing but is below repo only when it says nothing: user false stays user
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[sandbox]\nallow_localhost_any = false\n",
+    )
+    .unwrap();
+    let (_, v) = get_json(&home, repo.path(), key, None);
+    assert_eq!(
+        v["source"], "user",
+        "an explicit user false beats a repo true: {v}"
+    );
+    assert_eq!(v["value"], false);
+    assert_eq!(v["set"], true);
+
+    // local layer above user
+    let (so, se, st) = launch(
+        &home,
+        repo.path(),
+        &["config", "set", "--local", key, "true"],
+    );
+    assert!(st.success(), "config set --local:\n{so}{se}");
+    let (_, v) = get_json(&home, repo.path(), key, None);
+    assert_eq!(
+        (&v["value"], &v["source"], &v["set"]),
+        (&json!(true), &json!("local"), &json!(true))
+    );
+
+    // additive lists keep every file's entries, not only the highest layer's
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[sandbox]\nallow_localhost_any = false\n[allow]\ndomains = [\"user.example\"]\n",
+    )
+    .unwrap();
+    let (so, se, st) = launch(
+        &home,
+        repo.path(),
+        &["config", "set", "--local", "allow.domains", "local.example"],
+    );
+    assert!(st.success(), "config set --local list:\n{so}{se}");
+    let (_, v) = get_json(&home, repo.path(), "allow.domains", None);
+    assert_eq!(v["value"], json!(["local.example", "user.example"]));
+    assert_eq!(v["source"], "local");
+
+    // a scalar is declined, never guessed from the files
+    let (code, v) = get_json(&home, repo.path(), "proxy.port", None);
+    assert_eq!(code, 3);
+    assert_eq!(
+        v,
+        json!({"schema":1,"error":"unsupported key type for --json","key":"proxy.port"})
+    );
+    let (_, v) = get_json(&home, repo.path(), "sandbox.mask_missing_deny_paths", None);
+    assert!(v["value"].is_boolean(), "a bool key must be a bool: {v}");
+
+    // a repo [deny] applies without approval, so it is reported as repo
+    std::fs::write(
+        repo.path().join(".cplt.toml"),
+        "[deny]\nenv = [\"MY_SECRET\"]\n",
+    )
+    .unwrap();
+    for args in [
+        &["add", ".cplt.toml"][..],
+        &["commit", "--quiet", "-m", "deny"][..],
+    ] {
+        assert!(
+            common::git_cmd(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let (_, v) = get_json(&home, repo.path(), "deny.env", None);
+    assert_eq!(
+        (&v["value"], &v["source"], &v["set"]),
+        (&json!(["MY_SECRET"]), &json!("repo"), &json!(true))
+    );
+
+    // managed, on a list key it may extend
+    let dir = cfg.join("managed.d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("nav.toml");
+    std::fs::write(
+        &file,
+        "managed_by = \"nav-pilot\"\nschema = 1\n[allow]\ndomains = [\"managed-only.example\"]\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (code, v) = get_json(&home, repo.path(), "allow.domains", Some(&file));
+    assert_eq!(code, 0);
+    assert_eq!(
+        v,
+        json!({"schema":1,"key":"allow.domains","value":["local.example","user.example","managed-only.example"],
+               "source":"managed","set":true,"managed_by":"nav-pilot"})
+    );
+
+    // unknown key: exit 2, JSON on stdout
+    let (code, v) = get_json(&home, repo.path(), "sandbox.nope", None);
+    assert_eq!(code, 2);
+    assert_eq!(
+        v,
+        json!({"schema":1,"error":"unknown key","key":"sandbox.nope"})
+    );
+
+    // a local file the launch refuses is an error here too, not a missing layer
+    let (so, _, st) = launch(&home, repo.path(), &["config", "path", "--local"]);
+    assert!(st.success());
+    std::fs::write(so.trim(), "this is [not toml").unwrap();
+    let (code, v) = get_json(&home, repo.path(), key, None);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["error"], "cannot load local config");
+}

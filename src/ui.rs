@@ -96,7 +96,14 @@ pub fn ok(msg: &str) {
     eprintln!("{}[cplt]{} {msg}", color(GREEN), color(RESET));
 }
 
+/// Set while a command re-resolves config only to compare layers, so the
+/// launch's warnings are said once (by the final resolution), not per layer.
+pub static MUTE_WARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn warn(msg: &str) {
+    if muted() {
+        return;
+    }
     crate::session_summary::record_message(crate::session_summary::UNCLASSIFIED);
     print_warn(msg);
 }
@@ -104,8 +111,15 @@ pub fn warn(msg: &str) {
 /// A warning or hint with a stable id from `session_summary::MESSAGE_IDS`,
 /// reported in the launcher's session summary (#1157).
 pub fn warn_id(id: &'static str, msg: &str) {
+    if muted() {
+        return;
+    }
     crate::session_summary::record_message(id);
     print_warn(msg);
+}
+
+fn muted() -> bool {
+    MUTE_WARN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn print_warn(msg: &str) {

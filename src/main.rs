@@ -1214,6 +1214,12 @@ enum ConfigAction {
     Get {
         /// Config key in section.key format (e.g., sandbox.quiet, proxy.port)
         key: String,
+
+        /// Emit one JSON object: {"schema":1,"key":...,"value":...,"source":
+        /// "default|cli|local|user|managed|repo","set":bool}. Booleans and lists
+        /// only (other keys: exit 3). Unknown key: exit 2.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Set a config value. Creates the config file if it doesn't exist.
@@ -11795,7 +11801,7 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
         ConfigAction::Show => run_config_show(),
         ConfigAction::Path { local } => run_config_path(local),
         ConfigAction::Init => init_config(),
-        ConfigAction::Get { key } => run_config_get(&key),
+        ConfigAction::Get { key, json } => run_config_get(&key, json),
         ConfigAction::Set {
             key,
             values,
@@ -12247,7 +12253,115 @@ fn run_config_hosts(name: &str, json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_config_get(key: &str) -> ExitCode {
+/// `config get --json`: errors are JSON on stdout too, so a launcher parses one stream.
+fn run_config_get_json(key: &str) -> ExitCode {
+    let fail = |code: u8, msg: &str, what: &str| {
+        println!(
+            "{}",
+            serde_json::json!({"schema": 1, "error": what, "key": key})
+        );
+        ui::error(msg);
+        ExitCode::from(code)
+    };
+    let key_info = match config::lookup_key(key) {
+        Ok(k) => k,
+        Err(e) => return fail(2, &e.to_string(), "unknown key"),
+    };
+    let loaded = match config::Config::load_file() {
+        Ok(l) => l,
+        Err(e) => return fail(1, &e.to_string(), "cannot load config"),
+    };
+    // Launch refuses a bad local config; a launcher must not read "no local layer" instead.
+    let local = match detect_project_root().map(|d| config::load_local(&d)) {
+        Some(Err(e)) => return fail(1, &e.to_string(), "cannot load local config"),
+        Some(Ok(l)) => l,
+        None => None,
+    };
+    let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
+    // The comparison merges here and in the loader are muted: the final
+    // resolution in `key_json` is the one that may warn.
+    cplt::ui::MUTE_WARN.store(true, std::sync::atomic::Ordering::Relaxed);
+    let managed_loaded =
+        load_managed_for_display(loaded.as_ref(), local.as_ref(), project_dir.as_deref());
+    cplt::ui::MUTE_WARN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let managed = match managed_loaded {
+        Some(Ok(m)) => Some(m),
+        Some(Err(line)) => {
+            ui::warn(&line);
+            None
+        }
+        None => None,
+    };
+    // The launch gate's own rule: only a current approval bound to this checkout grants.
+    cplt::ui::MUTE_WARN.store(true, std::sync::atomic::Ordering::Relaxed);
+    let refuse_invalid = loaded
+        .as_ref()
+        .map(|l| l.config.clone())
+        .unwrap_or_default()
+        .merge_with_local(
+            local.as_ref().map(|l| &l.config),
+            config::CliFlags::default(),
+        )
+        .is_ok_and(|r| r.refuse_invalid_repo_config);
+    cplt::ui::MUTE_WARN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let repo = match project_dir.as_deref().map(repo_config::load_repo_config) {
+        Some(Err(e)) if refuse_invalid => {
+            return fail(
+                1,
+                &format!("Cannot load .cplt.toml: {e}"),
+                "invalid .cplt.toml",
+            );
+        }
+        Some(Ok(Some(l)))
+            if refuse_invalid && repo_config::has_unknown_tightening_keys(&l.config) =>
+        {
+            return fail(
+                1,
+                ".cplt.toml has [deny] keys this cplt does not understand",
+                "invalid .cplt.toml",
+            );
+        }
+        Some(Ok(l)) => l,
+        _ => None,
+    };
+    let approved: Vec<String> =
+        repo.as_ref()
+            .zip(project_dir.as_deref())
+            .map_or_else(Vec::new, |(l, dir)| {
+                let entry = trust::load_trust(dir);
+                let verdict = trust::verdict(entry.as_ref(), dir, l);
+                trust::granted_keys(entry.as_ref(), verdict, &l.config.propose)
+            });
+    let approved_refs: Vec<&str> = approved.iter().map(String::as_str).collect();
+    let layer = repo.as_ref().map(|l| config::RepoLayer {
+        config: &l.config,
+        dir: &l.dir,
+        approved: &approved_refs,
+    });
+    match config::key_json(
+        key_info,
+        loaded.as_ref(),
+        local.as_ref(),
+        layer.as_ref(),
+        managed.as_ref(),
+    ) {
+        Ok(Some(v)) => {
+            println!("{v}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => fail(
+            3,
+            &format!("{key}: --json supports booleans and lists only; use `cplt config get {key}`"),
+            "unsupported key type for --json",
+        ),
+        Err(e) => fail(1, &e, "cannot resolve config"),
+    }
+}
+
+fn run_config_get(key: &str, json: bool) -> ExitCode {
+    if json {
+        return run_config_get_json(key);
+    }
     let key_info = match config::lookup_key(key) {
         Ok(k) => k,
         Err(e) => {

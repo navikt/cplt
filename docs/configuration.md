@@ -979,7 +979,24 @@ cplt config explain                       # list all keys with descriptions
 cplt config explain sandbox.pass_env      # explain a specific key
 cplt config validate                      # check for syntax errors and unknown keys
 cplt config hosts --agent copilot --json  # an agent's effective hosts (built-in plus hosts detected on this machine), see docs/proxy.md
+cplt config get --json sandbox.allow_localhost_any  # machine-readable, see below
 ```
+
+#### Machine-readable: `config get --json`
+
+For launchers such as nav-pilot. Prints one JSON object on stdout; the text form of `config get` is unchanged.
+
+```json
+{"schema":1,"key":"sandbox.allow_localhost_any","value":false,"source":"default","set":false}
+```
+
+- `value` is typed (bool, number, string or array), the effective value after the same precedence as a launch.
+- `source` is the layer that supplied it: `default`, `cli`, `local`, `user`, `managed` or `repo`. `set` is `false` only when no layer set the key and the value is the built-in default. A preset that moves the default counts as set, by the layer that chose the preset, and the object then carries `"preset":"<name>"`. `cli` is reserved: `config get` takes no per-key flags, so it is not emitted today.
+- A `.cplt.toml` proposal is `repo` only when approved for this checkout (`cplt trust accept`). An unapproved proposal sets nothing. A proposal to turn a guard on (`gh_guard`, `git_push_prevention`) needs no approval and applies at launch, so it reports `repo` too. An explicit `false` in your own config still wins over an approved `repo` `true`, as at launch.
+- Supported keys: the booleans in the registry and these lists: `allow.read`, `allow.write`, `allow.socket`, `allow.exec`, `allow.domains`, `allow.ports`, `allow.localhost`, `deny.paths`, `deny.env`, `sandbox.pass_env`, `sandbox.allow_cache_exec`, `proxy.allow_private_domains`, `proxy.upstream_no_proxy`. Any other key (ports, enums, `proxy.upstream`, `gh_guard.hosts`, tri-state booleans such as `sandbox.use_bubblewrap`) exits 3 with `{"schema":1,"error":"unsupported key type for --json","key":"..."}`: a value guessed from the files could differ from launch. Use the text form for those.
+- Values are read from the same resolved config a launch builds, so an entry launch drops (an IP alias in `proxy.allow_private_domains`) is not reported, and paths appear as launch resolves them. `source` is the highest layer that changes the value. A repo `[deny]` needs no approval and reports `repo`; managed adds `"managed_by"`.
+- Unknown key: exit code 2, `{"schema":1,"error":"unknown key","key":"..."}` on stdout and a human line on stderr. A config the launch would refuse (user file, local file, an invalid `.cplt.toml` when `sandbox.refuse_invalid_repo_config` is on, or an unresolvable merge): exit 1 with an `error` such as `"cannot load config"`.
+- The contract is add-only: new fields may appear, existing ones keep their meaning. Check `schema` first.
 
 ## Build-host credentials (`sandbox.allow_build_credentials`)
 
