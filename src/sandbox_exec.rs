@@ -3539,7 +3539,9 @@ echo "failed to read keyring" >&2; exit 1"#,
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
-            c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            // #1179: the helper may exit before reading stdin (EPIPE); its
+            // output and status are what the test asserts.
+            let _ = c.stdin.take().unwrap().write_all(stdin.as_bytes());
             c.wait_with_output().unwrap()
         };
         let get = run("get", "protocol=https\nhost=ghe.example.com\n\n");

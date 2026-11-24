@@ -6769,23 +6769,19 @@ mod tests {
     #[test]
     fn probe_sends_real_connect_through_upstream() {
         require_localhost_tcp!();
+        // #1179: an IP literal resolves without DNS, so a slow resolver on a
+        // loaded runner cannot eat the budget before the upstream is dialled.
+        let target = "203.0.113.7";
         let policy = NetPolicy::default();
         let probe = |u: &UpstreamProxy| {
-            probe_dial(
-                &policy,
-                "probe.invalid",
-                443,
-                Some(u),
-                &[],
-                Duration::from_secs(2),
-            )
+            probe_dial(&policy, target, 443, Some(u), &[], Duration::from_secs(2))
         };
 
         let (u, h) = canned_upstream("HTTP/1.1 200 Connection established\r\n\r\n");
         assert!(probe(&u).is_ok(), "2xx from the upstream must pass");
         let req = h.join().unwrap();
         assert!(
-            req.starts_with("CONNECT probe.invalid:443 "),
+            req.starts_with("CONNECT 203.0.113.7:443 "),
             "wrong CONNECT line"
         );
         assert!(
@@ -6811,7 +6807,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}", silent.local_addr().unwrap().port());
         let err = probe_dial(
             &policy,
-            "probe.invalid",
+            target,
             443,
             Some(&UpstreamProxy::parse(&url).unwrap()),
             &[],
@@ -6883,6 +6879,7 @@ mod tests {
     #[test]
     fn probe_upstream_slow_drip_is_bounded_by_budget() {
         require_localhost_tcp!();
+        // #1179: IP literal, no DNS inside the budget; see the test above.
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -6900,7 +6897,7 @@ mod tests {
         let start = Instant::now();
         let err = probe_dial(
             &NetPolicy::default(),
-            "probe.invalid",
+            "203.0.113.7",
             443,
             Some(&u),
             &[],
@@ -6909,7 +6906,7 @@ mod tests {
         .unwrap_err()
         .0;
         assert!(
-            start.elapsed() < Duration::from_millis(2800),
+            start.elapsed() < Duration::from_secs(6),
             "slow-drip upstream must be cut off at the budget, took {:?}",
             start.elapsed()
         );
