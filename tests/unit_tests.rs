@@ -790,6 +790,13 @@ fn profile_contains_deny_default() {
 }
 
 #[test]
+fn profile_denies_only_directory_clones() {
+    let p = generate_profile(&base_profile_options(), &[]);
+    let clones: Vec<&str> = p.lines().filter(|l| l.contains("file-clone")).collect();
+    assert_eq!(clones, ["(deny file-clone (vnode-type DIRECTORY))"], "{p}");
+}
+
+#[test]
 fn profile_allows_tty_ioctl() {
     let p = generate_profile(
         &SandboxConfig {

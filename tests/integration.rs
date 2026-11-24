@@ -2661,6 +2661,9 @@ int main(int argc, char **argv) {
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("private"), "secret\n").unwrap();
         fs::write(temp.path().join("plain"), "plain\n").unwrap();
+        let allowed = temp.path().join("allowed/nested/deeper");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::write(allowed.join("file"), "ok\n").unwrap();
         let home = home_dir();
         let writes = [temp.path().to_path_buf()];
         let mut opts = default_opts(&project, &home);
@@ -2674,7 +2677,7 @@ int main(int argc, char **argv) {
             ))
         };
         let script = format!(
-            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; {}; cat '{t}/fileclone' 2>/dev/null && echo FILE_OK; {}; cat '{t}/filecopy' 2>/dev/null && echo LEAK",
+            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; {}; cat '{t}/fileclone' 2>/dev/null && echo FILE_OK; {}; cat '{t}/filecopy' 2>/dev/null && echo LEAK; cp -c -R '{t}/allowed' '{t}/allowed-copy' && cat '{t}/allowed-copy/nested/deeper/file' && echo TREE_OK",
             clone(&base.display().to_string(), &format!("{t}/dirclone")),
             clone(&format!("{t}/plain"), &format!("{t}/fileclone")),
             clone(
@@ -2686,6 +2689,7 @@ int main(int argc, char **argv) {
         fs::remove_file(profile).unwrap();
         assert!(!output.contains("LEAK"), "{output}");
         assert!(output.contains("FILE_OK"), "{output}");
+        assert!(output.contains("ok\nTREE_OK"), "{output}");
     }
 
     #[test]
