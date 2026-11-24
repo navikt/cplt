@@ -6678,7 +6678,7 @@ mod tests {
             !dial_notice_due(&seen, DialFailure::Refused, "fourth.example"),
             "capped at DIAL_NOTICE_CAP per session"
         );
-        assert!(hint.contains("If requests keep failing"), "{hint}");
+        assert!(hint.contains("If other hosts fail too"), "{hint}");
     }
 
     /// #1130: an allowed target whose dial fails gets a 502 that names the
