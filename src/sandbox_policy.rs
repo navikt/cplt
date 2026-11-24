@@ -3777,6 +3777,21 @@ pub fn no_exec_temp_dir_over(root: &Path, allow_tmp_exec: bool) -> Option<PathBu
         .find(|dir| root.starts_with(dir))
 }
 
+/// The no-exec dir `exe` (the cplt binary) sits under, if any (#1158). The
+/// gh/git guard wrappers and the `open` shim exec it from inside the sandbox,
+/// so under such a dir they would die in `exec`. Same data as the checkout
+/// warning above; macOS only, like `no_exec_temp_dir_over`.
+pub fn cplt_exe_no_exec_dir(
+    exe: &Path,
+    home: &Path,
+    allow_cache_exec: &[String],
+    allow_cache_exec_any: bool,
+    allow_tmp_exec: bool,
+) -> Option<PathBuf> {
+    no_exec_tool_dir_over(exe, home, allow_cache_exec, allow_cache_exec_any)
+        .or_else(|| no_exec_temp_dir_over(exe, allow_tmp_exec))
+}
+
 /// Environment lookup for the Copilot cache resolver: `&|k| std::env::var_os(k)`
 /// in production, a fixed map in tests.
 pub type CacheEnv<'a> = dyn Fn(&str) -> Option<OsString> + 'a;

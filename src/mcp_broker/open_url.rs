@@ -649,16 +649,11 @@ pub fn shim_script(cplt: &str, socket: &str, hosts: &[String], real: Option<&str
         "#!/bin/sh\n\
          case \"$#:$1\" in 1:*) u=$1 ;; 2:-u|2:--) u=$2 ;; *) u= ;; esac\n\
          case \"$u\" in https://*) \
-         export {SOCKET_ENV}={} {HOSTS_ENV}={}\n\
-         {run};; esac\n\
+         exec env {SOCKET_ENV}={} {HOSTS_ENV}={} {} mcp-open-url \"$u\" ;; esac\n\
          {fallback}\n",
         sh_quote(socket),
         sh_quote(&hosts.join(",")),
-        run = crate::gh_proxy::run_cplt_or_explain(
-            cplt,
-            "mcp-open-url \"$u\"",
-            "opening the MCP login link"
-        ),
+        sh_quote(cplt),
     )
 }
 
@@ -1404,6 +1399,8 @@ mod tests {
         let s = shim_script("/opt/c'p", "/tmp/s", &hosts(), Some("/usr/bin/open"));
         assert!(s.contains("'/opt/c'\\''p' mcp-open-url \"$u\""), "{s}");
         assert!(s.contains("CPLT_MCP_SOCKET='/tmp/s'"), "{s}");
+        // #1158: exec, not a child, so signals reach cplt directly.
+        assert!(s.contains("exec env CPLT_MCP_SOCKET="), "{s}");
         assert!(
             s.contains(&format!("CPLT_OPEN_URL_HOSTS='{}'", hosts().join(","))),
             "{s}"

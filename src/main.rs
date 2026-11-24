@@ -3133,16 +3133,16 @@ fn cplt_exe_no_exec_message(
     home_dir: &Path,
     exe: &Path,
 ) -> Option<String> {
-    let dir = cplt::sandbox::no_exec_tool_dir_over(
+    let dir = cplt::sandbox::cplt_exe_no_exec_dir(
         exe,
         home_dir,
         &resolved.allow_cache_exec,
         resolved.allow_cache_exec_any,
-    )
-    .or_else(|| cplt::sandbox::no_exec_temp_dir_over(exe, resolved.allow_tmp_exec))?;
+        resolved.allow_tmp_exec,
+    )?;
     Some(format!(
         "cplt runs from {}, under {}, where the sandbox denies execute. The gh and \
-         git guards will fail and MCP login links won't open. Install cplt outside \
+         git guards are off and MCP login links won't open. Install cplt outside \
          temp dirs, e.g. `brew install navikt/tap/cplt`.",
         exe.display(),
         dir.display()

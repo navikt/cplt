@@ -7907,23 +7907,33 @@ except Exception as e:
         let bin = bin_dir.path().join("cplt");
         fs::copy(common::binary_path(), &bin).unwrap();
         let repo = common::temp_repo("navikt/probe");
-        let out = common::cplt_cmd_at(&bin)
-            .args(["--agent", "shell", "--yes", "--project-dir"])
+        let mut cmd = common::cplt_cmd_at(&bin);
+        cmd.args(["--agent", "shell", "--yes", "--project-dir"])
             .arg(repo.path())
             .args(["--", "-c", "git status"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(Stdio::null());
+        // No controlling tty: the wrapper line must reach stderr on its own.
+        // SAFETY: setsid is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
         let all = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            all.contains("where the sandbox denies execute. The gh and git guards will fail"),
+            all.contains("where the sandbox denies execute. The gh and git guards are off"),
             "{all}"
         );
-        assert!(all.contains("cplt: the git guard failed"), "{all}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cplt: the git guard is off"),
+            "{all}"
+        );
         assert!(!out.status.success(), "{all}");
     }
 }
