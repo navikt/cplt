@@ -4499,8 +4499,22 @@ fi
         let scaffold = |name: &str| {
             let p = TempProject::new(name);
             p.write_file("settings.gradle.kts", "rootProject.name = \"p\"\n");
-            p.write_file("build.gradle.kts", "plugins { java }\n");
-            p.write_file("src/main/java/a/A.java", "package a; public class A {}\n");
+            // Forked javac and the test JVM both run as Gradle workers.
+            p.write_file(
+                "build.gradle.kts",
+                "plugins { java }\nrepositories { mavenCentral() }\n\
+                 dependencies { testImplementation(\"junit:junit:4.13.2\") }\n\
+                 tasks.withType<JavaCompile>().configureEach { options.isFork = true }\n",
+            );
+            p.write_file(
+                "src/main/java/a/A.java",
+                "package a; public class A { public static int one() { return 1; } }\n",
+            );
+            p.write_file(
+                "src/test/java/a/ATest.java",
+                "package a; public class ATest { @org.junit.Test public void t() { \
+                 org.junit.Assert.assertEquals(1, A.one()); } }\n",
+            );
             p
         };
         let home = tempfile::Builder::new()
@@ -4512,7 +4526,7 @@ fi
         // mismatch on this machine is not a sandbox failure.
         let host = scaffold("gradle-host");
         let host_ok = Command::new("gradle")
-            .args(["build", "--no-daemon", "-q"])
+            .args(["build", "test", "--no-daemon", "-q"])
             .current_dir(host.path())
             .env("HOME", &home)
             .env("GRADLE_USER_HOME", home.join("host-gradle"))
@@ -4525,6 +4539,17 @@ fi
         }
         let gradle_home = home.join(".gradle");
         fs::create_dir_all(gradle_home.join("init.d")).unwrap();
+        // Another Gradle version's marker: the dir exists, this version's not.
+        fs::create_dir_all(gradle_home.join("notifications/7.0")).unwrap();
+        // Seed JUnit from the host run so the sandboxed build runs offline.
+        fs::create_dir_all(gradle_home.join("caches")).unwrap();
+        let seeded = Command::new("/bin/cp")
+            .arg("-R")
+            .arg(home.join("host-gradle/caches/modules-2"))
+            .arg(gradle_home.join("caches/"))
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(seeded, "seed the module cache");
         let project = scaffold("gradle-ro");
         project.git_init();
         // The fake HOME moves mise/sdkman roots away from where the JDK and
@@ -4550,7 +4575,7 @@ fi
             .args([
                 "--",
                 "-c",
-                "gradle build --no-daemon -q >/dev/null 2>&1 && echo BUILD_OK; \
+                "gradle build test --no-daemon --offline 2>&1 && echo BUILD_OK; \
                  (echo x > \"$GRADLE_USER_HOME/init.d/evil.gradle\") 2>/dev/null && echo WROTE_INIT; \
                  (echo x > \"$GRADLE_USER_HOME/gradle.properties\") 2>/dev/null && echo WROTE_PROPS; true",
             ])
