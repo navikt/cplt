@@ -7,7 +7,8 @@ cplt resolves each setting in this order, highest first:
 1. CLI flags for the current run (`--with-proxy`, `--no-proxy`, `--proxy-port`, and so on)
 2. This project's per-repo user config, `~/.config/cplt/local/<hash>.toml` (see [Per-repo user config](#per-repo-user-config-config-set---local))
 3. The config file, `~/.config/cplt/config.toml`, or whatever `CPLT_CONFIG` points at
-4. The preset baseline (`--preset`, `[sandbox] preset`), then built-in defaults
+4. A managed layer from a wrapper, if `CPLT_MANAGED_CONFIG` is set (see [Managed config from a wrapper](#managed-config-from-a-wrapper-cplt_managed_config))
+5. The preset baseline (`--preset`, `[sandbox] preset`), then built-in defaults
 
 Per-repo config (`.cplt.toml`) is applied after those layers are merged, with its own rules. The launch repository's `[deny]` section, and any proposal in it that turns a guard on, always apply; a `--repo-dir` root contributes its `[deny]` only. Its other proposals do nothing until accepted with `cplt trust accept`. An accepted boolean takes effect only where none of layers 1 to 3 set the key, and accepted lists are appended. See [Per-repo configuration](#per-repo-configuration-cplttoml).
 
@@ -35,6 +36,24 @@ entering a directory, cplt keeps the substitution visible:
   review a `.cplt.toml` gets. Symlinks and `..` are resolved first, so a link
   from outside the repo back into it is refused too. Unset `CPLT_CONFIG` (check
   `.envrc` and mise config) to run.
+
+### Managed config from a wrapper (`CPLT_MANAGED_CONFIG`)
+
+A wrapper such as nav-pilot can supply organisation defaults without editing your config. Set `CPLT_MANAGED_CONFIG` to the absolute path of a TOML file:
+
+```toml
+managed_by = "nav-pilot"
+schema = 1
+
+[proxy]
+allow_private_domains = ["intern.nav.no"]
+```
+
+The file must lie under `~/.config/cplt/managed.d/`, after resolving symlinks. nav-pilot writes `~/.config/cplt/managed.d/nav-pilot.toml`. `~` here is your account's home directory from the system user database, not `$HOME`; if `$HOME` points elsewhere, cplt ignores the file. Every sandbox profile denies the agent write access to that directory, so an agent cannot plant or edit a managed file.
+
+The layer sits between the built-in defaults and your config. Its lists are added to yours and never replace them. Only `proxy.allow_private_domains` is accepted, and each entry must be a DNS name with at least one dot (`intern.nav.no`, not `internal` or an IP address). Any other key or table, a bad entry, a missing header or an unknown `schema` makes cplt ignore the whole file with one line naming the reason. cplt also ignores the file when the path is relative, when the file or any directory or symlink on the way to it is somewhere the session can write, when it is a symlink, FIFO or other non-regular file, when it has more than one hard link, or when you do not own it. The launch continues without the layer.
+
+`cplt config show` and `cplt doctor` tag each managed value with `managed:<managed_by>`. To drop the managed entries, unset `CPLT_MANAGED_CONFIG`.
 
 Paths in `[allow]` and `[deny]` support `~/` expansion and resolve relative to the config file's directory. `proxy.blocked_domains` supports `~/` expansion only.
 

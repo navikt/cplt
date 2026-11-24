@@ -11,6 +11,7 @@ mod editing;
 mod error;
 mod loading;
 mod local;
+mod managed;
 mod path;
 mod registry;
 mod repo;
@@ -32,6 +33,9 @@ pub use local::{
     is_local_path_key, linked_identities, list_local, load_local, local_dir, local_path,
     local_write_path, parse_local_doc, resolve_path_entry, resolve_path_entry_for_removal,
     set_linked_identity, stamp_local_header, validate_local_document,
+};
+pub use managed::{
+    MANAGED_CONFIG_ENV, ManagedConfig, TRUSTED_DIR, account_home, load_managed, load_managed_from,
 };
 pub(crate) use path::MAXSYMLINKS;
 pub use path::canonicalize_deepest;

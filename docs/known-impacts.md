@@ -360,6 +360,23 @@ To keep using it, do one of these:
 - Grant it once: `cplt config set allow.write ~/work/gopath` (or `allow.read`
   for an SDK).
 
+## cplt's state directory inside a writable tree (behaviour change)
+
+cplt now refuses to launch when a tree the agent can write holds cplt's state directory (`~/.config/cplt`, or `$XDG_CONFIG_HOME/cplt`). That directory holds the config, the trust store and the managed config, so an agent that could write it could approve its own next launch. The check applies whether or not `CPLT_MANAGED_CONFIG` is set (#1095). These setups launched on 2026.11.20 and are refused now:
+
+| Setup | One-step recovery |
+| --- | --- |
+| `allow.write ~/.config` (also in `config.toml`, where it fails every launch and `cplt check net`) | Remove the broad grant, then add the subdirectory you need: `cplt config unset allow.write ~/.config`, then `cplt config set allow.write ~/.config/<tool>`. Unset matches both `~/.config` and the expanded path. For a command-line grant, drop `--allow-write ~/.config` |
+| `allow.write $HOME` | Remove the broad grant, then grant the directories you need: `cplt config unset allow.write ~`, then `cplt config set allow.write ~/work`. For a command-line grant, drop `--allow-write ~` |
+| `allow.write ~/.config` in this repository's local config (`cplt config set --local`, or a hand-edited local file) | `cplt config unset --local allow.write ~/.config`, then `cplt config set --local allow.write ~/.config/<tool>` if you need one |
+| `allow.write ~/.config` proposed in an approved `.cplt.toml` | `cplt config unset --repo allow.write ~/.config`, commit `.cplt.toml`, then approve the change with `cplt trust accept --all` |
+| Launching with `~/.config` as the project directory (`$HOME` was already refused as too broad) | Launch from inside the repository, e.g. `cd ~/src/myrepo && cplt` |
+| `HOME` inside the project directory | Point `HOME` outside the project, or launch from a project that does not contain it |
+| A stow-style `~/.config/cplt` symlink into the project or an `allow.write` tree | Move the cplt directory out of that tree: `rm ~/.config/cplt && mv <dotfiles>/cplt ~/.config/cplt` |
+| A tool-path variable such as `GOCACHE=~/.config` | Point the variable at a directory that does not contain `~/.config/cplt`, or unset it. The error names the variable |
+
+The error names the tree, where it came from and the recovery for that source.
+
 ## Go builds in a git worktree
 
 A Go build in a git worktree can fail under cplt with:

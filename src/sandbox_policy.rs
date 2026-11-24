@@ -190,13 +190,37 @@ pub fn cplt_state_file(home: &Path, name: &str) -> PathBuf {
 
 /// Every directory holding cplt state: the config dir (`CPLT_CONFIG` can move
 /// it), the resolved state root, and the legacy root.
-fn cplt_state_dirs(home: &Path) -> [Option<PathBuf>; 3] {
+fn cplt_state_dirs(home: &Path) -> [Option<PathBuf>; 4] {
     [
         config::config_dir(),
         // The XDG root even when this launch pinned state away from it.
         xdg_state_dir(home),
         Some(home.join(CPLT_STATE_DIR)),
+        passwd_state_dir(home),
     ]
+}
+
+/// `~/.config/cplt` in the passwd home, when `$HOME` is elsewhere. The managed
+/// layer (#1095) trusts `managed.d` there whatever `$HOME` says, so a session
+/// with a relocated `$HOME` must not reach it either.
+#[must_use]
+pub fn passwd_state_dir(home: &Path) -> Option<PathBuf> {
+    let dir = config::account_home()?.join(CPLT_STATE_DIR);
+    (dir != home.join(CPLT_STATE_DIR)).then_some(dir)
+}
+
+/// The legacy state dir (`$HOME`'s or the passwd home's) that a write grant on
+/// `path` would cover: `path` is that dir or one of its ancestors. Landlock has
+/// no deny under a granted tree, so such a grant hands the agent `managed.d`
+/// (#1095); on macOS `--allow-write $HOME` lets it rename `~/.config` away.
+#[must_use]
+pub fn cplt_state_ancestor_grant(home: &Path, path: &Path) -> Option<PathBuf> {
+    let canon = resolver(home);
+    let resolved = canon(path);
+    [Some(home.join(CPLT_STATE_DIR)), passwd_state_dir(home)]
+        .into_iter()
+        .flatten()
+        .find(|dir| canon(dir).starts_with(&resolved) || dir.starts_with(path))
 }
 
 /// nav-pilot's state directory, relative to `$HOME`.

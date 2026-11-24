@@ -4731,6 +4731,23 @@ fn root_agents_md_outside(project_dir: &Path) -> Option<PathBuf> {
         .filter(|p| !p.starts_with(project_dir) && brief::agents_md_is_plain(p).is_ok())
 }
 
+/// The private domains the proxy holds for the whole session, outside its
+/// 5-second config reload: the approved repo proposals and the managed layer
+/// (#1095), both read once at launch.
+fn frozen_private_domains(resolved: &config::Resolved) -> Vec<String> {
+    resolved
+        .repo_private_domains
+        .iter()
+        .chain(
+            resolved
+                .managed
+                .iter()
+                .flat_map(|m| &m.allow_private_domains),
+        )
+        .cloned()
+        .collect()
+}
+
 fn start_proxy_if_enabled(
     resolved: &mut config::Resolved,
     cli: &Cli,
@@ -4942,10 +4959,15 @@ fn start_proxy_if_enabled(
                     .iter()
                     .any(|c| proxy::normalize_hostname(c) == **d)
                     && !resolved.repo_private_domains.contains(d)
+                    && resolved
+                        .managed
+                        .as_ref()
+                        .is_none_or(|m| !m.allow_private_domains.contains(d))
             })
             .cloned()
             .collect(),
-        repo_private_domains: resolved.repo_private_domains.clone(),
+        // The managed file is read once, like the repo proposals: frozen too.
+        repo_private_domains: frozen_private_domains(resolved),
         config_file: config_path.cloned(),
         log_file: resolved.proxy_log_file.clone(),
         log_level: proxy_log_level(
@@ -7343,6 +7365,49 @@ fn is_same_file(real: &Path, name: &str) -> bool {
 /// Every tree the session can write, for refusing a credential anchor the
 /// agent could have planted (`sandbox::keychain_substitute`). Over-including
 /// only falls back to the no-substitute path.
+/// The trees `check`, `doctor` and `config show` test a managed file against
+/// (#1095): the launch set without the agent dirs and the probed tool dirs.
+/// Only an extra refusal; trust itself is the fixed dirs in the passwd home.
+/// Kept as a list: the loader runs before the policy exists. The guarantee is
+/// `sandbox::refuse_policy_write_into_state`, which refuses any write rule at,
+/// above or inside the state dir, so the managed file is never writable.
+fn managed_layer_writable(
+    home: &Path,
+    project: &Path,
+    repos: &[PathBuf],
+    allow_write: &[PathBuf],
+) -> Vec<PathBuf> {
+    let scratch = scratch::ScratchDir::base(home);
+    let mut roots = sandbox::session_writable_roots(project, repos, allow_write, Some(&scratch));
+    // Named roots' separate git dirs are granted write too; on error the
+    // launch refuses the roots anyway.
+    roots.extend(sandbox::named_root_git_dirs(repos).unwrap_or_default());
+    roots.extend(cplt::sandbox::home_and_temp_writable_roots(home, &[], None));
+    roots
+}
+
+/// Load the managed layer (#1095) and, when it is trusted, union it into
+/// `resolved`. Launch, `check` and `doctor` all go through here.
+/// `check` loads the layer for its net snapshot and again in the sandbox
+/// assembly it shares with a launch; say a refusal once.
+fn warn_managed_once(line: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        ui::warn(line);
+    }
+}
+
+fn apply_managed_layer(
+    resolved: &mut config::Resolved,
+    writable: impl FnOnce() -> Vec<PathBuf>,
+) -> Option<Result<config::ManagedConfig, String>> {
+    let loaded = config::load_managed(writable)?;
+    if let Ok(m) = &loaded {
+        resolved.apply_managed(m);
+    }
+    Some(loaded)
+}
+
 fn session_writable_everywhere(
     probe: &HostProbe,
     repos: &[PathBuf],
@@ -7777,6 +7842,14 @@ fn assemble_sandbox(
     // AGENTS.md layer writes into the user's repo and must not run until the
     // launch is confirmed — see `apply_persistent_sandbox_brief`, which the
     // `exec` and `check` paths deliberately never call.
+    // Managed layer (#1095). Trust is the fixed dirs in the passwd home; the
+    // writable set, known only now that the agent dirs are, is an extra refusal.
+    let allow_write = resolved.allow_write.clone();
+    if let Some(Err(line)) = apply_managed_layer(resolved, || {
+        session_writable_everywhere(probe, opts.repos.dirs, &allow_write, &agent_dirs)
+    }) {
+        warn_managed_once(&line);
+    }
     write_session_sandbox_brief(
         resolved,
         active_agent,
@@ -8088,6 +8161,11 @@ fn assemble_sandbox(
     sandbox_config.oauth_port_claimed = mcp_broker
         .as_ref()
         .is_some_and(cplt::mcp_broker::Broker::oauth_port_claimed);
+    // Name the layer a broad allow.write came from; prepare() cannot (#1095).
+    if !opts.inspect_only {
+        sandbox::refuse_state_ancestor_layers(&resolved.allow_write_layers, &probe.home_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =
@@ -8997,6 +9075,20 @@ fn run_check_command(
     {
         ui::error(&proxy::missing_allowlist_error(path));
         return Ok(ExitCode::FAILURE);
+    }
+    // Managed layer (#1095), as the launch applies it.
+    let writable =
+        managed_layer_writable(&home_dir, &project_dir, &repo_paths, &resolved.allow_write);
+    if let Some(Err(line)) = apply_managed_layer(&mut resolved, || writable) {
+        warn_managed_once(&line);
+    }
+    // Read back from `resolved`, so this says what the policy below holds.
+    if let Some(m) = &resolved.managed {
+        ui::info(&format!(
+            "managed config: {} [{}]",
+            m.display_path(),
+            m.tag()
+        ));
     }
     // An unreadable blocklist file stops the live proxy from starting; say so
     // here too rather than report a policy that never runs.
@@ -10110,6 +10202,58 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         ));
     }
 
+    // ── the policy a launch would build, for the rules below ──
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
+    if active_agent == agent::Agent::OpenCode {
+        agent_dirs.extend(agent::opencode_launch_config_grants(
+            &home_dir,
+            &project_dir,
+        ));
+    }
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
+    agent::drop_script_grants_under(
+        &mut agent_dirs,
+        &[
+            std::slice::from_ref(&project_dir),
+            &repo_paths[..],
+            &resolved.allow_write,
+            &cplt::sandbox::home_and_temp_writable_roots(
+                &home_dir,
+                &probe.existing_home_tool_dirs,
+                probe.git_common_dir.as_deref(),
+            ),
+        ]
+        .concat(),
+    );
+    // Managed layer (#1095) before the network snapshot, with the same
+    // writable set a launch uses, so doctor agrees with launch.
+    let allow_write = resolved.allow_write.clone();
+    match apply_managed_layer(&mut resolved, || {
+        session_writable_everywhere(&probe, &repo_paths, &allow_write, &agent_dirs)
+    }) {
+        Some(Ok(managed)) => {
+            ok.push(format!(
+                "managed config: {} [{}]",
+                managed.display_path(),
+                managed.tag()
+            ));
+            for d in &managed.allow_private_domains {
+                ok.push(format!(
+                    "proxy.allow_private_domains: {d} [{}]",
+                    managed.tag()
+                ));
+            }
+        }
+        Some(Err(line)) => findings.push(Finding::warning(
+            line,
+            Some(format!(
+                "fix the file, or unset {}",
+                config::MANAGED_CONFIG_ENV
+            )),
+        )),
+        None => {}
+    }
     // ── network: the policy `cplt check net` classifies against (#604) ──
     // Static: the same gate, no connection and no sandbox battery.
     if resolved.with_proxy {
@@ -10140,30 +10284,6 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         }
     }
 
-    // ── the policy a launch would build, for the rules below ──
-    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
-    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
-    if active_agent == agent::Agent::OpenCode {
-        agent_dirs.extend(agent::opencode_launch_config_grants(
-            &home_dir,
-            &project_dir,
-        ));
-    }
-    agent::canonicalize_agent_dirs(&mut agent_dirs);
-    agent::drop_script_grants_under(
-        &mut agent_dirs,
-        &[
-            std::slice::from_ref(&project_dir),
-            &repo_paths[..],
-            &resolved.allow_write,
-            &cplt::sandbox::home_and_temp_writable_roots(
-                &home_dir,
-                &probe.existing_home_tool_dirs,
-                probe.git_common_dir.as_deref(),
-            ),
-        ]
-        .concat(),
-    );
     let keychain_substitute = cplt::sandbox::keychain_substitute(
         active_agent,
         &home_dir,
@@ -11111,6 +11231,7 @@ fn run_config_show() -> ExitCode {
 
     // Show repo config if present
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
+    show_managed_config(loaded.as_ref(), local.as_ref(), project_dir.as_deref());
     if let Some(ref dir) = project_dir {
         match repo_config::load_repo_config(dir) {
             Ok(Some(loaded_repo)) => {
@@ -11130,6 +11251,41 @@ fn run_config_show() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// The managed layer (#1095) in `config show`: each value tagged with its
+/// source. Same trust rule as a launch (fixed dirs in the passwd home); the
+/// extra writable-tree refusal leaves out the agent's own dirs.
+fn show_managed_config(
+    loaded: Option<&config::LoadedConfig>,
+    local: Option<&config::LoadedConfig>,
+    project_dir: Option<&Path>,
+) {
+    if std::env::var_os(config::MANAGED_CONFIG_ENV).is_none_or(|v| v.is_empty()) {
+        return;
+    }
+    let resolved = loaded
+        .map(|l| l.config.clone())
+        .unwrap_or_default()
+        .merge_with_local(local.map(|l| &l.config), config::CliFlags::default());
+    let allow_write = resolved.map(|r| r.allow_write).unwrap_or_default();
+    let writable = match (std::env::var_os("HOME"), project_dir) {
+        (Some(home), Some(project)) => {
+            managed_layer_writable(Path::new(&home), project, &[], &allow_write)
+        }
+        _ => Vec::new(),
+    };
+    println!();
+    match config::load_managed(|| writable) {
+        Some(Ok(m)) => {
+            println!("Managed config ({}):", m.display_path());
+            for d in &m.allow_private_domains {
+                println!("  proxy.allow_private_domains = {d}  [{}]", m.tag());
+            }
+        }
+        Some(Err(line)) => ui::warn(&line),
+        None => {}
+    }
 }
 
 /// Whether an `--unset` left the repo config's content as it was. Compares
@@ -13626,6 +13782,29 @@ fn lapsed_approval_notice(stored: Option<&trust::TrustEntry>, lapsed: &[&str]) -
     }
 }
 
+/// The first proposed `allow.write` entry that is, contains or lies inside
+/// cplt's state dir (`$HOME`'s or the passwd home's), as an error line.
+fn state_dir_write_proposal(project_dir: &std::path::Path, writes: &[String]) -> Option<String> {
+    let states: Vec<PathBuf> = [
+        std::env::var_os("HOME").map(PathBuf::from),
+        config::account_home(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|h| h.join(".config/cplt"))
+    .collect();
+    writes.iter().find_map(|w| {
+        let path = project_dir.join(config::expand_tilde(w));
+        let state = states.iter().find(|s| sandbox::overlaps_state(&path, s))?;
+        Some(format!(
+            "allow.write entry {w:?} in .cplt.toml would let the sandbox write cplt's state \
+             directory {}, so it cannot be approved. Approve the other keys by name \
+             (`cplt trust accept <key>`), or ask the repository to narrow that entry.",
+            state.display()
+        ))
+    })
+}
+
 fn trust_accept(
     project_dir: &std::path::Path,
     loaded: &repo_config::LoadedRepoConfig,
@@ -13897,6 +14076,15 @@ fn trust_accept(
         }
         keys.to_vec()
     };
+
+    // A write grant at, above or inside cplt's state dir would reach the
+    // trusted managed.d (#1095); the launch refuses it, so refuse it here first.
+    if keys_to_accept.iter().any(|k| k == "allow.write")
+        && let Some(e) = state_dir_write_proposal(project_dir, &loaded.config.propose.allow.write)
+    {
+        ui::error(&e);
+        return ExitCode::FAILURE;
+    }
 
     // Only when approving that key (#1110): an alias must not block `trust accept allow_docker`.
     let aliases = if keys_to_accept
@@ -15423,6 +15611,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// #1095: `trust accept` refuses an allow.write at, above or inside the
+    /// state dir; other entries pass.
+    #[test]
+    fn trust_accept_refuses_write_into_state_dir() {
+        let home = PathBuf::from("/nonexistent-cplt-1095/home");
+        temp_env::with_var("HOME", Some(&home), || {
+            let p = Path::new("/nonexistent-cplt-1095/repo");
+            for w in ["~/.config", "~", "~/.config/cplt/managed.d"] {
+                assert!(
+                    state_dir_write_proposal(p, &[w.to_string()]).is_some(),
+                    "{w}"
+                );
+            }
+            assert!(state_dir_write_proposal(p, &["build".into(), "~/.cache/x".into()]).is_none());
+        });
+    }
     use clap::Parser;
 
     fn parse(args: &[&str]) -> Cli {
@@ -17710,6 +17915,35 @@ mod tests {
                 &[private, a("169.254.169.254")]
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_private_domain_reaches_proxy_and_check_policy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(config::TRUSTED_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nav.toml");
+        std::fs::write(
+            &file,
+            "managed_by = \"nav-pilot\"\nschema = 1\n[proxy]\nallow_private_domains = [\"intern.nav.no\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let managed =
+            config::load_managed_from(file.as_os_str(), Some(home.path()), Some(home.path()), &[])
+                .expect("a file in managed.d is trusted");
+        let mut resolved = config::Config::default()
+            .merge_with_no_proxy_env(config::CliFlags::default(), None)
+            .unwrap();
+        resolved.apply_managed(&managed);
+        assert!(frozen_private_domains(&resolved).contains(&"intern.nav.no".to_string()));
+        let policy = build_net_policy(&resolved, agent::Agent::Copilot).expect("policy builds");
+        assert!(
+            policy
+                .private_domains
+                .contains(&"intern.nav.no".to_string())
         );
     }
 

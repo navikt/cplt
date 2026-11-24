@@ -1,7 +1,7 @@
 //! Per-repository config overrides (`.cplt.toml`).
 
 use super::error::ConfigError;
-use super::path::collapse_tilde;
+use super::path::{collapse_tilde, expand_tilde};
 use super::registry::{ConfigKeyInfo, ConfigValueType};
 
 // ── Repo config set support ──────────────────────────────────────────
@@ -382,12 +382,13 @@ pub fn set_repo_value_in_doc(
                     // --unset without value: remove the entire array
                     allow.remove(array_key);
                 } else if let Some(arr) = allow.get_mut(array_key).and_then(|v| v.as_array_mut()) {
-                    // Match both raw value and collapsed form for removal
-                    let collapsed = collapse_tilde(value);
+                    // Tilde-aware, like global/local `values_equal`: `~/x`, its
+                    // absolute expansion and `~` all name the same entry.
+                    let want = expand_tilde(value);
                     arr.retain(|v| {
                         let s = v.as_str().unwrap_or_default();
                         s != value
-                            && s != collapsed
+                            && v.as_str().is_none_or(|s| expand_tilde(s) != want)
                             && v.as_integer().map(|i| i.to_string()).as_deref() != Some(value)
                     });
                     if arr.is_empty() {
@@ -481,11 +482,11 @@ pub fn set_repo_value_in_doc(
                     section.remove(array_key);
                 } else if let Some(arr) = section.get_mut(array_key).and_then(|v| v.as_array_mut())
                 {
-                    // Match both raw value and collapsed form for removal
-                    let collapsed = collapse_tilde(value);
+                    // Tilde-aware, as for [propose.allow] above.
+                    let want = expand_tilde(value);
                     arr.retain(|v| {
-                        let s = v.as_str().unwrap_or_default();
-                        s != value && s != collapsed
+                        v.as_str()
+                            .is_none_or(|s| s != value && expand_tilde(s) != want)
                     });
                     if arr.is_empty() {
                         section.remove(array_key);
@@ -715,6 +716,29 @@ mod tests {
                 !result.contains("creds.json"),
                 "unset with absolute path should remove collapsed entry, got: {result}"
             );
+        });
+    }
+
+    /// The printed `config unset --repo allow.write ~/x` remedy must remove an
+    /// entry stored as the absolute path, and `~` must match `$HOME` (#1095).
+    #[test]
+    fn set_repo_value_unset_tilde_matches_absolute_entry() {
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let info = lookup_key("allow.write").unwrap();
+            let target = repo_key_target(info).unwrap();
+            for (stored, arg) in [
+                (format!("{home}/.config"), "~/.config"),
+                (home.clone(), "~"),
+            ] {
+                let mut doc = format!("[propose.allow]\nwrite = [{stored:?}, \"/keep\"]\n")
+                    .parse::<toml_edit::DocumentMut>()
+                    .unwrap();
+                set_repo_value_in_doc(&mut doc, info, target, arg, true).unwrap();
+                let out = doc.to_string();
+                assert!(!out.contains(&format!("{stored:?}")), "{arg}: {out}");
+                assert!(out.contains("/keep"), "{arg}: {out}");
+            }
         });
     }
 

@@ -391,7 +391,11 @@ fn array_index_of(arr: &toml_edit::Array, value: &toml_edit::Value) -> Option<us
 /// Compare two TOML values semantically (ignoring formatting).
 fn values_equal(a: &toml_edit::Value, b: &toml_edit::Value) -> bool {
     match (a, b) {
-        (toml_edit::Value::String(a), toml_edit::Value::String(b)) => a.value() == b.value(),
+        // `~/x` and `$HOME/x` name the same path: the shell expands `~` on the
+        // command line, while config.toml may hold the literal form.
+        (toml_edit::Value::String(a), toml_edit::Value::String(b)) => {
+            a.value() == b.value() || expand_tilde(a.value()) == expand_tilde(b.value())
+        }
         (toml_edit::Value::Integer(a), toml_edit::Value::Integer(b)) => a.value() == b.value(),
         _ => false,
     }
@@ -1068,6 +1072,19 @@ mod tests {
             !result.contains("read"),
             "empty array key should be removed"
         );
+    }
+
+    #[test]
+    fn remove_array_element_matches_literal_tilde() {
+        let home = std::env::var("HOME").unwrap();
+        let mut doc: toml_edit::DocumentMut = "[allow]\nwrite = [\"~/.config\", \"/tmp/a\"]\n"
+            .parse()
+            .unwrap();
+        let info = lookup_key("allow.write").unwrap();
+        let removed =
+            remove_array_element_in_doc(&mut doc, info, &format!("{home}/.config")).unwrap();
+        assert!(removed, "expanded form must remove the literal ~ entry");
+        assert!(!doc.to_string().contains("~/.config"));
     }
 
     #[test]

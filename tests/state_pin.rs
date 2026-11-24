@@ -105,8 +105,10 @@ fn e2e_planted_launch_state_is_never_touched_before_the_refusal() {
         let mut stderr = String::new();
         std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
         assert!(!status.success(), "{kind}: {stderr}");
+        // `granted` holds the linked state dir, so the allow.write ancestor
+        // check (#1095) refuses before the resolved-link check can.
         assert!(
-            stderr.contains("Move it out of that tree"),
+            stderr.contains("is a symlink into that tree"),
             "{kind}: {stderr}"
         );
         assert_eq!(
@@ -116,4 +118,53 @@ fn e2e_planted_launch_state_is_never_touched_before_the_refusal() {
         );
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+/// A launch the generated-policy check refuses must not flush or prune state
+/// first: maintenance runs only after every refusal has passed (#1095). The
+/// socket grant is not a writable tree, so only the policy-level check sees it.
+#[test]
+fn e2e_policy_refusal_prunes_nothing() {
+    let home = std::fs::canonicalize(common::make_config_home("policy-refusal")).unwrap();
+    let account = home.join("account");
+    std::fs::create_dir_all(account.join(".config/cplt/managed.d")).unwrap();
+    let launch = home.join(".config/cplt/launch");
+    std::fs::create_dir_all(&launch).unwrap();
+    let marker = launch.join("stale-marker");
+    let f = std::fs::File::create(&marker).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(400 * 24 * 3600);
+    f.set_modified(old).unwrap();
+    drop(f);
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(
+        common::git_ok(&project, &["init", "-q"]),
+        "git init should succeed"
+    );
+
+    let out = common::cplt_local(&home, &project)
+        .args(["--agent", "copilot", "--yes", "--allow-socket"])
+        .arg(account.join(".config/cplt/managed.d/agent.sock"))
+        .env("CPLT_TEST_ACCOUNT_HOME", &account)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_CACHE_HOME")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the launch should be refused: {stderr}"
+    );
+    assert!(
+        stderr.contains("would let the sandbox write cplt's state directory"),
+        "the policy-level check should be what refuses: {stderr}"
+    );
+    assert!(
+        marker.exists(),
+        "a refused launch must not prune launch records"
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }

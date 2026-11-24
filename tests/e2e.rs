@@ -2643,7 +2643,15 @@ mod e2e_tests {
         );
         let zshenv = std::fs::read_to_string(home.path().join(".zshenv")).unwrap();
         assert!(zshenv.contains(".local/share/cplt/bin"), "{zshenv}");
+        // A project of its own: one containing HOME is refused, since it would
+        // make cplt's state dir writable (#1095).
+        let proj = tempfile::Builder::new()
+            .prefix(".cplt-e2e-proj-")
+            .tempdir_in(project_dir())
+            .unwrap();
         let out = cplt_cmd()
+            .arg("--project-dir")
+            .arg(proj.path())
             .args(["--no-validate", "exec", "--", "/bin/zsh", "-c"])
             .arg("command -v copilot")
             .env("HOME", home.path())
@@ -2655,7 +2663,7 @@ mod e2e_tests {
                     fake.path().display()
                 ),
             )
-            .current_dir(project_dir())
+            .current_dir(proj.path())
             .output()
             .expect("cplt exec should run");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -10977,6 +10985,99 @@ paths = [
         );
     }
 
+    /// `check net` and `doctor` load the managed layer (#1095) the way a
+    /// launch does: a file the agent could plant in the project is refused,
+    /// not silently skipped and not applied.
+    #[test]
+    fn e2e_check_net_and_doctor_apply_the_managed_layer() {
+        let proj = check_project();
+        let planted = proj.path().join("managed.toml");
+        std::fs::write(
+            &planted,
+            "managed_by = \"x\"\nschema = 1\n[proxy]\nallow_private_domains = [\"a.nav.no\"]\n",
+        )
+        .unwrap();
+        for args in [
+            &["check", "net", "example.com", "--no-connect"][..],
+            &["doctor"][..],
+        ] {
+            let output = cplt_cmd()
+                .arg("--project-dir")
+                .arg(proj.path())
+                .args(["--agent", "shell"])
+                .args(args)
+                .env("CPLT_MANAGED_CONFIG", &planted)
+                .output()
+                .expect("cplt should run");
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // cplt_cmd() points HOME at a scratch dir, never the passwd home, so the
+            // HOME check refuses first; the path rule is covered by the unit tests.
+            let refused = format!(
+                "CPLT_MANAGED_CONFIG={} ignored: HOME is not the account's home directory",
+                planted.display()
+            );
+            assert!(
+                all.contains(&refused),
+                "{args:?} must load and refuse the planted managed file:\n{all}"
+            );
+        }
+    }
+
+    /// A trusted managed file reaches the policy `check` builds (#1095). Uses
+    /// the debug-only `CPLT_TEST_ACCOUNT_HOME` seam so the scratch home counts
+    /// as the passwd home; fails if `run_check_command` stops applying the layer
+    /// or `apply_managed_layer` stops writing it into the resolved config.
+    #[test]
+    fn e2e_check_applies_a_trusted_managed_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Under the checkout: /tmp and /var/folders are session-writable.
+        let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let dir = home.join(".config/cplt/managed.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nav.toml");
+        std::fs::write(
+            &file,
+            "managed_by = \"nav-pilot\"\nschema = 1\n[proxy]\nallow_private_domains = [\"intern.nav.no\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let proj = home.join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let output = cplt_cmd()
+            .env("HOME", &home)
+            .env("CPLT_TEST_ACCOUNT_HOME", &home)
+            .env("CPLT_MANAGED_CONFIG", &file)
+            .arg("--project-dir")
+            .arg(&proj)
+            .args([
+                "--agent",
+                "shell",
+                "check",
+                "net",
+                "example.com",
+                "--no-connect",
+            ])
+            .output()
+            .expect("cplt should run");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            all.contains(&format!(
+                "managed config: {} [managed:nav-pilot]",
+                file.display()
+            )),
+            "check must apply the trusted managed file:\n{all}"
+        );
+    }
+
     #[test]
     fn e2e_check_net_default_allowed() {
         let proj = check_project();
@@ -12342,6 +12443,289 @@ mod agent_stubs {
         read_only: &'static [&'static str],
         /// What cplt passes before the user args (exact, space-separated).
         extra_args: &'static str,
+    }
+
+    /// `GOCACHE=~/.config` is outside every env tool-dir root (#1104): it is
+    /// dropped with a warning naming GOCACHE, and cplt's state dir stays
+    /// unwritable (#1095).
+    #[test]
+    fn e2e_gocache_over_state_dir_names_the_variable() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-gocache-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(h.join(".config/cplt")).unwrap();
+        // A project directly under HOME is refused as too broad first.
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        // `exec` is quiet by contract, so read the warning off --print-profile.
+        let out = cplt_cmd()
+            .arg("--print-profile")
+            .current_dir(&proj)
+            .env("HOME", &h)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("GOCACHE", h.join(".config"))
+            .output()
+            .expect("binary should run");
+        assert!(out.status.success(), "--print-profile should succeed");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains("Ignoring GOCACHE"),
+            "the dropped GOCACHE grant should be named in a warning"
+        );
+        let cfg = h.join(".config");
+        for tree in [cfg.clone(), cfg.join("cplt")] {
+            let rule = format!("(allow file-write* (subpath \"{}\"))", tree.display());
+            assert!(
+                !all.contains(&rule),
+                "GOCACHE must not grant write over cplt's state dir"
+            );
+        }
+        let out = cplt_cmd()
+            .args(["exec", "--", "/bin/echo", "ok"])
+            .current_dir(&proj)
+            .env("HOME", &h)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("GOCACHE", h.join(".config"))
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "the launch should go ahead without the GOCACHE grant"
+        );
+    }
+
+    /// A broad allow.write over the state dir names the layer it came from:
+    /// `cplt config unset allow.write` cannot remove a local or CLI grant.
+    #[test]
+    fn e2e_state_dir_grant_names_its_layer() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-layer-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let cfg = h.join(".config");
+        std::fs::create_dir_all(cfg.join("cplt")).unwrap();
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let cplt = |args: &[&str]| {
+            cplt_cmd()
+                .args(args)
+                .current_dir(&proj)
+                .env("HOME", &h)
+                .env("XDG_CONFIG_HOME", &cfg)
+                .env("CPLT_CONFIG", cfg.join("cplt/config.toml"))
+                .env_remove("GOCACHE")
+                .output()
+                .expect("binary should run")
+        };
+        let launch_err = |pre: &[&str]| {
+            let mut args = pre.to_vec();
+            args.extend(["exec", "--", "/bin/echo", "ok"]);
+            let out = cplt(&args);
+            assert!(!out.status.success());
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+
+        let err = launch_err(&["--allow-write", cfg.to_str().unwrap()]);
+        assert!(err.contains("Drop `--allow-write ~/.config`"), "{err}");
+
+        // `config set --local` refuses ~/.config itself, so narrow then widen
+        // the saved line, as a hand edit would.
+        let narrow = cfg.join("gh");
+        assert!(
+            cplt(&[
+                "config",
+                "set",
+                "--local",
+                "allow.write",
+                narrow.to_str().unwrap()
+            ])
+            .status
+            .success()
+        );
+        let local = std::fs::read_dir(cfg.join("cplt/local"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(&local).unwrap();
+        std::fs::write(
+            &local,
+            text.replace(narrow.to_str().unwrap(), cfg.to_str().unwrap()),
+        )
+        .unwrap();
+        // The same grant in the global file too: both remedies are printed,
+        // and following only the local one would leave launch failing.
+        let global = cfg.join("cplt/config.toml");
+        std::fs::write(
+            &global,
+            format!("[allow]\nwrite = [{:?}]\n", cfg.to_str().unwrap()),
+        )
+        .unwrap();
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset --local allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`cplt config unset allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "--local", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        let out = cplt(&["exec", "--", "/bin/echo", "ok"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // An approved .cplt.toml proposal duplicating a global grant: both
+        // remedies are printed, and following both makes the launch succeed.
+        let commit = |msg: &str| {
+            assert!(git_ok(&proj, &["add", "-A"]));
+            assert!(git_ok(
+                &proj,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-qm",
+                    msg
+                ]
+            ));
+        };
+        assert!(git_ok(
+            &proj,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/proj.git"
+            ]
+        ));
+        std::fs::write(
+            proj.join(".cplt.toml"),
+            "[propose.allow]\nwrite = [\"~/.config\"]\n",
+        )
+        .unwrap();
+        commit("propose");
+        // `trust accept` now refuses a write grant over the state dir, so seed
+        // the value-pinned approval an older cplt would have written.
+        let seed_approval = |write: &str| {
+            let propose: cplt::repo_config::ProposeSection =
+                toml::from_str(&format!("[allow]\nwrite = [{write:?}]\n")).unwrap();
+            let mut entry = cplt::trust::TrustEntry::default();
+            entry.repo.remote =
+                cplt::trust::normalize_remote_url("https://github.com/acme/proj.git");
+            entry.repo.path = proj.display().to_string();
+            entry.repo.git_dir = std::fs::canonicalize(proj.join(".git"))
+                .unwrap()
+                .display()
+                .to_string();
+            cplt::trust::pin_keys(&mut entry.accepted, vec!["allow.write".into()], &propose);
+            assert!(
+                entry.accepted.keys == ["allow.write"],
+                "seeded approval should pin allow.write"
+            );
+            let file = cfg.join(format!(
+                "cplt/trust/{}.toml",
+                cplt::trust::repo_fingerprint(&proj)
+            ));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, toml::to_string(&entry).unwrap()).unwrap();
+        };
+        seed_approval("~/.config");
+        std::fs::write(
+            &global,
+            format!("[allow]\nwrite = [{:?}]\n", cfg.to_str().unwrap()),
+        )
+        .unwrap();
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset --repo allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`cplt config unset allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "--repo", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        commit("drop");
+        assert!(
+            cplt(&["trust", "accept", "--all"]).status.success(),
+            "trust accept should succeed once the proposal is dropped"
+        );
+
+        // The same proposal spelled as an absolute path: the printed `~/.config`
+        // remedy still removes it.
+        std::fs::write(
+            proj.join(".cplt.toml"),
+            format!("[propose.allow]\nwrite = [{:?}]\n", cfg.to_str().unwrap()),
+        )
+        .unwrap();
+        commit("propose absolute");
+        seed_approval(cfg.to_str().unwrap());
+        let err = launch_err(&[]);
+        assert!(
+            err.contains("`cplt config unset --repo allow.write ~/.config`"),
+            "{err}"
+        );
+        assert!(
+            cplt(&["config", "unset", "--repo", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        assert!(
+            !std::fs::read_to_string(proj.join(".cplt.toml"))
+                .unwrap()
+                .contains(".config"),
+            "absolute-path proposal was not removed"
+        );
+        commit("drop absolute");
+        assert!(
+            cplt(&["trust", "accept", "--all"]).status.success(),
+            "trust accept should succeed once the proposal is dropped"
+        );
+        assert!(
+            cplt(&["config", "unset", "allow.write", "~/.config"])
+                .status
+                .success()
+        );
+        let out = cplt(&["exec", "--", "/bin/echo", "ok"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn run(c: &Case) {
