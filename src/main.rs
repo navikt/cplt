@@ -16480,14 +16480,25 @@ mod tests {
             let d = dir.path().join(sub);
             std::fs::create_dir_all(&d).expect("mkdir");
             let bin = d.join("gh");
+            // #1179: written in-process, the script is open for writing while
+            // other test threads fork, and exec fails ETXTBSY. `cp` keeps the
+            // only writable descriptor in the child (see discover::fake_binary).
+            let staging = d.join("gh.staging");
             std::fs::write(
-                &bin,
+                &staging,
                 format!(
                     "#!/bin/sh\necho \"$PATH|$(pwd)|$@\" > '{}'\nexit {exit}\n",
                     log.display()
                 ),
             )
             .expect("write fake");
+            #[allow(clippy::disallowed_methods)] // absolute path
+            let copied = std::process::Command::new("/bin/cp")
+                .arg(&staging)
+                .arg(&bin)
+                .status()
+                .expect("cp");
+            assert!(copied.success(), "cp of the fake failed: {copied}");
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
             bin
         };
