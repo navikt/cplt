@@ -6148,8 +6148,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
-    if let Some(line) = managed_guard.and_then(config::ManagedSnapshot::finish) {
-        ui::warn(&line);
+    if let Some(guard) = managed_guard {
+        if let Some(line) = guard.finish() {
+            ui::warn(&line);
+        }
+        if !settled {
+            ui::warn(config::UNSETTLED_MANAGED_WARNING);
+        }
     }
     if let Some((own, before)) = &v2_model {
         cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
@@ -8953,8 +8958,13 @@ fn run_exec_command(
             })
         },
     );
-    if let Some(line) = managed_guard.and_then(config::ManagedSnapshot::finish) {
-        ui::warn(&line);
+    if let Some(guard) = managed_guard {
+        if let Some(line) = guard.finish() {
+            ui::warn(&line);
+        }
+        if !settled {
+            ui::warn(config::UNSETTLED_MANAGED_WARNING);
+        }
     }
     if resolved.git_guard.enabled
         && !resolved.quiet
@@ -14216,7 +14226,7 @@ fn lapsed_approval_notice(stored: Option<&trust::TrustEntry>, lapsed: &[&str]) -
 
 /// The first proposed `allow.write` entry that is, contains or lies inside
 /// cplt's state dir (`$HOME`'s or the passwd home's), as a line, and whether
-/// it is refused (inside: no launch can honour it) or only warned (at or above).
+/// it is refused (at or inside: no launch can honour it) or only warned (above).
 fn state_dir_write_proposal(
     project_dir: &std::path::Path,
     writes: &[String],
@@ -14232,7 +14242,8 @@ fn state_dir_write_proposal(
     writes.iter().find_map(|w| {
         let path = project_dir.join(config::expand_tilde(w));
         let state = states.iter().find(|s| sandbox::overlaps_state(&path, s))?;
-        if path != *state && path.starts_with(state) {
+        // The state dir itself counts as inside, as at launch (`validate_grant_path`).
+        if path.starts_with(state) {
             return Some((
                 format!(
                     "allow.write entry {w:?} in .cplt.toml lies inside cplt's state \
@@ -16090,6 +16101,7 @@ mod tests {
                 ("~/.config", false),
                 ("~", false),
                 ("~/.config/cplt/managed.d", true),
+                ("~/.config/cplt", true),
             ] {
                 let got = state_dir_write_proposal(p, &[w.to_string()]).map(|(_, r)| r);
                 assert_eq!(got, Some(refused), "{w}");

@@ -665,6 +665,14 @@ impl ManagedSnapshot {
     }
 }
 
+/// Printed after the managed.d check when a process the session started was
+/// still running: it can write after the check, which is the residual in
+/// SECURITY.md. The loader's checks still apply at the next launch.
+pub const UNSETTLED_MANAGED_WARNING: &str = "A process the session started may still be \
+    running and could write cplt's managed.d after cplt checked it. The managed config is \
+    checked again at the next launch, but stop any leftover process and review \
+    ~/.config/cplt/managed.d.";
+
 fn quarantine_line(dir: &Path, what: &str) -> String {
     format!(
         "The session could write cplt's state directory, and changed {} in {}. \
