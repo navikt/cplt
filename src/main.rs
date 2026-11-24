@@ -10413,7 +10413,11 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                 DoctorProbe::Reachable(host) => ok.push(format!("proxy upstream: {host} reachable")),
                 DoctorProbe::Blocked(hint) => findings.push(Finding::blocking(
                     hint.trim_start_matches("[cplt] ").to_string(),
-                    "allow this cplt binary in the host firewall, or launch with --no-proxy as a stopgap",
+                    format!(
+                        "allow this cplt binary in the host firewall. As a stopgap, launch with `{}`: \
+                         it turns off proxy enforcement and GitHub token masking",
+                        proxy::NO_PROXY_STOPGAP
+                    ),
                 )),
                 DoctorProbe::Inconclusive(why) => ok.push(format!(
                     "proxy upstream: reachability inconclusive: {}",

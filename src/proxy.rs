@@ -256,6 +256,12 @@ impl UpstreamProxy {
     /// tunnel to `host:port`. Includes a `Host` header and, when credentials
     /// were supplied, a `Proxy-Authorization: Basic` header.
     fn connect_request(&self, host: &str, port: u16) -> String {
+        // An IPv6 literal needs brackets in an authority; the live path already has them.
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
         let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
         if let Some(ref auth) = self.proxy_authorization {
             req.push_str("Proxy-Authorization: Basic ");
@@ -1536,6 +1542,10 @@ impl DialFailure {
     }
 }
 
+/// The flags that launch without the proxy when `proxy.forced` and
+/// `proxy.inject_github_token` are on (the generated default).
+pub const NO_PROXY_STOPGAP: &str = "--no-proxy --no-proxy-forced --no-inject-github-token";
+
 /// The one line shown when the proxy cannot dial a host its policy allows.
 /// `host` can be agent-controlled, so it is escaped; so is the binary path.
 #[must_use]
@@ -1547,7 +1557,8 @@ pub fn dial_failure_hint(host: &str, class: DialFailure) -> String {
     format!(
         "[cplt] the proxy could not reach {} ({}); this is not a cplt policy block. \
          If requests keep failing, a local firewall (e.g. Little Snitch) may block {exe}: \
-         allow it, or run `cplt doctor`. --no-proxy works as a stopgap.",
+         allow it, or run `cplt doctor`. As a stopgap, `{NO_PROXY_STOPGAP}` works, \
+         but it turns off proxy enforcement and GitHub token masking.",
         host.escape_default(),
         class.label()
     )
@@ -1615,13 +1626,25 @@ pub fn probe_dial(
     no_proxy: &[String],
     budget: Duration,
 ) -> Result<std::net::SocketAddr, (String, bool)> {
+    let deadline = Instant::now() + budget;
     let host = normalize_hostname(host);
+    if !connect_host_valid(&host) {
+        return Err((
+            format!("{} is not a valid CONNECT target", host.escape_default()),
+            false,
+        ));
+    }
     let localhost_opt_in =
         policy.allow_localhost_any || policy.allow_localhost_ports.contains(&port);
     let localhost_allowed = localhost_connect_allowed(&host, localhost_opt_in);
     let upstream =
         upstream.filter(|_| !localhost_allowed && !host_matches_no_proxy(&host, no_proxy));
-    let resolved = resolve_socket_addrs(&host, port);
+    let Some(resolved) = resolve_within(&host, port, deadline) else {
+        return Err((
+            format!("resolving {} timed out", host.escape_default()),
+            false,
+        ));
+    };
     let route = classify_resolved(
         &resolved,
         upstream.is_some(),
@@ -1641,13 +1664,37 @@ pub fn probe_dial(
             ),
             false,
         )),
-        (ConnectRoute::Direct(addrs), _) => connect_any_within(&addrs, budget)
+        (ConnectRoute::Direct(addrs), _) => connect_any_within(&addrs, time_left(deadline))
             .map(|(_, addr, _)| addr)
             .map_err(|(_, class)| (probe_hint(&host, class), class != DialFailure::Other)),
-        (ConnectRoute::Upstream, Some(u)) => probe_upstream(&host, port, u, budget),
+        (ConnectRoute::Upstream, Some(u)) => probe_upstream(&host, port, u, deadline),
         // classify_resolved returns Upstream only when asked to.
         (ConnectRoute::Upstream, None) => Err((format!("{shown} has no route"), false)),
     }
+}
+
+fn time_left(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Run `f` on a thread and wait until `deadline`; `None` when it has not
+/// finished (the thread is left to end on its own).
+fn run_until<T: Send + 'static>(
+    deadline: Instant,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(time_left(deadline)).ok()
+}
+
+/// [`resolve_socket_addrs`] bounded by `deadline`, so a stalled resolver cannot
+/// outlast the probe budget.
+fn resolve_within(host: &str, port: u16, deadline: Instant) -> Option<Vec<std::net::SocketAddr>> {
+    let host = host.to_string();
+    run_until(deadline, move || resolve_socket_addrs(&host, port))
 }
 
 /// The hosts doctor probes reachability with: `api.github.com` when the
@@ -1686,29 +1733,34 @@ fn probe_hint(host: &str, class: DialFailure) -> String {
 }
 
 /// The upstream leg of [`probe_dial`]: dial the upstream, send the CONNECT the
-/// live proxy would send and require a 2xx, all within `budget`.
+/// live proxy would send and require a 2xx, all before `deadline`.
 fn probe_upstream(
     host: &str,
     port: u16,
     upstream: &UpstreamProxy,
-    budget: Duration,
+    deadline: Instant,
 ) -> Result<std::net::SocketAddr, (String, bool)> {
-    let deadline = Instant::now() + budget;
     let proxy = upstream.host.escape_default();
     let target = host.escape_default();
-    let addrs = resolve_socket_addrs(&upstream.host, upstream.port);
+    let Some(addrs) = resolve_within(&upstream.host, upstream.port, deadline) else {
+        return Err((
+            format!("resolving the upstream proxy {proxy} timed out"),
+            false,
+        ));
+    };
     if addrs.is_empty() {
         return Err((
             format!("the upstream proxy {proxy} did not resolve here"),
             false,
         ));
     }
-    let (mut stream, addr, _) = connect_any_within(&addrs, budget).map_err(|(_, class)| {
-        (
-            probe_hint(&upstream.host, class),
-            class != DialFailure::Other,
-        )
-    })?;
+    let (mut stream, addr, _) =
+        connect_any_within(&addrs, time_left(deadline)).map_err(|(_, class)| {
+            (
+                probe_hint(&upstream.host, class),
+                class != DialFailure::Other,
+            )
+        })?;
     let left = deadline
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(1));
@@ -1737,8 +1789,7 @@ fn probe_upstream(
             ) =>
         {
             Err(format!(
-                "the upstream proxy {proxy} did not answer CONNECT {target}:{port} within {}s",
-                budget.as_secs()
+                "the upstream proxy {proxy} did not answer CONNECT {target}:{port} before the probe deadline"
             ))
         }
         Err(e) => Err(format!(
@@ -1893,6 +1944,15 @@ pub fn classify_connect(policy: &NetPolicy, host: &str, port: u16) -> NetVerdict
 /// `allow_private_domains` entry. This is the exact policy the direct-connect
 /// path enforces inline; the upstream-forward path reuses it so both modes
 /// treat a resolvable host identically.
+/// The host check shared by the live CONNECT path and [`probe_dial`]: no
+/// userinfo, path, fragment or control characters (CRLF would inject headers
+/// into the upstream CONNECT).
+fn connect_host_valid(host: &str) -> bool {
+    !host.is_empty()
+        && !host.contains(['@', '/', '\\', '?', '#'])
+        && !host.chars().any(char::is_control)
+}
+
 fn handle_connect(
     mut client: TcpStream,
     target: &str,
@@ -1927,10 +1987,7 @@ fn handle_connect(
     // Normalize hostname: lowercase, strip trailing dot (valid DNS but
     // would bypass exact-match rules otherwise).
     let host = normalize_hostname(raw_host);
-    if host.is_empty()
-        || host.contains(['@', '/', '\\', '?', '#'])
-        || host.chars().any(char::is_control)
-    {
+    if !connect_host_valid(&host) {
         log_connection(
             state,
             Some(classification),
@@ -6748,6 +6805,59 @@ mod tests {
         assert!(
             err.contains("did not answer"),
             "silent upstream must time out"
+        );
+    }
+
+    /// Review of #1132: the probe rejects what the live CONNECT path rejects.
+    #[test]
+    fn probe_rejects_crlf_host_before_resolving() {
+        let err = probe_dial(
+            &NetPolicy::default(),
+            "a.example\r\nX-Evil: 1",
+            443,
+            None,
+            &[],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(!err.1, "a malformed target is not network-level");
+        assert!(
+            err.0.contains("not a valid CONNECT target"),
+            "malformed host must be refused"
+        );
+    }
+
+    /// Review of #1132: IPv6 literals get brackets in the upstream CONNECT.
+    #[test]
+    fn upstream_connect_request_brackets_ipv6() {
+        let up = UpstreamProxy::parse("http://proxy.example.com:8080").unwrap();
+        let req = up.connect_request("2606:4700:4700::1111", 443);
+        assert!(
+            req.starts_with("CONNECT [2606:4700:4700::1111]:443 HTTP/1.1\r\nHost: [2606:4700:4700::1111]:443\r\n"),
+            "IPv6 authority must be bracketed"
+        );
+        assert!(
+            up.connect_request("[::1]", 443)
+                .starts_with("CONNECT [::1]:443 "),
+            "already bracketed host must stay single-bracketed"
+        );
+    }
+
+    /// Review of #1132: a stalled resolver cannot outlast the deadline.
+    #[test]
+    fn run_until_gives_up_at_the_deadline() {
+        let start = Instant::now();
+        let r = run_until(Instant::now() + Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        assert!(r.is_none(), "a stalled task must yield None");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return at the deadline"
+        );
+        assert_eq!(
+            run_until(Instant::now() + Duration::from_secs(2), || 7),
+            Some(7)
         );
     }
 
