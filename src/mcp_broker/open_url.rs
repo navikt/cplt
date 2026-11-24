@@ -146,25 +146,37 @@ pub fn private_domain_entries(domains: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The answer for a refused URL: for a host outside the list, name it and
-/// the one-line fix.
-fn refusal(url: &str, why: &str) -> String {
-    match host_of(url).filter(|_| why == HOST_NOT_ALLOWED) {
-        Some(h) => {
-            format!(
-                "denied: {h} is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains {h}"
-            )
-        }
+/// The answer for a refused URL. `host` is set only for a URL that passed
+/// the shape rules and names a plain DNS name, so the copy-paste fix never
+/// carries agent-chosen shell syntax or URL parts.
+fn refusal(host: Option<&str>, why: &str) -> String {
+    match host.filter(|_| why == HOST_NOT_ALLOWED) {
+        Some(h) => format!(
+            "denied: {h} is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains {h}"
+        ),
         None => format!("denied: {why}"),
     }
 }
 
-/// The lowercased host of a URL that passed [`check`]'s shape rules.
-fn host_of(url: &str) -> Option<String> {
-    url.strip_prefix("https://")
-        .and_then(|r| r.split(['/', '?', '#']).next())
-        .and_then(|a| a.split(':').next())
-        .map(str::to_ascii_lowercase)
+/// The lowercased host of a URL that passed [`check`]'s shape rules, only if
+/// it is a syntactically valid DNS name (letters, digits, `-`, `.`). Callers
+/// must not pass a URL that failed the shape rules: its "host" can hold
+/// userinfo or other secrets.
+fn dns_host(url: &str) -> Option<String> {
+    let h = url
+        .strip_prefix("https://")?
+        .split(['/', '?', '#'])
+        .next()?
+        .split(':')
+        .next()?
+        .to_ascii_lowercase();
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    (h.len() <= 253 && h.split('.').all(label_ok)).then_some(h)
 }
 
 /// macOS only (owner decision 2026-11-17): LaunchServices picks the handler
@@ -328,17 +340,28 @@ pub(crate) fn serve(
     let Some(url) = super::runtime::read_line(reader, MAX_LEN as u64 + 2) else {
         return;
     };
-    let answer = match check(&url, hosts).and_then(|()| limiter.take(Instant::now())) {
+    let checked = check(&url, hosts);
+    // The host only after the shape rules passed: a malformed URL's authority
+    // can carry userinfo, so its refusal logs and prints the reason alone.
+    let host = match checked {
+        Ok(()) | Err(HOST_NOT_ALLOWED) => dns_host(&url),
+        Err(_) => None,
+    };
+    let answer = match checked.and_then(|()| limiter.take(Instant::now())) {
         Err(why) => {
-            let host = host_of(&url).unwrap_or_default();
-            log.line("open_url", &format!("DENIED {host} {why}"));
-            refusal(&url, why)
+            match &host {
+                Some(h) => log.line("open_url", &format!("DENIED {h} {why}")),
+                None => log.line("open_url", &format!("DENIED {why}")),
+            }
+            refusal(host.as_deref(), why)
         }
         Ok(busy) => match opener(HOST_OPENER).map(|o| spawn_opener(&o, &url, home, busy)) {
             Some(Ok(())) => {
                 // The host only: the query carries OAuth state and PKCE.
-                let host = host_of(&url).unwrap_or_default();
-                log.line("open_url", &format!("ALLOWED {host}"));
+                log.line(
+                    "open_url",
+                    &format!("ALLOWED {}", host.as_deref().unwrap_or("")),
+                );
                 "ok".to_string()
             }
             Some(Err(e)) => {
@@ -598,14 +621,78 @@ mod tests {
 
     #[test]
     fn refusal_names_the_host_and_the_fix() {
+        let h = dns_host("https://Gh.Example:443/login?x");
         assert_eq!(
-            refusal("https://Gh.Example:443/login?x", HOST_NOT_ALLOWED),
+            refusal(h.as_deref(), HOST_NOT_ALLOWED),
             "denied: gh.example is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains gh.example"
         );
         assert_eq!(
-            refusal("http://x/", "URL must be https"),
+            refusal(None, "URL must be https"),
             "denied: URL must be https"
         );
+    }
+
+    /// Copilot review on #1124: an agent-chosen host with shell syntax must
+    /// never reach the copy-paste command.
+    #[test]
+    fn refusal_prints_no_command_for_a_non_dns_host() {
+        let none: &[String] = &[];
+        for u in [
+            "https://evil.example;true;/",
+            "https://evil.example$(id)/",
+            "https://a`b`.example/",
+            "https://-bad.example/",
+            "https://a..b/",
+            "https://x|y/",
+        ] {
+            assert_eq!(check(u, none), Err(HOST_NOT_ALLOWED), "{u}");
+            assert_eq!(dns_host(u), None, "{u}");
+            let mut out = Vec::new();
+            serve(
+                &mut format!("{u}\n").as_bytes(),
+                &mut out,
+                none,
+                &Limiter::default(),
+                Path::new("/nonexistent"),
+                &super::super::Log {
+                    level: crate::proxy::ProxyLogLevel::None,
+                    file: None,
+                },
+            );
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "denied: host not allowed\n"
+            );
+        }
+    }
+
+    /// Copilot review on #1124: a malformed URL's refusal carries no
+    /// URL-derived text, in the answer or in the session log.
+    #[test]
+    fn malformed_url_refusal_leaks_no_url_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("log");
+        let log = super::super::Log {
+            level: crate::proxy::ProxyLogLevel::All,
+            file: Some(file.clone()),
+        };
+        let mut out = Vec::new();
+        serve(
+            &mut "https://oauth-secret@gw.example/\n".as_bytes(),
+            &mut out,
+            &["gw.example".into()],
+            &Limiter::default(),
+            Path::new("/nonexistent"),
+            &log,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out, "denied: userinfo in URL\n");
+        let logged = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(
+            !logged.contains("secret") && !logged.contains("gw."),
+            "{logged}"
+        );
+        assert!(logged.contains("DENIED userinfo in URL"), "{logged}");
     }
 
     #[test]
