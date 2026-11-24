@@ -12640,6 +12640,7 @@ fn every_hinted_config_command_pastes_and_works() {
         "cplt config set --local sandbox.repo_dirs <dir>",
         "cplt config set --local sandbox.repo_dirs <DIR>",
         "cplt config set --local",
+        "cplt config set --repo {key}",
         "cplt config set --repo {key} true --force",
         "cplt config set --repo <key> true",
         "cplt config set --repo deny.env <VALUE>",
