@@ -777,8 +777,8 @@ pub fn refused_first_party_dir(home: &Path, path: &Path) -> Option<PathBuf> {
 /// its name elsewhere, and Landlock or a bwrap bind would then grant write at
 /// the target on the next launch. Below `$HOME` every component is checked;
 /// outside it (a relocated `XDG_*_HOME`) only the root's own name, since the
-/// user chose that path. Recovery: remove the link, or `--allow-write` the
-/// target.
+/// user chose that path. Recovery: replace the link with a real directory;
+/// a tool's `*_DIR` variable pointed at the target is not granted.
 #[must_use]
 pub fn refused_writable_app_root(home: &Path, path: &Path) -> Option<PathBuf> {
     let canon = config::canonicalize_deepest;

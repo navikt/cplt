@@ -75,9 +75,13 @@ uv python install 3.13
 Tools and Pythons already installed there still run inside the sandbox, which
 keeps read and execute on the directory.
 
-`cplt --allow-write ~/.local/share/uv` lets the agent write there, but
-programs it installs there will not run inside the sandbox: cplt never grants
-execute on an `--allow-write` tree.
+`cplt --allow-write ~/.local/share/uv` behaves differently per platform:
+
+- macOS: the agent can write there, but nothing there runs inside the
+  sandbox any more, including tools and Pythons that were already installed.
+  cplt denies execute on `--allow-write` trees.
+- Linux: the agent can write there and run what is there, so it can change
+  programs you run later on the host. cplt warns about this at launch.
 
 A writable application directory reached through a symlink (`~/.cache/uv`,
 `~/.local/share/mise`, or `~/.cache` itself being a link) is no longer
@@ -91,7 +95,7 @@ rm ~/.cache/uv && mv /path/to/target ~/.cache/uv
 
 Pointing the tool's variable at the target (`UV_CACHE_DIR`, `MISE_DATA_DIR`)
 does not help: cplt does not grant those paths, so the tool fails inside the
-sandbox. `--allow-write` on the target restores writes but not execute.
+sandbox. `--allow-write` on the target has the same platform split as above.
 
 ## `sandbox.readonly_host_tool_paths` (off by default)
 
