@@ -9413,6 +9413,39 @@ paths = [
         );
     }
 
+    /// #1128: `exec` and `doctor` force `quiet`, which used to hide the
+    /// "Ignoring <VAR>" warning while the tool failed with a bare EPERM.
+    #[test]
+    fn e2e_exec_and_doctor_warn_about_an_ignored_tool_dir() {
+        require_sandbox!();
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-1128-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let gopath = std::fs::canonicalize(dir.path()).unwrap().join("gopath");
+        std::fs::create_dir(&gopath).unwrap();
+        for args in [
+            vec!["--no-validate", "exec", "--", "/usr/bin/true"],
+            vec!["--agent", "shell", "doctor"],
+        ] {
+            let output = cplt_cmd()
+                .args(&args)
+                .env("GOPATH", &gopath)
+                .current_dir(project_dir())
+                .output()
+                .expect("cplt should run");
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                all.contains("Ignoring GOPATH"),
+                "{args:?} must warn:\n{all}"
+            );
+        }
+    }
+
     /// #343 review: `exec` ignores the agent `resolve_context` detected and
     /// always builds the Shell profile, so a warning about the detected agent's
     /// directories describes a session that was never assembled. The tool-dir
