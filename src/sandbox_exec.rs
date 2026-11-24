@@ -2974,9 +2974,10 @@ echo gho_stored_fixture"#,
         );
     }
 
-    /// #1063: an older gh that rejects `--no-refresh` still hands over its token.
+    /// #1147: an older gh that rejects `--no-refresh` is never retried with
+    /// refresh back on; the token is reported unavailable instead.
     #[test]
-    fn an_older_gh_without_no_refresh_still_hands_the_token_over() {
+    fn an_older_gh_without_no_refresh_is_never_called_without_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("calls");
         let gh = gh_stub(
@@ -2988,13 +2989,10 @@ echo gho_old"#,
                 log.display()
             ),
         );
-        assert_eq!(
-            gh_auth_token(&gh, Duration::from_secs(10)),
-            Some("gho_old".to_string())
-        );
+        assert_eq!(gh_auth_token(&gh, Duration::from_secs(10)), None);
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "auth token --hostname github.com --no-refresh\nauth token --hostname github.com\n"
+            "auth token --hostname github.com --no-refresh\n"
         );
     }
 

@@ -283,38 +283,31 @@ pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<
     Ok(real)
 }
 
+/// Shown when gh predates `auth token --no-refresh`.
+pub(crate) const GH_TOO_OLD: &str = "gh is too old to read its token without refreshing it; upgrade gh to hand its login to the sandbox";
+
 /// `config_dir` pins gh to the dir that was checked, so the lookup reads it.
 #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
 fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> Option<String> {
-    let probe = |no_refresh: bool| {
-        let mut cmd = std::process::Command::new(gh);
-        cmd.args(["auth", "token", "--hostname", "github.com"]);
-        // Without it gh refreshes an expiring token over the network and
-        // writes the keyring; doctor and offline launches must not (#1063).
-        if no_refresh {
-            cmd.arg("--no-refresh");
-        }
-        if let Some(dir) = config_dir {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        for var in AUTH_ENV_VARS {
-            cmd.env_remove(var);
-        }
-        bounded_run(cmd, timeout, true)
-    };
-    // Retry only when gh names the flag as unknown (an older gh, which has no
-    // refresh to suppress). A denied Keychain read also exits 1; retrying it
-    // would prompt again with refresh back on. A timeout (None) never retries.
-    let (ok, mut buf, stderr) = probe(true)?;
+    let mut cmd = std::process::Command::new(gh);
+    // Without `--no-refresh` gh 2.103+ refreshes an expiring token and rewrites
+    // the keyring. Refresh tokens are single-use, so a lost race deletes the
+    // user's stored login (#1063, #1147). Never run it without the flag.
+    cmd.args(["auth", "token", "--hostname", "github.com", "--no-refresh"]);
+    if let Some(dir) = config_dir {
+        cmd.env("GH_CONFIG_DIR", dir);
+    }
+    for var in AUTH_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    // A timeout (None) or any failure hands over nothing. An older gh that
+    // rejects the flag gets a hint, never a retry with refresh back on.
+    let (ok, buf, stderr) = bounded_run(cmd, timeout, true)?;
     if !ok {
-        if !String::from_utf8_lossy(&stderr).contains("unknown flag: --no-refresh") {
-            return None;
+        if String::from_utf8_lossy(&stderr).contains("unknown flag: --no-refresh") {
+            crate::ui::warn(GH_TOO_OLD);
         }
-        let (ok, retry, _) = probe(false)?;
-        if !ok {
-            return None;
-        }
-        buf = retry;
+        return None;
     }
     let token = String::from_utf8_lossy(&buf).trim().to_string();
     (!token.is_empty()).then_some(token)
