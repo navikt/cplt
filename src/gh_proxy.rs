@@ -301,18 +301,8 @@ fn api_flag_values(args: &[&str]) -> Vec<usize> {
             out.push(i);
             break;
         }
-        let mut takes_next = false;
-        if let Some(long) = a.strip_prefix("--") {
-            takes_next = !long.contains('=') && LONG.contains(&a);
-            out.push(i);
-        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
-            // When unsure whether a word is consumed, do not consume it: a
-            // cluster with `=` (`-i=t`, `-X=GET`) carries its own value.
-            if !cluster.contains('=')
-                && let Some(pos) = cluster.find(SHORT)
-            {
-                takes_next = pos + 1 == cluster.len();
-            }
+        let takes_next = flag_takes_next(a, SHORT, LONG);
+        if a.len() > 1 && a.starts_with('-') {
             out.push(i);
         }
         if takes_next && i + 1 < args.len() {
@@ -412,10 +402,8 @@ fn positional_operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
             out.extend(&rest[i + 1..]);
             break;
         }
-        let takes_next = if a.starts_with("--") {
-            long.contains(&a)
-        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
-            matches!(scan_short_cluster(cluster, short), Some((_, None)))
+        let takes_next = if a.len() > 1 && a.starts_with('-') {
+            flag_takes_next(a, short, long)
         } else {
             if seen_sub || sub.is_none() {
                 out.push(a);
@@ -1657,6 +1645,11 @@ fn scan_short_cluster<'a>(
     value_flags: &[char],
 ) -> Option<(char, Option<&'a str>)> {
     for (byte_idx, ch) in cluster.char_indices() {
+        // `=` ends the cluster: what follows is the value of the letter before
+        // it (`-c=t` sets boolean `c`), never more letters (#1109, #1119).
+        if ch == '=' {
+            return None;
+        }
         if value_flags.contains(&ch) {
             let rest = &cluster[byte_idx + ch.len_utf8()..];
             let attached = (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest));
@@ -1664,6 +1657,20 @@ fn scan_short_cluster<'a>(
         }
     }
     None
+}
+
+/// Whether flag word `a` consumes the next word, given a command's value-flag
+/// tables. The single arity rule for every argv walker: `--x=v` and clusters
+/// with `=` carry their own value, unknown flags consume nothing, and a cluster
+/// ending in a value letter takes the next word. When unsure, do not consume.
+fn flag_takes_next(a: &str, short: &[char], long: &[&str]) -> bool {
+    if a.starts_with("--") {
+        long.contains(&a)
+    } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+        matches!(scan_short_cluster(cluster, short), Some((_, None)))
+    } else {
+        false
+    }
 }
 
 fn find_subcommand_hint<'a>(command: &str, args: &'a [&'a str]) -> Option<&'a str> {
@@ -13728,6 +13735,62 @@ mod tests {
 
     /// Review of #1070 at 8623d4fc: a positional `HOST/OWNER/REPO` picks the
     /// host like `-R` does.
+    #[test]
+    fn equals_cluster_before_url_operand_withholds_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        for flag in ["-c=t", "-c=f", "-cc=t", "-x=t"] {
+            let args = ["pr", "view", flag, "https://gİthub.com/o/r/pull/1"];
+            assert!(
+                !github_token_allowed_for(&args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Every argv walker uses one arity rule, so they agree on which words
+    /// are consumed as flag values (#1109, #1119).
+    #[test]
+    fn argv_walkers_agree_on_flag_arity() {
+        // (args, word that must be an operand, not a consumed value)
+        for (args, operand) in [
+            (&["pr", "view", "-c=t", "U"][..], "U"),
+            (&["pr", "view", "-cc=t", "U"], "U"),
+            (&["pr", "view", "-x=t", "U"], "U"),
+            (&["pr", "view", "-t", "T", "U"], "U"),
+            (&["pr", "view", "-ct", "T", "U"], "U"),
+            (&["pr", "view", "--", "-t"], "-t"),
+        ] {
+            assert_eq!(positional_operands(args), vec![operand], "{args:?}");
+        }
+        for (args, endpoint) in [
+            (&["api", "-i=t", "E"][..], 2),
+            (&["api", "-ii=t", "E"], 2),
+            (&["api", "-X=GET", "E"], 2),
+            (&["api", "-iX", "GET", "E"], 3),
+            (&["api", "-iXGET", "E"], 2),
+            (&["api", "--method=GET", "E"], 2),
+            (&["api", "--unknown", "E"], 2),
+        ] {
+            assert!(!api_flag_values(args).contains(&endpoint), "{args:?}");
+        }
+        for (a, short, long, want) in [
+            ("-c=t", &['t'][..], &[][..], false),
+            ("-X=GET", &['X'], &[], false),
+            ("-iX", &['X'], &[], true),
+            ("-iXGET", &['X'], &[], false),
+            ("--x=v", &[], &["--x"], false),
+            ("--x", &[], &["--x"], true),
+            ("--y", &[], &["--x"], false),
+        ] {
+            assert_eq!(flag_takes_next(a, short, long), want, "{a}");
+        }
+        assert_eq!(scan_short_cluster("c=R", &['R']), None);
+        assert_eq!(
+            scan_short_cluster("X=GET", &['X']),
+            Some(('X', Some("GET")))
+        );
+    }
+
     #[test]
     fn positional_host_repo_withholds_token() {
         let hosts = vec![DEFAULT_GH_HOST.to_string()];
