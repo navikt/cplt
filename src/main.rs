@@ -9087,18 +9087,10 @@ fn split_host_port(target: &str) -> (String, u16) {
 /// Best-effort outbound reachability check (cplt runs outside the sandbox).
 /// Only used for an ALLOWED target to confirm "cplt is not blocking this";
 /// never affects the decision.
-fn probe_reachable(host: &str, port: u16) -> String {
-    use std::net::ToSocketAddrs;
-    let addr = format!("{host}:{port}");
-    let Ok(mut addrs) = addr.to_socket_addrs() else {
-        return format!("policy allows it, but {host} did not resolve here");
-    };
-    let Some(sa) = addrs.next() else {
-        return format!("policy allows it, but {host} did not resolve here");
-    };
-    match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(4)) {
-        Ok(_) => format!("reachable, connected to {sa} then closed"),
-        Err(_) => "policy allows it, but the host was not reachable from here".to_string(),
+fn probe_reachable(host: &str, port: u16, upstream: Option<&proxy::UpstreamProxy>) -> String {
+    match proxy::probe_dial(host, port, upstream, std::time::Duration::from_secs(4)) {
+        Ok(sa) => format!("reachable, connected to {sa} then closed"),
+        Err(hint) => format!("policy allows it, but upstream is unreachable: {hint}"),
     }
 }
 
@@ -9261,6 +9253,7 @@ fn run_check_command(
             resolved.proxy_forced,
             &dom,
             no_connect,
+            resolved.proxy_upstream.as_ref(),
             agent_name,
             preset_name,
         ),
@@ -9875,12 +9868,14 @@ fn resolved_ip_verdict(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_net_check(
     net_policy: &proxy::NetPolicy,
     proxy_enabled: bool,
     proxy_forced: bool,
     target: &str,
     no_connect: bool,
+    upstream: Option<&proxy::UpstreamProxy>,
     agent_name: String,
     preset_name: Option<String>,
 ) -> check::Report {
@@ -9908,7 +9903,7 @@ fn build_net_check(
     }
 
     let mut note = if !no_connect && expl.decision == check::Decision::Allowed && proxy_enabled {
-        Some(probe_reachable(&host, port))
+        Some(probe_reachable(&host, port, upstream))
     } else {
         None
     };
@@ -10343,6 +10338,23 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         // The refusal line carries its own remedy.
         Some(Err(line)) => findings.push(Finding::warning(line, None)),
         None => {}
+    }
+    // ── network: can the proxy dial out at all (#1130)? Doctor may use the
+    // network; a launch never runs this. A local firewall that has not seen
+    // this binary path fails every CONNECT with a bare 502 otherwise.
+    if resolved.with_proxy {
+        match proxy::probe_dial(
+            "api.github.com",
+            443,
+            resolved.proxy_upstream.as_ref(),
+            std::time::Duration::from_secs(4),
+        ) {
+            Ok(_) => ok.push("proxy upstream: api.github.com reachable".to_string()),
+            Err(hint) => findings.push(Finding::blocking(
+                hint.trim_start_matches("[cplt] ").to_string(),
+                "allow this cplt binary in the host firewall, or launch with --no-proxy as a stopgap",
+            )),
+        }
     }
     // ── network: the policy `cplt check net` classifies against (#604) ──
     // Static: the same gate, no connection and no sandbox battery.
@@ -17978,6 +17990,7 @@ mod tests {
             false,
             "github.com",
             true, // no_connect
+            None,
             "copilot".to_string(),
             None,
         );

@@ -214,6 +214,56 @@ mod tests {
         }
     }
 
+    /// A port nothing listens on: bound, read, released.
+    fn dead_upstream() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    }
+
+    /// #1130: when the proxy cannot dial out, the session prints one line that
+    /// names the cause and the fix, once however many requests fail.
+    #[test]
+    fn unreachable_upstream_prints_one_notice_per_session() {
+        let project = project();
+        let output = command(&project)
+            .args(["--with-proxy", "--proxy-upstream", &dead_upstream()])
+            .args([
+                "exec", "--", "/bin/sh", "-c",
+                "for i in 1 2 3; do /usr/bin/curl --silent --show-error --max-time 5 --proxy \"$HTTPS_PROXY\" --noproxy '' https://example.com/; done",
+            ])
+            .output()
+            .unwrap();
+        let stderr = stderr(&output);
+        assert!(stderr.contains("response 502"), "{stderr}");
+        assert_eq!(
+            stderr.matches("the proxy could not reach").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(stderr.contains("connection refused"), "{stderr}");
+        assert!(stderr.contains("Little Snitch"), "{stderr}");
+    }
+
+    #[test]
+    fn doctor_reports_unreachable_upstream_as_blocking() {
+        let project = project();
+        let output = cplt_cmd()
+            .current_dir(project.path())
+            .env("NO_COLOR", "1")
+            .args([
+                "--with-proxy",
+                "--proxy-upstream",
+                &dead_upstream(),
+                "doctor",
+            ])
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{out}");
+        assert!(out.contains("the proxy could not reach 127.0.0.1"), "{out}");
+        assert!(out.contains("blocking"), "{out}");
+    }
+
     #[test]
     fn disabled_proxy_is_unavailable_instead_of_zero() {
         let project = project();

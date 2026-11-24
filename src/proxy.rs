@@ -1463,8 +1463,18 @@ fn attempt_timeout(left: Duration, remaining: usize) -> Duration {
 /// does; a dead first address costs up to 2 s. Race them if that shows up.
 fn connect_any(
     addrs: &[std::net::SocketAddr],
-) -> Result<(TcpStream, std::net::SocketAddr, String), String> {
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
+) -> Result<(TcpStream, std::net::SocketAddr, String), (String, DialFailure)> {
+    connect_any_within(addrs, CONNECT_TIMEOUT)
+}
+
+/// [`connect_any`] with its own deadline; `cplt doctor` and `cplt check net`
+/// probe with a shorter one. The error carries the class of the last failure.
+fn connect_any_within(
+    addrs: &[std::net::SocketAddr],
+    budget: Duration,
+) -> Result<(TcpStream, std::net::SocketAddr, String), (String, DialFailure)> {
+    let deadline = Instant::now() + budget;
+    let mut class = DialFailure::Timeout;
     let ordered = interleave_families(addrs);
     let mut failures = Vec::new();
     for (i, addr) in ordered.iter().enumerate() {
@@ -1475,10 +1485,112 @@ fn connect_any(
         }
         match TcpStream::connect_timeout(addr, attempt_timeout(left, ordered.len() - i)) {
             Ok(stream) => return Ok((stream, *addr, failures.join("; "))),
-            Err(e) => failures.push(format!("{addr}: {e}")),
+            Err(e) => {
+                class = DialFailure::classify(e.kind());
+                failures.push(format!("{addr}: {e}"));
+            }
         }
     }
-    Err(failures.join("; "))
+    Err((failures.join("; "), class))
+}
+
+/// Why an upstream dial failed, coarse enough to name the likely fix. This is
+/// never a cplt policy verdict: every address dialled already passed policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialFailure {
+    Timeout,
+    Refused,
+    Reset,
+    /// EPERM/EACCES on connect: a local firewall or packet filter said no.
+    Denied,
+    NoRoute,
+    Other,
+}
+
+impl DialFailure {
+    #[must_use]
+    pub fn classify(kind: std::io::ErrorKind) -> Self {
+        use std::io::ErrorKind as K;
+        match kind {
+            K::TimedOut | K::WouldBlock => Self::Timeout,
+            K::ConnectionRefused => Self::Refused,
+            K::ConnectionReset | K::ConnectionAborted => Self::Reset,
+            K::PermissionDenied => Self::Denied,
+            K::HostUnreachable | K::NetworkUnreachable | K::NetworkDown | K::AddrNotAvailable => {
+                Self::NoRoute
+            }
+            _ => Self::Other,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "connection timed out",
+            Self::Refused => "connection refused",
+            Self::Reset => "connection reset",
+            Self::Denied => "connect denied by the local system",
+            Self::NoRoute => "no route to host",
+            Self::Other => "connect failed",
+        }
+    }
+}
+
+/// The one line shown when the proxy cannot dial a host its policy allows.
+/// `host` can be agent-controlled, so it is escaped; so is the binary path.
+#[must_use]
+pub fn dial_failure_hint(host: &str, class: DialFailure) -> String {
+    let exe = std::env::current_exe().map_or_else(
+        |_| "the cplt binary".to_string(),
+        |p| p.display().to_string().escape_default().to_string(),
+    );
+    format!(
+        "[cplt] the proxy could not reach {} ({}). This is not a cplt policy block. \
+         A local firewall (e.g. Little Snitch) may block this cplt binary; allow {exe}, \
+         or run `cplt doctor`. --no-proxy works as a stopgap.",
+        host.escape_default(),
+        class.label()
+    )
+}
+
+/// The 502 for a failed upstream dial, with [`dial_failure_hint`] as its body
+/// so curl -v and gh show the cause. Prints the hint to the terminal once per
+/// failure class per session, so a retry loop does not flood it.
+fn dial_failure_response(host: &str, class: DialFailure) -> Vec<u8> {
+    let hint = dial_failure_hint(host, class);
+    // The NUL prefix keeps these keys apart from the host names in the cache.
+    if first_hint_for(&format!("\0dial:{class:?}")) {
+        eprintln!("{hint}");
+    }
+    format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{hint}\n",
+        hint.len() + 1
+    )
+    .into_bytes()
+}
+
+/// Dial `host:port` the way the proxy would (through the upstream proxy when
+/// one is set), for `cplt doctor` and `cplt check net`. `Err` is the hint.
+pub fn probe_dial(
+    host: &str,
+    port: u16,
+    upstream: Option<&UpstreamProxy>,
+    budget: Duration,
+) -> Result<std::net::SocketAddr, String> {
+    let (dial_host, dial_port) = upstream.map_or((host, port), |u| (u.host.as_str(), u.port));
+    let addrs = resolve_socket_addrs(dial_host, dial_port);
+    if addrs.is_empty() {
+        return Err(format!(
+            "{} did not resolve here",
+            dial_host.escape_default()
+        ));
+    }
+    connect_any_within(&addrs, budget)
+        .map(|(_, addr, _)| addr)
+        // The caller is doctor or check, so drop the advice to run doctor.
+        .map_err(|(_, class)| {
+            dial_failure_hint(dial_host, class).replace(", or run `cplt doctor`", "")
+        })
 }
 
 /// The verdict of the proxy's pre-DNS CONNECT policy gates.
@@ -1867,7 +1979,7 @@ fn connect_direct(
             };
             (s, format!("CONNECTED (via {addr}{after}{skip})"))
         }
-        Err(e) => {
+        Err((e, class)) => {
             log_connection(
                 state,
                 Some(classification),
@@ -1875,7 +1987,7 @@ fn connect_direct(
                 target,
                 &format!("CONNECT-FAIL:{e}"),
             );
-            reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reject(&mut client, &dial_failure_response(host, class));
             return;
         }
     };
@@ -1940,7 +2052,7 @@ fn connect_via_upstream(
             s.set_nodelay(true).ok();
             (s, format!("CONNECTED (upstream via {addr} after {failed})"))
         }
-        Err(e) => {
+        Err((e, class)) => {
             log_connection(
                 state,
                 Some(classification),
@@ -1948,7 +2060,7 @@ fn connect_via_upstream(
                 target,
                 &format!("CONNECT-FAIL:upstream:{e}"),
             );
-            reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reject(&mut client, &dial_failure_response(&upstream.host, class));
             return;
         }
     };
@@ -3414,7 +3526,7 @@ mod tests {
         assert_eq!(used, live_addr);
         assert!(failed.contains(&closed.to_string()), "{failed}");
 
-        let err = connect_any(&[closed, closed]).unwrap_err();
+        let (err, _) = connect_any(&[closed, closed]).unwrap_err();
         assert_eq!(err.matches(&closed.to_string()).count(), 2, "{err}");
     }
 
@@ -6260,6 +6372,113 @@ mod tests {
     /// Security invariant (Finding 3a): a fail-closed allowlist rejects a target
     /// BEFORE the upstream proxy is contacted. The allowlist gate must run ahead
     /// of forwarding, exactly as the blocklist gate does.
+    #[test]
+    fn dial_failures_classify_and_name_the_fix() {
+        use std::io::ErrorKind as K;
+        assert_eq!(DialFailure::classify(K::TimedOut), DialFailure::Timeout);
+        assert_eq!(
+            DialFailure::classify(K::ConnectionRefused),
+            DialFailure::Refused
+        );
+        assert_eq!(
+            DialFailure::classify(K::ConnectionReset),
+            DialFailure::Reset
+        );
+        assert_eq!(
+            DialFailure::classify(K::PermissionDenied),
+            DialFailure::Denied
+        );
+        assert_eq!(
+            DialFailure::classify(K::HostUnreachable),
+            DialFailure::NoRoute
+        );
+        assert_eq!(
+            DialFailure::classify(K::NetworkUnreachable),
+            DialFailure::NoRoute
+        );
+        assert_eq!(DialFailure::classify(K::Other), DialFailure::Other);
+
+        let hint = dial_failure_hint("evil\n.example", DialFailure::Timeout);
+        assert!(
+            !hint.contains('\n'),
+            "agent-controlled host must be escaped: {hint}"
+        );
+        for needle in [
+            "connection timed out",
+            "not a cplt policy block",
+            "Little Snitch",
+            "cplt doctor",
+        ] {
+            assert!(hint.contains(needle), "{needle}: {hint}");
+        }
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        assert!(hint.contains(&exe.escape_default().to_string()), "{hint}");
+
+        let resp =
+            String::from_utf8(dial_failure_response("h.example", DialFailure::Denied)).unwrap();
+        let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 502"));
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "{resp}"
+        );
+        assert!(
+            body.contains("connect denied by the local system"),
+            "{body}"
+        );
+        // Once per class per session: a second failure of the same class is quiet.
+        assert!(!first_hint_for("\0dial:Denied"));
+    }
+
+    /// #1130: an allowed target whose dial fails gets a 502 that names the
+    /// cause and the fix, and `probe_dial` (doctor, check net) reports the same.
+    #[test]
+    fn unreachable_upstream_gets_an_explained_502_and_probe_fails() {
+        require_localhost_tcp!();
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{dead_port}")).unwrap();
+
+        let err = probe_dial(
+            "api.github.com",
+            443,
+            Some(&upstream),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("connection refused") && err.contains("Little Snitch"),
+            "{err}"
+        );
+
+        let proxy = make_proxy_with_upstream_opts(
+            upstream,
+            PathBuf::from("/dev/null"),
+            vec![443],
+            None,
+            Vec::new(),
+            None,
+        );
+        let resp = {
+            use std::io::{Read as _, Write as _};
+            let mut conn = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+            let _ = write!(
+                conn,
+                "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+            );
+            let mut resp = String::new();
+            let _ = conn.read_to_string(&mut resp);
+            resp
+        };
+        assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
+        assert!(resp.contains("could not reach 127.0.0.1"), "{resp}");
+        assert!(
+            resp.contains("connection refused") && resp.contains("allow "),
+            "{resp}"
+        );
+    }
+
     #[test]
     fn proxy_allowlist_blocks_before_upstream() {
         require_localhost_tcp!();
