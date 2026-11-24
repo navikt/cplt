@@ -5595,6 +5595,48 @@ paths = [
         }
     }
 
+    /// A symlink target can carry terminal escapes; neither `config set
+    /// --repo` nor `cplt trust` may print them raw.
+    #[test]
+    fn e2e_repo_refusal_escapes_a_hostile_symlink_target() {
+        let outside = tempfile::tempdir().unwrap();
+        let evil = outside.path().join("x\x1b[2J\ry");
+        std::fs::create_dir(&evil).unwrap();
+        let repo = temp_repo("test-org/escape");
+        std::os::unix::fs::symlink(&evil, repo.path().join("link")).unwrap();
+        let out = cplt_cmd()
+            .args(["config", "set", "--repo", "allow.read", "link"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            !stderr.contains('\x1b') && !stderr.contains('\r'),
+            "{stderr:?}"
+        );
+        assert!(stderr.contains("\\u{1b}[2J\\r"), "{stderr:?}");
+        std::fs::write(
+            repo.path().join(".cplt.toml"),
+            "[propose.allow]\nread = [\"link\"]\n[deny]\npaths = [\"link\"]\n",
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", ".cplt.toml", "link"]));
+        assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
+        let show = cplt_cmd()
+            .args(["trust"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&show.stdout),
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(all.contains("REFUSED"), "{all:?}");
+        assert!(!all.contains('\x1b') && !all.contains('\r'), "{all:?}");
+    }
+
     #[test]
     fn e2e_config_set_repo_deny_paths() {
         let repo = make_repo_dir("set-repo-deny");

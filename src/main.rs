@@ -13741,7 +13741,10 @@ fn spelled_with_canonical(raw: &str, dir: &Path) -> String {
     if canonical == spelled {
         raw.to_string()
     } else {
-        format!("{raw}  (resolves to {})", canonical.display())
+        format!(
+            "{raw}  (resolves to {})",
+            canonical.to_string_lossy().escape_debug()
+        )
     }
 }
 

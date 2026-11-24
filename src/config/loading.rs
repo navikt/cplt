@@ -2057,6 +2057,17 @@ fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Opti
 
 fn repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Result<PathBuf, String> {
     let resolved = resolve_repo_path(path_str, config_dir);
+    // A committed symlink chooses the resolved name, and every message below
+    // prints it: escape sequences in it would rewrite the trust display.
+    // Refused here, escaped, so no caller ever renders it raw.
+    let shown = resolved.to_string_lossy();
+    if shown.chars().any(char::is_control) {
+        return Err(format!(
+            "{key} entry {path_str:?} resolves to a path with control characters (\"{}\"), \
+             so cplt is ignoring it. Rename the target or name a different path.",
+            shown.escape_debug()
+        ));
+    }
     // #551: `docs/hosts` approved, then repointed by the agent at
     // `../ssh/id_ed25519` in a repo that holds the linked `~/.ssh`, still
     // resolves inside the repository.
