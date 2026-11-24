@@ -1843,6 +1843,58 @@ fn config_get_json_names_the_layer_that_set_the_key() {
         (&json!(true), &json!("local"), &json!(true))
     );
 
+    // additive lists keep every file's entries, not only the highest layer's
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[sandbox]\nallow_localhost_any = false\n[allow]\ndomains = [\"user.example\"]\n",
+    )
+    .unwrap();
+    let (so, se, st) = launch(
+        &home,
+        repo.path(),
+        &["config", "set", "--local", "allow.domains", "local.example"],
+    );
+    assert!(st.success(), "config set --local list:\n{so}{se}");
+    let (_, v) = get_json(&home, repo.path(), "allow.domains", None);
+    assert_eq!(v["value"], json!(["user.example", "local.example"]));
+    assert_eq!(v["source"], "local");
+
+    // baseline arrays are parsed, not split with their TOML quotes; booleans are bools
+    let (_, v) = get_json(&home, repo.path(), "gh_guard.hosts", None);
+    assert!(
+        v["value"].as_array().is_some_and(|a| a
+            .iter()
+            .all(|h| h.as_str().is_some_and(|h| !h.contains('"')))),
+        "no TOML quotes in values: {v}"
+    );
+    let (_, v) = get_json(&home, repo.path(), "sandbox.mask_missing_deny_paths", None);
+    assert!(v["value"].is_boolean(), "a bool key must be a bool: {v}");
+
+    // a repo [deny] applies without approval, so it is reported as repo
+    std::fs::write(
+        repo.path().join(".cplt.toml"),
+        "[deny]\nenv = [\"MY_SECRET\"]\n",
+    )
+    .unwrap();
+    for args in [
+        &["add", ".cplt.toml"][..],
+        &["commit", "--quiet", "-m", "deny"][..],
+    ] {
+        assert!(
+            common::git_cmd(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let (_, v) = get_json(&home, repo.path(), "deny.env", None);
+    assert_eq!(
+        (&v["value"], &v["source"], &v["set"]),
+        (&json!(["MY_SECRET"]), &json!("repo"), &json!(true))
+    );
+
     // managed, on a list key it may extend
     let dir = cfg.join("managed.d");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1857,7 +1909,7 @@ fn config_get_json_names_the_layer_that_set_the_key() {
     assert_eq!(code, 0);
     assert_eq!(
         v,
-        json!({"schema":1,"key":"allow.domains","value":["managed-only.example"],
+        json!({"schema":1,"key":"allow.domains","value":["user.example","local.example","managed-only.example"],
                "source":"managed","set":true,"managed_by":"nav-pilot"})
     );
 

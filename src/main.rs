@@ -12299,17 +12299,19 @@ fn run_config_get_json(key: &str) -> ExitCode {
         dir: &l.dir,
         approved: &approved_refs,
     });
-    println!(
-        "{}",
-        config::key_json(
-            key_info,
-            loaded.as_ref(),
-            local.as_ref(),
-            layer.as_ref(),
-            managed.as_ref()
-        )
-    );
-    ExitCode::SUCCESS
+    match config::key_json(
+        key_info,
+        loaded.as_ref(),
+        local.as_ref(),
+        layer.as_ref(),
+        managed.as_ref(),
+    ) {
+        Ok(v) => {
+            println!("{v}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(1, &e, "cannot resolve config"),
+    }
 }
 
 fn run_config_get(key: &str, json: bool) -> ExitCode {
