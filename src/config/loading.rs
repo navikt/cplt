@@ -2050,36 +2050,67 @@ impl Resolved {
 /// Deny paths deliberately get no such check — `[deny]` needs no approval and
 /// can only tighten, so a repointed deny symlink cannot escalate.
 fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Option<PathBuf> {
+    repo_allow_path(path_str, config_dir, key)
+        .map_err(|e| ui::warn(&e))
+        .ok()
+}
+
+fn repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Result<PathBuf, String> {
     let resolved = resolve_repo_path(path_str, config_dir);
     // #551: `docs/hosts` approved, then repointed by the agent at
     // `../ssh/id_ed25519` in a repo that holds the linked `~/.ssh`, still
     // resolves inside the repository.
     let spelled = config_dir.join(lexically_normalized(&expand_tilde(path_str)));
     if super::nofollow_names_symlink(&spelled) {
-        ui::warn(&format!(
+        return Err(format!(
             "{key} entry {path_str:?} {}",
             super::NOFOLLOW_LINK_MESSAGE
         ));
-        return None;
     }
     if let Some(target) = allow_path_credential_hop(&spelled) {
-        ui::warn(&format!(
+        return Err(format!(
             "{key} entry {path_str:?} {}",
             credential_hop_message(&target)
         ));
-        return None;
     }
     if expand_tilde(path_str).is_relative() && !resolved.starts_with(config_dir) {
-        ui::warn(&format!(
+        return Err(format!(
             "{key} entry {path_str:?} resolves outside the repository ({}), so cplt is ignoring it.\n  \
              A symlink target is not covered by the trust approval, so a later commit could \
              repoint it without re-approval. Name the target directly in .cplt.toml if you \
              mean to grant it.",
             resolved.display()
         ));
-        return None;
     }
-    Some(resolved)
+    Ok(resolved)
+}
+
+/// Every `[propose.allow]` path entry a launch would refuse, as
+/// `(key, entry, reason)`. The one question `cplt config set --repo`,
+/// `cplt trust` and the launch all ask (#1116): the launch drops an entry
+/// [`resolve_repo_allow_path`] refuses and refuses to start on one
+/// [`crate::sandbox::validate_grant_path`] refuses, so a proposal either
+/// check fails must never be written or approved.
+pub fn repo_proposal_refusals(
+    propose: &crate::repo_config::ProposeSection,
+    config_dir: &Path,
+    home: &Path,
+) -> Vec<(&'static str, String, String)> {
+    let mut out = Vec::new();
+    for (key, entries) in [
+        ("allow.read", &propose.allow.read),
+        ("allow.write", &propose.allow.write),
+        ("allow.socket", &propose.allow.socket),
+    ] {
+        for entry in entries {
+            let checked = repo_allow_path(entry, config_dir, &format!("propose.{key}"))
+                .and_then(|p| crate::sandbox::validate_grant_path(key, &p, home));
+            if let Err(reason) = checked {
+                out.push((key, entry.clone(), reason));
+            }
+        }
+    }
+    out
 }
 
 /// Drop ANSI SGR sequences (`ESC [ ... m`), the only ones `ui` emits.

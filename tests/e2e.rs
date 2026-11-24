@@ -5520,6 +5520,81 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// #1116: every `[propose]` entry a launch refuses is refused by
+    /// `config set --repo` (rc != 0, nothing written), marked REFUSED by
+    /// `cplt trust`, and never approved by `cplt trust accept`.
+    #[test]
+    fn e2e_config_set_repo_refuses_what_launch_refuses() {
+        let home = scratch_home();
+        let outside = tempfile::tempdir().unwrap();
+        let root_link = outside.path().join("root-link");
+        std::os::unix::fs::symlink("/", &root_link).unwrap();
+        let root_link = root_link.to_str().unwrap().to_string();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        // (key, value, .cplt.toml body when the file can express it)
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("allow.read", "/", None),
+            (
+                "allow.read",
+                "rel-root",
+                Some("[propose.allow]\nread = [\"rel-root\"]\n"),
+            ),
+            ("allow.read", &root_link, Some("")),
+            (
+                "allow.write",
+                "~/.ssh",
+                Some("[propose.allow]\nwrite = [\"~/.ssh\"]\n"),
+            ),
+            ("proxy.allow_private_domains", "10.0.0.1", None),
+            ("no.such_key", "x", None),
+            ("proxy.upstream", "http://p:1", None),
+        ];
+        for (key, value, toml) in cases {
+            let repo = temp_repo("test-org/refuse");
+            std::os::unix::fs::symlink("/", repo.path().join("rel-root")).unwrap();
+            let out = cplt_cmd()
+                .args(["config", "set", "--repo", key, value])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success(),
+                "{key} {value} must be refused: {stderr}"
+            );
+            assert!(
+                !repo.path().join(".cplt.toml").exists(),
+                "{key} {value}: nothing may be written"
+            );
+            let Some(toml) = toml else { continue };
+            let body = if toml.is_empty() {
+                format!("[propose.allow]\nread = [{root_link:?}]\n")
+            } else {
+                (*toml).to_string()
+            };
+            std::fs::write(repo.path().join(".cplt.toml"), body).unwrap();
+            assert!(git_ok(repo.path(), &["add", ".cplt.toml", "rel-root"]));
+            assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
+            let show = cplt_cmd()
+                .args(["trust"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            let show_out = String::from_utf8_lossy(&show.stdout);
+            assert!(show_out.contains("REFUSED"), "{key} {value}: {show_out}");
+            let accept = cplt_cmd()
+                .args(["trust", "accept", "--all"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                !accept.status.success(),
+                "{key} {value}: accept must refuse: {}",
+                String::from_utf8_lossy(&accept.stderr)
+            );
+        }
+    }
+
     #[test]
     fn e2e_config_set_repo_deny_paths() {
         let repo = make_repo_dir("set-repo-deny");

@@ -12773,6 +12773,23 @@ fn run_config_set_repo(
             return ExitCode::FAILURE;
         }
     };
+    // The launch's own check on `[propose.allow]` paths (#1116): a proposal
+    // every teammate approves and no launch honours must not be written.
+    // Only this key's entries, so an older bad line does not block other keys.
+    if !unset {
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        let dir = std::fs::canonicalize(&project_dir).unwrap_or_else(|_| project_dir.clone());
+        if let Some((_, _, reason)) = config::repo_proposal_refusals(&written.propose, &dir, &home)
+            .into_iter()
+            .find(|(k, _, _)| *k == key)
+        {
+            ui::error(&format!(
+                "{reason}\n  Name a specific path inside the repository, or a single file, \
+                 and run `cplt config set --repo {key}` again.\n  No changes were saved."
+            ));
+            return ExitCode::FAILURE;
+        }
+    }
     if let Err(e) = config::write_repo_document_atomically(&repo_config_path, &doc) {
         ui::error(&format!("cannot write {}: {e}", repo_config_path.display()));
         return ExitCode::FAILURE;
@@ -13774,6 +13791,13 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         println!();
     }
 
+    // Entries the launch would refuse (#1116): name them here, before any
+    // approval is offered, so nobody approves a grant that will never apply.
+    for (key, entry, reason) in repo_proposal_refusals(loaded) {
+        println!("{blue}[cplt]{nc}  {red}REFUSED{nc} {key} {entry:?}: {reason}");
+        println!();
+    }
+
     // Whether the stored entry applies to the repository in front of us. The
     // launch gate drops every key when it does not, so showing them as approved
     // — which this did, above a warning saying they were not auto-trusted —
@@ -14491,6 +14515,14 @@ fn state_dir_write_proposal(
     })
 }
 
+/// What the launch would refuse among `loaded`'s `[propose.allow]` paths.
+fn repo_proposal_refusals(
+    loaded: &repo_config::LoadedRepoConfig,
+) -> Vec<(&'static str, String, String)> {
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    config::repo_proposal_refusals(&loaded.config.propose, &loaded.dir, &home)
+}
+
 fn trust_accept(
     project_dir: &std::path::Path,
     loaded: &repo_config::LoadedRepoConfig,
@@ -14777,6 +14809,20 @@ fn trust_accept(
             return ExitCode::FAILURE;
         }
         ui::warn(&line);
+    }
+
+    // A key holding an entry the launch refuses is not approved (#1116): the
+    // same refuse-and-exit as the IP alias below, so an approval on file
+    // always means every entry it covers applies.
+    if let Some((key, entry, reason)) = repo_proposal_refusals(loaded)
+        .into_iter()
+        .find(|(k, _, _)| keys_to_accept.iter().any(|a| a == k))
+    {
+        ui::error(&format!(
+            "{reason}\n  {key} entry {entry:?} cannot be approved, so nothing was approved. \
+             Fix or remove it in .cplt.toml, commit, and run `cplt trust accept` again."
+        ));
+        return ExitCode::FAILURE;
     }
 
     // Only when approving that key (#1110): an alias must not block `trust accept allow_docker`.
