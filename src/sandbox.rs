@@ -121,26 +121,27 @@ pub use policy::{
     AppDir, AppDirKind, BUILD_CREDENTIAL_FILES, CLONE_CACHE_DIRS, CPLT_STATE_DIR, CacheEnv,
     DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, DockerAccess, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS,
-    HOST_EXEC_TOOL_PATHS, HOST_TOOL_RO_OVERLAYS, HardeningCategory, HardeningEnvVar, HomeToolDir,
-    HostExec, HostExecPath, LinuxCoverage, OAUTH_CALLBACK_PORT, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES,
-    PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT,
-    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
-    Protected, READONLY_HOST_TOOL_TWINS, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS,
-    SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar,
-    ToolPathOverride, ToolRoot, XDG_PINNED_MARKER, active_tool_dirs, app_dirs,
-    apply_readonly_host_tool_paths, build_credential_grants, copilot_default_pkg_dir,
-    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, cplt_exe_no_exec_dir,
-    cplt_state_ancestor_grant, cplt_state_dir, cplt_state_dir_grant, cplt_state_file,
-    credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
-    cypress_runtime_intent, dir_overlaps_credentials, ensure_split_tool_dirs, env_tool_dir_allowed,
-    env_tool_dir_hint_ok, env_tool_path_protected, env_tool_temp_roots, exec_write_conflicts,
-    first_party_read_target, gradle_loopback_hint, grant_is_refused, home_config_link_targets,
-    home_tool_dirs, host_tool_ro_overlays, linux_docker_socket_paths, linux_rootless_socket_paths,
-    linux_runtime_dirs, mise_ro_protect_paths, missing_wrapper_dist_hint, nested_alternation,
-    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
+    HOST_EXEC_APP_DIRS, HOST_EXEC_TOOL_PATHS, HOST_TOOL_RO_OVERLAYS, HardeningCategory,
+    HardeningEnvVar, HomeToolDir, HostExec, HostExecPath, LinuxCoverage, OAUTH_CALLBACK_PORT,
+    PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
+    PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
+    PROTECTED_IN_ROOT, PathBinDir, Protected, READONLY_HOST_TOOL_TWINS, ResolvedToolDir,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
+    TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, XDG_PINNED_MARKER,
+    active_tool_dirs, app_dirs, app_root_warning, apply_readonly_host_tool_paths,
+    build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
+    copilot_ro_protect_paths, cplt_exe_no_exec_dir, cplt_state_ancestor_grant, cplt_state_dir,
+    cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
+    ensure_split_tool_dirs, env_tool_dir_allowed, env_tool_dir_hint_ok, env_tool_path_protected,
+    env_tool_temp_roots, exec_write_conflicts, first_party_read_target, gradle_loopback_hint,
+    grant_is_refused, home_config_link_targets, home_tool_dirs, host_tool_ro_overlays,
+    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
+    no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
-    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
+    refused_writable_app_root, relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths,
+    socket_mask_paths, state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
     validate_playwright_socket_dir, validate_sbpl_path, wrapper_lock_files, xdg_runtime_dir_env,
     xdg_state_dir,
 };
@@ -981,16 +982,30 @@ fn validate_cache_exec_dirs(
     for subdir in config.allow_cache_exec {
         let named = cache_base.join(subdir);
         let resolved = crate::config::canonicalize_deepest(&named);
-        if resolved != actual_base.join(subdir) {
-            if config.refuse_cache_exec_links {
-                return Err(format!(
-                    "allow_cache_exec path {} resolves through a symlink inside ~/.cache to \
-                     {}. sandbox.refuse_cache_exec_links is set, so cplt refuses a link the \
-                     sandbox could have planted. Replace the symlink with a real directory.",
-                    named.display(),
-                    resolved.display()
-                ));
-            }
+        let linked = resolved != actual_base.join(subdir);
+        // Before the app-root drop: with the key set, a link stops the launch.
+        if linked && config.refuse_cache_exec_links {
+            return Err(format!(
+                "allow_cache_exec path {} resolves through a symlink inside ~/.cache to \
+                 {}. sandbox.refuse_cache_exec_links is set, so cplt refuses a link the \
+                 sandbox could have planted. Replace the symlink with a real directory.",
+                named.display(),
+                resolved.display()
+            ));
+        }
+        if let Some(root) = policy::under_refused_app_root(config.home_dir, &named) {
+            return Err(format!(
+                "allow_cache_exec path {} is inside {}, which resolves through a symlink to \
+                 {}. cplt never grants a writable application directory through a symlink, \
+                 so it cannot grant this entry either. If you made the link, replace it with \
+                 a real directory; otherwise remove it, or drop {} from allow_cache_exec.",
+                named.display(),
+                root.display(),
+                crate::config::canonicalize_deepest(&root).display(),
+                named.strip_prefix(&cache_base).unwrap_or(&named).display()
+            ));
+        }
+        if linked {
             if let Some(why) = cache_exec_target_refusal(config, rules(), &resolved, &actual_base) {
                 return Err(format!(
                     "allow_cache_exec path {} resolves through a symlink to {}, and cplt will \
@@ -1134,7 +1149,13 @@ fn cache_exec_target_refusal(
         let path = canonicalize_deepest(&rule.path);
         let cache = in_cache(&rule.path, &path)
             && (target == cache_base || rule.access.write || rule.access.create_dirs);
-        if !rule.nofollow && !cache && overlaps(&path) {
+        // Only the cache-exec and Cypress rules are skipped; writable AppDir
+        // roots are `nofollow` too but are grants a target must not overlap.
+        let cache_exec_rule = rule.nofollow
+            && (rule.path.starts_with(&home_cache)
+                || rule.path
+                    == policy::cypress_app_data_dir_with_env(home, config.copilot_cache_env));
+        if !cache_exec_rule && !cache && overlaps(&path) {
             return Some(format!(
                 "it overlaps {}, which the sandbox already grants",
                 path.display()
@@ -6338,6 +6359,49 @@ mod tests {
             assert!(error.contains(why), "{error}");
             assert!(error.contains(&project), "{error}");
         }
+    }
+
+    /// An `allow_cache_exec` entry below a symlinked writable app root
+    /// (`~/.cache/pnpm -> elsewhere`) gets no Landlock rule and refuses the
+    /// launch, with or without `sandbox.refuse_cache_exec_links`.
+    #[test]
+    fn cache_exec_under_a_refused_app_root_is_refused() {
+        crate::with_env_lock_no_xdg(|| {
+            let (_guard, root) = copilot_cache_tree();
+            let home = root.join("home");
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("dlx")).unwrap();
+            std::fs::create_dir_all(home.join(".cache")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, home.join(".cache/pnpm")).unwrap();
+            let allow_cache_exec = ["pnpm/dlx".to_string()];
+            let mut config = test_config(&home, &[]);
+            config.existing_home_tool_dirs = Some(&[]);
+            config.allow_cache_exec = &allow_cache_exec;
+            let named = home.join(".cache/pnpm/dlx");
+            assert!(policy::under_refused_app_root(&home, &named).is_some());
+            let lp = landlock_mod::generate_policy(&config);
+            assert!(!lp.fs_rules.iter().any(|r| r.path == named
+                || r.path.starts_with(&elsewhere)
+                || (r.access.write
+                    && r.access.execute
+                    && named.starts_with(&r.path)
+                    && r.path != home.join(".cache"))));
+            if cfg!(target_os = "linux") {
+                // An explicit entry is refused, never silently dropped.
+                let base = std::cell::OnceCell::from(lp);
+                let err = validate_cache_exec_dirs(&config, &base).unwrap_err();
+                assert!(err.contains("replace it with a real directory"), "{err}");
+
+                // With sandbox.refuse_cache_exec_links set, the link still stops the launch.
+                config.refuse_cache_exec_links = true;
+                let base = std::cell::OnceCell::new();
+                let err = validate_cache_exec_dirs(&config, &base).unwrap_err();
+                assert!(
+                    err.contains("sandbox.refuse_cache_exec_links is set"),
+                    "{err}"
+                );
+            }
+        });
     }
 
     /// Seatbelt matches the resolved path, so a relocated cache is harmless

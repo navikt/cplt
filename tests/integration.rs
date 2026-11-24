@@ -4594,16 +4594,23 @@ int main(int argc, char **argv) {
             fs::read_to_string(&path).ok()
         };
 
-        let off = write_real_profile(&default_opts(&project, &home));
+        // Under temp_env's lock: other tests set XDG_CONFIG_HOME for a moment,
+        // which would move pnpm's config dir (and its denies) out of `home`.
+        let profile_for = |protect: bool| {
+            temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+                let mut opts = default_opts(&project, &home);
+                opts.protect_pnpm_config = protect;
+                write_real_profile(&opts)
+            })
+        };
+        let off = profile_for(false);
         let off_reads: Vec<_> = ["auth.ini", "rc", "config.yaml"]
             .iter()
             .map(|f| (*f, cat(&off, f)))
             .collect();
         let off_write = touch(&off, "new-off.txt");
 
-        let mut opts = default_opts(&project, &home);
-        opts.protect_pnpm_config = true;
-        let on = write_real_profile(&opts);
+        let on = profile_for(true);
         let on_tokens: Vec<_> = ["auth.ini", "rc"]
             .iter()
             .map(|f| (*f, cat(&on, f)))
@@ -5906,6 +5913,50 @@ print("BROKE " + ",".join(broke) if broke else "HELD")
             !denied_store,
             "--deny-path on the pnpm home must block writes into store/"
         );
+    }
+
+    /// uv's data dir: existing tools run, writes fail. The uv cache stays
+    /// writable. The fake home sits under `target/`, since exec under the
+    /// temp dir is denied by design.
+    #[test]
+    fn real_profile_uv_data_read_only_cache_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        // Home and project are siblings: a home inside the project is writable.
+        let fake_home = root.join("home");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        // The XDG defaults under the fake home, never an ambient XDG dir.
+        let data = fake_home.join(".local/share/uv");
+        let cache = fake_home.join(".cache/uv");
+        let tool = data.join("tools/t/bin/t");
+        fs::create_dir_all(tool.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(&tool, "#!/bin/sh\necho uv-tool-ran\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = temp_env::with_vars_unset(
+            [
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+            ],
+            || write_real_profile(&default_opts(&project, &fake_home)),
+        );
+        let cmd = format!(
+            "'{t}'; echo x > '{d}/new' && echo DATA_W || echo DATA_RO; \
+             echo x > '{c}/new' && echo CACHE_W || echo CACHE_RO",
+            t = tool.display(),
+            d = data.display(),
+            c = cache.display()
+        );
+        let (out, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_file(&profile).ok();
+        assert!(out.contains("uv-tool-ran"), "{out}");
+        assert!(out.contains("DATA_RO"), "{out}");
+        assert!(out.contains("CACHE_W"), "{out}");
     }
 
     // ── Localhost blocking ────────────────────────────────────────

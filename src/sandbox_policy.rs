@@ -769,6 +769,70 @@ pub fn refused_first_party_dir(home: &Path, path: &Path) -> Option<PathBuf> {
     (!unmoved && overlaps_credential_entry(home, &target, path)).then_some(target)
 }
 
+/// Where a writable [`APP_DIRS`] root lands when a symlink moves it, or
+/// `None` when it may be granted.
+///
+/// The AppDir counterpart of the writable-root rule in
+/// [`ResolvedToolDir::refused_target`]: a session can remove the root and link
+/// its name elsewhere, and Landlock or a bwrap bind would then grant write at
+/// the target on the next launch. Below `$HOME` every component is checked;
+/// outside it (a relocated `XDG_*_HOME`) only the root's own name, since the
+/// user chose that path. Recovery: replace the link with a real directory;
+/// a tool's `*_DIR` variable pointed at the target is not granted.
+#[must_use]
+pub fn refused_writable_app_root(home: &Path, path: &Path) -> Option<PathBuf> {
+    let canon = config::canonicalize_deepest;
+    let target = canon(path);
+    let moved = match path.strip_prefix(home) {
+        Ok(rel) => canon(home).join(rel) != target,
+        Err(_) => path.symlink_metadata().is_ok_and(|m| m.is_symlink()),
+    };
+    moved.then_some(target)
+}
+
+/// The path a writable [`APP_DIRS`] rule names: `$HOME` (or, outside it,
+/// the root's parent) resolved, the writable components below it spelled
+/// as-is. Resolving the whole path again after [`refused_writable_app_root`]
+/// accepted it would follow a link swapped in since; spelled as-is, the
+/// no-symlink open refuses such a link instead.
+#[must_use]
+pub fn writable_app_root_rule_path(home: &Path, path: &Path) -> PathBuf {
+    let canon = config::canonicalize_deepest;
+    match path.strip_prefix(home) {
+        Ok(rel) => canon(home).join(rel),
+        Err(_) => match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => canon(parent).join(name),
+            _ => path.to_path_buf(),
+        },
+    }
+}
+
+/// The refused writable [`APP_DIRS`] root `path` sits in, if any. A grant
+/// derived from such a root (an `allow_cache_exec` entry below
+/// `~/.cache/pnpm`) would follow the same link, so it is dropped too.
+#[must_use]
+pub fn under_refused_app_root(home: &Path, path: &Path) -> Option<PathBuf> {
+    APP_DIRS
+        .iter()
+        .flat_map(|d| d.write_paths(home))
+        .find(|root| path.starts_with(root) && refused_writable_app_root(home, root).is_some())
+}
+
+/// The warning for a root [`refused_writable_app_root`] refuses.
+#[must_use]
+pub fn app_root_warning(path: &Path, target: &Path) -> String {
+    format!(
+        "Not granting {}: it resolves through a symlink to {}, and a writable \
+         application directory is never granted through a symlink (a sandboxed \
+         session could have planted it). If you made the link, replace it with a real \
+         directory (move the contents back from {}); cplt does not grant a tool's \
+         *_DIR variable pointed at the target either.",
+        path.display(),
+        target.display(),
+        target.display()
+    )
+}
+
 /// Where `~/.gnupg/{file}` resolves, or `None` when `--allow-gpg-signing`
 /// must not grant it (#551).
 ///
@@ -2068,6 +2132,7 @@ pub const GPG_SIGNING_ALLOW_FILES: &[&str] = &[
 /// The macOS paths below apply only with a non-empty qualifier. Every
 /// [`APP_DIRS`] entry has an empty one, which selects XDG on macOS too, so a
 /// native macOS path (`~/Library/Preferences/<app>`, ...) needs its own grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppDirKind {
     /// macOS: `~/Library/Caches/<app>` · Linux/macOS when using XDG: `~/.cache/<app>`
     Cache,
@@ -2313,7 +2378,10 @@ pub const APP_DIRS: &[AppDir] = &[
         application: "uv",
         process_exec: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
         map_exec: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
-        write: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+        // Data (~/.local/share/uv) holds `uv tool` venvs and uv-managed
+        // Pythons the host runs later, so it is read-only: run `uv tool
+        // install` / `uv python install` on the host (HOST_EXEC_APP_DIRS).
+        write: &[AppDirKind::Cache],
         read: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
     },
     // rtk (token-optimized CLI proxy) stores its tracking database at
@@ -3067,6 +3135,81 @@ pub struct HostExecPath {
     pub host_use: &'static str,
     pub handling: HostExec,
 }
+
+/// An [`APP_DIRS`] entry's kinds and what the host does with them: the
+/// AppDir half of [`HOST_EXEC_TOOL_PATHS`]. Every writable kind needs a
+/// non-`ReadOnly` row and no `ReadOnly` kind may be writable (unit test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostExecAppDir {
+    pub application: &'static str,
+    pub kinds: &'static [AppDirKind],
+    pub host_use: &'static str,
+    pub handling: HostExec,
+}
+
+pub const HOST_EXEC_APP_DIRS: &[HostExecAppDir] = &[
+    HostExecAppDir {
+        application: "mise",
+        kinds: &[AppDirKind::Data, AppDirKind::DataLocal],
+        host_use: "host shims and `mise exec` run the installed tool versions",
+        handling: HostExec::Gap("`mise install` in the sandbox writes here"),
+    },
+    HostExecAppDir {
+        application: "mise",
+        kinds: &[AppDirKind::Cache, AppDirKind::Runtime, AppDirKind::State],
+        host_use: "download cache and state, not executed directly",
+        handling: HostExec::Gap("mise caches and tracks state here"),
+    },
+    HostExecAppDir {
+        application: "pnpm",
+        kinds: &[AppDirKind::Data, AppDirKind::DataLocal],
+        host_use: "$PNPM_HOME: global shims on the host PATH",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecAppDir {
+        application: "pnpm",
+        kinds: &[
+            AppDirKind::Cache,
+            AppDirKind::Config,
+            AppDirKind::ConfigLocal,
+            AppDirKind::Preference,
+            AppDirKind::Runtime,
+            AppDirKind::State,
+        ],
+        host_use: "config obeyed by host pnpm",
+        handling: HostExec::Gap("read-only with sandbox.protect_pnpm_config"),
+    },
+    HostExecAppDir {
+        application: "kubebuilder-envtest",
+        kinds: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+        host_use: "host tests run the control-plane binaries setup-envtest stores",
+        handling: HostExec::Gap("setup-envtest in the sandbox downloads here"),
+    },
+    HostExecAppDir {
+        application: "uv",
+        kinds: &[AppDirKind::Cache],
+        host_use: "host `uv run`/`uvx` reuse cached environments and wheels",
+        handling: HostExec::Gap("the cache every uv command writes"),
+    },
+    HostExecAppDir {
+        application: "uv",
+        kinds: &[AppDirKind::Data, AppDirKind::DataLocal],
+        host_use: "`uv tool` venvs and uv-managed Pythons the host runs",
+        handling: HostExec::ReadOnly,
+    },
+    HostExecAppDir {
+        application: "rtk",
+        kinds: &[AppDirKind::Data, AppDirKind::DataLocal],
+        host_use: "tracking database read by host rtk, not executed",
+        handling: HostExec::Gap("rtk records history here"),
+    },
+    HostExecAppDir {
+        application: "fnm",
+        kinds: &[AppDirKind::Data, AppDirKind::DataLocal],
+        host_use: "Node versions on the host PATH",
+        handling: HostExec::ReadOnly,
+    },
+];
 
 /// Paths inside writable [`HOME_TOOL_DIRS`] trees that host tools execute or
 /// obey later. Agent-config dirs have the same class in
@@ -5948,6 +6091,62 @@ mod tests {
     }
 
     #[test]
+    fn writable_app_dir_roots_refuse_symlinks() {
+        let home = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let elsewhere = home.join(".config/othertool");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for root in APP_DIRS.iter().flat_map(|d| d.write_paths(&home)) {
+            if !root.starts_with(&home) {
+                continue;
+            }
+            assert_eq!(
+                refused_writable_app_root(&home, &root),
+                None,
+                "{}",
+                root.display()
+            );
+            std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+            assert_eq!(
+                refused_writable_app_root(&home, &root),
+                Some(elsewhere.clone()),
+                "{}",
+                root.display()
+            );
+        }
+        // A symlinked parent below $HOME moves the root just the same.
+        let h2 = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::create_dir_all(h2.join("real")).unwrap();
+        std::os::unix::fs::symlink(h2.join("real"), h2.join(".cache")).unwrap();
+        assert!(refused_writable_app_root(&h2, &h2.join(".cache/uv")).is_some());
+    }
+
+    #[test]
+    fn writable_app_root_rule_path_does_not_follow_a_swapped_link() {
+        let home = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let root = home.join(".cache/uv");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(writable_app_root_rule_path(&home, &root), root);
+        // Swapped for a link after the check: the rule still names the link,
+        // which the no-symlink open then refuses.
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::create_dir_all(home.join(".config/autostart")).unwrap();
+        std::os::unix::fs::symlink(home.join(".config/autostart"), &root).unwrap();
+        assert_eq!(writable_app_root_rule_path(&home, &root), root);
+    }
+
+    #[test]
+    fn uv_data_dir_is_read_only_cache_writable() {
+        crate::with_env_lock_no_xdg(|| {
+            let home = Path::new("/h");
+            let uv = APP_DIRS.iter().find(|d| d.application == "uv").unwrap();
+            let w = uv.write_paths(home);
+            assert!(w.contains(&home.join(".cache/uv")));
+            assert!(!w.iter().any(|p| p.ends_with("share/uv")), "{w:?}");
+        });
+    }
+
+    #[test]
     fn host_exec_tool_paths_cover_every_writable_tool_dir() {
         let under = |p: &str, root: &str| p == root || p.starts_with(&format!("{root}/"));
         let writable: Vec<&str> = HOME_TOOL_DIRS
@@ -5987,6 +6186,34 @@ mod tests {
                 (orig.map_exec, orig.process_exec),
                 (t.map_exec, t.process_exec)
             );
+        }
+        for a in APP_DIRS {
+            for k in a.write {
+                assert!(
+                    HOST_EXEC_APP_DIRS
+                        .iter()
+                        .any(|r| r.application == a.application
+                            && r.kinds.contains(k)
+                            && !matches!(r.handling, HostExec::ReadOnly)),
+                    "writable app dir {} {k:?} has no HOST_EXEC_APP_DIRS row",
+                    a.application
+                );
+            }
+        }
+        for r in HOST_EXEC_APP_DIRS {
+            let a = APP_DIRS
+                .iter()
+                .find(|a| a.application == r.application)
+                .unwrap();
+            if matches!(r.handling, HostExec::ReadOnly) {
+                for k in r.kinds {
+                    assert!(
+                        !a.write.contains(k),
+                        "{} {k:?} is host-executed but writable",
+                        r.application
+                    );
+                }
+            }
         }
         for o in HOST_TOOL_RO_OVERLAYS {
             assert!(

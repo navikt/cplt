@@ -5,6 +5,9 @@
 # dir). tempfile::TempDir removes them on drop — including on panic — so this
 # pattern only catches the rare case where a run is SIGKILLed before cleanup.
 .cplt-e2e-*
+# Other fixture dirs the suites create in the checkout (.cplt-envdeny-*,
+# .cplt-pnpm-home-*, ...). Directories only: `.cplt.toml` is tracked.
+/.cplt-*/
 
 .DS_Store
 .idea

@@ -5802,6 +5802,17 @@ fn profile_fnm_has_exec() {
 }
 
 #[test]
+fn profile_uv_data_read_exec_only_cache_writable() {
+    let p = default_profile();
+    let data = "/Users/test/.local/share/uv";
+    let cache = "/Users/test/.cache/uv";
+    assert!(p.contains(&format!("(allow file-read* (subpath \"{data}\"))")));
+    assert!(p.contains(&format!("(allow process-exec (subpath \"{data}\"))")));
+    assert!(!p.contains(&format!("(allow file-write* (subpath \"{data}\"))")));
+    assert!(p.contains(&format!("(allow file-write* (subpath \"{cache}\"))")));
+}
+
+#[test]
 fn profile_gradle_has_map_exec_only() {
     let p = default_profile();
     assert!(

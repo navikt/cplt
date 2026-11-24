@@ -56,6 +56,57 @@ ignores the failed write of `_update-notifier-last-checked` in the root, so
 `~/.m2` and `~/.yarn` and their writable subdirectories before launch, since
 the sandbox cannot.
 
+## uv's data directory is read-only (behaviour change)
+
+Inside cplt, `~/.local/share/uv` is read-only. The host runs the `uv tool`
+environments and uv-managed Pythons stored there, so a sandboxed session must
+not change them. `~/.cache/uv` stays writable, so `uv sync`, `uv run`, `uvx`
+and `uv pip install` into a project venv work as before, and Pythons already
+installed there still run.
+
+`uv tool install` and `uv python install` inside cplt now fail with a
+permission error. Run them in a normal terminal, outside the agent:
+
+```sh
+uv tool install <tool>
+uv python install 3.13
+```
+
+Tools and Pythons already installed there still run inside the sandbox, which
+keeps read and execute on the directory.
+
+`cplt --allow-write ~/.local/share/uv` behaves differently per platform:
+
+- macOS: the agent can write there, but nothing there runs inside the
+  sandbox any more, including tools and Pythons that were already installed.
+  cplt denies execute on `--allow-write` trees.
+- Linux: the agent can write there and run what is there, so it can change
+  programs you run later on the host. cplt warns about this at launch.
+
+A writable application directory reached through a symlink (`~/.cache/uv`,
+`~/.local/share/mise`, or `~/.cache` itself being a link) is no longer
+granted: cplt warns and skips it, since a sandboxed session could have planted
+that link. If you made the link, replace it with a real directory, for
+example:
+
+```sh
+rm ~/.cache/uv && mv /path/to/target ~/.cache/uv
+```
+
+An explicit `--allow-cache-exec` entry (or `allow_cache_exec` in config)
+inside such a linked directory, for example `pnpm/dlx` with `~/.cache/pnpm` a
+link, now stops the launch with an error naming the link. Replace the link
+with a real directory, or remove the entry.
+
+On Linux, every writable application directory is now opened without
+following symlinks. Where a container's seccomp profile refuses `openat2(2)`,
+cplt walks the path one component at a time instead, so the launch still
+works.
+
+Pointing the tool's variable at the target (`UV_CACHE_DIR`, `MISE_DATA_DIR`)
+does not help: cplt does not grant those paths, so the tool fails inside the
+sandbox. `--allow-write` on the target restores writes but not execute.
+
 ## `sandbox.readonly_host_tool_paths` (off by default)
 
 With this key on, tool downloads and settings the host runs later are
