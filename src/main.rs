@@ -12278,16 +12278,22 @@ fn run_config_get_json(key: &str) -> ExitCode {
         None => None,
     };
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
-    let managed =
-        match load_managed_for_display(loaded.as_ref(), local.as_ref(), project_dir.as_deref()) {
-            Some(Ok(m)) => Some(m),
-            Some(Err(line)) => {
-                ui::warn(&line);
-                None
-            }
-            None => None,
-        };
+    // The comparison merges here and in the loader are muted: the final
+    // resolution in `key_json` is the one that may warn.
+    cplt::ui::MUTE_WARN.store(true, std::sync::atomic::Ordering::Relaxed);
+    let managed_loaded =
+        load_managed_for_display(loaded.as_ref(), local.as_ref(), project_dir.as_deref());
+    cplt::ui::MUTE_WARN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let managed = match managed_loaded {
+        Some(Ok(m)) => Some(m),
+        Some(Err(line)) => {
+            ui::warn(&line);
+            None
+        }
+        None => None,
+    };
     // The launch gate's own rule: only a current approval bound to this checkout grants.
+    cplt::ui::MUTE_WARN.store(true, std::sync::atomic::Ordering::Relaxed);
     let refuse_invalid = loaded
         .as_ref()
         .map(|l| l.config.clone())
@@ -12297,6 +12303,7 @@ fn run_config_get_json(key: &str) -> ExitCode {
             config::CliFlags::default(),
         )
         .is_ok_and(|r| r.refuse_invalid_repo_config);
+    cplt::ui::MUTE_WARN.store(false, std::sync::atomic::Ordering::Relaxed);
     let repo = match project_dir.as_deref().map(repo_config::load_repo_config) {
         Some(Err(e)) if refuse_invalid => {
             return fail(

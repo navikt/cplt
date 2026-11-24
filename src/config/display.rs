@@ -248,11 +248,12 @@ pub fn key_json(
                 CliFlags::default(),
             )
             .map_err(|e| e.to_string())?;
-        if let Some(m) = managed.filter(|_| mg) {
-            r.apply_managed(m);
-        }
+        // Launch order: the repo's proposal, then the managed layer.
         if let Some(x) = repo.filter(|_| rp) {
             r.apply_repo_config(x.config, x.dir, x.approved);
+        }
+        if let Some(m) = managed.filter(|_| mg) {
+            r.apply_managed(m);
         }
         Ok::<_, String>(r)
     };
@@ -264,6 +265,7 @@ pub fn key_json(
         ConfigLayer::Baseline => "default",
     };
     let mut managed_by = None;
+    let mut via_preset = None;
 
     // The per-layer passes only compare; the final one may warn, once.
     use std::sync::atomic::Ordering::Relaxed;
@@ -276,7 +278,7 @@ pub fn key_json(
                 (resolve(false, false, false, false)?, "default"),
                 (resolve(true, false, false, false)?, "user"),
                 (resolve(true, true, false, false)?, "local"),
-                (resolve(true, true, true, false)?, "managed"),
+                (resolve(true, true, false, true)?, "repo"),
             ])
         })();
         ui::MUTE_WARN.store(false, Relaxed);
@@ -287,11 +289,30 @@ pub fn key_json(
         let layer = full
             .bool_layer(key_info.section, key_info.key)
             .filter(|l| *l != ConfigLayer::Baseline);
-        (
-            Value::Bool((row.resolved)(&full)),
-            layer.map_or("default", layer_name),
-            layer.is_some(),
-        )
+        // A preset moves the baseline: the value is decided, by the layer that
+        // chose the preset, so `set` is true and `preset` names it.
+        let preset = active_preset(loaded, local);
+        let moved = preset
+            .baseline()
+            .value_for_key(key_info.section, key_info.key)
+            != Preset::Standard
+                .baseline()
+                .value_for_key(key_info.section, key_info.key);
+        if layer.is_none() && moved {
+            via_preset = Some(preset.to_string());
+            let by = if local.is_some_and(|l| l.config.sandbox.preset.is_some()) {
+                "local"
+            } else {
+                "user"
+            };
+            (Value::Bool((row.resolved)(&full)), by, true)
+        } else {
+            (
+                Value::Bool((row.resolved)(&full)),
+                layer.map_or("default", layer_name),
+                layer.is_some(),
+            )
+        }
     } else {
         let final_list = list_of(&full, &dotted).unwrap_or_default();
         let mut source = "default";
@@ -304,7 +325,7 @@ pub fn key_json(
             prev = cur;
         }
         if prev.as_ref() != Some(&final_list) {
-            source = "repo";
+            source = "managed";
         }
         if source == "managed" {
             managed_by = managed.map(|m| m.managed_by.clone());
@@ -320,6 +341,9 @@ pub fn key_json(
     let mut out = json!({"schema": 1, "key": dotted, "value": value, "source": source, "set": set});
     if let Some(name) = managed_by {
         out["managed_by"] = json!(name);
+    }
+    if let Some(name) = via_preset {
+        out["preset"] = json!(name);
     }
     Ok(Some(out))
 }
@@ -1261,6 +1285,33 @@ mod tests {
         );
         // brief = false beats agents_md = true, as the resolver says
         assert_eq!(get("sandbox.agents_md")["value"], false);
+        // a bool a preset moved is decided: set, attributed to the layer that chose it
+        for (preset, key, want) in [
+            ("strict", "proxy.forced", true),
+            ("permissive", "sandbox.allow_tmp_exec", true),
+            ("permissive", "gh_guard.enabled", false),
+        ] {
+            let u = loaded(&format!("[sandbox]\npreset = \"{preset}\"\n"));
+            let v = key_json(
+                crate::config::lookup_key(key).unwrap(),
+                Some(&u),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                (&v["value"], &v["source"], &v["set"], &v["preset"]),
+                (
+                    &serde_json::json!(want),
+                    &serde_json::json!("user"),
+                    &serde_json::json!(true),
+                    &serde_json::json!(preset)
+                ),
+                "{preset} {key}: {v}"
+            );
+        }
         // scalars, tri-state bools and global-only lists are declined
         for k in [
             "proxy.upstream",
