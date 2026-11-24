@@ -2722,12 +2722,6 @@ int main(int argc, char **argv) {
         opts.managed_worktree_root = Some(&root);
         let profile = write_real_profile(&opts);
         let text = fs::read_to_string(&profile).unwrap();
-        assert!(
-            !text
-                .lines()
-                .any(|l| l.contains("allow file-clone") && l.contains(".cplt-worktrees")),
-            "{text}"
-        );
         let t = temp.path().display();
         let script = format!(
             "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; echo DONE",
@@ -2742,6 +2736,52 @@ int main(int argc, char **argv) {
         fs::remove_file(profile).unwrap();
         assert!(!output.contains("LEAK"), "{output}");
         assert!(output.contains("DONE"), "{output}");
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.contains("allow file-clone") && l.contains(".cplt-worktrees")),
+            "{text}"
+        );
+    }
+
+    /// A `--deny-path` on a file inside a clone cache must not be copied out by
+    /// a directory clone of that cache.
+    #[test]
+    fn real_profile_deny_path_inside_clone_cache_blocks_dir_clone() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let home = temp.path().join("home");
+        let cache = home.join(".bun/install/cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("secret"), "secret\n").unwrap();
+        let denied = [cache.join("secret")];
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.extra_deny = &denied;
+        let profile = write_real_profile(&opts);
+        let text = fs::read_to_string(&profile).unwrap();
+        let t = temp.path().display();
+        let script = format!(
+            "{}; cat '{t}/dirclone/secret' 2>/dev/null && echo LEAK; echo DONE",
+            python_inline_command(&format!(
+                "import ctypes,sys\nc=ctypes.CDLL(None).clonefile\nsys.exit(c({:?}.encode(),{:?}.encode(),0))",
+                cache.display().to_string(),
+                format!("{t}/dirclone")
+            ))
+            .replacen("python3", "/usr/bin/python3", 1)
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(!output.contains("LEAK"), "{output}");
+        assert!(output.contains("DONE"), "{output}");
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.contains("allow file-clone") && l.contains("/home/.bun/install/cache\"")),
+            "{text}"
+        );
     }
 
     #[test]

@@ -2919,14 +2919,44 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // default backend has no fallback), so re-allow directory clones whose
     // source is one of those caches. They hold downloaded packages, never a
     // read-denied path (`clone_cache_dirs_hold_no_denied_path` pins that).
-    for p in CLONE_CACHE_DIRS
-        .iter()
-        .flat_map(|d| clone_cache_spellings(home, d))
-    {
-        sbpl!(
-            sb,
-            "(allow file-clone (require-all (vnode-type DIRECTORY) (subpath \"{p}\")))"
-        );
+    // A user `--deny-path` inside (or around) a cache must not be copied out by
+    // a clone of the whole cache, so such a cache gets no allow, and says so.
+    let mut linked: std::collections::BTreeMap<PathBuf, Vec<&str>> =
+        std::collections::BTreeMap::default();
+    for rel in CLONE_CACHE_DIRS {
+        let spellings = match clone_cache_spellings(home, rel) {
+            Ok(s) => s,
+            Err(link) => {
+                linked.entry(link).or_default().push(rel);
+                continue;
+            }
+        };
+        if let Some(deny) = spellings
+            .iter()
+            .find_map(|p| overlapping_deny(config.extra_deny, Path::new(p)))
+        {
+            crate::ui::warn(&format!(
+                "Directory clones out of ~/{rel} are not allowed because of --deny-path {}.",
+                deny.display()
+            ));
+            continue;
+        }
+        for p in spellings {
+            sbpl!(
+                sb,
+                "(allow file-clone (require-all (vnode-type DIRECTORY) (subpath \"{p}\")))"
+            );
+        }
+    }
+    for (link, rels) in &linked {
+        let names: Vec<String> = rels.iter().map(|r| format!("~/{r}")).collect();
+        crate::ui::warn(&format!(
+            "{} is a symlink, so package managers cannot clone directories out of {}. \
+             Remove the symlink (bun: or use `bun install --backend copyfile`); \
+             other tools fall back to per-file copies.",
+            link.display(),
+            names.join(", ")
+        ));
     }
     // `bsd.sb` allows `file-read-metadata` everywhere, and that named operation
     // outranks the `file-read*` deny above, so a denied `~/.npmrc` still stats
@@ -3052,19 +3082,12 @@ fn home_spellings(home: &str, rel: &str) -> Vec<String> {
 /// next launch allow cloning it. A symlink anywhere between `$HOME` and the
 /// cache gets no allow at all. The canonical `$HOME` spelling is kept, since
 /// `$HOME` itself is not the agent's to move.
-fn clone_cache_spellings(home: &str, rel: &str) -> Vec<String> {
+fn clone_cache_spellings(home: &str, rel: &str) -> Result<Vec<String>, PathBuf> {
     let mut walk = PathBuf::from(home);
     for part in Path::new(rel).components() {
         walk.push(part);
         match std::fs::symlink_metadata(&walk) {
-            Ok(m) if m.file_type().is_symlink() => {
-                crate::ui::warn(&format!(
-                    "{} is a symlink, so package managers cannot clone directories out of ~/{rel}. \
-                     Remove the symlink, or use `bun install --backend copyfile`.",
-                    walk.display()
-                ));
-                return Vec::new();
-            }
+            Ok(m) if m.file_type().is_symlink() => return Err(walk),
             Ok(_) => {}
             Err(_) => break,
         }
@@ -3075,10 +3098,11 @@ fn clone_cache_spellings(home: &str, rel: &str) -> Vec<String> {
         out.push(h.join(rel));
     }
     out.dedup();
-    out.into_iter()
+    Ok(out
+        .into_iter()
         .filter(|p| validate_sbpl_path(p).is_ok())
         .map(|p| p.to_string_lossy().into_owned())
-        .collect()
+        .collect())
 }
 
 /// [`home_spellings`] for a path already resolved.
