@@ -1223,20 +1223,6 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
         ("allow.socket", config.extra_socket),
     ] {
         for p in paths {
-            // A tool-path variable (`GOCACHE=~/.config`) lands in allow.write;
-            // name it here, the earliest refusal, not the grant (#1095).
-            if key == "allow.write"
-                && let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, p)
-                && let Some(var) = tool_env_var_for(p, config.home_dir)
-            {
-                return Err(state_ancestor_refusal(
-                    key,
-                    p,
-                    &dir,
-                    Some(var),
-                    config.home_dir,
-                ));
-            }
             validate_grant_path(key, p, config.home_dir)?;
         }
     }
@@ -1245,28 +1231,11 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
 
 /// The refusal for a writable tree that holds cplt's state dir, with a remedy
 /// that fits where the tree came from: telling someone to narrow `allow.write`
-/// when the tree is their project or an exported `GOCACHE` sends them looking
-/// for a grant they never wrote.
-fn state_ancestor_refusal(
-    what: &str,
-    p: &Path,
-    dir: &Path,
-    env_var: Option<&str>,
-    home: &Path,
-) -> String {
-    let remedy = if !dir.starts_with(p) {
-        // Only a symlink on the way to the state dir puts it inside `p`.
-        format!(
-            "{} is a symlink into that tree (a stow-style dotfiles link). Move the cplt \
-             directory out of it, so the state directory is not reachable through it.",
-            dir.display()
-        )
-    } else if let Some(var) = env_var {
-        format!(
-            "That grant comes from the environment variable {var}. Point {var} at a \
-             directory that does not contain cplt's state directory, or unset it."
-        )
-    } else {
+/// when the tree is their project sends them looking for a grant they never
+/// wrote. An env-set tool dir never gets here: #1104 grants one only under a
+/// root that is itself a grant, and the state dir is pinned out of those.
+fn state_ancestor_refusal(what: &str, p: &Path, dir: &Path, home: &Path) -> String {
+    let remedy = if dir.starts_with(p) {
         match what {
             "allow.write" => format!(
                 "Grant only the subdirectory you need: `cplt config set allow.write {}/<tool>`.",
@@ -1285,6 +1254,13 @@ fn state_ancestor_refusal(
                 .to_string(),
             _ => "Make sure that tree does not contain cplt's state directory.".to_string(),
         }
+    } else {
+        // Only a symlink on the way to the state dir puts it inside `p`.
+        format!(
+            "{} is a symlink into that tree (a stow-style dotfiles link). Move the cplt \
+             directory out of it, so the state directory is not reachable through it.",
+            dir.display()
+        )
     };
     format!(
         "{what} {} would make cplt's state directory {} writable in the sandbox. {remedy}",
@@ -1354,7 +1330,6 @@ pub fn refuse_state_ancestor_layers(
     for (p, _) in layers {
         if let Some(dir) = policy::cplt_state_ancestor_grant(home, p)
             && dir.starts_with(p)
-            && tool_env_var_for(p, home).is_none()
         {
             // One remedy per layer that sets the path: the same grant can sit in
             // several, and launch keeps failing until every one is removed.
@@ -1380,24 +1355,6 @@ pub fn refuse_state_ancestor_layers(
     Ok(())
 }
 
-/// The tool-path variable (`GOCACHE`, `CARGO_HOME`, ...) whose value became the
-/// write grant `tree`, so the refusal names it instead of blaming `allow.write`.
-fn tool_env_var_for(tree: &Path, home: &Path) -> Option<&'static str> {
-    let env: Vec<(String, String)> = policy::TOOL_PATH_ENV_VARS
-        .iter()
-        .filter_map(|tv| {
-            std::env::var(tv.name)
-                .ok()
-                .map(|v| (tv.name.to_string(), v))
-        })
-        .collect();
-    let want = std::fs::canonicalize(tree).ok()?;
-    policy::tool_path_env_overrides(&env, home)
-        .into_iter()
-        .find(|o| o.write && std::fs::canonicalize(&o.path).ok().as_deref() == Some(&*want))
-        .map(|o| o.name)
-}
-
 /// Refuse one grant that no launch can honour, with the reason.
 ///
 /// Shared with `cplt config set` (#306). The tool used to accept
@@ -1416,7 +1373,7 @@ pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), S
     if key == "allow.write"
         && let Some(dir) = policy::cplt_state_ancestor_grant(home_dir, p)
     {
-        return Err(state_ancestor_refusal(key, p, &dir, None, home_dir));
+        return Err(state_ancestor_refusal(key, p, &dir, home_dir));
     }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
@@ -1541,16 +1498,7 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         .filter(|(_, why)| *why != TEMP_DIR_SOURCE)
     {
         if let Some(dir) = policy::cplt_state_ancestor_grant(config.home_dir, &tree) {
-            let var = (why == "the allow.write grant")
-                .then(|| tool_env_var_for(&tree, config.home_dir))
-                .flatten();
-            return Err(state_ancestor_refusal(
-                why,
-                &tree,
-                &dir,
-                var,
-                config.home_dir,
-            ));
+            return Err(state_ancestor_refusal(why, &tree, &dir, config.home_dir));
         }
     }
     let trees: Vec<PathBuf> = canonical_writable_trees(config)
@@ -7435,26 +7383,6 @@ mod tests {
         config.extra_write = &writes;
         let err = refuse(&config);
         assert!(err.contains("Remove the broad grant"), "{err}");
-
-        // The same grant derived from GOCACHE names the variable.
-        let err = temp_env::with_vars(
-            [
-                ("GOCACHE", Some(cfg.as_os_str())),
-                ("XDG_CONFIG_HOME", None),
-            ],
-            || keep_cplt_state_out_of_grants(&config).unwrap_err(),
-        );
-        assert!(err.contains("environment variable GOCACHE"), "{err}");
-        assert!(!err.contains("Remove the broad grant"), "{err}");
-        // validate_hard_denied_grants runs first at launch and must name it too.
-        let err = temp_env::with_vars(
-            [
-                ("GOCACHE", Some(cfg.as_os_str())),
-                ("XDG_CONFIG_HOME", None),
-            ],
-            || validate_hard_denied_grants(&config).unwrap_err(),
-        );
-        assert!(err.contains("environment variable GOCACHE"), "{err}");
 
         // Project directory = ~/.config.
         let mut config = test_config(&h, &[]);
