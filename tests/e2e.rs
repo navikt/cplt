@@ -668,6 +668,44 @@ mod e2e_tests {
         );
     }
 
+    /// #1121: gh's own credential helper answers inside the sandbox once a
+    /// token is passed in, so the push hint must not fire then.
+    #[test]
+    fn e2e_push_hint_counts_gh_helper_when_token_is_passed() {
+        const HINT: &str = "git push to https://github.com will fail";
+        let home = crate::common::make_config_home("push-hint-token");
+        let repo = crate::common::temp_repo("navikt/probe");
+        let _ = crate::common::launch(
+            &home,
+            repo.path(),
+            &["config", "set", "gh_guard.enabled", "false", "--force"],
+        );
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "credential.helper", "!gh auth git-credential"]
+        ));
+        let run = |pass: bool| {
+            let mut cmd = crate::common::cplt_local(&home, repo.path());
+            cmd.env("GH_TOKEN", "ghp_probe")
+                .args(["--agent", "shell", "--yes"]);
+            if pass {
+                cmd.args(["--pass-env", "GH_TOKEN"]);
+            }
+            let o = cmd
+                .args(["--", "-c", "true"])
+                .output()
+                .expect("cplt should run");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
+        assert!(run(false).contains(HINT), "token not passed: hint fires");
+        let out = run(true);
+        assert!(!out.contains(HINT), "token passed: no hint\n{out}");
+    }
+
     #[test]
     fn e2e_doctor_header_names_agent_config_and_enforcement() {
         // No require_copilot!: the header prints whatever is installed, and
