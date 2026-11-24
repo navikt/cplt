@@ -747,6 +747,10 @@ fn prepare_locked(
         let policy = base.get_or_init(|| landlock_mod::generate_policy(config));
         refuse_policy_write_into_state(config, policy, &home.join(CPLT_STATE_DIR))?;
     }
+    // Only now is the state dir known to sit outside every grant.
+    if !inspect_only {
+        maintain_cplt_state(config)?;
+    }
     let mut canonical_grants = validate_cache_exec_dirs(config, &base)?;
     validate_exec_grants(config)?;
     canonical_grants.extend(prepare_cypress_app_data(config, inspect_only, &base)?);
@@ -1606,7 +1610,13 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
             ));
         }
     }
-    // Only now is the state dir known to sit outside every grant.
+    Ok(())
+}
+
+/// Flush the pinned state record and prune launch records. Call only after
+/// every refusal (writable trees and the generated policy) has passed: pruning
+/// walks the state dir, which an unvalidated grant could have redirected.
+fn maintain_cplt_state(config: &SandboxConfig) -> Result<(), String> {
     policy::flush_state_pinned(config.home_dir, config.project_dir)?;
     crate::launch_state::prune(config.home_dir);
     Ok(())
