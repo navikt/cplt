@@ -946,6 +946,16 @@ fn walk(path: &Path) -> Result<(std::fs::File, std::fs::File, (u64, u64)), Optio
             // Not the last: managed.d itself must be listable for the scan.
             Err(e) if e.raw_os_error() == Some(libc::EACCES) && at != path => {
                 match open_nofollow(cur.as_raw_fd(), name, search) {
+                    // Linux `O_PATH` opens even a mode-000 dir; macOS
+                    // `O_SEARCH` needs search permission. Require it on both,
+                    // or the walk would stop one level lower, holding an
+                    // `O_PATH` parent that cannot rename or `fchmod` it aside.
+                    #[cfg(target_os = "linux")]
+                    Ok(n) => match open_nofollow(n.as_raw_fd(), OsStr::new("."), search) {
+                        Ok(_) => n,
+                        Err(e) => return Err(Some((std::fs::File::from(cur), at, e))),
+                    },
+                    #[cfg(not(target_os = "linux"))]
                     Ok(n) => n,
                     Err(e) => return Err(Some((std::fs::File::from(cur), at, e))),
                 }
