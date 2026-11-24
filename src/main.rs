@@ -12270,7 +12270,12 @@ fn run_config_get_json(key: &str) -> ExitCode {
         Ok(l) => l,
         Err(e) => return fail(1, &e.to_string(), "cannot load config"),
     };
-    let local = local_for_display();
+    // Launch refuses a bad local config; a launcher must not read "no local layer" instead.
+    let local = match detect_project_root().map(|d| config::load_local(&d)) {
+        Some(Err(e)) => return fail(1, &e.to_string(), "cannot load local config"),
+        Some(Ok(l)) => l,
+        None => None,
+    };
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
     let managed =
         match load_managed_for_display(loaded.as_ref(), local.as_ref(), project_dir.as_deref()) {
@@ -12282,9 +12287,35 @@ fn run_config_get_json(key: &str) -> ExitCode {
             None => None,
         };
     // The launch gate's own rule: only a current approval bound to this checkout grants.
-    let repo = project_dir
-        .as_deref()
-        .and_then(|dir| repo_config::load_repo_config(dir).ok().flatten());
+    let refuse_invalid = loaded
+        .as_ref()
+        .map(|l| l.config.clone())
+        .unwrap_or_default()
+        .merge_with_local(
+            local.as_ref().map(|l| &l.config),
+            config::CliFlags::default(),
+        )
+        .is_ok_and(|r| r.refuse_invalid_repo_config);
+    let repo = match project_dir.as_deref().map(repo_config::load_repo_config) {
+        Some(Err(e)) if refuse_invalid => {
+            return fail(
+                1,
+                &format!("Cannot load .cplt.toml: {e}"),
+                "invalid .cplt.toml",
+            );
+        }
+        Some(Ok(Some(l)))
+            if refuse_invalid && repo_config::has_unknown_tightening_keys(&l.config) =>
+        {
+            return fail(
+                1,
+                ".cplt.toml has [deny] keys this cplt does not understand",
+                "invalid .cplt.toml",
+            );
+        }
+        Some(Ok(l)) => l,
+        _ => None,
+    };
     let approved: Vec<String> =
         repo.as_ref()
             .zip(project_dir.as_deref())

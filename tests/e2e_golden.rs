@@ -1856,7 +1856,7 @@ fn config_get_json_names_the_layer_that_set_the_key() {
     );
     assert!(st.success(), "config set --local list:\n{so}{se}");
     let (_, v) = get_json(&home, repo.path(), "allow.domains", None);
-    assert_eq!(v["value"], json!(["user.example", "local.example"]));
+    assert_eq!(v["value"], json!(["local.example", "user.example"]));
     assert_eq!(v["source"], "local");
 
     // baseline arrays are parsed, not split with their TOML quotes; booleans are bools
@@ -1909,7 +1909,7 @@ fn config_get_json_names_the_layer_that_set_the_key() {
     assert_eq!(code, 0);
     assert_eq!(
         v,
-        json!({"schema":1,"key":"allow.domains","value":["user.example","local.example","managed-only.example"],
+        json!({"schema":1,"key":"allow.domains","value":["local.example","user.example","managed-only.example"],
                "source":"managed","set":true,"managed_by":"nav-pilot"})
     );
 
@@ -1920,4 +1920,12 @@ fn config_get_json_names_the_layer_that_set_the_key() {
         v,
         json!({"schema":1,"error":"unknown key","key":"sandbox.nope"})
     );
+
+    // a local file the launch refuses is an error here too, not a missing layer
+    let (so, _, st) = launch(&home, repo.path(), &["config", "path", "--local"]);
+    assert!(st.success());
+    std::fs::write(so.trim(), "this is [not toml").unwrap();
+    let (code, v) = get_json(&home, repo.path(), key, None);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["error"], "cannot load local config");
 }
