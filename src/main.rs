@@ -3096,6 +3096,12 @@ fn repo_under_no_exec_cache_messages(
     if !cfg!(target_os = "macos") {
         return out;
     }
+    if let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+    {
+        out.extend(cplt_exe_no_exec_message(resolved, home_dir, &exe));
+    }
     for root in std::iter::once(project_dir).chain(named_roots.iter().map(PathBuf::as_path)) {
         if let Some(dir) = cplt::sandbox::no_exec_tool_dir_over(
             root,
@@ -3116,6 +3122,31 @@ fn repo_under_no_exec_cache_messages(
         }
     }
     out
+}
+
+/// #1158: the gh/git guard wrappers and the `open` shim run `exe` from inside
+/// the sandbox. Under a no-exec temp or tool dir that exec is denied, so say
+/// so once at launch. Not fixed with a literal exec allow: those trees are
+/// agent-writable, so the agent could swap the binary first.
+fn cplt_exe_no_exec_message(
+    resolved: &config::Resolved,
+    home_dir: &Path,
+    exe: &Path,
+) -> Option<String> {
+    let dir = cplt::sandbox::no_exec_tool_dir_over(
+        exe,
+        home_dir,
+        &resolved.allow_cache_exec,
+        resolved.allow_cache_exec_any,
+    )
+    .or_else(|| cplt::sandbox::no_exec_temp_dir_over(exe, resolved.allow_tmp_exec))?;
+    Some(format!(
+        "cplt runs from {}, under {}, where the sandbox denies execute. The gh and \
+         git guards will fail and MCP login links won't open. Install cplt outside \
+         temp dirs, e.g. `brew install navikt/tap/cplt`.",
+        exe.display(),
+        dir.display()
+    ))
 }
 
 fn warn_write_granted_repos(
@@ -19775,6 +19806,28 @@ mod tests {
             let f = state_split_finding(&home).expect("marker");
             assert!(f.message.contains("ignores"), "{}", f.message);
         });
+    }
+
+    /// #1158: a cplt under an exec-denied temp tree gets one launch warning
+    /// naming what breaks and the fix; a normal install gets none.
+    #[test]
+    fn cplt_exe_under_temp_dir_warns() {
+        let r = toml::from_str::<config::Config>("")
+            .unwrap()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        let home = Path::new("/Users/u");
+        let msg = cplt_exe_no_exec_message(&r, home, Path::new("/private/tmp/x/cplt")).unwrap();
+        assert!(msg.contains("gh and git guards") && msg.contains("MCP login links"));
+        assert!(msg.contains("brew install navikt/tap/cplt"));
+        assert!(
+            cplt_exe_no_exec_message(&r, home, Path::new("/private/var/folders/a/T/cplt"))
+                .is_some()
+        );
+        assert!(cplt_exe_no_exec_message(&r, home, Path::new("/opt/homebrew/bin/cplt")).is_none());
+        assert!(
+            cplt_exe_no_exec_message(&r, home, Path::new("/Users/u/.local/bin/cplt")).is_none()
+        );
     }
 
     #[test]
