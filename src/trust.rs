@@ -277,6 +277,31 @@ pub fn save_trust(project_dir: &Path, entry: &TrustEntry) -> Result<(), String> 
     Ok(())
 }
 
+/// Subdirectory of the trust dir holding host-opener disclosure markers.
+const OPENER_SEEN_DIR: &str = "opener-seen";
+
+/// `true` the first time `line` is shown for this repository, recording it
+/// (#1091). The marker sits in the trust dir, which the sandbox cannot write,
+/// and its name holds a hash of `line`, so a changed list is disclosed again
+/// even if an old marker exists. An unwritable store fails open: the line is
+/// shown again next launch.
+pub fn first_disclosure(project_dir: &Path, line: &str) -> bool {
+    let Some(dir) = trust_dir().map(|d| d.join(OPENER_SEEN_DIR)) else {
+        return true;
+    };
+    let name = format!(
+        "{}-{}",
+        repo_fingerprint(project_dir),
+        &sha256_hex(&format!("cplt-opener-v1\0{line}"))[..32]
+    );
+    let marker = dir.join(name);
+    if marker.symlink_metadata().is_ok() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&marker, b""));
+    true
+}
+
 /// Remove the trust entry for a repository.
 pub fn revoke_trust(project_dir: &Path) -> Result<(), String> {
     let fingerprint = repo_fingerprint(project_dir);

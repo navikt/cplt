@@ -89,6 +89,8 @@ pub(crate) struct Shared {
     /// Hosts `open_url` may open; empty means the op is off.
     open_hosts: Vec<String>,
     open_limiter: super::open_url::Limiter,
+    /// Every `open_url` decision, for the post-session report.
+    open_records: Mutex<Vec<String>>,
     /// Set by [`Broker::disable_open_url`].
     open_off: AtomicBool,
     /// Open connections (socket clients and egress tunnels together).
@@ -292,15 +294,27 @@ fn refuse_oauth_remotes_unless_claimed(specs: Vec<Spec>, claimed: bool) -> Vec<S
 }
 
 impl Shared {
+    /// macOS serves the op in every broker session (#1091), so a refused
+    /// host gets the fix line instead of a silent failure. Linux has no host
+    /// opener; its shim only prints, and only takes over when some host is
+    /// allowed, so `xdg-open` keeps working as before otherwise.
     fn open_url_enabled(&self) -> bool {
-        !self.open_hosts.is_empty() && !self.open_off.load(Ordering::Acquire)
+        (super::open_url::HOST_OPENER || !self.open_hosts.is_empty())
+            && !self.open_off.load(Ordering::Acquire)
     }
 }
 
 impl Broker {
     /// Bind the socket and serve `specs`. The child's egress goes through the
     /// proxy on `proxy_port`, whose allowlist already holds the specs' hosts.
-    pub fn start(specs: Vec<Spec>, home: &Path, log: Log) -> Result<Self, String> {
+    /// `open_domains`: the session's `proxy.allow_private_domains`, which
+    /// `open_url` may open with their subdomains (#1091).
+    pub fn start(
+        specs: Vec<Spec>,
+        home: &Path,
+        log: Log,
+        open_domains: &[String],
+    ) -> Result<Self, String> {
         // No brokered mechanism uses OAuth yet (#1017): reserve the callback port
         // only once one does, so existing sessions keep binding freely.
         let oauth_guard =
@@ -362,7 +376,12 @@ impl Broker {
             };
             servers.insert(server.spec.id.clone(), server);
         }
-        let open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
+        let mut open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
+        // Linux: only alongside an OAuth host, so a session without one keeps
+        // the real `xdg-open` exactly as before (#1091).
+        if super::open_url::HOST_OPENER || !open_hosts.is_empty() {
+            open_hosts.extend(super::open_url::private_domain_entries(open_domains));
+        }
         // A crashed broker's children left their temp dirs behind (#1072).
         #[cfg(target_os = "macos")]
         sweep_child_temp_dirs(home);
@@ -370,6 +389,7 @@ impl Broker {
             servers,
             open_hosts,
             open_limiter: super::open_url::Limiter::default(),
+            open_records: Mutex::new(Vec::new()),
             open_off: AtomicBool::new(false),
             home: home.to_path_buf(),
             log,
@@ -469,6 +489,20 @@ impl Broker {
     #[must_use]
     pub fn open_url_hosts(&self) -> &[String] {
         &self.shared.open_hosts
+    }
+
+    /// Every `open_url` decision this session (host and reason, no query).
+    #[must_use]
+    pub fn open_url_records(&self) -> Vec<String> {
+        // A client can disconnect while its opener runs; wait for the record.
+        self.shared
+            .open_limiter
+            .drain(std::time::Duration::from_secs(5));
+        self.shared
+            .open_records
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_default()
     }
 
     /// Turn `open_url` off for this session.
@@ -1507,6 +1541,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
                 &shared.open_limiter,
                 &shared.home,
                 &shared.log,
+                &shared.open_records,
             );
         }
         return;
@@ -2472,13 +2507,38 @@ mod tests {
                 level: crate::proxy::ProxyLogLevel::None,
                 file: None,
             },
+            &[],
         )
         .unwrap()
     }
 
-    /// #910: no oauth-remote spec, no `open_url`: the op line is answered
-    /// as an unknown id and the launcher installs no shims.
+    /// #1091: on macOS every broker serves `open_url`; a host outside
+    /// `allow_private_domains` is refused with the fix, and nothing opens.
     #[test]
+    #[cfg(target_os = "macos")]
+    fn open_url_refuses_an_unlisted_host_with_the_fix() {
+        let b = cat_broker();
+        assert!(b.open_url_enabled());
+        let mut s = UnixStream::connect(b.socket()).unwrap();
+        write!(
+            s,
+            "{}\nhttps://evil.local/\n",
+            super::super::open_url::OP_LINE
+        )
+        .unwrap();
+        let mut answer = String::new();
+        BufReader::new(s).read_line(&mut answer).unwrap();
+        assert!(
+            answer.contains("cplt config set proxy.allow_private_domains evil.local"),
+            "{answer}"
+        );
+    }
+
+    /// #910: no oauth-remote spec and no private domain: on Linux the op line
+    /// is answered as an unknown id and the launcher installs no shims. On
+    /// macOS the op is served (#1091) and refuses the host.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
     fn open_url_is_off_without_an_oauth_spec() {
         let b = cat_broker();
         assert!(!b.open_url_enabled());
@@ -2495,6 +2555,28 @@ mod tests {
             !answer.starts_with("denied") && !answer.starts_with("ok"),
             "{answer}"
         );
+    }
+
+    /// Copilot review on #1124: on Linux, `allow_private_domains` alone must
+    /// not turn on the print-only shim; the real `xdg-open` stays.
+    #[test]
+    fn private_domains_alone_enable_the_opener_only_on_macos() {
+        let mut spec = check(base()).unwrap();
+        spec.command = vec!["cat".into()];
+        spec.program = "/bin/cat".into();
+        let b = Broker::start(
+            vec![spec],
+            Path::new("/tmp"),
+            Log {
+                level: crate::proxy::ProxyLogLevel::None,
+                file: None,
+            },
+            &["intern.example".into()],
+        )
+        .unwrap();
+        let host_opener = super::super::open_url::HOST_OPENER;
+        assert_eq!(b.open_url_enabled(), host_opener);
+        assert_eq!(b.open_url_hosts().is_empty(), !host_opener);
     }
 
     /// #930: the macOS probe's command is the child's: sandbox-exec with
@@ -2765,6 +2847,7 @@ mod tests {
                 level: crate::proxy::ProxyLogLevel::None,
                 file: None,
             },
+            &[],
         )
         .unwrap()
     }

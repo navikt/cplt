@@ -6160,6 +6160,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             settled,
         );
     }
+    if let Some(broker) = &mcp_broker {
+        // #1091: every host-opener decision, whatever the log level.
+        let opens = broker.open_url_records();
+        if !opens.is_empty() {
+            ui::info(&format!("host opener: {}", opens.join("; ")));
+        }
+    }
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),
@@ -7482,6 +7489,36 @@ fn managed_layer_writable(
     roots
 }
 
+/// The one line naming the domains the host opener may open in the browser
+/// that this user did not write themselves: approved `.cplt.toml` proposals
+/// and the managed layer (#1091). `None` when every entry is the user's own.
+fn opener_disclosure(resolved: &config::Resolved) -> Option<String> {
+    let mut parts = Vec::new();
+    if !resolved.repo_private_domains.is_empty() {
+        parts.push(format!(
+            "{} (from .cplt.toml)",
+            resolved.repo_private_domains.join(", ")
+        ));
+    }
+    if let Some(m) = &resolved.managed {
+        let only: Vec<&str> = m
+            .allow_private_domains
+            .iter()
+            .filter(|d| !resolved.repo_private_domains.contains(d))
+            .map(String::as_str)
+            .collect();
+        if !only.is_empty() {
+            parts.push(format!("{} (from {})", only.join(", "), m.tag()));
+        }
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "The agent can ask cplt to open https links on these domains and their subdomains in your browser: {}",
+            parts.join("; ")
+        )
+    })
+}
+
 /// Load the managed layer (#1095) and, when it is trusted, union it into
 /// `resolved`. Launch, `check` and `doctor` all go through here.
 /// `check` loads the layer for its net snapshot and again in the sandbox
@@ -8183,8 +8220,30 @@ fn assemble_sandbox(
         for r in &found.rejected {
             ui::warn(&r.line());
         }
+        let log = cplt::mcp_broker::Log {
+            level: resolved.proxy_log_level,
+            file: resolved.proxy_log_file.clone(),
+        };
         if found.specs.is_empty() {
-            return None;
+            // #1091: with no specs, macOS still runs the broker for its host
+            // opener alone, so OAuth links (an MCP gateway, `gh auth login
+            // --web`) reach the browser without `lsopen`. Not with
+            // `--allow-browser`, where the agent's own `open` already works
+            // for every host, nor with `sandbox.mcp_broker = false`.
+            if !cplt::mcp_broker::OPEN_URL_HOST_OPENER
+                || !resolved.mcp_broker
+                || resolved.allow_browser
+                || cplt::mcp_broker::opener_config_writable(&policy, home_dir).is_some()
+            {
+                return None;
+            }
+            return cplt::mcp_broker::Broker::start(
+                Vec::new(),
+                home_dir,
+                log,
+                &resolved.allow_private_domains,
+            )
+            .ok();
         }
         let mut refused = sandbox::mcp_broker_refusal(&sandbox_config);
         // A launch, not `--print-profile`: offer the host fix, then judge again.
@@ -8210,14 +8269,19 @@ fn assemble_sandbox(
             ));
             return None;
         }
-        let log = cplt::mcp_broker::Log {
-            level: resolved.proxy_log_level,
-            file: resolved.proxy_log_file.clone(),
-        };
-        let broker = cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
-            .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
-            .ok()?;
-        if cplt::mcp_broker::OPEN_URL_HOST_OPENER
+        let broker = cplt::mcp_broker::Broker::start(
+            found.specs,
+            home_dir,
+            log,
+            &resolved.allow_private_domains,
+        )
+        .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
+        .ok()?;
+        if resolved.allow_browser {
+            // `--allow-browser`: the system opener handles every host, as
+            // before the shim existed; the broker stays for its MCP services.
+            broker.disable_open_url();
+        } else if cplt::mcp_broker::OPEN_URL_HOST_OPENER
             && broker.open_url_enabled()
             && let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir)
         {
@@ -8229,6 +8293,17 @@ fn assemble_sandbox(
         }
         Some(broker)
     });
+    if !opts.inspect_only
+        && cplt::mcp_broker::OPEN_URL_HOST_OPENER
+        && mcp_broker
+            .as_ref()
+            .is_some_and(cplt::mcp_broker::Broker::open_url_enabled)
+        && let Some(line) = opener_disclosure(resolved)
+        && cplt::trust::first_disclosure(&probe.project_dir, &line)
+    {
+        // Printed under `--quiet` too: a teammate's list must not go unseen.
+        ui::warn(&line);
+    }
     let mcp_refusal = opts
         .mcp_probe
         .then(|| sandbox::mcp_broker_refusal(&sandbox_config))
@@ -8606,7 +8681,8 @@ fn run_exec_command(
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
-        mcp_broker: _,
+        // Held until the child exits: it serves the host opener (#1091).
+        mcp_broker,
         mcp_refusal: _,
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -8632,7 +8708,9 @@ fn run_exec_command(
                 launch_dir: Some(&launch_dir),
                 inspect_only: cli.print_profile,
                 opencode_v2: false,
-                mcp: None,
+                // No MCP discovery for `exec`; an empty set still starts the
+                // host opener on macOS (#1091).
+                mcp: Some(&cplt::mcp_broker::Detected::default()),
                 mcp_probe: false,
             },
         )?
@@ -8665,6 +8743,14 @@ fn run_exec_command(
             .as_ref()
             .and_then(|shadow| shadow.binary_for(&cmd[0], &bin))
             .unwrap_or(bin);
+        // A bare `open` resolves to an absolute path, so the PATH-prepended
+        // URL shim never sees it; name the shim directly (#1091).
+        let bin = match prepared.open_url_shim_dir() {
+            Some(dir) if cplt::mcp_broker::OPEN_URL_SHIMS.contains(&cmd[0].as_str()) => {
+                dir.join(&cmd[0])
+            }
+            _ => bin,
+        };
         // Only the binary the user named: a guard shim or pnpm shadow is
         // cplt's own file and is run by the path cplt chose for it.
         let bin = match requested_path.as_deref() {
@@ -8793,6 +8879,13 @@ fn run_exec_command(
             &resolved.git_guard,
             settled,
         );
+    }
+    if let Some(broker) = &mcp_broker {
+        // #1091: same opener record as an agent launch.
+        let opens = broker.open_url_records();
+        if !opens.is_empty() {
+            ui::info(&format!("host opener: {}", opens.join("; ")));
+        }
     }
     warn_worktrees_not_audited(
         audit_enabled,
@@ -10581,6 +10674,33 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         keychain_substitute.clone(),
     );
     let policy = sandbox::generate_policy(&sandbox_config);
+    // The host opener's allow-list is `proxy.allow_private_domains` (#1091).
+    // A launch turns the opener off when the sandbox can write the LaunchServices
+    // preferences, so report that instead of hosts nothing will open.
+    if cplt::mcp_broker::OPEN_URL_HOST_OPENER && resolved.mcp_broker && !resolved.allow_browser {
+        if let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, &home_dir) {
+            findings.push(Finding::warning(
+                format!(
+                    "browser opener off: the sandbox can write {}, so MCP login links will not open",
+                    doctor_tilde(&p.display().to_string(), &home_dir)
+                ),
+                None,
+            ));
+        } else {
+            for d in &resolved.allow_private_domains {
+                let source = if resolved.repo_private_domains.contains(d) {
+                    ".cplt.toml".to_string()
+                } else {
+                    resolved
+                        .managed_tag(d, &[])
+                        .unwrap_or_else(|| "config".to_string())
+                };
+                ok.push(format!(
+                    "browser opener may open: {d} and subdomains [{source}]"
+                ));
+            }
+        }
+    }
     // The cache-exec and Cypress checks the launch refuses on (#602), from the
     // same function, reusing this policy rather than generating it again.
     let launch_grants = match sandbox::launch_grants(&sandbox_config, &policy) {
@@ -14256,6 +14376,9 @@ fn trust_accept(
             } else {
                 println!("  {yellow}•{nc} {key}");
             }
+            if key == "proxy.allow_private_domains" {
+                println!("    {}", repo_config::PRIVATE_DOMAINS_BROWSER_NOTE);
+            }
         }
         println!();
 
@@ -14398,6 +14521,12 @@ fn trust_accept(
     );
     for key in &keys_to_accept {
         println!("  • {key}");
+    }
+    if keys_to_accept
+        .iter()
+        .any(|k| k == "proxy.allow_private_domains")
+    {
+        println!("  {}", repo_config::PRIVATE_DOMAINS_BROWSER_NOTE);
     }
     if keys_to_accept.iter().any(|k| k == "repos") {
         report_linked_count(loaded.config.propose.repos.len(), &not_linked);

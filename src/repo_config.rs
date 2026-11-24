@@ -934,9 +934,15 @@ pub const PROPOSE_COSTS: &[(&str, &str)] = &[
     ),
     (
         "proxy.allow_private_domains",
-        "lets the listed domains resolve to private IPs, which is a DNS-rebinding bypass",
+        "lets the listed domains resolve to private IPs, which is a DNS-rebinding bypass. \
+         On macOS they are also hosts cplt may open in your browser when the agent asks",
     ),
 ];
+
+/// Said wherever `proxy.allow_private_domains` is approved (#1091): the list
+/// doubles as the host opener's allow-list, so approving it is also consent to
+/// browser opens on those hosts.
+pub const PRIVATE_DOMAINS_BROWSER_NOTE: &str = "proxy.allow_private_domains: on macOS these domains are also hosts cplt may open in your browser when the agent asks";
 
 /// The cost text for a `[propose]` key, from [`PROPOSE_COSTS`].
 #[must_use]

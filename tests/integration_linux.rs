@@ -2327,6 +2327,62 @@ print('CONNECTED')
         );
     }
 
+    /// #1091: the HOST browser calls the client's loopback OAuth listener
+    /// inside the sandbox. Without `proxy.netns` the sandbox shares the host
+    /// network, so a listener bound in it on `127.0.0.1` or `::1` must accept
+    /// a connection from outside. With `proxy.netns` it cannot (known gap).
+    #[test]
+    fn host_reaches_loopback_listener_inside_sandbox() {
+        use std::io::{BufRead, BufReader, Read};
+        require_landlock!(4);
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let home = crate::common::home_temp_dir("loopback-callback");
+        let home_path = fs::canonicalize(home.path()).unwrap();
+        for (family, addr) in [("AF_INET", "127.0.0.1"), ("AF_INET6", "::1")] {
+            let script = format!(
+                "python3 -c \"import socket,sys\n\
+                 s=socket.socket(socket.{family},socket.SOCK_STREAM)\n\
+                 s.bind(('{addr}',0)); s.listen(1); s.settimeout(10)\n\
+                 print(s.getsockname()[1]); sys.stdout.flush()\n\
+                 c,_=s.accept(); c.sendall(b'CALLBACK_OK')\n\""
+            );
+            let mut child = cplt_cmd()
+                .args([
+                    "--yes",
+                    "--no-validate",
+                    "--quiet",
+                    "--agent",
+                    "shell",
+                    "--project-dir",
+                    &project.path().to_string_lossy(),
+                    "--",
+                    "-c",
+                    &script,
+                ])
+                .env("HOME", &home_path)
+                .env_remove("XDG_CONFIG_HOME")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("Failed to execute cplt");
+            let mut out = BufReader::new(child.stdout.take().unwrap());
+            let mut port = String::new();
+            out.read_line(&mut port).unwrap();
+            let Ok(port) = port.trim().parse::<u16>() else {
+                let _ = child.kill();
+                panic!("no listener port for {addr}: {port:?}");
+            };
+            let mut conn = std::net::TcpStream::connect((addr, port)).expect("host connect");
+            let mut reply = String::new();
+            conn.read_to_string(&mut reply).unwrap();
+            assert!(child.wait().unwrap().success(), "{addr}");
+            assert_eq!(reply, "CALLBACK_OK", "{addr}");
+        }
+    }
+
     #[test]
     fn landlock_allows_dev_server_bind_without_broker_oauth() {
         require_landlock!(4);

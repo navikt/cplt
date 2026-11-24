@@ -1125,6 +1125,34 @@ fn golden_check_exec_agrees_with_the_launch_in_both_modes() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Copilot review on #1124: doctor lists the opener hosts only when a launch
+/// would install the opener; with `~/Library/Preferences` writable it says why not (an explicit grant here;
+/// the scratch HOME under the temp dir is writable anyway).
+#[test]
+#[cfg(target_os = "macos")]
+fn golden_doctor_reports_the_opener_off_when_preferences_are_writable() {
+    let home = make_config_home("golden-doctor-opener");
+    let repo = temp_repo("navikt/probe");
+    let prefs = home.join("Library/Preferences");
+    std::fs::create_dir_all(&prefs).unwrap();
+    let cfg = home.join(".config/cplt");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[proxy]\nallow_private_domains = [\"intern.example.no\"]\n",
+    )
+    .unwrap();
+    let grant = prefs.display().to_string();
+    let (out, err, _) = launch(
+        &home,
+        repo.path(),
+        &["--agent", "shell", "--allow-write", &grant, "doctor"],
+    );
+    assert!(out.contains("browser opener off"), "{out}{err}");
+    assert!(!out.contains("browser opener may open"), "{out}{err}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// `cplt check exec "gh pr merge 1"` (one quoted word) said "not specifically
 /// gated" while the launch blocks it, and `doctor` showed no guard verdict at
 /// all (navikt/copilot#1348). Both now give the launch's answer.

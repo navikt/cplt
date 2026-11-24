@@ -6120,6 +6120,50 @@ print(f'OK:{port}')
         let _ = fs::remove_file(&profile);
     }
 
+    /// #1091: the last OAuth hop is the HOST browser calling the client's
+    /// loopback listener inside the sandbox (`127.0.0.1`, `localhost`, `::1`
+    /// on a client-chosen port). A listener bound in the sandbox must accept
+    /// a connection from outside it.
+    #[test]
+    fn real_profile_accepts_host_connection_to_loopback_listener() {
+        use std::io::{BufRead, BufReader, Read};
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let profile = write_real_profile(&default_opts(&project, &home));
+        for (family, addr) in [("AF_INET", "127.0.0.1"), ("AF_INET6", "::1")] {
+            let script = format!(
+                "import socket,sys\n\
+                 s=socket.socket(socket.{family},socket.SOCK_STREAM)\n\
+                 s.bind(('{addr}',0)); s.listen(1); s.settimeout(10)\n\
+                 print(s.getsockname()[1]); sys.stdout.flush()\n\
+                 c,_=s.accept(); c.sendall(b'CALLBACK_OK')\n"
+            );
+            let mut child = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile)
+                .args(["/bin/bash", "-c", &format!("{py} -c \"$0\""), &script])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to run sandbox-exec");
+            let mut out = BufReader::new(child.stdout.take().unwrap());
+            let mut port = String::new();
+            out.read_line(&mut port).unwrap();
+            let port: u16 = port.trim().parse().expect("listener port");
+            // `localhost` resolves to either family; dial the literal the
+            // client bound, as the browser does after resolving it.
+            let mut conn = std::net::TcpStream::connect((addr, port)).expect("host connect");
+            let mut reply = String::new();
+            conn.read_to_string(&mut reply).unwrap();
+            assert!(child.wait().unwrap().success(), "{addr}");
+            assert_eq!(reply, "CALLBACK_OK", "{addr}");
+        }
+        let _ = fs::remove_file(&profile);
+    }
+
     #[test]
     fn real_profile_denies_oauth_callback_port_bind() {
         let Some(py) = crate::common::sandbox_python3() else {

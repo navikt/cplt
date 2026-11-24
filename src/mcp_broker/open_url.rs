@@ -31,6 +31,10 @@ const OAUTH_CREDENTIAL: &str = "oauth";
 
 /// Opens per [`WINDOW`], and the window itself.
 const MAX_OPENS: usize = 3;
+/// Refusals kept for the post-session report; later ones are only counted.
+/// Allowed opens are never dropped: the limiter already bounds them.
+const MAX_REFUSALS: usize = 200;
+const MORE_REFUSALS: &str = "...and ";
 const WINDOW: Duration = Duration::from_secs(60);
 
 /// Hosts a URL may name: each oauth spec's `remote` URL host (the fleet
@@ -63,9 +67,28 @@ pub(crate) fn allowed_hosts<'a>(specs: impl Iterator<Item = &'a Spec>) -> Vec<St
 pub(crate) struct Limiter {
     recent: Mutex<VecDeque<Instant>>,
     busy: Arc<AtomicBool>,
+    /// Requests between `serve` entry and their record being written. The
+    /// client may disconnect while its opener still runs, so the report waits
+    /// on this ([`Limiter::drain`]) before reading the records.
+    inflight: std::sync::atomic::AtomicUsize,
+}
+
+struct Inflight<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Limiter {
+    /// Wait up to `max` for pending requests to record their outcome.
+    pub(crate) fn drain(&self, max: std::time::Duration) {
+        let end = Instant::now() + max;
+        while self.inflight.load(Ordering::Acquire) > 0 && Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// Take a slot, or say why not. The returned flag is cleared when the
     /// opener exits.
     fn take(&self, now: Instant) -> Result<Arc<AtomicBool>, &'static str> {
@@ -118,11 +141,106 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
         Some(_) => return Err("port other than 443"),
     };
     let host = host.to_ascii_lowercase();
-    if hosts.contains(&host) {
-        Ok(())
-    } else {
-        Err("host not allowed")
+    // One root dot, as DNS allows; `x..` or `.x` has an empty label.
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if host.split('.').any(str::is_empty) {
+        return Err("empty label in host");
     }
+    // An entry with a leading `.` is an `allow_private_domains` domain: the
+    // proxy's own matcher (the domain and its subdomains, not siblings).
+    let allowed = hosts.iter().any(|h| match h.strip_prefix('.') {
+        Some(d) => crate::proxy::is_domain_match(host, &[d.to_string()]),
+        None => *h == host,
+    });
+    if !allowed {
+        return Err(HOST_NOT_ALLOWED);
+    }
+    // A suffix match is not enough: the opener must get a real DNS name.
+    if !is_dns_name(host) {
+        return Err("host is not a valid DNS name");
+    }
+    Ok(())
+}
+
+/// Letters, digits, `-` and `.` labels, and not an IP literal or alias
+/// (`127.0.0.1`, `10.1`): config rejects those for `allow_private_domains`.
+fn is_dns_name(h: &str) -> bool {
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    h.len() <= 253
+        && h.split('.').all(label_ok)
+        && !crate::proxy::is_ip_alias(h)
+        && h.parse::<std::net::IpAddr>().is_err()
+}
+
+const HOST_NOT_ALLOWED: &str = "host not allowed";
+
+/// `proxy.allow_private_domains` as [`check`] entries (#1091). The session's
+/// effective list, managed layer included, already normalised and stripped of
+/// IP entries by config resolution.
+#[must_use]
+pub fn private_domain_entries(domains: &[String]) -> Vec<String> {
+    domains
+        .iter()
+        .map(|d| crate::proxy::normalize_hostname(d))
+        .filter(|d| !d.is_empty())
+        .map(|d| format!(".{d}"))
+        .collect()
+}
+
+/// The answer for a refused URL. `host` is set only for a URL that passed
+/// the shape rules and names a plain DNS name, so the copy-paste fix never
+/// carries agent-chosen shell syntax or URL parts. The config fix is offered
+/// only for a host that looks internal ([`looks_private`]): suggesting
+/// `allow_private_domains` for github.com would teach users to widen the
+/// proxy's private-IP rule for public hosts.
+fn refusal(host: Option<&str>, why: &str, hosts: &[String]) -> String {
+    match host.filter(|_| why == HOST_NOT_ALLOWED) {
+        Some(h) if looks_private(h, hosts) => format!(
+            "denied: {h} is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains {h}"
+        ),
+        Some(h) => format!(
+            "denied: {h} is not allowed to open in the host browser. If you trust it, copy the URL into your browser yourself."
+        ),
+        None => format!("denied: {why}"),
+    }
+}
+
+/// A `.local`/`.localhost` name, or one sharing its last two labels with an
+/// allow-list entry (`a.intern.nav.no` next to `.ansatt.nav.no`). Errs on
+/// not suggesting.
+fn looks_private(host: &str, hosts: &[String]) -> bool {
+    fn base(h: &str) -> Option<Vec<&str>> {
+        let v: Vec<&str> = h.rsplit('.').take(2).collect();
+        (v.len() == 2).then_some(v)
+    }
+    crate::proxy::is_private_hostname(host)
+        || base(host).is_some_and(|b| {
+            hosts
+                .iter()
+                .any(|e| base(e.trim_start_matches('.')).as_ref() == Some(&b))
+        })
+}
+
+/// The lowercased host of a URL that passed [`check`]'s shape rules, only if
+/// it is a syntactically valid DNS name (letters, digits, `-`, `.`). Callers
+/// must not pass a URL that failed the shape rules: its "host" can hold
+/// userinfo or other secrets.
+fn dns_host(url: &str) -> Option<String> {
+    let h = url
+        .strip_prefix("https://")?
+        .split(['/', '?', '#'])
+        .next()?
+        .split(':')
+        .next()?
+        .to_ascii_lowercase();
+    // The domain matcher ignores one root dot, so the printed host must too.
+    let h = h.strip_suffix('.').map(str::to_owned).unwrap_or(h);
+    is_dns_name(&h).then_some(h)
 }
 
 /// macOS only (owner decision 2026-11-17): LaunchServices picks the handler
@@ -265,6 +383,12 @@ fn collect_links(
 
 /// The host opener: `/usr/bin/open` on macOS, none elsewhere.
 fn opener(macos: bool) -> Option<PathBuf> {
+    // Debug builds only, for the e2e suite: a fake opener from the parent's
+    // own environment (the user's, never the agent's). Release ignores it.
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os("CPLT_TEST_OPENER").filter(|_| macos) {
+        return Some(p.into());
+    }
     macos.then(|| "/usr/bin/open".into())
 }
 
@@ -276,28 +400,84 @@ pub(crate) fn serve(
     limiter: &Limiter,
     home: &Path,
     log: &super::Log,
+    records: &Mutex<Vec<String>>,
 ) {
+    serve_with(
+        reader,
+        reply,
+        hosts,
+        limiter,
+        home,
+        log,
+        records,
+        opener(HOST_OPENER),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_with(
+    reader: &mut impl BufRead,
+    reply: &mut impl Write,
+    hosts: &[String],
+    limiter: &Limiter,
+    home: &Path,
+    log: &super::Log,
+    records: &Mutex<Vec<String>>,
+    host_opener: Option<PathBuf>,
+) {
+    limiter.inflight.fetch_add(1, Ordering::AcqRel);
+    let _inflight = Inflight(&limiter.inflight);
+    // Every decision is kept for the post-session report, whatever the log
+    // level or file. Host and reason only, never the URL's query.
+    let note = |text: String| {
+        log.line("open_url", &text);
+        let Ok(mut r) = records.lock() else { return };
+        if !text.starts_with("DENIED")
+            || r.iter().filter(|t| t.starts_with("DENIED")).count() < MAX_REFUSALS
+        {
+            r.push(text);
+        } else if let Some(m) = r.iter_mut().find(|t| t.starts_with(MORE_REFUSALS)) {
+            let n: usize = m[MORE_REFUSALS.len()..]
+                .split(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            *m = format!("{MORE_REFUSALS}{} more refusals", n + 1);
+        } else {
+            r.push(format!("{MORE_REFUSALS}1 more refusals"));
+        }
+    };
     let Some(url) = super::runtime::read_line(reader, MAX_LEN as u64 + 2) else {
         return;
     };
-    let answer = match check(&url, hosts).and_then(|()| limiter.take(Instant::now())) {
+    let checked = check(&url, hosts);
+    // The host only after the shape rules passed: a malformed URL's authority
+    // can carry userinfo, so its refusal logs and prints the reason alone.
+    let host = match checked {
+        Ok(()) | Err(HOST_NOT_ALLOWED) => dns_host(&url),
+        Err(_) => None,
+    };
+    let answer = match checked.and_then(|()| limiter.take(Instant::now())) {
         Err(why) => {
-            log.line("open_url", &format!("DENIED {why}"));
-            format!("denied: {why}")
+            match &host {
+                Some(h) => note(format!("DENIED {h} {why}")),
+                None => note(format!("DENIED {why}")),
+            }
+            refusal(host.as_deref(), why, hosts)
         }
-        Ok(busy) => match opener(HOST_OPENER).map(|o| spawn_opener(&o, &url, home, busy)) {
+        Ok(busy) => match host_opener.map(|o| run_opener(&o, &url, home, &busy)) {
             Some(Ok(())) => {
-                log.line("open_url", "ALLOWED");
+                // The host only: the query carries OAuth state and PKCE.
+                note(format!("ALLOWED {}", host.as_deref().unwrap_or("")));
                 "ok".to_string()
             }
             Some(Err(e)) => {
-                limiter.busy.store(false, Ordering::Release);
-                log.line("open_url", &format!("FAIL {e}"));
-                "failed: cannot run the opener".to_string()
+                note(format!("FAIL {e}"));
+                "failed: the host opener did not open the URL".to_string()
             }
             None => {
                 limiter.busy.store(false, Ordering::Release);
-                log.line("open_url", "FAIL no opener");
+                note("FAIL no opener".into());
                 "failed: no opener on the host".to_string()
             }
         },
@@ -322,12 +502,20 @@ fn opener_env(
     env
 }
 
-fn spawn_opener(
-    opener: &Path,
-    url: &str,
-    home: &Path,
-    busy: Arc<AtomicBool>,
-) -> std::io::Result<()> {
+/// Run the opener and wait for it: `open` returns once LaunchServices has
+/// the URL, so its exit status says whether it was handed off. `-u` makes
+/// `open` treat the argument as a URL, never a file path; cwd `/` keeps a
+/// relative path from resolving into the project. Frees the slot on return.
+fn run_opener(opener: &Path, url: &str, home: &Path, busy: &AtomicBool) -> std::io::Result<()> {
+    let status = opener_command(opener, url, home).status();
+    busy.store(false, Ordering::Release);
+    match status? {
+        s if s.success() => Ok(()),
+        s => Err(std::io::Error::other(format!("opener exited with {s}"))),
+    }
+}
+
+fn opener_command(opener: &Path, url: &str, home: &Path) -> Command {
     // `opener` is an absolute path from `opener()`, never a PATH lookup.
     #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(opener);
@@ -335,18 +523,12 @@ fn spawn_opener(
     for (k, v) in opener_env(home, &|k| std::env::var_os(k)) {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .arg(url)
+    cmd.args(["-u", url])
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // Reap it without holding the connection; the slot frees on exit.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-        busy.store(false, Ordering::Release);
-    });
-    Ok(())
+        .stderr(Stdio::null());
+    cmd
 }
 
 /// `cplt mcp-open-url <url>`, inside the sandbox: ask the broker to open it.
@@ -483,7 +665,6 @@ mod tests {
             ("https://evil.example/", "host not allowed"),
             ("https://fgw.example.evil/", "host not allowed"),
             ("https://sub.fgw.example/", "host not allowed"),
-            ("https://fgw.example./", "host not allowed"),
             (
                 "https://login.microsoftonline.com/t/oauth2/v2.0/authorize?client_id=x",
                 "host not allowed",
@@ -505,6 +686,202 @@ mod tests {
         ] {
             assert_eq!(check(u, &hosts()), Err(why), "{u:?}");
         }
+    }
+
+    /// #1091: `allow_private_domains` entries match the host and its
+    /// subdomains, as the proxy does, and nothing else.
+    #[test]
+    fn private_domains_allow_host_and_subdomains_only() {
+        let d = private_domain_entries(&["Intern.Dev.Nav.No.".into(), String::new()]);
+        assert_eq!(d, vec![".intern.dev.nav.no".to_string()]);
+        for u in [
+            "https://intern.dev.nav.no/",
+            "https://fleet-gateway.intern.dev.nav.no/authorize?x=1",
+            "https://A.B.INTERN.DEV.NAV.NO:443/",
+        ] {
+            assert_eq!(check(u, &d), Ok(()), "{u}");
+        }
+        for (u, why) in [
+            ("https://evilintern.dev.nav.no/", HOST_NOT_ALLOWED),
+            ("https://dev.nav.no/", HOST_NOT_ALLOWED),
+            ("https://intern.dev.nav.no.evil/", HOST_NOT_ALLOWED),
+            ("https://xn--intrn-dev-nav-no/", HOST_NOT_ALLOWED),
+            (
+                "http://fleet-gateway.intern.dev.nav.no/",
+                "URL must be https",
+            ),
+            ("javascript://intern.dev.nav.no/", "URL must be https"),
+            ("https://u@intern.dev.nav.no/", "userinfo in URL"),
+            (
+                "https://int\u{e9}rn.dev.nav.no/",
+                "URL must be printable ASCII",
+            ),
+            ("https://x.intern%2edev.nav.no/", "percent-encoded host"),
+            (
+                "https://intern.dev.nav.no/\u{1b}[2J",
+                "URL must be printable ASCII",
+            ),
+        ] {
+            assert_eq!(check(u, &d), Err(why), "{u:?}");
+        }
+    }
+
+    #[test]
+    fn refusal_names_the_host_and_the_fix() {
+        let list = vec![".intern.example".to_string()];
+        let h = dns_host("https://Gh.Intern.Example:443/login?x");
+        assert_eq!(
+            refusal(h.as_deref(), HOST_NOT_ALLOWED, &list),
+            "denied: gh.intern.example is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains gh.intern.example"
+        );
+        assert_eq!(
+            refusal(None, "URL must be https", &list),
+            "denied: URL must be https"
+        );
+    }
+
+    /// Fable on #1124: a public host never gets the `allow_private_domains`
+    /// suggestion; a `.local` name or one next to an allow-list entry does.
+    #[test]
+    fn refusal_suggests_the_config_fix_only_for_internal_looking_hosts() {
+        let list = vec![".ansatt.nav.no".to_string(), "fgw.example".to_string()];
+        for h in ["github.com", "login.microsoftonline.com", "evil.no", "x"] {
+            let r = refusal(Some(h), HOST_NOT_ALLOWED, &list);
+            assert!(!r.contains("config set"), "{r}");
+            assert!(r.contains("copy the URL into your browser yourself"), "{r}");
+        }
+        for h in ["a.intern.nav.no", "printer.local", "login.fgw.example"] {
+            let r = refusal(Some(h), HOST_NOT_ALLOWED, &list);
+            assert!(
+                r.contains(&format!("proxy.allow_private_domains {h}")),
+                "{r}"
+            );
+        }
+    }
+
+    /// Fable on #1124: one root dot is a DNS name; more, or an empty label,
+    /// is refused before any matching.
+    #[test]
+    fn check_trims_one_root_dot_and_refuses_empty_labels() {
+        let list = vec![".intern.example".to_string(), "fgw.example".to_string()];
+        assert_eq!(check("https://gw.intern.example./x", &list), Ok(()));
+        assert_eq!(check("https://fgw.example./x", &list), Ok(()));
+        for u in [
+            "https://gw.intern.example../x",
+            "https://.intern.example/",
+            "https://gw..intern.example/",
+            "https://./",
+            "https:///x",
+        ] {
+            assert_eq!(check(u, &list), Err("empty label in host"), "{u}");
+        }
+    }
+
+    /// Fable on #1124: `open -u <url>` from `/`, and a failing opener is
+    /// reported, not answered `ok`.
+    #[test]
+    fn opener_runs_in_url_mode_and_reports_failure() {
+        let cmd = opener_command(
+            Path::new("/usr/bin/open"),
+            "https://a.example/",
+            Path::new("/h"),
+        );
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-u", "https://a.example/"]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+        let busy = AtomicBool::new(true);
+        assert!(
+            run_opener(
+                Path::new("/usr/bin/false"),
+                "https://a.example/",
+                Path::new("/h"),
+                &busy
+            )
+            .is_err()
+        );
+        assert!(!busy.load(Ordering::Acquire), "slot must free on failure");
+        assert!(
+            run_opener(
+                Path::new("/usr/bin/true"),
+                "https://a.example/",
+                Path::new("/h"),
+                &busy
+            )
+            .is_ok()
+        );
+    }
+
+    /// Copilot review on #1124: an agent-chosen host with shell syntax must
+    /// never reach the copy-paste command.
+    #[test]
+    fn dns_host_drops_one_root_dot() {
+        assert_eq!(
+            dns_host("https://GW.intern.example./authorize").as_deref(),
+            Some("gw.intern.example")
+        );
+        assert_eq!(dns_host("https://gw.example../x"), None);
+    }
+
+    #[test]
+    fn refusal_prints_no_command_for_a_non_dns_host() {
+        let none: &[String] = &[];
+        for u in [
+            "https://evil.example;true;/",
+            "https://evil.example$(id)/",
+            "https://a`b`.example/",
+            "https://-bad.example/",
+            "https://x|y/",
+        ] {
+            assert_eq!(check(u, none), Err(HOST_NOT_ALLOWED), "{u}");
+            assert_eq!(dns_host(u), None, "{u}");
+            let mut out = Vec::new();
+            serve(
+                &mut format!("{u}\n").as_bytes(),
+                &mut out,
+                none,
+                &Limiter::default(),
+                Path::new("/nonexistent"),
+                &super::super::Log {
+                    level: crate::proxy::ProxyLogLevel::None,
+                    file: None,
+                },
+                &Mutex::new(Vec::new()),
+            );
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "denied: host not allowed\n"
+            );
+        }
+    }
+
+    /// Copilot review on #1124: a malformed URL's refusal carries no
+    /// URL-derived text, in the answer or in the session log.
+    #[test]
+    fn malformed_url_refusal_leaks_no_url_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("log");
+        let log = super::super::Log {
+            level: crate::proxy::ProxyLogLevel::All,
+            file: Some(file.clone()),
+        };
+        let mut out = Vec::new();
+        serve(
+            &mut "https://oauth-secret@gw.example/\n".as_bytes(),
+            &mut out,
+            &["gw.example".into()],
+            &Limiter::default(),
+            Path::new("/nonexistent"),
+            &log,
+            &Mutex::new(Vec::new()),
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out, "denied: userinfo in URL\n");
+        let logged = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(
+            !logged.contains("secret") && !logged.contains("gw."),
+            "{logged}"
+        );
+        assert!(logged.contains("DENIED userinfo in URL"), "{logged}");
     }
 
     #[test]
@@ -1008,10 +1385,165 @@ mod tests {
             &Limiter::default(),
             Path::new("/h"),
             &log,
+            &Mutex::new(Vec::new()),
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "denied: host not allowed\n"
+            "denied: evil.example is not allowed to open in the host browser. If you trust it, copy the URL into your browser yourself.\n"
         );
+    }
+
+    /// Copilot review on #1124: a suffix match needs a valid DNS host too.
+    #[test]
+    fn allowed_suffix_still_needs_a_valid_dns_host() {
+        let list = vec![".intern.example".to_string()];
+        assert_eq!(
+            check("https://bad_label.intern.example/", &list),
+            Err("host is not a valid DNS name")
+        );
+        assert_eq!(dns_host("https://bad_label.intern.example/"), None);
+        assert_eq!(check("https://ok-label.intern.example/", &list), Ok(()));
+    }
+
+    /// Copilot review on #1124: an IP literal or alias is no DNS name, so no
+    /// `allow_private_domains` suggestion (config rejects it).
+    #[test]
+    fn ip_hosts_get_no_config_suggestion() {
+        for u in ["https://127.0.0.1/", "https://10.1/", "https://10.1.2.3./"] {
+            assert_eq!(dns_host(u), None, "{u}");
+            let mut out = Vec::new();
+            serve(
+                &mut format!("{u}\n").as_bytes(),
+                &mut out,
+                &[".intern.example".to_string()],
+                &Limiter::default(),
+                Path::new("/nonexistent"),
+                &super::super::Log {
+                    level: crate::proxy::ProxyLogLevel::None,
+                    file: None,
+                },
+                &Mutex::new(Vec::new()),
+            );
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(out, "denied: host not allowed\n", "{u}");
+        }
+    }
+
+    /// Copilot review on #1124: every decision is recorded without a log
+    /// file or level, host and reason only.
+    #[test]
+    fn every_decision_is_recorded_without_the_query() {
+        let records = Mutex::new(Vec::new());
+        let log = super::super::Log {
+            level: crate::proxy::ProxyLogLevel::None,
+            file: None,
+        };
+        for u in [
+            "https://evil.example/cb?code=SECRET",
+            "https://u@evil.example/?code=SECRET",
+        ] {
+            serve(
+                &mut format!("{u}\n").as_bytes(),
+                &mut Vec::new(),
+                &["gw.example".into()],
+                &Limiter::default(),
+                Path::new("/nonexistent"),
+                &log,
+                &records,
+            );
+        }
+        let r = records.into_inner().unwrap();
+        assert_eq!(
+            r,
+            vec![
+                "DENIED evil.example host not allowed".to_string(),
+                "DENIED userinfo in URL".to_string()
+            ]
+        );
+    }
+
+    fn serve_open(
+        records: &Mutex<Vec<String>>,
+        limiter: &Limiter,
+        url: &str,
+        opener: Option<PathBuf>,
+    ) {
+        let log = super::super::Log {
+            level: crate::proxy::ProxyLogLevel::None,
+            file: None,
+        };
+        serve_with(
+            &mut format!("{url}\n").as_bytes(),
+            &mut Vec::new(),
+            &["gw.example".into()],
+            limiter,
+            Path::new("/nonexistent"),
+            &log,
+            records,
+            opener,
+        );
+    }
+
+    #[test]
+    fn refusal_flood_never_hides_an_allowed_open() {
+        let records = Mutex::new(Vec::new());
+        let limiter = Limiter::default();
+        for _ in 0..300 {
+            serve_open(&records, &limiter, "https://evil.example/", None);
+        }
+        serve_open(
+            &records,
+            &limiter,
+            "https://gw.example/ok",
+            Some("/usr/bin/true".into()),
+        );
+        let r = records.into_inner().unwrap();
+        assert_eq!(r.len(), MAX_REFUSALS + 2, "{r:?}");
+        assert!(r.contains(&"...and 100 more refusals".to_string()));
+        assert_eq!(r.last().map(String::as_str), Some("ALLOWED gw.example"));
+    }
+
+    /// Copilot review on #1124: the report waits for a slow opener whose
+    /// client already left.
+    #[test]
+    fn drain_waits_for_a_slow_opener_before_the_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cplt-slow-opener-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let slow = dir.join("slow");
+        let (started, go) = (dir.join("started"), dir.join("go"));
+        // Blocks until the test releases it, so no scheduling can finish it early.
+        std::fs::write(
+            &slow,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+                started.display(),
+                go.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let records = Mutex::new(Vec::new());
+        let limiter = Limiter::default();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                serve_open(
+                    &records,
+                    &limiter,
+                    "https://gw.example/ok",
+                    Some(slow.clone()),
+                );
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !started.exists() {
+                assert!(std::time::Instant::now() < deadline, "opener never started");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(records.lock().unwrap().is_empty(), "opener still running");
+            std::fs::write(&go, "").unwrap();
+            limiter.drain(std::time::Duration::from_secs(10));
+            assert_eq!(*records.lock().unwrap(), ["ALLOWED gw.example"]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

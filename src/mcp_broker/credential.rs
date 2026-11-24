@@ -199,7 +199,8 @@ fn sandboxed_probe(
         level: crate::proxy::ProxyLogLevel::None,
         file: None,
     };
-    let Ok(broker) = super::Broker::start(vec![spec.clone()], std::path::Path::new(&home), log)
+    let Ok(broker) =
+        super::Broker::start(vec![spec.clone()], std::path::Path::new(&home), log, &[])
     else {
         return (None, Some("cannot start the probe's sandbox"));
     };
