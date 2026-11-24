@@ -139,7 +139,7 @@ fn token_withheld_reason_for(
         } else if args.iter().any(|a| non_ascii_host(a, false)) {
             "GitHub token withheld: a URL names a host with non-ASCII characters."
         } else if repo_flag_non_ascii(args) {
-            "GitHub token withheld: -R/--repo names a host with non-ASCII characters (HOST/OWNER/REPO or git@HOST:OWNER/REPO)."
+            "GitHub token withheld: a repository (-R/--repo or operand) names a host with non-ASCII characters (HOST/OWNER/REPO or git@HOST:OWNER/REPO)."
         } else if args.iter().any(|a| names_token_tenant(a)) {
             "GitHub token withheld: an argument mentions a non-github.com GitHub host (ghe.com / github.localhost). Use --body-file for text that names one."
         } else {
@@ -334,9 +334,51 @@ fn repo_flag_values<'a>(args: &[&'a str]) -> Vec<&'a str> {
     out
 }
 
-/// Whether a `-R` value names a non-ASCII host, in `HOST/O/R` or scp form.
+/// `gh repo` subcommands whose positional operand is a repository, which gh
+/// reads with `FromFullName` and so accepts as `HOST/OWNER/REPO`.
+const REPO_OPERAND_SUBCOMMANDS: &[&str] = &[
+    "view",
+    "clone",
+    "fork",
+    "edit",
+    "delete",
+    "archive",
+    "unarchive",
+    "sync",
+    "set-default",
+];
+
+/// Every value that can name the repository's host: `-R`/`--repo` values (the
+/// plain scan plus `parse_command`, which knows clustered `-cR`), and the
+/// non-flag words of a `gh repo` subcommand that takes a repository operand.
+/// Over-collecting a flag value there only over-refuses an odd-looking word.
+fn repo_selector_values<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
+    let mut out: Vec<std::borrow::Cow<str>> =
+        repo_flag_values(args).into_iter().map(Into::into).collect();
+    if let Some(cmd) = parse_command(args) {
+        out.extend(cmd.repo_flag.clone().map(Into::into));
+        if cmd.command == "repo"
+            && let Some(sub) = cmd.subcommand.as_deref()
+            && REPO_OPERAND_SUBCOMMANDS.contains(&sub)
+            && let Some(at) = args.iter().position(|a| *a == sub)
+        {
+            let rest = &args[at + 1..];
+            let end = rest.iter().position(|a| *a == "--").unwrap_or(rest.len());
+            out.extend(
+                rest[..end]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|a| (*a).into()),
+            );
+        }
+    }
+    out
+}
+
+/// Whether a repository selector names a non-ASCII host, in `HOST/O/R` or scp form.
 fn repo_flag_non_ascii(args: &[&str]) -> bool {
-    repo_flag_values(args).iter().any(|v| {
+    repo_selector_values(args).iter().any(|v| {
+        let v: &str = v;
         if v.contains("://") {
             return false; // read by non_ascii_host as a URL
         }
@@ -8272,6 +8314,51 @@ mod tests {
                 "{args:?}"
             );
             assert!(arg_names_untrusted_host(args), "{args:?}");
+        }
+    }
+
+    /// Review of #1109: clustered `-cR` and positional repository operands
+    /// name a host too, so both reach the non-ASCII refusal and withholding.
+    #[test]
+    fn non_ascii_host_in_clustered_r_or_repo_operand_is_refused() {
+        let scope = || Ok(vec!["o/r".to_string(), "navikt/cplt".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        for args in [
+            &["pr", "view", "1", "-cRg\u{130}thub.com/o/r"][..],
+            &["pr", "view", "1", "-cR", "g\u{130}thub.com/o/r"],
+            &["pr", "view", "1", "-R", "g\u{130}thub.com/o/r"],
+            &["pr", "view", "1", "-Rg\u{130}thub.com/o/r"],
+            &["repo", "view", "g\u{130}thub.com/o/r"],
+            &["repo", "clone", "git@g\u{130}thub.com:o/r"],
+            &["repo", "set-default", "g\u{130}thub.com/o/r"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_err(),
+                "{args:?}"
+            );
+            assert!(arg_names_untrusted_host(args), "{args:?}");
+            assert!(
+                !github_token_allowed_for(args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["pr", "checkout", "\u{e6}rlig/fix/x"][..],
+            &["repo", "view", "navikt/cplt"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_ok(),
+                "{args:?}"
+            );
+            assert!(!arg_names_untrusted_host(args), "{args:?}");
+            assert!(
+                github_token_allowed_for(args, None, None, &hosts),
+                "{args:?}"
+            );
         }
     }
 
