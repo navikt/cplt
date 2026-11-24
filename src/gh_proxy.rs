@@ -136,8 +136,11 @@ fn token_withheld_reason_for(
             "GitHub token withheld: cplt could not decode an argument (failing closed)."
         } else if any_templated_host(args) {
             "GitHub token withheld: a placeholder ({owner}, {repo}, {branch}) in the gh api endpoint could choose the host."
-        } else if args.iter().any(|a| non_ascii_host(a, false)) {
-            "GitHub token withheld: a URL names a host with non-ASCII characters."
+        } else if url_withhold_words(args)
+            .iter()
+            .any(|a| non_ascii_host(a, false))
+        {
+            "GitHub token withheld: a URL names a host with non-ASCII characters. Use --body-file for text that contains one."
         } else if repo_flag_non_ascii(args) {
             "GitHub token withheld: a repository (-R/--repo or operand) names a host with non-ASCII characters (HOST/OWNER/REPO or git@HOST:OWNER/REPO)."
         } else if args.iter().any(|a| names_token_tenant(a)) {
@@ -249,9 +252,9 @@ fn decode_stable(s: &str) -> Option<String> {
 #[must_use]
 pub fn arg_names_untrusted_host(args: &[&str]) -> bool {
     args.iter().any(|a| names_token_tenant(a))
-        // Any URL in any word, prose included: gh derives the host from URL
-        // operands no per-command table lists (`gh pr view URL`).
-        || args.iter().any(|a| non_ascii_host(a, false))
+        || url_withhold_words(args)
+            .iter()
+            .any(|a| non_ascii_host(a, false))
         || any_templated_host(args)
         || repo_flag_non_ascii(args)
 }
@@ -298,18 +301,8 @@ fn api_flag_values(args: &[&str]) -> Vec<usize> {
             out.push(i);
             break;
         }
-        let mut takes_next = false;
-        if let Some(long) = a.strip_prefix("--") {
-            takes_next = !long.contains('=') && LONG.contains(&a);
-            out.push(i);
-        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
-            // When unsure whether a word is consumed, do not consume it: a
-            // cluster with `=` (`-i=t`, `-X=GET`) carries its own value.
-            if !cluster.contains('=')
-                && let Some(pos) = cluster.find(SHORT)
-            {
-                takes_next = pos + 1 == cluster.len();
-            }
+        let takes_next = flag_takes_next(a, SHORT, LONG);
+        if a.len() > 1 && a.starts_with('-') {
             out.push(i);
         }
         if takes_next && i + 1 < args.len() {
@@ -318,6 +311,22 @@ fn api_flag_values(args: &[&str]) -> Vec<usize> {
         }
         i += 1;
     }
+    out
+}
+
+/// Words whose non-ASCII URL host withholds the token. gh attaches the token
+/// by request host, and only the `gh api` endpoint (or `--hostname`, checked
+/// separately) sends it to a raw host, so for other commands a URL in a flag
+/// value (`--body "«https://nav.no»"`) cannot choose where it goes (#1119).
+/// Every `gh api` word, every operand and every repository selector still
+/// counts: gh derives the host from URL operands (`gh pr view URL`). Tenant
+/// names are matched in every word by [`names_token_tenant`].
+fn url_withhold_words<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
+    if is_api(args) {
+        return args.iter().map(|a| (*a).into()).collect();
+    }
+    let mut out = repo_selector_values(args);
+    out.extend(positional_operands(args).into_iter().map(Into::into));
     out
 }
 
@@ -340,7 +349,7 @@ fn host_words<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
                 .into_iter()
                 .filter(|a| {
                     a.split_once("://")
-                        .is_some_and(|(s, _)| !s.contains(char::is_whitespace))
+                        .is_some_and(|(s, _)| !s.contains(|c: char| c.is_ascii_whitespace()))
                 })
                 .map(Into::into),
         );
@@ -359,6 +368,10 @@ fn subcommand_long_value_flags(command: &str, subcommand: Option<&str>) -> &'sta
             "--repo",
             "--title",
             "--body",
+            "--notes",
+            "--search",
+            "--subject",
+            "--description",
             "--json",
             "--jq",
             "--template",
@@ -389,10 +402,8 @@ fn positional_operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
             out.extend(&rest[i + 1..]);
             break;
         }
-        let takes_next = if a.starts_with("--") {
-            long.contains(&a)
-        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
-            matches!(scan_short_cluster(cluster, short), Some((_, None)))
+        let takes_next = if a.len() > 1 && a.starts_with('-') {
+            flag_takes_next(a, short, long)
         } else {
             if seen_sub || sub.is_none() {
                 out.push(a);
@@ -1634,6 +1645,11 @@ fn scan_short_cluster<'a>(
     value_flags: &[char],
 ) -> Option<(char, Option<&'a str>)> {
     for (byte_idx, ch) in cluster.char_indices() {
+        // `=` ends the cluster: what follows is the value of the letter before
+        // it (`-c=t` sets boolean `c`), never more letters (#1109, #1119).
+        if ch == '=' {
+            return None;
+        }
         if value_flags.contains(&ch) {
             let rest = &cluster[byte_idx + ch.len_utf8()..];
             let attached = (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest));
@@ -1641,6 +1657,20 @@ fn scan_short_cluster<'a>(
         }
     }
     None
+}
+
+/// Whether flag word `a` consumes the next word, given a command's value-flag
+/// tables. The single arity rule for every argv walker: `--x=v` and clusters
+/// with `=` carry their own value, unknown flags consume nothing, and a cluster
+/// ending in a value letter takes the next word. When unsure, do not consume.
+fn flag_takes_next(a: &str, short: &[char], long: &[&str]) -> bool {
+    if a.starts_with("--") {
+        long.contains(&a)
+    } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+        matches!(scan_short_cluster(cluster, short), Some((_, None)))
+    } else {
+        false
+    }
 }
 
 fn find_subcommand_hint<'a>(command: &str, args: &'a [&'a str]) -> Option<&'a str> {
@@ -8433,7 +8463,7 @@ mod tests {
         let branch = ["repo", "view", "o/r", "--branch", "\u{e6}rlig/fix/x"];
         assert!(ok(&branch));
         assert!(github_token_allowed_for(&branch, None, None, &hosts));
-        // Prose: a non-ASCII URL is not refused, but costs the token.
+        // Prose: a non-ASCII URL in a flag value is not refused and keeps the token (#1119).
         let prose = [
             "pr",
             "comment",
@@ -8442,7 +8472,7 @@ mod tests {
             "Se https://bl\u{e5}b\u{e6}r.no",
         ];
         assert!(ok(&prose));
-        assert!(!github_token_allowed_for(&prose, None, None, &hosts));
+        assert!(github_token_allowed_for(&prose, None, None, &hosts));
         let ascii = ["pr", "comment", "1", "--body", "Se https://nav.no"];
         assert!(ok(&ascii));
         assert!(github_token_allowed_for(&ascii, None, None, &hosts));
@@ -8549,8 +8579,9 @@ mod tests {
                 "{args:?}"
             );
         }
-        // A URL in prose runs, but a non-ASCII character in what Go would
-        // read as its host (even trailing punctuation) costs the token.
+        // A URL in a flag value runs with the token, even when Go would
+        // read a glued non-ASCII character as part of its host (#1119):
+        // gh attaches the token by request host, not by prose.
         for args in [
             &[
                 "pr",
@@ -8561,16 +8592,38 @@ mod tests {
             ][..],
             &["pr", "comment", "1", "--body", "https://nav.no\u{2014}og"],
             &["issue", "create", "--body", "https://bl\u{e5}b\u{e6}r.no/x"],
+            &["issue", "list", "--search", "https://bl\u{e5}b\u{e6}r.no"],
+            &[
+                "issue",
+                "comment",
+                "1",
+                "--body",
+                "\u{ab}https://nav.no\u{bb}",
+            ],
         ] {
             assert!(
                 gate_with_scope_resolver(args, &off, scope, None).is_ok(),
                 "{args:?}"
             );
             assert!(
-                !github_token_allowed_for(args, None, None, &hosts),
+                github_token_allowed_for(args, None, None, &hosts),
                 "{args:?}"
             );
         }
+        assert_eq!(
+            positional_operands(&["release", "create", "v1", "--notes", "https://x\u{e5}.no"]),
+            ["v1"]
+        );
+        // A tenant name in a flag value still withholds the token.
+        let tenant = ["pr", "comment", "1", "--body", "see https://x.ghe.com/o"];
+        assert!(!github_token_allowed_for(&tenant, None, None, &hosts));
+        // A positional URL with a non-ASCII host is refused and withheld.
+        let positional = ["pr", "view", "https://g\u{130}thub.com/o/r/pull/1"];
+        assert!(gate_with_scope_resolver(&positional, &off, scope, None).is_err());
+        assert!(!github_token_allowed_for(&positional, None, None, &hosts));
+        let api = ["api", "https://g\u{130}thub.com/user"];
+        assert!(gate_with_scope_resolver(&api, &off, scope, None).is_err());
+        assert!(!github_token_allowed_for(&api, None, None, &hosts));
     }
 
     #[test]
@@ -13682,6 +13735,62 @@ mod tests {
 
     /// Review of #1070 at 8623d4fc: a positional `HOST/OWNER/REPO` picks the
     /// host like `-R` does.
+    #[test]
+    fn equals_cluster_before_url_operand_withholds_token() {
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        for flag in ["-c=t", "-c=f", "-cc=t", "-x=t"] {
+            let args = ["pr", "view", flag, "https://gİthub.com/o/r/pull/1"];
+            assert!(
+                !github_token_allowed_for(&args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Every argv walker uses one arity rule, so they agree on which words
+    /// are consumed as flag values (#1109, #1119).
+    #[test]
+    fn argv_walkers_agree_on_flag_arity() {
+        // (args, word that must be an operand, not a consumed value)
+        for (args, operand) in [
+            (&["pr", "view", "-c=t", "U"][..], "U"),
+            (&["pr", "view", "-cc=t", "U"], "U"),
+            (&["pr", "view", "-x=t", "U"], "U"),
+            (&["pr", "view", "-t", "T", "U"], "U"),
+            (&["pr", "view", "-ct", "T", "U"], "U"),
+            (&["pr", "view", "--", "-t"], "-t"),
+        ] {
+            assert_eq!(positional_operands(args), vec![operand], "{args:?}");
+        }
+        for (args, endpoint) in [
+            (&["api", "-i=t", "E"][..], 2),
+            (&["api", "-ii=t", "E"], 2),
+            (&["api", "-X=GET", "E"], 2),
+            (&["api", "-iX", "GET", "E"], 3),
+            (&["api", "-iXGET", "E"], 2),
+            (&["api", "--method=GET", "E"], 2),
+            (&["api", "--unknown", "E"], 2),
+        ] {
+            assert!(!api_flag_values(args).contains(&endpoint), "{args:?}");
+        }
+        for (a, short, long, want) in [
+            ("-c=t", &['t'][..], &[][..], false),
+            ("-X=GET", &['X'], &[], false),
+            ("-iX", &['X'], &[], true),
+            ("-iXGET", &['X'], &[], false),
+            ("--x=v", &[], &["--x"], false),
+            ("--x", &[], &["--x"], true),
+            ("--y", &[], &["--x"], false),
+        ] {
+            assert_eq!(flag_takes_next(a, short, long), want, "{a}");
+        }
+        assert_eq!(scan_short_cluster("c=R", &['R']), None);
+        assert_eq!(
+            scan_short_cluster("X=GET", &['X']),
+            Some(('X', Some("GET")))
+        );
+    }
+
     #[test]
     fn positional_host_repo_withholds_token() {
         let hosts = vec![DEFAULT_GH_HOST.to_string()];
