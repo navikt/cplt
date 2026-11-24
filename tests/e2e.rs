@@ -12701,6 +12701,48 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
         assert_eq!(opened, "https://gw.intern.example/x\n");
     }
 
+    /// Copilot review on #1124: `cplt exec -- open <url>` runs the URL shim,
+    /// not the resolved `/usr/bin/open`, which the sandbox cannot launch.
+    #[test]
+    fn e2e_exec_direct_open_reaches_host_opener() {
+        if !sandbox_usable() {
+            return;
+        }
+        let work = home_temp_dir("exec-direct-open");
+        let project = work.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let record = work.path().join("opened");
+        let opener = work.path().join("fake-open");
+        std::fs::write(
+            &opener,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = cplt_cmd()
+            .args(["--no-validate", "--allow-private-domain", "intern.example"])
+            .arg("--project-dir")
+            .arg(&project)
+            .args(["exec", "--", "open", "https://gw.intern.example/x"])
+            .env("CPLT_TEST_OPENER", &opener)
+            .output()
+            .expect("binary should run");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "stderr: {err}");
+        for _ in 0..50 {
+            if record.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let opened = std::fs::read_to_string(&record).unwrap_or_default();
+        assert_eq!(opened, "https://gw.intern.example/x\n");
+    }
+
     /// Copilot review on #1124: with an MCP spec present, `--allow-browser`
     /// keeps the system opener: no shim on PATH, no BROWSER override. The
     /// same launch without the flag is the control that the broker runs.

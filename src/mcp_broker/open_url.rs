@@ -170,6 +170,8 @@ fn dns_host(url: &str) -> Option<String> {
         .split(':')
         .next()?
         .to_ascii_lowercase();
+    // The domain matcher ignores one root dot, so the printed host must too.
+    let h = h.strip_suffix('.').map(str::to_owned).unwrap_or(h);
     let label_ok = |l: &str| {
         (1..=63).contains(&l.len())
             && !l.starts_with('-')
@@ -634,6 +636,15 @@ mod tests {
 
     /// Copilot review on #1124: an agent-chosen host with shell syntax must
     /// never reach the copy-paste command.
+    #[test]
+    fn dns_host_drops_one_root_dot() {
+        assert_eq!(
+            dns_host("https://GW.intern.example./authorize").as_deref(),
+            Some("gw.intern.example")
+        );
+        assert_eq!(dns_host("https://gw.example../x"), None);
+    }
+
     #[test]
     fn refusal_prints_no_command_for_a_non_dns_host() {
         let none: &[String] = &[];

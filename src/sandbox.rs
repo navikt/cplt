@@ -474,6 +474,12 @@ impl PreparedSandbox {
         self.worktree_socket = socket.map(Path::to_path_buf);
     }
 
+    /// Where the `open`/`xdg-open` shims are written, when they are.
+    pub fn open_url_shim_dir(&self) -> Option<PathBuf> {
+        self.mcp_socket.as_ref()?;
+        Some(self.scratch_dir.as_deref()?.join("open-url-bin"))
+    }
+
     /// The MCP broker socket the `open`/`xdg-open` shims forward to.
     pub fn set_mcp_socket(&mut self, socket: &Path, hosts: &[String]) {
         self.mcp_socket = Some(socket.to_path_buf());

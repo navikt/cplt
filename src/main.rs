@@ -8662,6 +8662,14 @@ fn run_exec_command(
             .as_ref()
             .and_then(|shadow| shadow.binary_for(&cmd[0], &bin))
             .unwrap_or(bin);
+        // A bare `open` resolves to an absolute path, so the PATH-prepended
+        // URL shim never sees it; name the shim directly (#1091).
+        let bin = match prepared.open_url_shim_dir() {
+            Some(dir) if cplt::mcp_broker::OPEN_URL_SHIMS.contains(&cmd[0].as_str()) => {
+                dir.join(&cmd[0])
+            }
+            _ => bin,
+        };
         // Only the binary the user named: a guard shim or pnpm shadow is
         // cplt's own file and is run by the path cplt chose for it.
         let bin = match requested_path.as_deref() {

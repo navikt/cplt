@@ -1306,16 +1306,13 @@ fn install_open_url_shims(
     inherit_env: bool,
 ) {
     use std::os::unix::fs::PermissionsExt;
-    let (Some(socket), Some(scratch)) = (
-        sandbox.mcp_socket.as_deref(),
-        sandbox.scratch_dir.as_deref(),
-    ) else {
+    let (Some(socket), Some(dir)) = (sandbox.mcp_socket.as_deref(), sandbox.open_url_shim_dir())
+    else {
         return;
     };
     let Ok(cplt) = std::env::current_exe() else {
         return;
     };
-    let dir = scratch.join("open-url-bin");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
