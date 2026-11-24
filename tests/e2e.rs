@@ -650,6 +650,22 @@ mod e2e_tests {
         let out = run(&session);
         assert!(!out.contains(HINT), "SSH remote: no hint:\n{out}");
         assert!(run(&["--agent", "shell", "doctor"]).contains("not HTTPS to a GitHub host"));
+
+        // The remote name is agent-writable: no escape reaches the terminal.
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "remote.pushDefault", "x\x1b[2Jy"]
+        ));
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "remote.x\x1b[2Jy.url", "git@github.com:o/r.git"]
+        ));
+        let doctor = run(&["--agent", "shell", "doctor"]);
+        let push = doctor.lines().find(|l| l.starts_with("push:")).unwrap();
+        assert!(
+            !push.contains('\x1b') && push.contains("x\u{fffd}[2Jy"),
+            "{push:?}"
+        );
     }
 
     #[test]

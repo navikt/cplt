@@ -1570,7 +1570,18 @@ fn parse_push_remote(list: &str, hosts: &[String], keychain: bool) -> Option<Pus
             continue;
         }
         let (k, v) = kv.split_once('\n').unwrap_or((kv, ""));
-        entries.push((k.to_ascii_lowercase(), v.to_string()));
+        // Section and variable are case-insensitive, the subsection is not:
+        // `remote.Fork.url` and `remote.fork.url` are two remotes.
+        let k = match (k.split_once('.'), k.rsplit_once('.')) {
+            (Some((sec, _)), Some((mid, var))) if mid.len() > sec.len() => format!(
+                "{}{}.{}",
+                sec.to_ascii_lowercase(),
+                &mid[sec.len()..],
+                var.to_ascii_lowercase()
+            ),
+            _ => k.to_ascii_lowercase(),
+        };
+        entries.push((k, v.to_string()));
     }
     let last = |key: &str| {
         entries
@@ -1580,19 +1591,27 @@ fn parse_push_remote(list: &str, hosts: &[String], keychain: bool) -> Option<Pus
             .map(|(_, v)| v.clone())
     };
     let remote = last("remote.pushdefault").unwrap_or_else(|| "origin".to_string());
-    let lower = remote.to_ascii_lowercase();
-    let url = last(&format!("remote.{lower}.pushurl"))
-        .or_else(|| last(&format!("remote.{lower}.url")))?;
+    let url = last(&format!("remote.{remote}.pushurl"))
+        .or_else(|| last(&format!("remote.{remote}.url")))?;
     let https_host = url
         .strip_prefix("https://")
         .and_then(|rest| rest.split(['/', ':']).next())
         .map(|h| h.rsplit('@').next().unwrap_or(h).to_ascii_lowercase())
         .filter(|h| hosts.iter().any(|g| g == h));
     let mut usable_helpers = Vec::new();
-    if let Some(host) = &https_host {
-        let scoped = format!("credential.https://{host}.helper");
+    if https_host.is_some() {
         for (k, v) in &entries {
-            if k != "credential.helper" && *k != scoped {
+            let Some(scope) = k
+                .strip_prefix("credential.")
+                .and_then(|r| r.strip_suffix("helper"))
+            else {
+                continue;
+            };
+            if !(scope.is_empty()
+                || scope
+                    .strip_suffix('.')
+                    .is_some_and(|u| credential_scope_matches(u, &url)))
+            {
                 continue;
             }
             // An empty value resets the list, as git does.
@@ -1609,6 +1628,43 @@ fn parse_push_remote(list: &str, hosts: &[String], keychain: bool) -> Option<Pus
         https_host,
         usable_helpers,
     })
+}
+
+/// Whether `credential.<scope>.*` applies to the HTTPS push `url`, by git's
+/// urlmatch rules: same scheme, host equal (each `*` label matches one
+/// label), user equal if the scope names one, path a prefix at a `/`.
+/// Every matching entry applies in config order, as `credential.c` does.
+fn credential_scope_matches(scope: &str, url: &str) -> bool {
+    fn split(u: &str) -> Option<(Option<&str>, String, &str)> {
+        let rest = u.strip_prefix("https://")?;
+        let (auth, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let (user, host) = match auth.rsplit_once('@') {
+            Some((u, h)) => (Some(u.split(':').next().unwrap_or(u)), h),
+            None => (None, auth),
+        };
+        let host = host
+            .strip_suffix(":443")
+            .unwrap_or(host)
+            .to_ascii_lowercase();
+        Some((user, host, path.trim_end_matches('/')))
+    }
+    let (Some((s_user, s_host, s_path)), Some((u_user, u_host, u_path))) =
+        (split(scope), split(url))
+    else {
+        return false;
+    };
+    let host_ok = s_host.split('.').count() == u_host.split('.').count()
+        && s_host
+            .split('.')
+            .zip(u_host.split('.'))
+            .all(|(s, u)| s == "*" || s == u);
+    let user_ok = s_user.is_none() || s_user == u_user;
+    let path_ok = s_path.is_empty()
+        || u_path == s_path
+        || u_path
+            .strip_prefix(s_path)
+            .is_some_and(|r| r.starts_with('/'));
+    host_ok && user_ok && path_ok
 }
 
 /// Whether a helper can answer inside the sandbox without the gh guard,
@@ -1653,15 +1709,17 @@ pub fn push_line(push: Option<&PushRemote>, gh_guard: bool, gh_token: bool) -> S
         return "no push remote".to_string();
     };
     let Some(host) = p.https_host.as_deref() else {
+        // Never the URL: it can embed a token, and this output is pasted.
         return format!(
-            "{} ({}): not HTTPS to a GitHub host, the gh guard does not apply",
-            p.remote, p.url
+            "{}: not HTTPS to a GitHub host, the gh guard does not apply",
+            p.remote
         );
     };
     let helpers = if p.usable_helpers.is_empty() {
         "no usable credential helper".to_string()
     } else {
-        format!("credential helper {}", p.usable_helpers.join(", "))
+        // A count, not the command text: a helper can carry a literal secret.
+        format!("{} usable credential helper(s)", p.usable_helpers.len())
     };
     let guard = if gh_guard {
         "gh guard on"
@@ -2864,6 +2922,103 @@ mod tests {
             None,
             "no remote"
         );
+    }
+
+    #[test]
+    fn push_line_never_prints_url_or_helper_text() {
+        let secret = parse_push_remote(
+            &list(&[(
+                "local",
+                "remote.origin.url",
+                "https://u:TOKEN@gitlab.com/o/r.git",
+            )]),
+            &gh(),
+            false,
+        )
+        .unwrap();
+        assert!(!push_line(Some(&secret), false, false).contains("TOKEN"));
+        let helper = parse_push_remote(
+            &list(&[
+                ("global", "credential.helper", "!echo password=SECRET"),
+                ("local", "remote.origin.url", "https://github.com/o/r"),
+            ]),
+            &gh(),
+            false,
+        )
+        .unwrap();
+        let line = push_line(Some(&helper), false, false);
+        assert!(
+            !line.contains("SECRET") && line.contains("1 usable"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn remote_subsection_is_case_sensitive() {
+        let p = parse_push_remote(
+            &list(&[
+                ("local", "remote.Fork.url", "https://github.com/me/r"),
+                ("local", "remote.fork.url", "git@github.com:me/r.git"),
+                ("local", "remote.pushdefault", "Fork"),
+            ]),
+            &gh(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(p.https_host.as_deref(), Some("github.com"), "{}", p.url);
+    }
+
+    #[test]
+    fn url_scoped_helpers_match_like_git() {
+        let helpers = |scope: &str, v: &str| {
+            parse_push_remote(
+                &list(&[
+                    ("global", &format!("credential.{scope}.helper"), v),
+                    (
+                        "local",
+                        "remote.origin.url",
+                        "https://me@github.com/o/r.git",
+                    ),
+                ]),
+                &gh(),
+                true,
+            )
+            .unwrap()
+            .usable_helpers
+            .len()
+        };
+        for scope in [
+            "https://github.com",
+            "https://github.com/",
+            "https://*.com",
+            "https://me@github.com",
+            "https://github.com/o",
+            "https://GitHub.com/o/r.git",
+        ] {
+            assert_eq!(helpers(scope, "osxkeychain"), 1, "{scope}");
+        }
+        for scope in [
+            "http://github.com",
+            "https://gitlab.com",
+            "https://you@github.com",
+            "https://github.com/other",
+            "https://github.com/o/re",
+            "github.com",
+        ] {
+            assert_eq!(helpers(scope, "osxkeychain"), 0, "{scope}");
+        }
+        // A matching scoped reset clears an earlier global helper.
+        let reset = parse_push_remote(
+            &list(&[
+                ("global", "credential.helper", "osxkeychain"),
+                ("global", "credential.https://github.com/o.helper", ""),
+                ("local", "remote.origin.url", "https://github.com/o/r"),
+            ]),
+            &gh(),
+            true,
+        )
+        .unwrap();
+        assert!(reset.usable_helpers.is_empty());
     }
 
     #[test]

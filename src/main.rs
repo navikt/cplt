@@ -10716,7 +10716,12 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     );
     println!(
         "push:        {}",
-        doctor::push_line(push.as_ref(), resolved.gh_guard.enabled, auth.gh_cli_auth)
+        // The remote name comes from agent-writable git config.
+        sanitize_terminal_text(&doctor::push_line(
+            push.as_ref(),
+            resolved.gh_guard.enabled,
+            auth.gh_cli_auth
+        ))
     );
     let guard_fix = doctor::gh_guard_fix(cli.no_gh_guard);
     if let Some(hint) = doctor::push_hint(push.as_ref(), resolved.gh_guard.enabled, guard_fix) {
