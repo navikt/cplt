@@ -7223,7 +7223,7 @@ except Exception as e:
             let (out, err) = firmlink_profile(&home, &project, None, &[]);
             assert!(
                 !out.contains("(subpath \"/\")")
-                    && format!("{trust_err}{err}").contains("filesystem root"),
+                    && format!("{trust_err}{err}").contains("resolves outside the repository"),
                 "repo {key}:\n{trust_err}{err}\n{out}"
             );
         }
