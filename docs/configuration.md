@@ -608,10 +608,16 @@ policy, checks the private checkout, and publishes it atomically. It:
 at most 64 characters. Plain `git worktree add` inside the sandbox still works
 as before, but git runs it directly and none of the checks above apply.
 
-The command works only in a session cplt started, on macOS (on Linux, worktrees
-inside the sandbox are unsupported because the parent-side worktree broker is
-macOS-only). The worktrees it creates outlive the session, like any other in the
-root.
+The command works only in a session cplt started, on macOS or Linux. The
+worktrees it creates outlive the session, like any other in the root.
+
+On Linux the sandbox reaches the broker through an inherited descriptor, not a
+socket path, so a tool that closes inherited descriptors before running a
+command (Python's `subprocess` does by default) cannot run `cplt worktree add`
+from that command. If a grant such as `allow.write` covers `~/.cplt-worktrees`,
+the broker is off for the session and the launch says so. On Linux the
+persistence denies listed below do not apply inside the managed root: see
+[SECURITY.md](../SECURITY.md#managed-worktrees-on-linux).
 The broker requires a launch HEAD commit whose protected bytes and executable
 modes match the checkout. Symlinked protected paths or ancestors, filesystem
 aliases of protected names, and protected files larger than 1 MiB are refused.
@@ -650,7 +656,7 @@ What you get:
 - The launch prints the root in the startup summary, exports it as
   `CPLT_WORKTREE_ROOT`, and names it in the sandbox brief. With the key off the
   variable is removed, even if your shell has one.
-- The same persistence denies apply as in the project, at any depth: the shared
+- On macOS, the same persistence denies apply as in the project, at any depth: the shared
   `.git/hooks` and `.git/config`, each worktree's `config.worktree`, and
   `.github/hooks`, `.claude/settings.json`, `.cplt.toml` and the rest of the
   per-root list inside every worktree. See

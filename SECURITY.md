@@ -714,7 +714,8 @@ Denied credential paths and filtered environment variables reduce what can be ex
 
 #### Managed worktree root (`sandbox.allow_git_worktrees`)
 
-Off by default (#531). When on, the session gets one more project-grade tree:
+Off by default (#531; Linux since #965, see [the Linux part](#managed-worktrees-on-linux)
+below). When on, the session gets one more project-grade tree:
 `~/.cplt-worktrees/<id>`, read, write and execute, so sub-agents can run
 `git worktree add "$CPLT_WORKTREE_ROOT/<name>"`. What that grants and what it
 does not:
@@ -959,18 +960,58 @@ does not:
   the settle-probe notes in `src/audit.rs` on why a process group is not used.
   When the audit runs and the tree has not settled, the audit's own warning
   says processes were left running.
-- **macOS only.** On Linux the launch fails with the key on, and `config set`
-  refuses to turn it on. Landlock cannot subtract a path from the granted
-  root, and bubblewrap re-binds only paths that exist at launch, at fixed
-  depths, never `<root>/<worktree>/<rel>`. So nothing inside the root would
-  be kernel-enforced.
+- **macOS and Linux.** On Linux nothing inside the root is kernel-enforced;
+  see [Managed worktrees on Linux](#managed-worktrees-on-linux).
 - **Residuals.** Everything written to the root outlives the session: cplt
   never deletes worktrees or branches. The agent can empty the root or plant
   files you later run outside cplt, the same as in the project directory. The
   end-of-session audit does not inspect the worktrees' contents; it prints a
   line saying so.
 
+##### Managed worktrees on Linux
 
+The key and `cplt worktree add` work on Linux since #965. The broker is the
+same code as on macOS: the same request format and limits, the same name and
+ref validation, the same private checkout in `~/.cplt-worktrees/.staging`, the
+same tree and protected-file checks. Three parts differ.
+
+- **Transport: an inherited descriptor, no socket path.** Below Landlock ABI
+  v9, nothing on Linux gates `connect(2)` to a pathname Unix socket, so a
+  socket file would be reachable by anything that can resolve its path. The
+  parent instead creates a `SOCK_SEQPACKET` socketpair and the sandbox inherits
+  one end (`CPLT_WORKTREE_SOCKET=fd:<n>`). It is the only descriptor
+  `seal_inherited_fds` keeps open besides the audit's settle probe, on the
+  Landlock-only path and through bubblewrap alike. A client creates a fresh
+  stream pair and passes one end over it with `SCM_RIGHTS`; the request and
+  reply then travel on that private stream. The parent accepts a datagram only
+  if it carries exactly one descriptor and that descriptor is an `AF_UNIX`
+  stream socket; anything else is closed unread. A tool that closes inherited
+  descriptors (Python's `subprocess` with its default `close_fds=True`, for
+  example) cannot reach the broker from its children. That fails closed.
+- **Git confinement: Landlock instead of `sandbox-exec`.** The broker's git
+  runs under the final session Landlock rules plus read and write (never
+  execute) on its private request directory, applied between fork and exec
+  with the same hook the agent spawn uses. If any session rule reaches
+  `~/.cplt-worktrees/.staging` (an `allow.write` over HOME, for example), the
+  broker is turned off for the session with a warning and
+  `CPLT_WORKTREE_SOCKET` is unset: Landlock cannot take staging back out of a
+  granted tree, and the broker never runs with staging exposed. The managed
+  root stays.
+- **Publish: `renameat2(RENAME_NOREPLACE)`**, called through `syscall(2)`, the
+  counterpart of `renameatx_np(RENAME_EXCL)`.
+
+**Stated gap: no denies inside the root.** macOS denies the protected paths at
+any depth below the root with a regex, and pins `commondir` and every `.git`
+below it. Linux cannot. Landlock cannot subtract a path from a granted tree,
+and bubblewrap re-binds read-only only paths that exist at launch, at fixed
+depths. So inside the managed root, on both Linux backends, an agent can write
+a worktree's `.git` pointer, its admin links under `<common>/worktrees/<id>`,
+and protected files such as `.github/hooks` or `.cplt.toml` after the broker
+created them. Plain `git worktree add` into the root also works directly. That
+matches the project itself on a Landlock-only host. What remains on Linux: the
+broker's checks at creation time, the end-of-session link check, and the
+next-launch refusal while a tampered link is present. Do not run git or cplt in
+a managed worktree that the end-of-session check flagged.
 #### Keychain access is all-or-nothing
 
 The macOS Keychain grant is two SBPL file rules on `~/Library/Keychains` plus the
