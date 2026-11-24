@@ -10,9 +10,9 @@
 //! passwd entry. That is inside cplt's own state tree (`.config/cplt`), which
 //! every agent profile denies on macOS and Linux, both as spelled from `$HOME`
 //! and in the passwd home. Refused there: any grant (`allow.*`, env-relocated
-//! tool dirs) inside the tree, and any writable tree (`allow.write`, the
-//! project, named repos, agent and tool dirs) that is the tree or an ancestor
-//! of it, such as `~/.config` or `$HOME`. The file is
+//! tool dirs) inside the tree. A writable tree above it (`~/.config`, `$HOME`)
+//! only warns: macOS keeps the tree denied, and on Linux the session ignores
+//! this layer and [`ManagedSnapshot`] quarantines what it changed. The file is
 //! opened by walking from `/` one component at a time with `O_NOFOLLOW`,
 //! so the file read is the one trust was decided on. The denies are spelled
 //! from `$HOME`, so the file is also refused when `$HOME` does not resolve to
@@ -26,6 +26,7 @@
 //! The layer can only add entries to `proxy.allow_private_domains`: never
 //! anything that widens file access or weakens the sandbox.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -321,6 +322,15 @@ pub fn load_managed_from(
         )
     })?;
     let rel = canonical.strip_prefix(&trusted).map_err(|_| under())?;
+    if rel.iter().any(|c| {
+        c.as_encoded_bytes()
+            .starts_with(QUARANTINE_PREFIX.as_bytes())
+    }) {
+        return Err(refuse(
+            "it was quarantined after a session that could write it",
+            "Review the quarantined file, then have the wrapper rewrite it under its original name.",
+        ));
+    }
     crate::sandbox::resolve_unwritable(path, writable).map_err(|()| {
         let tree = writable
             .iter()
@@ -561,6 +571,236 @@ impl super::types::Resolved {
             .then(|| m.tag())
         })
     }
+}
+
+/// Name prefix of an entry moved aside by [`ManagedSnapshot::finish`]. The
+/// loader refuses any path with a component carrying it.
+pub const QUARANTINE_PREFIX: &str = ".quarantine-";
+
+/// One `managed.d` entry as the parent saw it: inode, size, mtime in ns, and a
+/// SHA-256 of the content for a regular file.
+type Entry = (u64, u64, i64, Option<[u8; 32]>);
+
+/// The held dir, its (dev, ino), and its entries (`None`: too many to compare).
+type Before = (std::fs::File, (u64, u64), Option<BTreeMap<PathBuf, Entry>>);
+
+/// Entries scanned before the whole dir counts as changed: a session must not
+/// be able to stall the parent's check with a million files.
+const MAX_ENTRIES: usize = 4096;
+
+/// `managed.d` as it was before a Linux session that can write it (a grant at
+/// or above cplt's state dir, warned instead of refused). Landlock cannot deny
+/// below a granted tree, so the parent keeps this in memory, where the agent
+/// cannot reach it, and after the session moves aside every entry that is new
+/// or changed. The residual (parent SIGKILLed before the check, or a process
+/// the session left behind writing after it) is in SECURITY.md.
+pub struct ManagedSnapshot {
+    path: PathBuf,
+    before: Option<Before>,
+}
+
+impl ManagedSnapshot {
+    /// Snapshot `<home>/.config/cplt/managed.d`.
+    #[must_use]
+    pub fn take(home: &Path) -> Self {
+        // Canonical, as the loader takes it: `open_dir` refuses any symlink hop.
+        let path = std::fs::canonicalize(home)
+            .unwrap_or_else(|_| home.to_path_buf())
+            .join(TRUSTED_DIR);
+        let before = open_dir(&path).map(|(f, id)| {
+            let entries = scan(&f);
+            (f, id, entries)
+        });
+        Self { path, before }
+    }
+
+    /// Re-scan and quarantine what changed. Returns one warning line, or
+    /// `None` when nothing did.
+    #[must_use]
+    pub fn finish(self) -> Option<String> {
+        let now = open_dir(&self.path);
+        let moved = match (self.before, now) {
+            (_, None) => return None,
+            (Some((_, id, Some(old))), Some((f, now_id))) if id == now_id => {
+                let Some(new) = scan(&f) else {
+                    return quarantine_dir(&self.path);
+                };
+                let mut names: Vec<&OsStr> = new
+                    .iter()
+                    .filter(|(rel, e)| old.get(*rel) != Some(e))
+                    .filter_map(|(rel, _)| rel.iter().next())
+                    .collect();
+                names.dedup();
+                names
+                    .into_iter()
+                    .filter_map(|n| quarantine_at(&f, n))
+                    .collect::<Vec<_>>()
+            }
+            // Created, replaced, or too big to compare: the whole dir goes.
+            _ => return quarantine_dir(&self.path),
+        };
+        (!moved.is_empty()).then(|| quarantine_line(&self.path, &moved.join(", ")))
+    }
+}
+
+fn quarantine_line(dir: &Path, what: &str) -> String {
+    format!(
+        "The session could write cplt's state directory, and changed {} in {}. \
+         Moved aside as {QUARANTINE_PREFIX}*, so the managed config ignores it. \
+         Review it, and remove the grant that covers ~/.config/cplt.",
+        esc(what),
+        esc(&dir.to_string_lossy())
+    )
+}
+
+fn stamp() -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{QUARANTINE_PREFIX}{}{:09}-", t.as_secs(), t.subsec_nanos())
+}
+
+/// Move the whole dir aside, next to itself.
+fn quarantine_dir(path: &Path) -> Option<String> {
+    let name = path.file_name()?;
+    let mut to = std::ffi::OsString::from(stamp());
+    to.push(name);
+    std::fs::rename(path, path.with_file_name(&to)).ok()?;
+    Some(quarantine_line(path, &name.to_string_lossy()))
+}
+
+/// Rename `name` inside the held dir, never through a path an agent may have
+/// re-pointed.
+fn quarantine_at(dir: &std::fs::File, name: &OsStr) -> Option<String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut to = std::ffi::OsString::from(stamp());
+    to.push(name);
+    let from = std::ffi::CString::new(name.as_bytes()).ok()?;
+    let to = std::ffi::CString::new(to.as_bytes()).ok()?;
+    let fd = dir.as_raw_fd();
+    // SAFETY: both names are NUL-terminated; `fd` is an open directory.
+    (unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0)
+        .then(|| name.to_string_lossy().into_owned())
+}
+
+/// Open `path` as a directory when it, and every parent, is no symlink.
+fn open_dir(path: &Path) -> Option<(std::fs::File, (u64, u64))> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    if std::fs::canonicalize(path).ok()? != path {
+        return None;
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let m = f.metadata().ok()?;
+    Some((f, (m.dev(), m.ino())))
+}
+
+/// Every entry below `dir`, `None` past [`MAX_ENTRIES`] or on a read error.
+fn scan(dir: &std::fs::File) -> Option<BTreeMap<PathBuf, Entry>> {
+    let mut out = BTreeMap::new();
+    scan_into(dir, Path::new(""), &mut out, 0)?;
+    Some(out)
+}
+
+fn scan_into(
+    dir: &std::fs::File,
+    prefix: &Path,
+    out: &mut BTreeMap<PathBuf, Entry>,
+    depth: usize,
+) -> Option<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    // SAFETY: dup of an open fd; fdopendir takes ownership of the copy.
+    let dp = unsafe { libc::fdopendir(libc::dup(dir.as_raw_fd())) };
+    if dp.is_null() {
+        return None;
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `dp` is a valid DIR*; the entry is copied before the next call.
+        let ent = unsafe { libc::readdir(dp) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    // SAFETY: `dp` came from fdopendir and is closed once.
+    unsafe { libc::closedir(dp) };
+    for name in names {
+        if out.len() >= MAX_ENTRIES || depth > 8 {
+            return None;
+        }
+        let rel = prefix.join(OsStr::from_bytes(name.to_bytes()));
+        // SAFETY: `name` is NUL-terminated; `fd` is an open directory.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            // A symlink (ELOOP) or a socket: record by lstat, content-free.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: as above; `st` is a valid out pointer.
+            if unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    &raw mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return None;
+            }
+            out.insert(rel, stat_entry(&st, None));
+            continue;
+        }
+        // SAFETY: `fd` was just opened and is owned here.
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let m = f.metadata().ok()?;
+        let entry = {
+            use std::os::unix::fs::MetadataExt as _;
+            let hash = if m.is_file() {
+                use sha2::Digest as _;
+                let mut buf = Vec::new();
+                (&f).take(LIMIT + 1).read_to_end(&mut buf).ok()?;
+                Some(sha2::Sha256::digest(&buf).into())
+            } else {
+                None
+            };
+            (
+                m.ino(),
+                m.size(),
+                m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+                hash,
+            )
+        };
+        out.insert(rel.clone(), entry);
+        if m.is_dir() {
+            scan_into(&f, &rel, out, depth + 1)?;
+        }
+    }
+    Some(())
+}
+
+#[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+fn stat_entry(st: &libc::stat, hash: Option<[u8; 32]>) -> Entry {
+    (
+        st.st_ino as u64,
+        st.st_size as u64,
+        st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
+        hash,
+    )
 }
 
 #[cfg(test)]
@@ -1109,5 +1349,82 @@ mod tests {
         );
         assert_eq!(r.managed_tag("b.nav.no", &user_domains), None);
         assert_eq!(r.managed_tag("user.nav.no", &user_domains), None);
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Linux warn mode: a session that could write `managed.d` leaves files,
+    /// links, FIFOs and in-place edits. The parent's in-memory snapshot moves
+    /// each new or changed entry aside, keeps the untouched one, and the
+    /// loader then refuses the quarantined name.
+    #[test]
+    fn snapshot_quarantines_what_a_session_adds_or_changes() {
+        let h = Home::new();
+        let d = h.managed_d();
+        write(&d, "keep.toml", GOOD);
+        let edit = write(&d, "edit.toml", GOOD);
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let nested = write(&d.join("sub"), "n.toml", GOOD);
+        let snap = ManagedSnapshot::take(h.path());
+        assert!(
+            ManagedSnapshot::take(h.path()).finish().is_none(),
+            "no change, no line"
+        );
+
+        // The session.
+        write(&d, "planted.toml", GOOD);
+        std::fs::write(&edit, GOOD.replace("b.nav.no", "x.nav.no")).unwrap();
+        std::fs::write(&nested, GOOD.replace("b.nav.no", "y.nav.no")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", d.join("link.toml")).unwrap();
+        let fifo = std::ffi::CString::new(d.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let line = snap.finish().expect("changes are reported");
+        assert_one_line(&line);
+        let left = names(&d);
+        assert!(left.contains(&"keep.toml".to_string()), "{left:?}");
+        for gone in ["planted.toml", "edit.toml", "sub", "link.toml", "fifo"] {
+            assert!(!left.contains(&gone.to_string()), "{gone} left in {left:?}");
+            assert!(
+                left.iter()
+                    .any(|n| n.starts_with(QUARANTINE_PREFIX) && n.ends_with(gone)),
+                "{gone} not quarantined: {left:?}"
+            );
+        }
+        let q = left.iter().find(|n| n.ends_with("planted.toml")).unwrap();
+        h.refused(d.join(q).as_os_str(), &[], "quarantined");
+        assert!(h.load(d.join("keep.toml").as_os_str(), &[]).is_ok());
+    }
+
+    /// `managed.d` created, or swapped for a fresh dir, during the session:
+    /// the whole dir is moved aside.
+    #[test]
+    fn snapshot_quarantines_a_created_or_replaced_dir() {
+        let h = Home::new();
+        let d = h.managed_d();
+        std::fs::remove_dir(&d).unwrap();
+        let snap = ManagedSnapshot::take(h.path());
+        std::fs::create_dir(&d).unwrap();
+        write(&d, "planted.toml", GOOD);
+        assert!(snap.finish().is_some());
+        assert!(!d.exists());
+
+        std::fs::create_dir(&d).unwrap();
+        write(&d, "nav-pilot.toml", GOOD);
+        let snap = ManagedSnapshot::take(h.path());
+        let parent = d.parent().unwrap();
+        std::fs::rename(&d, parent.join("old")).unwrap();
+        std::fs::create_dir(&d).unwrap();
+        write(&d, "nav-pilot.toml", GOOD);
+        assert!(snap.finish().is_some());
+        assert!(!d.exists(), "replaced dir must be moved aside");
     }
 }

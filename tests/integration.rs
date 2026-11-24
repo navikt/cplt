@@ -2165,6 +2165,47 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Warn mode (#1096 follow-up): `allow.write ~/.config` and `allow.write ~`
+    /// launch again, so the kernel must keep `managed.d` closed inside them:
+    /// no write into it, no rename of `cplt`, and no rename of `~/.config`
+    /// (which would carry `managed.d` out from under its deny, to be written
+    /// and moved back). A sibling under `~/.config` is the control.
+    #[test]
+    fn state_dir_stays_closed_under_a_grant_that_covers_it() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(tmp.path()).unwrap();
+        let config = home.join(".config");
+        let managed = config.join("cplt/managed.d");
+        fs::create_dir_all(&managed).unwrap();
+        for grant in [config.clone(), home.clone()] {
+            let writes = [grant.clone()];
+            let mut opts = default_opts(&project, &home);
+            opts.extra_write = &writes;
+            let profile = write_real_profile(&opts);
+            let c = config.display();
+            let (ctl_out, ctl_ok) = run_sandboxed(&profile, &format!("echo ok > '{c}/other' 2>&1"));
+            let (w_out, w_ok) = run_sandboxed(
+                &profile,
+                &format!("echo x > '{}/evil.toml' 2>&1", managed.display()),
+            );
+            let (mv_out, mv_ok) = run_sandboxed(&profile, &format!("mv '{c}/cplt' '{c}/c2' 2>&1"));
+            let (up_out, up_ok) = run_sandboxed(&profile, &format!("mv '{c}' '{c}.old' 2>&1"));
+            fs::remove_file(&profile).ok();
+            assert!(ctl_ok, "{grant:?}: ~/.config must stay writable: {ctl_out}");
+            assert!(
+                !w_ok && !managed.join("evil.toml").exists(),
+                "{grant:?}: write into managed.d: {w_out}"
+            );
+            assert!(!mv_ok && managed.exists(), "{grant:?}: mv cplt: {mv_out}");
+            assert!(
+                !up_ok && managed.exists(),
+                "{grant:?}: mv ~/.config: {up_out}"
+            );
+        }
+    }
+
     /// Kernel truth for #524: the dotfiles repo IS the project, and
     /// `~/.gitconfig` points into it. The project grant makes the tree
     /// writable; the target must still refuse a write, and the directory

@@ -105,10 +105,10 @@ fn e2e_planted_launch_state_is_never_touched_before_the_refusal() {
         let mut stderr = String::new();
         std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
         assert!(!status.success(), "{kind}: {stderr}");
-        // `granted` holds the linked state dir, so the allow.write ancestor
-        // check (#1095) refuses before the resolved-link check can.
+        // `granted` holds the linked state dir: the ancestor check only warns
+        // about that (#1096 follow-up), and the resolved-link check refuses.
         assert!(
-            stderr.contains("is a symlink into that tree"),
+            stderr.contains("which is writable in the sandbox"),
             "{kind}: {stderr}"
         );
         assert_eq!(
@@ -120,9 +120,11 @@ fn e2e_planted_launch_state_is_never_touched_before_the_refusal() {
     }
 }
 
-/// A launch the generated-policy check refuses must not flush or prune state
-/// first: maintenance runs only after every refusal has passed (#1095). The
-/// socket grant is not a writable tree, so only the policy-level check sees it.
+/// A launch refused for a grant inside the state dir must not flush or prune
+/// state first: maintenance runs only after every refusal has passed (#1095).
+/// (This used to pass on the temp dir's grant over the fake account home,
+/// which now only warns; `policy_write_into_state_dir_is_refused` covers the
+/// policy-level check itself.)
 #[test]
 fn e2e_policy_refusal_prunes_nothing() {
     let home = std::fs::canonicalize(common::make_config_home("policy-refusal")).unwrap();
@@ -142,6 +144,9 @@ fn e2e_policy_refusal_prunes_nothing() {
         "git init should succeed"
     );
 
+    // Present: a missing socket path is dropped with a warning, not granted.
+    let sock = account.join(".config/cplt/managed.d/agent.sock");
+    std::fs::write(&sock, "").unwrap();
     let out = common::cplt_local(&home, &project)
         .args(["--agent", "copilot", "--yes", "--allow-socket"])
         .arg(account.join(".config/cplt/managed.d/agent.sock"))
@@ -159,8 +164,8 @@ fn e2e_policy_refusal_prunes_nothing() {
         "the launch should be refused: {stderr}"
     );
     assert!(
-        stderr.contains("would let the sandbox write cplt's state directory"),
-        "the policy-level check should be what refuses: {stderr}"
+        stderr.contains("inside cplt's own state directory"),
+        "the grant inside the state dir should be what refuses: {stderr}"
     );
     assert!(
         marker.exists(),

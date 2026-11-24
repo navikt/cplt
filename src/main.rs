@@ -6098,6 +6098,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         None
     };
     let mut proxy_handle = proxy_handle;
+    let managed_guard = prepared.guard_managed();
     // OpenCode's snapshot stores sit in its writable data dir, outside every
     // root the `.git` check walks; unsandboxed OpenCode runs git in them.
     let opencode_stores = (active_agent == agent::Agent::OpenCode).then(|| {
@@ -6147,6 +6148,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
+    if let Some(line) = managed_guard.and_then(config::ManagedSnapshot::finish) {
+        ui::warn(&line);
+    }
     if let Some((own, before)) = &v2_model {
         cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
     }
@@ -7507,6 +7511,10 @@ fn managed_layer_writable(
     // launch refuses the roots anyway.
     roots.extend(sandbox::named_root_git_dirs(repos).unwrap_or_default());
     roots.extend(cplt::sandbox::home_and_temp_writable_roots(home, &[], None));
+    // macOS denies the state dir inside such a grant and pins its ancestors
+    // against rename, so the managed file stays out of the agent's reach.
+    #[cfg(target_os = "macos")]
+    roots.retain(|r| sandbox::cplt_state_ancestor_grant(home, r).is_none());
     roots
 }
 
@@ -8407,9 +8415,11 @@ fn assemble_sandbox(
         .as_ref()
         .is_some_and(cplt::mcp_broker::Broker::oauth_port_claimed);
     // Name the layer a broad allow.write came from; prepare() cannot (#1095).
-    if !opts.inspect_only {
-        sandbox::refuse_state_ancestor_layers(&resolved.allow_write_layers, &probe.home_dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !opts.inspect_only
+        && let Some(line) =
+            sandbox::state_ancestor_layers_warning(&resolved.allow_write_layers, &probe.home_dir)
+    {
+        sandbox::warn_state_exposed(&line);
     }
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
@@ -8907,6 +8917,7 @@ fn run_exec_command(
         None
     };
     let mut proxy_handle = proxy_handle;
+    let managed_guard = prepared.guard_managed();
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
@@ -8942,6 +8953,9 @@ fn run_exec_command(
             })
         },
     );
+    if let Some(line) = managed_guard.and_then(config::ManagedSnapshot::finish) {
+        ui::warn(&line);
+    }
     if resolved.git_guard.enabled
         && !resolved.quiet
         && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)
@@ -12129,6 +12143,9 @@ fn run_config_set_via(
                 ui::error(&e);
                 return ExitCode::FAILURE;
             }
+            if let Some(w) = sandbox::state_ancestor_warning(key, &path, &home) {
+                ui::warn(&w);
+            }
             // The exec-overlap refusal needs the resolved config the launch builds,
             // so this is the part of it that a single grant can be judged against:
             // the trees that are writable whatever else is configured. An overlap
@@ -14198,8 +14215,12 @@ fn lapsed_approval_notice(stored: Option<&trust::TrustEntry>, lapsed: &[&str]) -
 }
 
 /// The first proposed `allow.write` entry that is, contains or lies inside
-/// cplt's state dir (`$HOME`'s or the passwd home's), as an error line.
-fn state_dir_write_proposal(project_dir: &std::path::Path, writes: &[String]) -> Option<String> {
+/// cplt's state dir (`$HOME`'s or the passwd home's), as a line, and whether
+/// it is refused (inside: no launch can honour it) or only warned (at or above).
+fn state_dir_write_proposal(
+    project_dir: &std::path::Path,
+    writes: &[String],
+) -> Option<(String, bool)> {
     let states: Vec<PathBuf> = [
         std::env::var_os("HOME").map(PathBuf::from),
         config::account_home(),
@@ -14211,11 +14232,29 @@ fn state_dir_write_proposal(project_dir: &std::path::Path, writes: &[String]) ->
     writes.iter().find_map(|w| {
         let path = project_dir.join(config::expand_tilde(w));
         let state = states.iter().find(|s| sandbox::overlaps_state(&path, s))?;
-        Some(format!(
-            "allow.write entry {w:?} in .cplt.toml would let the sandbox write cplt's state \
-             directory {}, so it cannot be approved. Approve the other keys by name \
-             (`cplt trust accept <key>`), or ask the repository to narrow that entry.",
-            state.display()
+        if path != *state && path.starts_with(state) {
+            return Some((
+                format!(
+                    "allow.write entry {w:?} in .cplt.toml lies inside cplt's state \
+                     directory {}, so it cannot be approved. Approve the other keys by name \
+                     (`cplt trust accept <key>`), or ask the repository to narrow that entry.",
+                    state.display()
+                ),
+                true,
+            ));
+        }
+        Some((
+            format!(
+                "allow.write entry {w:?} in .cplt.toml covers cplt's state directory {}. \
+             Launches warn about it{}. Ask the repository to narrow that entry.",
+                state.display(),
+                if cfg!(target_os = "macos") {
+                    ""
+                } else {
+                    ", ignore the managed config and quarantine what the session adds to managed.d"
+                }
+            ),
+            false,
         ))
     })
 }
@@ -14495,13 +14534,17 @@ fn trust_accept(
         keys.to_vec()
     };
 
-    // A write grant at, above or inside cplt's state dir would reach the
-    // trusted managed.d (#1095); the launch refuses it, so refuse it here first.
+    // A write grant at or above cplt's state dir reaches the trusted
+    // managed.d (#1095); the launch warns about it, so warn here too.
     if keys_to_accept.iter().any(|k| k == "allow.write")
-        && let Some(e) = state_dir_write_proposal(project_dir, &loaded.config.propose.allow.write)
+        && let Some((line, refused)) =
+            state_dir_write_proposal(project_dir, &loaded.config.propose.allow.write)
     {
-        ui::error(&e);
-        return ExitCode::FAILURE;
+        if refused {
+            ui::error(&line);
+            return ExitCode::FAILURE;
+        }
+        ui::warn(&line);
     }
 
     // Only when approving that key (#1110): an alias must not block `trust accept allow_docker`.
@@ -16036,18 +16079,20 @@ mod tests {
 
     use super::*;
 
-    /// #1095: `trust accept` refuses an allow.write at, above or inside the
-    /// state dir; other entries pass.
+    /// #1095: `trust accept` warns on an allow.write at or above the state
+    /// dir and refuses one inside it; other entries pass.
     #[test]
-    fn trust_accept_refuses_write_into_state_dir() {
+    fn trust_accept_warns_or_refuses_write_into_state_dir() {
         let home = PathBuf::from("/nonexistent-cplt-1095/home");
         temp_env::with_var("HOME", Some(&home), || {
             let p = Path::new("/nonexistent-cplt-1095/repo");
-            for w in ["~/.config", "~", "~/.config/cplt/managed.d"] {
-                assert!(
-                    state_dir_write_proposal(p, &[w.to_string()]).is_some(),
-                    "{w}"
-                );
+            for (w, refused) in [
+                ("~/.config", false),
+                ("~", false),
+                ("~/.config/cplt/managed.d", true),
+            ] {
+                let got = state_dir_write_proposal(p, &[w.to_string()]).map(|(_, r)| r);
+                assert_eq!(got, Some(refused), "{w}");
             }
             assert!(state_dir_write_proposal(p, &["build".into(), "~/.cache/x".into()]).is_none());
         });

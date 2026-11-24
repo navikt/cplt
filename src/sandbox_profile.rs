@@ -2996,6 +2996,15 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // And HOME itself when it lies inside a writable tree: `~/.ssh` is denied
     // whether or not it exists, so pin every ancestor of it, HOME included.
     targets.push(crate::config::canonicalize_deepest(Path::new(config.home_dir)).join(".ssh"));
+    // cplt's state dir keeps its path even unlinked: under `allow.write ~` a
+    // renamed `~/.config` would carry `managed.d` out from under its deny, to be
+    // written and moved back. Pins appear only inside a writable tree, so a
+    // launch without such a grant gets the same profile as before.
+    targets.extend(
+        std::iter::once(Path::new(home).join(super::policy::CPLT_STATE_DIR))
+            .chain(crate::sandbox::passwd_state_dir(Path::new(home)))
+            .map(|d| crate::config::canonicalize_deepest(&d)),
+    );
     emit_resolved_deny_pins(sb, config, &targets);
     for path in config.extra_deny {
         let p = path.to_string_lossy();

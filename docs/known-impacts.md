@@ -381,20 +381,21 @@ under your home.
 
 ## cplt's state directory inside a writable tree (behaviour change)
 
-cplt now refuses to launch when a tree the agent can write holds cplt's state directory (`~/.config/cplt`, or `$XDG_CONFIG_HOME/cplt`). That directory holds the config, the trust store and the managed config, so an agent that could write it could approve its own next launch. The check applies whether or not `CPLT_MANAGED_CONFIG` is set (#1095). These setups launched on 2026.11.20 and are refused now:
+cplt's state directory (`~/.config/cplt`, or `$XDG_CONFIG_HOME/cplt`) holds the config, the trust store and the managed config, so an agent that could write it could approve its own next launch (#1095). Release 2026.11.24-020236-4ea5789 refused every launch with a write grant that covers that directory. Those setups launch again, with one warning line that names the grant, where it came from and how to narrow it:
 
-| Setup | One-step recovery |
-| --- | --- |
-| `allow.write ~/.config` (also in `config.toml`, where it fails every launch and `cplt check net`) | Remove the broad grant, then add the subdirectory you need: `cplt config unset allow.write ~/.config`, then `cplt config set allow.write ~/.config/<tool>`. Unset matches both `~/.config` and the expanded path. For a command-line grant, drop `--allow-write ~/.config` |
-| `allow.write $HOME` | Remove the broad grant, then grant the directories you need: `cplt config unset allow.write ~`, then `cplt config set allow.write ~/work`. For a command-line grant, drop `--allow-write ~` |
-| `allow.write ~/.config` in this repository's local config (`cplt config set --local`, or a hand-edited local file) | `cplt config unset --local allow.write ~/.config`, then `cplt config set --local allow.write ~/.config/<tool>` if you need one |
-| `allow.write ~/.config` proposed in an approved `.cplt.toml` | `cplt config unset --repo allow.write ~/.config`, commit `.cplt.toml`, then approve the change with `cplt trust accept --all` |
-| Launching with `~/.config` as the project directory (`$HOME` was already refused as too broad) | Launch from inside the repository, e.g. `cd ~/src/myrepo && cplt` |
-| `HOME` inside the project directory | Point `HOME` outside the project, or launch from a project that does not contain it |
-| A stow-style `~/.config/cplt` symlink into the project or an `allow.write` tree | Move the cplt directory out of that tree: `rm ~/.config/cplt && mv <dotfiles>/cplt ~/.config/cplt` |
-| A tool-path variable such as `GOCACHE=~/.config` | Point the variable at a directory that does not contain `~/.config/cplt`, or unset it. The error names the variable |
+- **macOS:** the sandbox still denies writes to the state directory inside the grant, and `~/.config` (or any other directory between the grant and the state directory) cannot be renamed. The managed config is still used.
+- **Linux:** Landlock cannot deny a directory inside a granted tree, so the session can write the state directory. cplt then ignores the managed config for that session, and when the session has ended it moves aside anything new or changed in `~/.config/cplt/managed.d`, as `.quarantine-<time>-<name>`, and warns. See SECURITY.md for what this does not cover.
 
-The error names the tree, where it came from and the recovery for that source.
+| Setup | Now | To silence the warning |
+| --- | --- | --- |
+| `allow.write ~/.config` (in `config.toml`, the local config, or on the command line) | warns | `cplt config unset allow.write ~/.config`, then `cplt config set allow.write ~/.config/<tool>`. Local config: add `--local`. Command line: drop `--allow-write ~/.config` |
+| `allow.write $HOME` | warns | `cplt config unset allow.write ~`, then `cplt config set allow.write ~/work` |
+| `allow.write ~/.config` proposed in an approved `.cplt.toml` | warns, and `cplt trust accept` warns too | `cplt config unset --repo allow.write ~/.config`, commit `.cplt.toml`, then `cplt trust accept --all` |
+| `~/.config` as the project directory, or `HOME` inside the project | warns | Launch from inside the repository, or point `HOME` outside the project |
+| A stow-style `~/.config/cplt` symlink into the project or an `allow.write` tree | warns; refused when `XDG_CONFIG_HOME` is set and state stays in `~/.config/cplt` | `rm ~/.config/cplt && mv <dotfiles>/cplt ~/.config/cplt` |
+| A tool-path variable such as `GOCACHE=~/.config` | the variable is ignored with a warning, no grant (#1104) | Point the variable under `~/.cache` |
+
+Still refused: any grant inside the state directory (`allow.write ~/.config/cplt/...`, `--allow-socket` on a path in it, `XDG_RUNTIME_DIR` or `XDG_DATA_HOME` inside it), and an `allow.write` entry inside it proposed in `.cplt.toml`. Move that path out of `~/.config/cplt`.
 
 ## Go builds in a git worktree
 

@@ -35,7 +35,8 @@ pub use local::{
     set_linked_identity, stamp_local_header, validate_local_document,
 };
 pub use managed::{
-    MANAGED_CONFIG_ENV, ManagedConfig, TRUSTED_DIR, account_home, load_managed, load_managed_from,
+    MANAGED_CONFIG_ENV, ManagedConfig, ManagedSnapshot, TRUSTED_DIR, account_home, load_managed,
+    load_managed_from,
 };
 pub(crate) use path::MAXSYMLINKS;
 pub use path::canonicalize_deepest;
