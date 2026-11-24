@@ -1286,6 +1286,13 @@ on the host, outside the sandbox, and points your client's entry at
   `X-MCP-Toolsets`, a non-empty list of toolset names (`a-z`, `0-9`, `_`,
   `-`, comma). When the spec sets it, the agent's copy is dropped; otherwise
   the agent's passes. Any other header in the spec is refused at launch.
+- With `CPLT_MCP_REMOTE=1`, a gh-token spec that cannot be used (refused,
+  invalid, more than one, disabled with `--no-mcp-broker`, an unreadable spec
+  directory, or `sandbox.mcp_broker = false`) does not turn GitHub MCP off.
+  The built-in endpoint serves it instead, still read-only with lockdown, but
+  without the spec's `tools.allow`. cplt prints one warning at launch naming
+  the spec, the reason and the fix, and `cplt mcp status` shows the spec as
+  `inactive` and a `github-mcp` row as `built-in`.
 - Copilot CLI gets `--additional-mcp-config` with an entry named exactly the
   server id (`io.github.nais/nais-mcp`), so a "Registry only" MCP policy
   still allows it, and `--disable-mcp-server` for your own entries that run

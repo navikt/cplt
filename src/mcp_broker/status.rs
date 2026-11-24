@@ -30,6 +30,7 @@ pub fn status_json(
     // Remote specs are served on the proxy port, so the stdio broker's
     // platform refusal does not reach them.
     let remote_on = enabled;
+    let fallback = remote_off.is_some_and(|r| r.starts_with(super::spec::FALLBACK_PREFIX));
     let enabled = enabled && supported;
     let mut servers: Vec<Value> = found
         .specs
@@ -67,6 +68,7 @@ pub fn status_json(
         json!({
             "id": s.id,
             "state": match (remote_clients.is_empty(), remote_off) {
+                _ if fallback => "inactive",
                 (true, _) => "off",
                 (false, Some(_)) => "inactive",
                 (false, None) => "brokered",
@@ -82,7 +84,7 @@ pub fn status_json(
             "clients": remote_clients,
         })
     }));
-    // A refused gh-token spec keeps GitHub MCP off (#909): show why.
+    // A gh-token spec that cannot serve: the built-in endpoint does (#1115).
     servers.extend(found.remote_refused.iter().map(|r| {
         json!({
             "id": r.file,
@@ -96,6 +98,25 @@ pub fn status_json(
             "clients": [],
         })
     }));
+    if fallback {
+        let gh: Vec<&str> = clients
+            .iter()
+            .copied()
+            .filter(|c| *c == "opencode")
+            .collect();
+        servers.push(json!({
+            "id": "github-mcp",
+            "state": "built-in",
+            "reason": "served by the built-in endpoint without the spec's restrictions \
+                       (tools.allow is NOT applied); read-only and lockdown are still forced",
+            "transport": "http",
+            "credential": null,
+            "credential_ok": null,
+            "credential_note": null,
+            "tools_allowed": null,
+            "clients": gh,
+        }));
+    }
     servers.extend(found.disabled.iter().map(|id| {
         // Skipped before loading: nothing else is known about it.
         json!({
@@ -147,15 +168,17 @@ pub fn run_status(
         println!("  broker off for this launch: {why}");
     }
     for s in status["servers"].as_array().into_iter().flatten() {
+        let state = s["state"].as_str().unwrap_or("");
+        // Only gh-token rows (#909, gated) carry a reason.
+        let state = match s["reason"].as_str() {
+            Some(why) => format!("{state}: {}", why.escape_debug()),
+            None => state.to_string(),
+        };
         println!(
-            "  {}  {}  credential_ok: {}",
+            "  {}  {state}  credential_ok: {}",
             s["id"].as_str().unwrap_or("").escape_debug(),
-            s["state"].as_str().unwrap_or(""),
             s["credential_ok"]
         );
-        if let Some(why) = s["reason"].as_str() {
-            println!("    {}", why.escape_debug());
-        }
     }
     for r in &found.rejected {
         println!("  {}", r.line());
@@ -193,6 +216,71 @@ mod tests {
         assert_eq!(row["id"], "/x/gh.json");
         assert_eq!(row["state"], "inactive");
         assert_eq!(row["reason"], "off: why");
+    }
+
+    /// #1115: a fallback shows the spec inactive and a GitHub MCP row
+    /// served by the built-in endpoint without the spec's restrictions.
+    #[test]
+    fn fallback_shows_builtin_github_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::mcp_broker::spec::tests::gh_root();
+        std::fs::write(
+            dir.path().join(crate::mcp_broker::test_util::FILE),
+            root.to_string(),
+        )
+        .unwrap();
+        let mut found =
+            crate::mcp_broker::spec::load_with_gate(dir.path(), &[], &[], |_| None, true);
+        found.broker_off();
+        let why = crate::mcp_broker::github_spec(&found, dir.path(), |_| None).unwrap_err();
+        let v = status_json(
+            &found,
+            None,
+            false,
+            false,
+            true,
+            None,
+            &["opencode"],
+            Some(&why),
+        );
+        let rows = v["servers"].as_array().unwrap();
+        let gh = rows.iter().find(|r| r["id"] == "github-mcp").unwrap();
+        assert_eq!(gh["state"], "built-in");
+        assert!(gh["reason"].as_str().unwrap().contains("NOT applied"));
+        assert_eq!(gh["clients"], json!(["opencode"]));
+        // No fallback, no row.
+        let v = status_json(
+            &found,
+            None,
+            false,
+            false,
+            true,
+            None,
+            &["opencode"],
+            Some("x"),
+        );
+        assert!(
+            v["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["id"] != "github-mcp")
+        );
+        // A spec still loaded but unusable (ambiguous) is inactive.
+        let mut two = crate::mcp_broker::spec::load_with_gate(dir.path(), &[], &[], |_| None, true);
+        two.remotes.push(two.remotes[0].clone());
+        let why = crate::mcp_broker::github_spec(&two, dir.path(), |_| None).unwrap_err();
+        let v = status_json(
+            &two,
+            None,
+            true,
+            false,
+            true,
+            None,
+            &["opencode"],
+            Some(&why),
+        );
+        assert_eq!(v["servers"][0]["state"], "inactive");
     }
 
     #[test]

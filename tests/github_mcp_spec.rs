@@ -66,13 +66,17 @@ fn gh_token_spec_filters_opencode_github_mcp() {
     write_spec(&home);
     let none = |_: &Path| None;
 
-    // Disabled means off, by id or by the GitHub MCP toggle; never the
-    // built-in endpoint.
+    // A spec that cannot serve falls back to the built-in endpoint with a
+    // warning naming the spec, the reason and the unapplied restrictions
+    // (#1115).
+    let fallback = |e: String, why: &str| {
+        assert!(e.starts_with(mcp_broker::FALLBACK_PREFIX), "{e}");
+        assert!(e.contains("NOT applied") && e.contains(why), "{e}");
+    };
     let off = mcp_broker::load(&mcp_broker::spec_dir(&home), &[], &[ID.into()]);
-    assert!(
-        mcp_broker::github_spec(&off, Path::new("/nohome"), none)
-            .unwrap_err()
-            .contains("disabled")
+    fallback(
+        mcp_broker::github_spec(&off, Path::new("/nohome"), none).unwrap_err(),
+        "--no-mcp-broker",
     );
     let mut found = mcp_broker::load(&mcp_broker::spec_dir(&home), &[], &[]);
     assert_eq!(found.remotes.len(), 1, "{:?}", found.rejected);
@@ -81,21 +85,20 @@ fn gh_token_spec_filters_opencode_github_mcp() {
         ..Default::default()
     };
     toggled.disable_remotes();
-    assert!(
-        mcp_broker::github_spec(&toggled, Path::new("/nohome"), none)
-            .unwrap_err()
-            .contains("disabled")
+    fallback(
+        mcp_broker::github_spec(&toggled, Path::new("/nohome"), none).unwrap_err(),
+        "proxy is off",
     );
-    // A spec the final policy can write is refused, and GitHub MCP is off.
-    let err =
-        mcp_broker::github_spec(&found, Path::new("/nohome"), |_| Some(home.clone())).unwrap_err();
-    assert!(err.contains("writable"), "{err}");
+    // A spec the final policy can write is refused: fallback.
+    fallback(
+        mcp_broker::github_spec(&found, Path::new("/nohome"), |_| Some(home.clone())).unwrap_err(),
+        "writable",
+    );
     // Two specs are ambiguous.
     found.remotes.push(found.remotes[0].clone());
-    assert!(
-        mcp_broker::github_spec(&found, Path::new("/nohome"), none)
-            .unwrap_err()
-            .contains("ambiguous")
+    fallback(
+        mcp_broker::github_spec(&found, Path::new("/nohome"), none).unwrap_err(),
+        "ambiguous",
     );
     found.remotes.pop();
     let spec = mcp_broker::github_spec(&found, Path::new("/nohome"), none)

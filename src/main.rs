@@ -5527,8 +5527,26 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &cli.no_mcp_broker,
         ),
         (None, true) => cplt::mcp_broker::detect(&home_dir, &mcp_writable, &cli.no_mcp_broker),
+        // Broker off: a gh-token spec is still found, so GitHub MCP can warn
+        // that it is not applied (#1115 item 1). Nothing else is kept.
+        (None, false) if cplt::mcp_broker::remote_gate_enabled() => {
+            let mut all = cplt::mcp_broker::load(
+                &cplt::mcp_broker::spec_dir(&home_dir),
+                &mcp_writable,
+                &cli.no_mcp_broker,
+            );
+            all.broker_off();
+            cplt::mcp_broker::Detected {
+                remote_refused: all.remote_refused,
+                remote_disabled: all.remote_disabled,
+                ..Default::default()
+            }
+        }
         (None, false) => cplt::mcp_broker::Detected::default(),
     };
+    if mcp_status.is_some() && !resolved.mcp_broker {
+        mcp_found.broker_off();
+    }
     // `sandbox.github_mcp_proxy = false` / `--no-github-mcp-proxy` also turn
     // off the spec-backed GitHub endpoint (#909): no new knob.
     if !resolved.github_mcp_proxy {
@@ -5675,27 +5693,26 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         v2_tui = std::mem::take(&mut session.tui);
         if resolved.github_mcp_proxy {
             // A gh-token remote spec the final policy cannot write is refused (#909).
-            let spec = cplt::mcp_broker::github_spec(&mcp_found, &home_dir, |p| {
-                cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree)
-            });
-            match spec {
-                Err(line) => ui::warn(&line),
-                Ok(github_spec) => {
-                    let reaches = |v: &str| {
-                        !resolved.deny_env.iter().any(|d| d == v)
-                            && (resolved.inherit_env || resolved.pass_env.iter().any(|p| p == v))
-                    };
-                    cplt::opencode_v2::github_mcp(
-                        &mut session,
-                        &home_dir,
-                        &resolved.deny_env,
-                        reaches,
-                        proxy_handle.as_ref().map(|h| h.port),
-                        cplt::discover::stored_gh_secret,
-                        github_spec.as_ref(),
-                    );
-                }
-            }
+            // A spec that cannot serve falls back to the built-in endpoint, loudly (#1115).
+            let github_spec = cplt::mcp_broker::launch_github_spec(
+                &mcp_found,
+                &home_dir,
+                |p| cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree),
+                ui::warn,
+            );
+            let reaches = |v: &str| {
+                !resolved.deny_env.iter().any(|d| d == v)
+                    && (resolved.inherit_env || resolved.pass_env.iter().any(|p| p == v))
+            };
+            cplt::opencode_v2::github_mcp(
+                &mut session,
+                &home_dir,
+                &resolved.deny_env,
+                reaches,
+                proxy_handle.as_ref().map(|h| h.port),
+                cplt::discover::stored_gh_secret,
+                github_spec.as_ref(),
+            );
         }
         // These variables carry the session's isolation; dropping them would
         // point OpenCode back at the host service.
