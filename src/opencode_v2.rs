@@ -1156,6 +1156,29 @@ mod tests {
 
     use super::*;
 
+    /// #1164: the history grant v2 really emits counts as a write grant, so
+    /// the session summary cannot be aimed at it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prompt_history_grant_is_a_write_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let scratch = home.join("scratch");
+        let launch = home.join("proj");
+        std::fs::create_dir_all(&launch).unwrap();
+        let history =
+            xdg_base("XDG_STATE_HOME", &home, ".local/state").join("opencode/prompt-history.jsonl");
+        if !history.starts_with(&home) {
+            // An inherited XDG_STATE_HOME would make this write the real file.
+            return;
+        }
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::write(&history, "").unwrap();
+        let session = prepare(&scratch, &home, &launch).unwrap();
+        let grants = crate::sandbox::write_grant_paths(&session.sbpl_before_denies);
+        assert!(grants.contains(&history), "{grants:?}");
+    }
+
     #[test]
     fn host_service_pid_needs_a_live_process() {
         let tmp = tempfile::tempdir().unwrap();

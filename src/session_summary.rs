@@ -352,7 +352,7 @@ pub fn path_refusal(
             ));
         }
     }
-    Target::open(&canonical).map_err(|e| format!("its directory cannot be opened ({e})"))
+    Target::open(&canonical).map_err(|e| format!("it cannot be used ({e})"))
 }
 
 /// The summary's directory, opened once at check time and held until exit,

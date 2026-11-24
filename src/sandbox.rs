@@ -447,12 +447,24 @@ pub struct PreparedSandbox {
     bwrap_wrapper: Option<bubblewrap::BubblewrapWrapper>,
 }
 
-/// Every path a `(allow file-write…)` line names with `(subpath "…")` or
+/// Every path an `(allow …)` rule with a `file-write*` operation names with `(subpath "…")` or
 /// `(literal "…")`, whatever the write kind (`file-write-data` included).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn write_grant_paths(sbpl: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for line in sbpl.lines().filter(|l| l.starts_with("(allow file-write")) {
+    for line in sbpl.lines() {
+        // The operation list runs from `allow` to the first filter:
+        // `(allow file-read* file-write* (literal ..))` grants write too.
+        let Some(rest) = line.trim_start().strip_prefix("(allow ") else {
+            continue;
+        };
+        let ops = rest.split('(').next().unwrap_or("");
+        if !ops
+            .split_whitespace()
+            .any(|op| op.starts_with("file-write"))
+        {
+            continue;
+        }
         for kind in ["(subpath \"", "(literal \""] {
             for rest in line.split(kind).skip(1) {
                 if let Some(path) = rest.split('"').next() {
@@ -5401,6 +5413,7 @@ mod tests {
         let sbpl = "(allow file-write* (subpath \"/a\"))\n\
                     (allow file-write-data (literal \"/h/.konan/dependencies/cache/.lock\"))\n\
                     (allow file-write* (literal \"/h/.local/state/opencode/prompt-history.jsonl\"))\n\
+                    (allow file-read* file-write* (literal \"/h/two-ops\"))\n\
                     (deny file-write* (subpath \"/b\"))\n\
                     (allow file-read* (subpath \"/c\"))";
         assert_eq!(
@@ -5409,6 +5422,7 @@ mod tests {
                 PathBuf::from("/a"),
                 PathBuf::from("/h/.konan/dependencies/cache/.lock"),
                 PathBuf::from("/h/.local/state/opencode/prompt-history.jsonl"),
+                PathBuf::from("/h/two-ops"),
             ]
         );
     }
