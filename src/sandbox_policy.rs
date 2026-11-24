@@ -2616,6 +2616,20 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: true,
     },
+    // Measured with Gradle 8.14.8, `gradle build test` with forked javac and
+    // test workers in a fresh GRADLE_USER_HOME: these two plus the five above.
+    HomeToolDir {
+        path: ".gradle/notifications",
+        process_exec: false,
+        map_exec: false,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".gradle/workers",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
     HomeToolDir {
         path: ".m2",
         process_exec: false,
@@ -3077,6 +3091,16 @@ pub const HOST_EXEC_TOOL_PATHS: &[HostExecPath] = &[
         path: ".gradle/.tmp",
         host_use: "scratch only",
         handling: HostExec::Gap("Gradle's temp dir"),
+    },
+    HostExecPath {
+        path: ".gradle/notifications",
+        host_use: "per-version welcome-message marker",
+        handling: HostExec::Gap("every Gradle version writes its marker on first run"),
+    },
+    HostExecPath {
+        path: ".gradle/workers",
+        host_use: "worker process scratch for forked compile and test",
+        handling: HostExec::Gap("forked workers write here on every build"),
     },
     // ── Maven ── maven.apache.org: settings, toolchains, core extensions, wrapper
     HostExecPath {
@@ -6000,7 +6024,9 @@ mod tests {
                 ".gradle/wrapper",
                 ".gradle/native",
                 ".gradle/daemon",
-                ".gradle/.tmp"
+                ".gradle/.tmp",
+                ".gradle/notifications",
+                ".gradle/workers"
             ]
         );
         assert_eq!(writable(".m2"), [".m2/repository", ".m2/wrapper"]);

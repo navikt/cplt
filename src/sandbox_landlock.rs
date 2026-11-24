@@ -4133,6 +4133,26 @@ mod tests {
                 );
             }
         }
+        // Landlock checks rmdir, rename and symlink creation against the
+        // parent: with no RemoveDir/RemoveFile/MakeSym/Refer on a read-only
+        // parent, a writable child root cannot be swapped for a symlink.
+        #[cfg(target_os = "linux")]
+        for rule in policy.fs_rules.iter().filter(|r| {
+            [".gradle", ".m2", ".yarn", ".npm", ".cargo"]
+                .iter()
+                .any(|p| r.path == home.join(p))
+        }) {
+            use landlock::AccessFs;
+            let flags = access_to_flags(&rule.access);
+            for bit in [
+                AccessFs::RemoveDir,
+                AccessFs::RemoveFile,
+                AccessFs::MakeSym,
+                AccessFs::Refer,
+            ] {
+                assert!(!flags.contains(bit), "{:?} grants {bit:?}", rule.path);
+            }
+        }
     }
 
     /// `sandbox.readonly_host_tool_paths`: with the twins applied, the wrapper
