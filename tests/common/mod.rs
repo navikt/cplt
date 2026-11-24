@@ -224,6 +224,12 @@ pub fn with_real_home(cmd: &mut Command) {
     let xdg = scratch_home().join(".config");
     std::fs::create_dir_all(xdg.join("cplt/launch")).expect("scratch launch dir");
     cmd.env("HOME", real_home()).env("XDG_CONFIG_HOME", xdg);
+    // Real toolchains need their real SDK dirs: undo the scratch-HOME removal.
+    for var in ["JAVA_HOME", "DOTNET_ROOT"] {
+        if let Some(v) = std::env::var_os(var) {
+            cmd.env(var, v);
+        }
+    }
 }
 
 /// A cplt PATH shim (#514) run directly, isolated the way [`cplt_cmd`] is: the
