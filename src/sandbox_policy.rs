@@ -2893,16 +2893,18 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
 ///
 /// With `sandbox.readonly_host_tool_paths` on, the [`HOST_TOOL_RO_OVERLAYS`]
 /// are created the same way, because Bubblewrap can only bind a path that
-/// exists.
+/// exists. Their roots are created too, although writable: a missing root
+/// gets no pin, so a staged directory renamed into its place would bring the
+/// read-only children with it.
 pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
     let overlays = HOST_TOOL_RO_OVERLAYS
         .iter()
         .filter(|_| readonly_host_tool_paths);
-    for child in HOME_TOOL_DIRS
+    for (child, overlay) in HOME_TOOL_DIRS
         .iter()
         .filter(|d| d.write)
-        .map(|d| d.path)
-        .chain(overlays.copied())
+        .map(|d| (d.path, false))
+        .chain(overlays.map(|p| (*p, true)))
     {
         let Some((parent, _)) = child.rsplit_once('/') else {
             continue;
@@ -2912,11 +2914,38 @@ pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
         };
         // A read-only root is created too: the sandbox can no longer create
         // it, and a first `npm install` on a fresh machine would fail.
-        if !root.write {
+        if !root.write || overlay {
             let _ = std::fs::create_dir(home.join(parent));
         }
         if home.join(parent).is_dir() {
             let _ = std::fs::create_dir(home.join(child));
+        }
+    }
+    // Bubblewrap skips a missing path, so every keyed overlay must exist.
+    // One component at a time; a symlinked component stops the walk.
+    if readonly_host_tool_paths {
+        for path in host_tool_ro_overlay_paths(home) {
+            let Ok(rel) = path.strip_prefix(home) else {
+                // Under an external `XDG_*` dir: only the last level.
+                if path
+                    .parent()
+                    .is_some_and(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
+                {
+                    let _ = std::fs::create_dir(&path);
+                }
+                continue;
+            };
+            let mut cur = home.to_path_buf();
+            for c in rel.components() {
+                cur.push(c);
+                let ok = match cur.symlink_metadata() {
+                    Ok(m) => m.is_dir(),
+                    Err(_) => std::fs::create_dir(&cur).is_ok(),
+                };
+                if !ok {
+                    break;
+                }
+            }
         }
     }
 }
@@ -2997,8 +3026,11 @@ pub fn wrapper_lock_files(dists: &Path) -> Vec<PathBuf> {
     for hash_dir in dirs(dists).iter().flat_map(|d| dirs(d)) {
         for entry in std::fs::read_dir(&hash_dir).into_iter().flatten().flatten() {
             let path = entry.path();
+            // A second hard link would let the grant reach another name's inode.
             if path.extension().is_some_and(|e| e == "lck")
-                && path.symlink_metadata().is_ok_and(|m| m.is_file())
+                && path
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.is_file() && std::os::unix::fs::MetadataExt::nlink(&m) == 1)
             {
                 out.push(path);
             }
@@ -3008,14 +3040,90 @@ pub fn wrapper_lock_files(dists: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The [`HOST_TOOL_RO_OVERLAYS`] under `home`, or none with the key off.
+/// Whether `path` has the shape of a [`wrapper_lock_files`] entry of a
+/// read-only wrapper twin in `dirs`: `<twin>/dists/<name>/<hash>/*.lck`. By
+/// path alone, so a lock swapped for a directory after the probe is still
+/// granted as a file, never as a tree.
+#[must_use]
+pub fn is_readonly_wrapper_lock_path(dirs: &[ResolvedToolDir], path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "lck")
+        && dirs
+            .iter()
+            .filter(|d| !d.dir.write && matches!(d.dir.path, ".gradle/wrapper" | ".m2/wrapper"))
+            .any(|d| {
+                path.strip_prefix(d.path.join("dists"))
+                    .is_ok_and(|r| r.components().count() == 3)
+            })
+}
+
+/// [`wrapper_lock_files`] of every read-only wrapper twin in `dirs`. Callers
+/// apply it only with `sandbox.readonly_host_tool_paths` on.
+#[must_use]
+pub fn readonly_wrapper_lock_files(dirs: &[ResolvedToolDir]) -> Vec<PathBuf> {
+    dirs.iter()
+        .filter(|d| !d.dir.write && matches!(d.dir.path, ".gradle/wrapper" | ".m2/wrapper"))
+        .flat_map(|d| wrapper_lock_files(&d.path.join("dists")))
+        .collect()
+}
+
+/// The [`HOST_TOOL_RO_OVERLAYS`] and the `Keyed` [`HOST_EXEC_APP_DIRS`] under `home`,
+/// or none with the key off. An overlay reached through a symlink below
+/// `home` is followed by its resolved target as well: a deny on the link's
+/// own spelling does not cover writes through the target's (#1161). The
+/// launch warns about each one ([`host_tool_ro_overlay_links`]).
 #[must_use]
 pub fn host_tool_ro_overlays(home: &Path, readonly_host_tool_paths: bool) -> Vec<PathBuf> {
-    HOST_TOOL_RO_OVERLAYS
-        .iter()
-        .filter(|_| readonly_host_tool_paths)
-        .map(|p| home.join(p))
+    if !readonly_host_tool_paths {
+        return Vec::new();
+    }
+    let mut out = host_tool_ro_overlay_paths(home);
+    for (_, target) in host_tool_ro_overlay_links(home) {
+        if !out.contains(&target) {
+            out.push(target);
+        }
+    }
+    out
+}
+
+/// Each keyed overlay whose path goes through a symlink below `home`, or
+/// whose own entry is a symlink under an external `XDG_*` dir, with its
+/// resolved target.
+#[must_use]
+pub fn host_tool_ro_overlay_links(home: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    host_tool_ro_overlay_paths(home)
+        .into_iter()
+        .filter_map(|p| {
+            // An app-dir overlay under an external `XDG_*` dir is checked too.
+            let expected = match p.strip_prefix(home) {
+                Ok(rel) => canon_home.join(rel),
+                Err(_) => config::canonicalize_deepest(p.parent()?).join(p.file_name()?),
+            };
+            let target = config::canonicalize_deepest(&p);
+            (target != expected).then_some((p, target))
+        })
         .collect()
+}
+
+fn host_tool_ro_overlay_paths(home: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = HOST_TOOL_RO_OVERLAYS.iter().map(|p| home.join(p)).collect();
+    // The `Keyed` rows of HOST_EXEC_APP_DIRS: mise data, kubebuilder-envtest
+    // cache and data, uv cache.
+    for r in HOST_EXEC_APP_DIRS
+        .iter()
+        .filter(|r| matches!(r.handling, HostExec::Keyed(_)))
+    {
+        for p in r
+            .kinds
+            .iter()
+            .filter_map(|k| k.resolve("", "", r.application, home))
+        {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// A wrapper distribution the project pins but the Gradle or Maven user home
@@ -3152,7 +3260,7 @@ pub const HOST_EXEC_APP_DIRS: &[HostExecAppDir] = &[
         application: "mise",
         kinds: &[AppDirKind::Data, AppDirKind::DataLocal],
         host_use: "host shims and `mise exec` run the installed tool versions",
-        handling: HostExec::Gap("`mise install` in the sandbox writes here"),
+        handling: HostExec::Keyed("`mise install` and `mise upgrade` in the sandbox fail"),
     },
     HostExecAppDir {
         application: "mise",
@@ -3183,13 +3291,13 @@ pub const HOST_EXEC_APP_DIRS: &[HostExecAppDir] = &[
         application: "kubebuilder-envtest",
         kinds: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
         host_use: "host tests run the control-plane binaries setup-envtest stores",
-        handling: HostExec::Gap("setup-envtest in the sandbox downloads here"),
+        handling: HostExec::Keyed("setup-envtest in the sandbox cannot download binaries"),
     },
     HostExecAppDir {
         application: "uv",
         kinds: &[AppDirKind::Cache],
         host_use: "host `uv run`/`uvx` reuse cached environments and wheels",
-        handling: HostExec::Gap("the cache every uv command writes"),
+        handling: HostExec::Keyed("every uv command that fills its cache fails in the sandbox"),
     },
     HostExecAppDir {
         application: "uv",
@@ -3260,7 +3368,7 @@ pub const HOST_EXEC_TOOL_PATHS: &[HostExecPath] = &[
     },
     HostExecPath {
         path: ".gradle/native",
-        host_use: "native-platform libraries Gradle loads",
+        host_use: "native-platform JNI libraries a host Gradle loads into its JVM",
         handling: HostExec::Gap("Gradle extracts them on first run"),
     },
     HostExecPath {
@@ -3441,12 +3549,12 @@ pub const HOST_EXEC_TOOL_PATHS: &[HostExecPath] = &[
     // ── Generic caches ──
     HostExecPath {
         path: "Library/Caches",
-        host_use: "per-tool caches, data only",
+        host_use: "per-tool caches, some holding executables and native libraries",
         handling: HostExec::Gap("every build tool caches here"),
     },
     HostExecPath {
         path: ".cache",
-        host_use: "pip, go-build, node-gyp caches: data only",
+        host_use: "pip, go-build, node-gyp caches, some holding executables and built objects",
         handling: HostExec::Gap("every build tool caches here"),
     },
     HostExecPath {
@@ -4767,6 +4875,32 @@ pub fn env_tool_path_protected(home: &Path, path: &Path) -> Option<PathBuf> {
             real.ancestors().any(|a| id(a) == Some(me))
                 // `path` inside the protected entry.
                 || id(&real).is_some_and(|did| path.ancestors().any(|a| id(a) == Some(did)))
+        })
+}
+
+/// The [`READONLY_HOST_TOOL_TWINS`] or [`host_tool_ro_overlays`] path an
+/// env-derived write grant on `path` would reopen, if any.
+///
+/// With `sandbox.readonly_host_tool_paths` on, `PIP_CACHE_DIR=~/.gradle/wrapper`
+/// would otherwise pass [`env_tool_dir_allowed`], which consults the static
+/// [`HOME_TOOL_DIRS`] write flags, and grant write to a tree host tools run.
+/// Refused when `path` equals, lies in, or contains one. Compared by identity
+/// (dev, ino); `path` must exist and be canonical. A missing entry is matched
+/// through its deepest existing ancestor for containment only, so a grant
+/// above where it will be created is refused, a sibling is not.
+#[must_use]
+pub fn env_tool_path_readonly_host(home: &Path, path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let me = id(path)?;
+    let canon = resolver(home);
+    READONLY_HOST_TOOL_TWINS
+        .iter()
+        .map(|t| home.join(t.path))
+        .chain(host_tool_ro_overlays(home, true))
+        .find(|d| {
+            canon(d).ancestors().any(|a| id(a) == Some(me))
+                || id(d).is_some_and(|did| path.ancestors().any(|a| id(a) == Some(did)))
         })
 }
 
@@ -6148,6 +6282,11 @@ mod tests {
 
     #[test]
     fn host_exec_tool_paths_cover_every_writable_tool_dir() {
+        // The APP_DIRS rows resolve through XDG_*.
+        crate::with_env_lock_no_xdg(host_exec_tool_paths_cover_every_writable_tool_dir_inner);
+    }
+
+    fn host_exec_tool_paths_cover_every_writable_tool_dir_inner() {
         let under = |p: &str, root: &str| p == root || p.starts_with(&format!("{root}/"));
         let writable: Vec<&str> = HOME_TOOL_DIRS
             .iter()
@@ -6238,12 +6377,12 @@ mod tests {
             assert_eq!(d.dir.write, orig.write && !twin, "{}", orig.path);
         }
         assert!(host_tool_ro_overlays(home, false).is_empty());
-        assert_eq!(
-            host_tool_ro_overlays(home, true),
+        let on = host_tool_ro_overlays(home, true);
+        assert!(
             HOST_TOOL_RO_OVERLAYS
                 .iter()
-                .map(|p| home.join(p))
-                .collect::<Vec<_>>()
+                .all(|p| on.contains(&home.join(p))),
+            "{on:?}"
         );
     }
 
@@ -6257,10 +6396,94 @@ mod tests {
         std::fs::write(tmp.path().join("x"), "").unwrap();
         std::os::unix::fs::symlink(tmp.path().join("x"), d.join("link.lck")).unwrap();
         crate::untrusted::tests::mkfifo(&d.join("fifo.lck"));
+        // A hard link to a file elsewhere is not a lock file of this tree.
+        std::fs::hard_link(tmp.path().join("x"), d.join("hard.lck")).unwrap();
         assert_eq!(
             wrapper_lock_files(tmp.path()),
             [d.join("gradle-8.14-bin.zip.lck")]
         );
+    }
+
+    /// Lock grants are classified by path shape, so a lock replaced by a
+    /// directory after the probe is still a file grant.
+    #[test]
+    fn readonly_wrapper_lock_path_is_shape_only() {
+        let home = Path::new("/h");
+        let mut dirs: Vec<ResolvedToolDir> = HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(home, &[]))
+            .collect();
+        let lock = Path::new("/h/.gradle/wrapper/dists/gradle-8/abc/gradle-8.zip.lck");
+        assert!(
+            !is_readonly_wrapper_lock_path(&dirs, lock),
+            "key off: twin writable"
+        );
+        apply_readonly_host_tool_paths(&mut dirs);
+        assert!(is_readonly_wrapper_lock_path(&dirs, lock));
+        for other in [
+            "/h/.gradle/wrapper/dists/gradle-8/abc/x.zip",
+            "/h/.gradle/wrapper/dists/gradle-8/x.lck",
+            "/h/.gradle/caches/a/b/x.lck",
+        ] {
+            assert!(
+                !is_readonly_wrapper_lock_path(&dirs, Path::new(other)),
+                "{other}"
+            );
+        }
+    }
+
+    /// An app-dir overlay under an external `XDG_CACHE_HOME` that is a
+    /// symlink is reported with its target, so its target is denied too.
+    #[test]
+    fn host_tool_ro_overlay_links_follow_external_xdg_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, xdg) = (root.join("home"), root.join("work/cache"));
+        std::fs::create_dir_all(home.join(".cache/uv-real")).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::os::unix::fs::symlink(home.join(".cache/uv-real"), xdg.join("uv")).unwrap();
+        crate::with_env_lock_no_xdg(|| {
+            temp_env::with_var("XDG_CACHE_HOME", Some(&xdg), || {
+                assert!(
+                    host_tool_ro_overlay_links(&home)
+                        .contains(&(xdg.join("uv"), home.join(".cache/uv-real"))),
+                    "{:?}",
+                    host_tool_ro_overlay_links(&home)
+                );
+                assert!(host_tool_ro_overlays(&home, true).contains(&home.join(".cache/uv-real")));
+            });
+        });
+    }
+
+    /// With `sandbox.readonly_host_tool_paths` on, an env tool dir at, under
+    /// or above a read-only twin or overlay is refused; a sibling is not.
+    #[test]
+    fn env_tool_path_readonly_host_matches_twins_and_overlays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(tmp.path()).unwrap();
+        for d in [
+            ".gradle/wrapper/dists",
+            ".gradle/caches",
+            ".konan",
+            ".cache/pre-commit",
+            ".cache/pip",
+            ".nuget",
+        ] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        let hit = |rel: &str| env_tool_path_readonly_host(&h, &h.join(rel));
+        assert_eq!(hit(".gradle/wrapper"), Some(h.join(".gradle/wrapper")));
+        assert_eq!(
+            hit(".gradle/wrapper/dists"),
+            Some(h.join(".gradle/wrapper"))
+        );
+        assert_eq!(hit(".konan"), Some(h.join(".konan")));
+        assert_eq!(hit(".cache/pre-commit"), Some(h.join(".cache/pre-commit")));
+        assert_eq!(hit(".cache"), Some(h.join(".cache/pre-commit")));
+        // `~/.nuget/NuGet` is absent: `~/.nuget` would contain it once created.
+        assert!(hit(".nuget").is_some());
+        assert_eq!(hit(".gradle/caches"), None);
+        assert_eq!(hit(".cache/pip"), None);
     }
 
     #[test]
@@ -6365,6 +6588,13 @@ mod tests {
         // root without them is not.
         assert!(h.join(".m2/repository").is_dir());
         assert!(!h.join(".nuget").exists());
+        // With the key on, overlay roots are created so they get pinned.
+        crate::with_env_lock_no_xdg(|| {
+            ensure_split_tool_dirs(h, true);
+            for p in host_tool_ro_overlay_paths(h) {
+                assert!(p.is_dir(), "{}", p.display());
+            }
+        });
     }
     /// The pinned-state line touches no state file before validation: a
     /// planted symlink or FIFO there must not be written to or block.

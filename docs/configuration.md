@@ -1093,7 +1093,7 @@ Either way, cplt opens the directory it checked without following any symlink wh
 Some tool directories hold programs that a sandboxed command downloads and your host runs later, outside the sandbox: the distribution `./gradlew` and `./mvnw` unpack, Kotlin/Native toolchains, pre-commit hook environments, .NET global tools, and NuGet's user config and credential providers. With this key on, the sandbox can read and run them but not write them:
 
 - `~/.gradle/wrapper`, `~/.m2/wrapper` and `~/.konan`, on macOS and Linux
-- `~/.cache/pre-commit`, `~/.dotnet/tools`, `~/.nuget/NuGet` and `~/.nuget/plugins`, on macOS, and on Linux only when Bubblewrap is active
+- `~/.cache/pre-commit`, `~/.dotnet/tools`, `~/.nuget/NuGet`, `~/.nuget/plugins`, mise's data dir (`~/.local/share/mise`), kubebuilder-envtest's cache and data dirs, and `~/.cache/uv`, on macOS, and on Linux only when Bubblewrap is active
 
 ```bash
 cplt config set sandbox.readonly_host_tool_paths true
@@ -1105,6 +1105,7 @@ Off by default, because it breaks a first download inside the sandbox:
 - a first Kotlin/Native build. Run it once outside cplt.
 - `git commit` with pre-commit hooks inside the sandbox: pre-commit takes a lock in `~/.cache/pre-commit` on every run. Commit outside cplt.
 - `dotnet tool install -g`, and a first `dotnet restore` on a machine with no `~/.nuget/NuGet/NuGet.Config`. Run them once outside cplt.
+- `mise install` and `mise upgrade`, `setup-envtest` downloads, and any `uv` command that fills its cache. Run them outside cplt.
 
 ## Blocking new nested `.git` entries (`sandbox.deny_nested_git`)
 

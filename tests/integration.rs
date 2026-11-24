@@ -5141,6 +5141,10 @@ int main(int argc, char **argv) {
             ".dotnet/tools/x",
             ".nuget/NuGet/NuGet.Config",
             ".nuget/plugins/x",
+            ".local/share/mise/x",
+            ".cache/kubebuilder-envtest/x",
+            ".local/share/kubebuilder-envtest/x",
+            ".cache/uv/x",
         ];
         let open = [
             ".gradle/caches/x",
@@ -5179,6 +5183,179 @@ int main(int argc, char **argv) {
             fs::remove_file(&profile).ok();
         }
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// `sandbox.readonly_host_tool_paths` on a home without `~/.dotnet` or
+    /// `~/.nuget`: a staged tree renamed into place must not bring the
+    /// read-only overlay children with it.
+    #[test]
+    fn real_profile_readonly_host_tool_paths_missing_overlay_roots() {
+        require_sandbox!();
+        let mk = |prefix| {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .unwrap()
+        };
+        let (project_dir, home_dir) = (mk(".cplt-roroot-project-"), mk(".cplt-roroot-home-"));
+        let project = fs::canonicalize(project_dir.path()).unwrap();
+        let home = fs::canonicalize(home_dir.path()).unwrap();
+        cplt::sandbox::ensure_split_tool_dirs(&home, true);
+        let mut dirs: Vec<_> = cplt::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        cplt::sandbox::apply_readonly_host_tool_paths(&mut dirs);
+        let mut opts = default_opts(&project, &home);
+        opts.existing_home_tool_dirs = Some(&dirs);
+        opts.readonly_host_tool_paths = true;
+        let profile = write_real_profile(&opts);
+        let mut failures = Vec::new();
+        for (root, child) in [(".dotnet", "tools"), (".nuget", "NuGet")] {
+            let stage = project.join(format!("stage{root}"));
+            fs::create_dir_all(stage.join(child)).unwrap();
+            fs::write(stage.join(child).join("x"), "planted").unwrap();
+            let target = home.join(root);
+            let cmd = format!(
+                "rm -rf '{t}' 2>/dev/null; mv '{t}' '{t}.old' 2>/dev/null; mv '{s}' '{t}' 2>&1",
+                s = stage.display(),
+                t = target.display()
+            );
+            let (out, _) = run_sandboxed(&profile, &cmd);
+            if target.join(child).join("x").exists() {
+                failures.push(format!("{root}: staged tree renamed in: {out:?}"));
+            }
+        }
+        fs::remove_file(&profile).ok();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// `sandbox.readonly_host_tool_paths`: a keyed overlay that is a symlink
+    /// into a writable tree is denied at its target too, for every overlay.
+    #[test]
+    fn real_profile_readonly_host_tool_paths_symlinked_overlay() {
+        require_sandbox!();
+        let mk = |prefix| {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .unwrap()
+        };
+        let (project_dir, home_dir) = (mk(".cplt-rolink-project-"), mk(".cplt-rolink-home-"));
+        let project = fs::canonicalize(project_dir.path()).unwrap();
+        let home = fs::canonicalize(home_dir.path()).unwrap();
+        let overlays = [
+            ".cache/pre-commit",
+            ".dotnet/tools",
+            ".nuget/NuGet",
+            ".nuget/plugins",
+            ".local/share/mise",
+            ".cache/kubebuilder-envtest",
+            ".local/share/kubebuilder-envtest",
+            ".cache/uv",
+        ];
+        // Each link points at a sibling in the writable `~/.cache`.
+        for (i, rel) in overlays.iter().enumerate() {
+            let target = home.join(format!(".cache/real{i}"));
+            fs::create_dir_all(&target).unwrap();
+            fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, home.join(rel)).unwrap();
+        }
+        let links = cplt::sandbox::host_tool_ro_overlay_links(&home);
+        assert_eq!(links.len(), overlays.len(), "{links:?}");
+        let mut dirs: Vec<_> = cplt::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        cplt::sandbox::apply_readonly_host_tool_paths(&mut dirs);
+        let mut opts = default_opts(&project, &home);
+        opts.existing_home_tool_dirs = Some(&dirs);
+        opts.readonly_host_tool_paths = true;
+        let profile = write_real_profile(&opts);
+        let mut failures = Vec::new();
+        for (i, rel) in overlays.iter().enumerate() {
+            for p in [
+                home.join(rel).join("x"),
+                home.join(format!(".cache/real{i}/y")),
+            ] {
+                let cmd = format!("echo x > '{}' 2>&1; echo EXIT:$?", p.display());
+                let (out, _) = run_sandboxed(&profile, &cmd);
+                if out.contains("EXIT:0") {
+                    failures.push(format!("{rel}: {} writable", p.display()));
+                }
+            }
+        }
+        // A target nested under a writable dir: renaming that dir would move
+        // the target out from under the deny, so the rename is pinned.
+        let group = home.join(".cache/group");
+        fs::create_dir_all(group.join("uv")).unwrap();
+        fs::remove_file(home.join(".cache/uv")).unwrap();
+        std::os::unix::fs::symlink(group.join("uv"), home.join(".cache/uv")).unwrap();
+        let profile2 = write_real_profile(&opts);
+        let g = group.display();
+        let (out, _) = run_sandboxed(
+            &profile2,
+            &format!(
+                "mv '{g}' '{g}2' && echo x > '{g}2/uv/x'; mv '{g}2' '{g}' 2>/dev/null; echo EXIT:$?"
+            ),
+        );
+        if group.join("uv/x").exists() || !group.is_dir() {
+            failures.push(format!("nested target moved and written: {out:?}"));
+        }
+        fs::remove_file(&profile2).ok();
+        // Control: the rest of `~/.cache` stays writable.
+        let (out, _) = run_sandboxed(
+            &profile,
+            &format!("echo x > '{}/.cache/ok'; echo EXIT:$?", home.display()),
+        );
+        assert!(out.contains("EXIT:0"), "control: {out:?}");
+        fs::remove_file(&profile).ok();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// The `./gradlew` lock-file grant under a read-only wrapper tree is a
+    /// file grant: the lock stays writable, but it cannot be swapped for a
+    /// directory to fill with files.
+    #[test]
+    fn real_profile_wrapper_lock_grant_is_literal() {
+        require_sandbox!();
+        let mk = |prefix| {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .unwrap()
+        };
+        let (project_dir, home_dir) = (mk(".cplt-rolck-project-"), mk(".cplt-rolck-home-"));
+        let project = fs::canonicalize(project_dir.path()).unwrap();
+        let home = fs::canonicalize(home_dir.path()).unwrap();
+        let dist = home.join(".gradle/wrapper/dists/gradle-8.14-bin/abc");
+        fs::create_dir_all(&dist).unwrap();
+        let lock = dist.join("gradle-8.14-bin.zip.lck");
+        fs::write(&lock, "").unwrap();
+        let mut dirs: Vec<_> = cplt::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        cplt::sandbox::apply_readonly_host_tool_paths(&mut dirs);
+        let locks = cplt::sandbox::readonly_wrapper_lock_files(&dirs);
+        assert_eq!(locks, std::slice::from_ref(&lock));
+        let mut opts = default_opts(&project, &home);
+        opts.existing_home_tool_dirs = Some(&dirs);
+        opts.readonly_host_tool_paths = true;
+        opts.extra_write = &locks;
+        let profile = write_real_profile(&opts);
+        let l = lock.display();
+        let (out, _) = run_sandboxed(&profile, &format!("echo x > '{l}'; echo EXIT:$?"));
+        assert!(out.contains("EXIT:0"), "lock not writable: {out:?}");
+        let (out, _) = run_sandboxed(
+            &profile,
+            &format!("rm -f '{l}'; mkdir '{l}' && echo x > '{l}/gradle'; echo EXIT:$?"),
+        );
+        assert!(
+            !out.contains("EXIT:0") && !lock.join("gradle").exists(),
+            "lock swapped for a directory: {out:?}"
+        );
+        fs::remove_file(&profile).ok();
     }
 
     // ── sandbox.allow_build_credentials (#463) ──────────────────

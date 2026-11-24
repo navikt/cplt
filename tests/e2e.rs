@@ -13927,6 +13927,78 @@ mod agent_stubs {
         extra_args: &'static str,
     }
 
+    /// `sandbox.readonly_host_tool_paths` on: an env tool dir must not give
+    /// write back to a read-only twin or overlay, and a wrapper lock file the
+    /// profile cannot name is skipped with a warning instead of aborting.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn e2e_readonly_host_tool_paths_env_dirs_and_unnameable_locks() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-rohost-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let cmd = |env: &[(&str, &std::path::Path)]| {
+            let mut c = cplt_cmd();
+            c.env_remove("CPLT_CONFIG")
+                .current_dir(&proj)
+                .env("HOME", &h)
+                .env("XDG_CONFIG_HOME", h.join(".config"))
+                .env("XDG_STATE_HOME", h.join(".local/state"))
+                .env("XDG_DATA_HOME", h.join(".local/share"))
+                .env("XDG_CACHE_HOME", h.join(".cache"))
+                .env("XDG_RUNTIME_DIR", h.join("run"))
+                .env("GRADLE_USER_HOME", h.join(".gradle"))
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            for (k, v) in env {
+                c.env(k, v);
+            }
+            c
+        };
+        let set = cmd(&[])
+            .args(["config", "set", "sandbox.readonly_host_tool_paths", "true"])
+            .output()
+            .unwrap();
+        assert!(set.status.success(), "{set:?}");
+        // Control: the shell runs, and a plain cache dir stays writable.
+        let pip = h.join(".cache/pip");
+        std::fs::create_dir_all(&pip).unwrap();
+        let out = cmd(&[("PIP_CACHE_DIR", &pip)])
+            .args(["--agent", "shell", "--yes", "--no-proxy", "--", "-c"])
+            .arg(format!("echo x > '{}/f'", pip.display()))
+            .output()
+            .unwrap();
+        assert!(pip.join("f").exists(), "control write failed: {out:?}");
+        for rel in [".gradle/wrapper", ".konan", ".cache/pre-commit"] {
+            let target = h.join(rel);
+            std::fs::create_dir_all(&target).unwrap();
+            let out = cmd(&[("PIP_CACHE_DIR", &target)])
+                .args(["--agent", "shell", "--yes", "--no-proxy", "--", "-c"])
+                .arg(format!("echo x > '{}/f'", target.display()))
+                .output()
+                .unwrap();
+            assert!(!target.join("f").exists(), "{rel}: write went through");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("Ignoring PIP_CACHE_DIR =")
+                    && err.contains("sandbox.readonly_host_tool_paths"),
+                "{rel}: no refusal: {err}"
+            );
+        }
+        // A lock file under a directory the profile cannot name.
+        let dist = h.join(".gradle/wrapper/dists/gradle(x)/abc");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("gradle.zip.lck"), "").unwrap();
+        let out = cmd(&[]).arg("--print-profile").output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "launch aborted: {err}");
+        assert!(err.contains("not granting write to"), "{err}");
+    }
+
     /// An env tool dir refused only by the positive rule (#1104) ends its
     /// warning with a `cplt config set allow.write <dir>` line. Running that
     /// line makes the next launch grant the dir. A protected, persistence or
