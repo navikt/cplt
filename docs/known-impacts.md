@@ -528,7 +528,7 @@ Tools that compile then execute from `$TMPDIR` are **blocked by default**, becau
 allow_localhost_any = true
 ```
 
-For yourself, run `cplt config set sandbox.allow_localhost_any true`; for one run, pass `--allow-localhost-any`. This opens every loopback port, including local databases and dev servers; on Linux it also lifts the Landlock TCP connect filter. `proxy.forced` overrides it, so Gradle builds do not work under forced proxying.
+For yourself in one repository, run `cplt config set --local sandbox.allow_localhost_any true`, or `false` to keep loopback closed; either answer silences the hint, as does setting the key at any other layer. For one run, pass `--allow-localhost-any`. This opens every loopback port, including local databases and dev servers; on Linux it also lifts the Landlock TCP connect filter. `proxy.forced` overrides it, so Gradle builds do not work under forced proxying.
 
 **Gradle/JVM still failing?** Some JVM native libraries, `libjli.dylib` and JNI libs among them, call `dlopen` on the system temp dir *before* `JAVA_TOOL_OPTIONS` takes effect. If you see "Operation not permitted" during JVM startup itself rather than during the Gradle build, add `--allow-tmp-exec`:
 

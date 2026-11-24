@@ -4596,7 +4596,7 @@ fi
             "loopback must stay closed by default: {closed_out}"
         );
         assert!(
-            closed_err.contains("cplt config set sandbox.allow_localhost_any true"),
+            closed_err.contains("cplt config set --local sandbox.allow_localhost_any true"),
             "the Gradle loopback hint must fire at launch:\n{closed_err}"
         );
         let out = cplt_cmd()

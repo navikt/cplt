@@ -946,6 +946,16 @@ impl Resolved {
         self.bool_layers.get(index).copied()
     }
 
+    /// Whether loopback is open, or `sandbox.allow_localhost_any` was set at a
+    /// layer above the baseline, so the user has answered the Gradle hint.
+    #[must_use]
+    pub fn localhost_any_decided(&self) -> bool {
+        self.allow_localhost_any
+            || self
+                .bool_layer("sandbox", "allow_localhost_any")
+                .is_some_and(|l| l != ConfigLayer::Baseline)
+    }
+
     fn set_bool_layer(&mut self, section: &str, key: &str, layer: ConfigLayer) {
         if let Some(index) = super::registry::BOOL_KEYS
             .iter()
@@ -5093,6 +5103,68 @@ mod precedence {
             );
         }
         resolved
+    }
+
+    #[test]
+    fn localhost_any_decided_follows_every_explicit_layer() {
+        let case =
+            |local: &'static str, repo: Option<RepoCase>, cli: Option<fn(&mut CliFlags)>| Case {
+                name: "",
+                key: "sandbox.allow_localhost_any",
+                global: "",
+                local,
+                repo,
+                cli,
+                expect: (false, ConfigLayer::Baseline),
+            };
+        assert!(
+            !run(&case("", None, None)).localhost_any_decided(),
+            "unset: hint"
+        );
+        assert!(
+            run(&case(
+                "[sandbox]\nallow_localhost_any = false\n",
+                None,
+                None
+            ))
+            .localhost_any_decided(),
+            "explicit local false: quiet"
+        );
+        assert!(
+            run(&case("[sandbox]\nallow_localhost_any = true\n", None, None))
+                .localhost_any_decided(),
+            "explicit true: quiet"
+        );
+        assert!(
+            run(&case(
+                "",
+                None,
+                Some(|c| c.allow_localhost_any = FeatureToggle::ForceOff)
+            ))
+            .localhost_any_decided(),
+            "explicit CLI off: quiet"
+        );
+        assert!(
+            run(&case(
+                "",
+                Some((
+                    |p| p.allow_localhost_any = Some(true),
+                    &["allow_localhost_any"]
+                )),
+                None
+            ))
+            .localhost_any_decided(),
+            "approved repo proposal: quiet"
+        );
+        assert!(
+            !run(&case(
+                "",
+                Some((|p| p.allow_localhost_any = Some(true), &[])),
+                None
+            ))
+            .localhost_any_decided(),
+            "unapproved proposal grants nothing: hint"
+        );
     }
 
     fn cases() -> Vec<Case> {

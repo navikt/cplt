@@ -8124,7 +8124,7 @@ fn assemble_sandbox(
 
     if let Some(line) = sandbox::gradle_loopback_hint(
         &probe.project_dir,
-        resolved.allow_localhost_any,
+        resolved.localhost_any_decided(),
         resolved.proxy_forced,
     ) {
         ui::warn(&line);
