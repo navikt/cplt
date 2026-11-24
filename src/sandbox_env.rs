@@ -353,6 +353,13 @@ pub fn build_sandbox_env(
     // but --require/--loader/--import can inject code into all Node.js child processes.
     sanitize_node_options(&mut env.vars);
 
+    // #1157: the summary path is the parent's alone. Stripped past --pass-env
+    // and --inherit-env: an agent that knew it could aim the parent's write.
+    for var in crate::session_summary::PARENT_ONLY_ENV {
+        env.vars.retain(|(k, _)| k != var);
+        env.remove.push((*var).to_string());
+    }
+
     env
 }
 

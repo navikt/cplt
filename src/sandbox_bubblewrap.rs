@@ -1456,7 +1456,10 @@ pub(crate) fn resolve(
     match use_bubblewrap {
         Some(false) => Ok(None),
         Some(true) => build_wrapper(policy, overlays, deny_masks, true, netns)
-            .map(Some)
+            .map(|wrapper| {
+                crate::session_summary::set_backend("bwrap");
+                Some(wrapper)
+            })
             .map_err(|e| {
                 format!(
                     "Bubblewrap explicitly requested but unavailable: {e}. \
@@ -1464,14 +1467,18 @@ pub(crate) fn resolve(
                 )
             }),
         None => match build_wrapper(policy, overlays, deny_masks, false, netns) {
-            Ok(wrapper) => Ok(Some(wrapper)),
+            Ok(wrapper) => {
+                crate::session_summary::set_backend("bwrap");
+                Ok(Some(wrapper))
+            }
             Err(e) => {
                 if e.starts_with("bwrap test failed") {
                     PROBE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                crate::ui::warn(&format!(
-                    "Bubblewrap unavailable ({e}). Using Landlock + seccomp only."
-                ));
+                crate::ui::warn_id(
+                    "warn.bubblewrap-unavailable",
+                    &format!("Bubblewrap unavailable ({e}). Using Landlock + seccomp only."),
+                );
                 Ok(None)
             }
         },

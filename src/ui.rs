@@ -97,6 +97,18 @@ pub fn ok(msg: &str) {
 }
 
 pub fn warn(msg: &str) {
+    crate::session_summary::record_message(crate::session_summary::UNCLASSIFIED);
+    print_warn(msg);
+}
+
+/// A warning or hint with a stable id from `session_summary::MESSAGE_IDS`,
+/// reported in the launcher's session summary (#1157).
+pub fn warn_id(id: &'static str, msg: &str) {
+    crate::session_summary::record_message(id);
+    print_warn(msg);
+}
+
+fn print_warn(msg: &str) {
     eprintln!("{}[cplt]{} {msg}", color(YELLOW), color(RESET));
 }
 

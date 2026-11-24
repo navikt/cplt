@@ -3141,6 +3141,7 @@ fn log_connection(
     // client attribution only. REJECT / INTERNAL / non-CONNECT lines are skipped.
     if method.eq_ignore_ascii_case("CONNECT") {
         let host = target.rsplit_once(':').map_or(target, |(h, _)| h);
+        crate::session_summary::record_net(status, host);
         let verdict = if status.starts_with("BLOCKED") {
             DomainVerdict::Blocked
         } else {

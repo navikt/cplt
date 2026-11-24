@@ -27,6 +27,7 @@ pub mod proxy;
 pub mod repo_config;
 pub mod sandbox;
 pub mod scratch;
+pub mod session_summary;
 pub mod settings;
 pub mod shim;
 pub mod subscriptions;

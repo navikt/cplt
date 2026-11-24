@@ -1586,9 +1586,14 @@ fn forward_and_wait(mut child: std::process::Child) -> u8 {
     }
 
     match child.wait() {
-        Ok(status) => status
-            .code()
-            .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s)) as u8,
+        Ok(status) => {
+            if let Some(sig) = status.signal() {
+                crate::session_summary::set_signal(sig);
+            }
+            status
+                .code()
+                .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s)) as u8
+        }
         Err(e) => {
             ui::error(&format!("Error waiting for child: {e}"));
             unsafe {
