@@ -1278,7 +1278,14 @@ fn bad_connect_target(target: &str) -> &str {
 }
 
 /// The 403 body for a host outside the allowlist, with the next step.
-const ALLOWLIST_BLOCK_BODY: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n";
+const ALLOWLIST_BLOCK_BODY: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset, a tool or a wrapper's managed config may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`, which also lists managed entries tagged [managed:<name>].\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n";
+
+#[cfg(test)]
+#[test]
+fn allowlist_block_body_names_the_managed_source() {
+    let body = std::str::from_utf8(ALLOWLIST_BLOCK_BODY).unwrap();
+    assert!(body.contains("managed config") && body.contains("[managed:<name>]"));
+}
 
 /// The 403 body for a refused GitHub MCP request: the allowlist hint where it
 /// applies, as `handle_connect` gives it.

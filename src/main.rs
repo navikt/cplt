@@ -10657,6 +10657,9 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                     managed.tag()
                 ));
             }
+            for d in &managed.allow_domains {
+                ok.push(format!("allow.domains: {d} [{}]", managed.tag()));
+            }
         }
         // The refusal line carries its own remedy.
         Some(Err(line)) => findings.push(Finding::warning(line, None)),
@@ -11790,8 +11793,32 @@ fn show_managed_config(
     local: Option<&config::LoadedConfig>,
     project_dir: Option<&Path>,
 ) {
-    if std::env::var_os(config::MANAGED_CONFIG_ENV).is_none_or(|v| v.is_empty()) {
+    let Some(managed) = load_managed_for_display(loaded, local, project_dir) else {
         return;
+    };
+    println!();
+    match managed {
+        Ok(m) => {
+            println!("Managed config ({}):", m.display_path());
+            for d in &m.allow_private_domains {
+                println!("  proxy.allow_private_domains = {d}  [{}]", m.tag());
+            }
+            for d in &m.allow_domains {
+                println!("  allow.domains = {d}  [{}]", m.tag());
+            }
+        }
+        Err(line) => ui::warn(&line),
+    }
+}
+
+/// The managed layer as `config show` and `config get` see it.
+fn load_managed_for_display(
+    loaded: Option<&config::LoadedConfig>,
+    local: Option<&config::LoadedConfig>,
+    project_dir: Option<&Path>,
+) -> Option<Result<config::ManagedConfig, String>> {
+    if std::env::var_os(config::MANAGED_CONFIG_ENV).is_none_or(|v| v.is_empty()) {
+        return None;
     }
     let resolved = loaded
         .map(|l| l.config.clone())
@@ -11804,17 +11831,7 @@ fn show_managed_config(
         }
         _ => Vec::new(),
     };
-    println!();
-    match config::load_managed(|| writable) {
-        Some(Ok(m)) => {
-            println!("Managed config ({}):", m.display_path());
-            for d in &m.allow_private_domains {
-                println!("  proxy.allow_private_domains = {d}  [{}]", m.tag());
-            }
-        }
-        Some(Err(line)) => ui::warn(&line),
-        None => {}
-    }
+    config::load_managed(|| writable)
 }
 
 /// Whether an `--unset` left the repo config's content as it was. Compares
@@ -12108,6 +12125,20 @@ fn run_config_get(key: &str) -> ExitCode {
             ui::color(ui::RESET)
         ),
         _ => {}
+    }
+    // #1097: managed entries add to the user's list; tag them, on stderr so
+    // the stdout value stays the user's own.
+    if key == "allow.domains" {
+        let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
+        match load_managed_for_display(loaded.as_ref(), local.as_ref(), project_dir.as_deref()) {
+            Some(Ok(m)) => {
+                for d in &m.allow_domains {
+                    eprintln!("{d}  [{}]", m.tag());
+                }
+            }
+            Some(Err(line)) => ui::warn(&line),
+            None => {}
+        }
     }
     ExitCode::SUCCESS
 }

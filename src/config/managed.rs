@@ -23,8 +23,10 @@
 //! entry is wrong. A refusal is one line, with every agent-controlled part
 //! escaped, and the launch continues without the layer.
 //!
-//! The layer can only add entries to `proxy.allow_private_domains`: never
-//! anything that widens file access or weakens the sandbox.
+//! The layer can only add entries to `proxy.allow_private_domains` and
+//! `allow.domains` (#1097): never anything that widens file access or
+//! weakens the sandbox. Managed `allow.domains` joins the user's list: it widens an allowlist already in force and never
+//! turns one on, so it cannot move a user between blocklist and allowlist mode.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -127,6 +129,8 @@ pub struct ManagedConfig {
     pub managed_by: String,
     /// Normalized, validated DNS names, sorted, deduplicated.
     pub allow_private_domains: Vec<String>,
+    /// `allow.domains`, checked the same way.
+    pub allow_domains: Vec<String>,
 }
 
 impl ManagedConfig {
@@ -466,11 +470,13 @@ pub fn load_managed_from(
     if raw.len() as u64 > LIMIT {
         return Err(invalid(&format!("it is larger than {LIMIT} bytes"), ""));
     }
-    let (managed_by, allow_private_domains) = parse(&raw).map_err(|e| invalid(&e, &raw))?;
+    let (managed_by, allow_private_domains, allow_domains) =
+        parse(&raw).map_err(|e| invalid(&e, &raw))?;
     Ok(ManagedConfig {
         path: path.to_path_buf(),
         managed_by,
         allow_private_domains,
+        allow_domains,
     })
 }
 
@@ -497,7 +503,9 @@ fn wrote_by(raw: &str) -> String {
 /// escaped. Walks the tables by hand rather than flattening them, so a quoted
 /// dotted key (`"proxy.allow_private_domains" = [...]`) and an empty unknown
 /// table are refused too.
-fn parse(raw: &str) -> Result<(String, Vec<String>), String> {
+type Parsed = (String, Vec<String>, Vec<String>);
+
+fn parse(raw: &str) -> Result<Parsed, String> {
     let table: toml::Table = toml::from_str(raw)
         .map_err(|e: toml::de::Error| format!("not valid TOML ({})", esc(e.message().trim())))?;
     let managed_by = match table.get("managed_by") {
@@ -526,32 +534,44 @@ fn parse(raw: &str) -> Result<(String, Vec<String>), String> {
         }
         None => return Err("the `schema` header is missing".into()),
     }
-    let mut domains = Vec::new();
+    let (mut private, mut allowed) = (Vec::new(), Vec::new());
     for (key, value) in &table {
         match (key.as_str(), value) {
             ("managed_by" | "schema", _) => {}
-            ("proxy", toml::Value::Table(proxy)) => {
-                for (k, v) in proxy {
-                    if k != "allow_private_domains" {
-                        return Err(format!(
-                            "key `proxy.{}` is not allowed in a managed config",
-                            esc(k)
-                        ));
-                    }
+            (t @ ("proxy" | "allow"), toml::Value::Table(sub)) => {
+                for (k, v) in sub {
+                    let out = match (t, k.as_str()) {
+                        ("proxy", "allow_private_domains") => &mut private,
+                        ("allow", "domains") => &mut allowed,
+                        // One key, one meaning: in user config this names a file.
+                        ("proxy", "allowed_domains") => {
+                            return Err(
+                                "key `proxy.allowed_domains` is not allowed in a managed config; list extra domains under `[allow] domains`".into(),
+                            );
+                        }
+                        _ => {
+                            return Err(format!(
+                                "key `{t}.{}` is not allowed in a managed config",
+                                esc(k)
+                            ));
+                        }
+                    };
+                    let k = format!("{t}.{k}");
                     let list = v
                         .as_array()
                         .filter(|a| a.iter().all(toml::Value::is_str))
-                        .ok_or("`proxy.allow_private_domains` must be a list of strings")?;
+                        .ok_or_else(|| format!("`{k}` must be a list of strings"))?;
                     for d in list {
                         let raw = d.as_str().unwrap_or_default();
                         let d = crate::proxy::normalize_hostname(raw);
-                        if !is_dns_name(&d) {
+                        // #1102: an IP literal or inet_aton alias is never a name.
+                        if !is_dns_name(&d) || crate::proxy::is_ip_alias(&d) {
                             return Err(format!(
-                                "`proxy.allow_private_domains` entry \"{}\" is not a DNS name with at least one dot",
+                                "`{k}` entry \"{}\" is not a DNS name with at least one dot",
                                 esc(raw)
                             ));
                         }
-                        domains.push(d);
+                        out.push(d);
                     }
                 }
             }
@@ -563,9 +583,11 @@ fn parse(raw: &str) -> Result<(String, Vec<String>), String> {
             }
         }
     }
-    domains.sort_unstable();
-    domains.dedup();
-    Ok((managed_by, domains))
+    for l in [&mut private, &mut allowed] {
+        l.sort_unstable();
+        l.dedup();
+    }
+    Ok((managed_by, private, allowed))
 }
 
 /// A lowercase DNS name with at least two labels: labels of 1-63 `[a-z0-9-]`
@@ -598,6 +620,13 @@ impl super::types::Resolved {
         }
         self.allow_private_domains.sort_unstable();
         self.allow_private_domains.dedup();
+        // Into `allow.domains`, never the `allowed_domains` file or the
+        // default allowlist: it extends an allowlist in force, never starts one.
+        for d in &managed.allow_domains {
+            if !self.allow_domains.contains(d) {
+                self.allow_domains.push(d.clone());
+            }
+        }
         self.managed = Some(managed.clone());
     }
 
@@ -1551,11 +1580,10 @@ mod tests {
     #[test]
     fn refuses_disallowed_keys_by_name() {
         for (body, key) in [
-            ("[allow]\nwrite = [\"/\"]\n", "allow"),
             ("[sandbox]\npreset = \"open\"\n", "sandbox"),
             (
-                "[proxy]\nallowed_domains = \"/x\"\n",
-                "proxy.allowed_domains",
+                "[proxy]\nallowed_domains_file = \"/x\"\n",
+                "proxy.allowed_domains_file",
             ),
             // Empty unknown table: nothing to flatten, still refused.
             ("[future]\n", "future"),
@@ -1644,6 +1672,7 @@ mod tests {
             path: PathBuf::from("/m"),
             managed_by: "nav-pilot".into(),
             allow_private_domains: vec!["b.nav.no".into(), "intern.nav.no".into()],
+            allow_domains: Vec::new(),
         };
         r.apply_managed(&m);
         assert_eq!(
@@ -1656,6 +1685,83 @@ mod tests {
         );
         assert_eq!(r.managed_tag("b.nav.no", &user_domains), None);
         assert_eq!(r.managed_tag("user.nav.no", &user_domains), None);
+    }
+
+    /// #1097: managed `allow.domains` joins `allow.domains` (the list that
+    /// widens an allowlist in force and never starts one). It never sets the
+    /// `allowed_domains` file or the default allowlist, so the mode is the
+    /// user's; it never removes a user entry or adds a private domain.
+    #[test]
+    fn managed_allow_domains_extend_but_never_switch_allowlist_mode() {
+        let h = Home::new();
+        let p = write(
+            &h.managed_d(),
+            "m.toml",
+            "managed_by = \"nav-pilot\"\nschema = 1\n[allow]\ndomains = [\"API.Nav.no.\", \"user.nav.no\"]\n",
+        );
+        let m = h.load(p.as_os_str(), &[]).unwrap();
+        assert_eq!(m.allow_domains, ["api.nav.no", "user.nav.no"]);
+        assert!(m.allow_private_domains.is_empty());
+        for user in [
+            "[allow]\ndomains = [\"user.nav.no\", \"own.example.com\"]\n",
+            "[proxy]\ndefault_allowlist = true\n",
+        ] {
+            let resolve = || {
+                crate::config::Config::parse(user)
+                    .unwrap()
+                    .merge_with_no_proxy_env(crate::config::CliFlags::default(), None)
+                    .unwrap()
+            };
+            let (mut r, before) = (resolve(), resolve());
+            r.apply_managed(&m);
+            assert_eq!(r.allowed_domains, before.allowed_domains);
+            assert_eq!(r.default_allowlist, before.default_allowlist);
+            assert_eq!(r.allow_all_domains, before.allow_all_domains);
+            assert_eq!(r.allow_private_domains, before.allow_private_domains);
+            assert!(
+                before
+                    .allow_domains
+                    .iter()
+                    .all(|d| r.allow_domains.contains(d))
+            );
+            assert!(r.allow_domains.contains(&"api.nav.no".to_string()));
+            assert_eq!(
+                r.allow_domains
+                    .iter()
+                    .filter(|d| *d == "user.nav.no")
+                    .count(),
+                before
+                    .allow_domains
+                    .iter()
+                    .filter(|d| *d == "user.nav.no")
+                    .count()
+                    .max(1)
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_bad_managed_allow_domains() {
+        for (body, why) in [
+            (
+                "[proxy]\nallowed_domains = [\"a.nav.no\"]",
+                "list extra domains under `[allow] domains`",
+            ),
+            (
+                "[allow]\ndomains = \"a.nav.no\"",
+                "`allow.domains` must be a list",
+            ),
+            ("[allow]\ndomains = [\"127.0.0.1\"]", "is not a DNS name"),
+            ("[allow]\ndomains = [\"1.0x1\"]", "is not a DNS name"),
+            ("[allow]\ndomains = [\"*.nav.no\"]", "is not a DNS name"),
+            ("[allow]\ndomains = [\"localhost\"]", "is not a DNS name"),
+            (
+                "[allow]\nwrite = [\"/\"]",
+                "key `allow.write` is not allowed",
+            ),
+        ] {
+            refused_body(&format!("managed_by = \"x\"\nschema = 1\n{body}\n"), why);
+        }
     }
 
     fn names(dir: &Path) -> Vec<String> {
