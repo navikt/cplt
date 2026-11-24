@@ -3014,11 +3014,9 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     }
     for d in chain {
         if validate_sbpl_path(&d).is_ok() {
-            sbpl!(
-                sb,
-                "(deny file-write-unlink file-write-create (literal \"{}\"))",
-                d.display()
-            );
+            let d = d.display();
+            sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
+            sbpl!(sb, "(deny file-write-create (literal \"{d}\"))");
         }
     }
     for path in config.extra_deny {
