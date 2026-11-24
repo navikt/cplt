@@ -10317,7 +10317,19 @@ fn readonly_host_tool_paths_adds_only_the_overlay_denies() {
         );
         assert!(block.contains(&line), "{block}");
     }
-    assert_eq!(format!("{}{}", &on[..start], &on[end..]), off);
+    // Plus the ancestor pins of those denies, which carry only unlink/create
+    // denies on paths below a write root.
+    let rest: String = format!("{}{}", &on[..start], &on[end..])
+        .lines()
+        .filter(|l| !l.starts_with(";; Ancestors of user deny paths"))
+        .filter(|l| {
+            off.contains(l)
+                || !(l.starts_with("(deny file-write-unlink (literal")
+                    || l.starts_with("(deny file-write-create (literal"))
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(rest, off);
     let tool_grant = on
         .find(&format!("{}/.cache", base.home_dir.display()))
         .expect("~/.cache grant");

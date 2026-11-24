@@ -2002,6 +2002,22 @@ fn merge_tool_path_env_overrides(
             ));
             continue;
         }
+        // Third layer: with `sandbox.readonly_host_tool_paths` on, an env var
+        // must not hand write back to a path the key made read-only.
+        if ovr.write
+            && resolved.readonly_host_tool_paths
+            && let Some(ro) = cplt::sandbox::env_tool_path_readonly_host(home, &path)
+        {
+            ui::warn(&format!(
+                "Ignoring {var} = {}: it overlaps {ro}, which sandbox.readonly_host_tool_paths \
+             keeps read-only, so no grant is added. Point {var} at a directory that is not \
+             {ro}, inside it or above it (for example a sibling of it), or turn the key off.",
+                path.to_string_lossy().escape_debug(),
+                var = ovr.name,
+                ro = ro.to_string_lossy().escape_debug(),
+            ));
+            continue;
+        }
         // One root per default tree: a second segment of a list var
         // (`GOPATH=/a:/b`) keeps the plain whole-tree grant below.
         if let Some(default) = cplt::sandbox::relocatable_tool_prefix(ovr.name)
@@ -7815,17 +7831,57 @@ impl HostProbe {
             cplt::sandbox::apply_readonly_host_tool_paths(
                 &mut tool_discovery.existing_home_tool_dirs,
             );
-            // `./gradlew` locks its distribution for writing on every run.
-            for d in tool_discovery
-                .existing_home_tool_dirs
-                .iter()
-                .filter(|d| matches!(d.dir.path, ".gradle/wrapper" | ".m2/wrapper"))
-            {
-                for lock in cplt::sandbox::wrapper_lock_files(&d.path.join("dists")) {
-                    if !resolved.allow_write.contains(&lock) {
-                        resolved.allow_write.push(lock);
-                    }
+            // A keyed overlay reached through a symlink is denied at its
+            // target too; say so, since the target is not where the key points.
+            let canon_home = std::fs::canonicalize(home_dir).unwrap_or_else(|_| home_dir.into());
+            for (link, target) in cplt::sandbox::host_tool_ro_overlay_links(home_dir) {
+                let inside = target.starts_with(&canon_home)
+                    && cplt::sandbox::env_tool_path_protected(home_dir, &target).is_none();
+                ui::warn(&format!(
+                    "sandbox.readonly_host_tool_paths: {} resolves through a symlink to {}{}. \
+                     Writes there are denied as well. Replace the link with a directory.",
+                    link.to_string_lossy().escape_debug(),
+                    target.to_string_lossy().escape_debug(),
+                    if inside {
+                        ""
+                    } else {
+                        ", outside $HOME or in a protected path"
+                    },
+                ));
+            }
+            // Bubblewrap binds only what exists: say which overlay it cannot.
+            #[cfg(target_os = "linux")]
+            for p in cplt::sandbox::host_tool_ro_overlays(home_dir, true) {
+                if !p.exists() {
+                    ui::warn(&format!(
+                        "sandbox.readonly_host_tool_paths: {} does not exist, so it is not bound \
+                         read-only this session. Create it as a directory.",
+                        p.to_string_lossy().escape_debug()
+                    ));
                 }
+            }
+            // `./gradlew` locks its distribution for writing on every run.
+            // A lock the profile cannot name is skipped, not fatal: the grant
+            // is automatic, and refusing it would abort every launch.
+            let mut unnameable = None;
+            for lock in
+                cplt::sandbox::readonly_wrapper_lock_files(&tool_discovery.existing_home_tool_dirs)
+            {
+                // Only the macOS profile has to spell it; Linux grants it as is.
+                if cfg!(target_os = "macos") && cplt::sandbox::validate_sbpl_path(&lock).is_err() {
+                    unnameable.get_or_insert(lock);
+                } else if !resolved.allow_write.contains(&lock) {
+                    resolved.allow_write.push(lock);
+                }
+            }
+            if let Some(lock) = unnameable {
+                ui::warn(&format!(
+                    "sandbox.readonly_host_tool_paths: not granting write to {} (or any other \
+                     wrapper lock file the sandbox profile cannot name), so ./gradlew or ./mvnw \
+                     may fail on that distribution. Rename the directory to a path without \
+                     ( ) \" ; or \\.",
+                    lock.to_string_lossy().escape_debug()
+                ));
             }
         }
         // Git worktree common directory (shared .git for worktrees).

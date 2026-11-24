@@ -30,9 +30,9 @@ use super::policy::{
     XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs, ancestor_alternation, app_dirs,
     colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
     cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, host_tool_ro_overlays, missing_home_config_link_targets,
-    nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
-    pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
+    home_config_link_targets, host_tool_ro_overlays, is_readonly_wrapper_lock_path,
+    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    pnpm_config_dirs, pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
     validate_playwright_socket_dir, validate_sbpl_path,
 };
 
@@ -189,11 +189,23 @@ fn profile_locked(
             emit_copilot_pkg_exec(&mut sb, &pkg);
         }
     }
+    // The wrapper lock grants are files in a read-only tree: `literal`, so the
+    // agent cannot swap one for a directory and fill it.
+    let wrapper_locks: Vec<PathBuf> = match config.existing_home_tool_dirs {
+        Some(dirs) if config.readonly_host_tool_paths => config
+            .extra_write
+            .iter()
+            .filter(|p| is_readonly_wrapper_lock_path(dirs, p))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
     emit_user_allows(
         &mut sb,
         config.extra_read,
         config.extra_write,
         config.extra_exec,
+        &wrapper_locks,
     );
     // This deny must follow user exec grants so Cypress's persistent writable
     // state cannot become executable through a broader allow.exec ancestor.
@@ -380,7 +392,10 @@ pub(crate) fn emitted_write_subpaths(sb: &str) -> Vec<PathBuf> {
 /// would move the denied content to a path the deny no longer names. Emitted
 /// last, after every grant, so it covers each one.
 fn emit_user_deny_pins(sb: &mut String, config: &SandboxConfig) {
-    if config.extra_deny.is_empty() {
+    // The keyed overlays are denies too: a rename of a writable ancestor of a
+    // symlinked overlay's target would move it out from under the deny.
+    let overlays = host_tool_ro_overlays(config.home_dir, config.readonly_host_tool_paths);
+    if config.extra_deny.is_empty() && overlays.is_empty() {
         return;
     }
     let mut roots = emitted_write_subpaths(sb);
@@ -392,6 +407,7 @@ fn emit_user_deny_pins(sb: &mut String, config: &SandboxConfig) {
     let targets: Vec<PathBuf> = config
         .extra_deny
         .iter()
+        .chain(&overlays)
         .flat_map(|p| [p.clone(), crate::config::canonicalize_deepest(p)])
         .collect();
     let (mut unlink, mut create) = super::user_deny_pins(&roots, &targets);
@@ -2758,6 +2774,7 @@ fn emit_user_allows(
     extra_read: &[PathBuf],
     extra_write: &[PathBuf],
     extra_exec: &[PathBuf],
+    literal_write: &[PathBuf],
 ) {
     if !extra_read.is_empty() || !extra_write.is_empty() || !extra_exec.is_empty() {
         sbpl!(sb, ";; User-specified allows");
@@ -2767,6 +2784,10 @@ fn emit_user_allows(
         }
         for path in extra_write {
             let p = path.to_string_lossy();
+            if literal_write.contains(path) {
+                sbpl!(sb, "(allow file-read* file-write* (literal \"{p}\"))");
+                continue;
+            }
             sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
             sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
         }

@@ -111,8 +111,10 @@ sandbox. `--allow-write` on the target restores writes but not execute.
 
 With this key on, tool downloads and settings the host runs later are
 read-only in the sandbox: `~/.gradle/wrapper`, `~/.m2/wrapper`, `~/.konan`,
-`~/.cache/pre-commit`, `~/.dotnet/tools`, `~/.nuget/NuGet` and
-`~/.nuget/plugins`. The last four need bubblewrap on Linux. What breaks, and
+`~/.cache/pre-commit`, `~/.dotnet/tools`, `~/.nuget/NuGet`,
+`~/.nuget/plugins`, `~/.local/share/mise`, kubebuilder-envtest's cache and
+data dirs, and `~/.cache/uv`. All but the first three need bubblewrap on
+Linux. What breaks, and
 the fix:
 
 - `./gradlew` or `./mvnw` when the pinned distribution is not downloaded yet.
@@ -125,6 +127,8 @@ the fix:
   lock in `~/.cache/pre-commit` on every run. Commit outside cplt.
 - `dotnet tool install -g`, and a first `dotnet restore` on a machine without
   `~/.nuget/NuGet/NuGet.Config`. Run them once outside cplt.
+- `mise install` and `mise upgrade`, `setup-envtest` downloads, and `uv`
+  commands that fill its cache. Run them outside cplt.
 
 `npx` is not covered: it writes `~/.npm/_npx` even for a package it has
 cached, so a read-only `_npx` would break every `npx` call, MCP servers

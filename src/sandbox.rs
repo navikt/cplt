@@ -134,14 +134,15 @@ pub use policy::{
     cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
     cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
     ensure_split_tool_dirs, env_tool_dir_allowed, env_tool_dir_hint_ok, env_tool_path_protected,
-    env_tool_temp_roots, exec_write_conflicts, first_party_read_target, gradle_loopback_hint,
-    grant_is_refused, home_config_link_targets, home_tool_dirs, host_tool_ro_overlays,
-    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
-    no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
-    pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
-    refused_writable_app_root, relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths,
-    socket_mask_paths, state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
+    env_tool_path_readonly_host, env_tool_temp_roots, exec_write_conflicts,
+    first_party_read_target, gradle_loopback_hint, grant_is_refused, home_config_link_targets,
+    home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays, linux_docker_socket_paths,
+    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
+    missing_wrapper_dist_hint, nested_alternation, no_cache_env, no_exec_temp_dir_over,
+    no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs, pin_legacy_state_dir_if_inside,
+    playwright_runtime_intent, process_env, readonly_wrapper_lock_files, refused_writable_app_root,
+    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
+    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
     validate_playwright_socket_dir, validate_sbpl_path, wrapper_lock_files, xdg_runtime_dir_env,
     xdg_state_dir,
 };
@@ -1361,6 +1362,20 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     }
     for p in config.extra_deny {
         refuse_filesystem_root("deny path", p)?;
+    }
+    // A keyed overlay deny the profile cannot name would be dropped while the
+    // launch claims it holds: refuse instead.
+    if cfg!(target_os = "macos") {
+        for p in host_tool_ro_overlays(config.home_dir, config.readonly_host_tool_paths) {
+            validate_sbpl_path(&p).map_err(|e| {
+                format!(
+                    "sandbox.readonly_host_tool_paths cannot make {} read-only: {}. Rename it \
+                     (or the symlink target) to a path without ( ) \" ; or \\, or turn the key off.",
+                    p.display(),
+                    e.replace('\n', " ")
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -5830,6 +5845,24 @@ mod tests {
             masks.contains(&root_cw) && masks.contains(&wt_cw),
             "{masks:?}"
         );
+    }
+
+    /// A keyed overlay whose target the macOS profile cannot name refuses the
+    /// launch instead of dropping the deny.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readonly_host_tool_paths_refuses_an_unnameable_overlay_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(home.join(".cache/uv(real)")).unwrap();
+        std::os::unix::fs::symlink(home.join(".cache/uv(real)"), home.join(".cache/uv")).unwrap();
+        crate::with_env_lock_no_xdg(|| {
+            let mut config = test_config(&home, &[]);
+            assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+            config.readonly_host_tool_paths = true;
+            let err = validate_hard_denied_grants(&config).unwrap_err();
+            assert!(err.contains("uv(real)"), "{err}");
+        });
     }
 
     pub(super) fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
