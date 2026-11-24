@@ -5155,6 +5155,92 @@ print("LEAKED" if any("top-secret" in l for l in leaked) else "HELD")
         );
     }
 
+    /// A `--deny-path` inside a writable tool dir (`~/go/pkg`) holds when the
+    /// agent renames or swaps the tool dir's root or its parent into the
+    /// project, creates the path with O_EXCL, reads it through a symlink in the
+    /// project, or creates a missing ancestor as a symlink elsewhere.
+    #[test]
+    fn real_profile_deny_path_in_tool_dir_survives_root_rename_and_swap() {
+        require_sandbox!();
+        // A HOME outside the temp dirs, which are themselves writable trees.
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cplt-deny-root-{}", std::process::id()));
+        let home = base.join("home");
+        let pkg = home.join("go/pkg");
+        fs::create_dir_all(pkg.join("mod/sec")).unwrap();
+        fs::write(pkg.join("mod/sec/data.txt"), "top-secret\n").unwrap();
+        fs::write(base.join(".metadata_never_index"), "").unwrap();
+        let tmp = std::env::temp_dir().join(format!("cplt-deny-root-p-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("proj/swapdir")).unwrap();
+        let project = fs::canonicalize(tmp.join("proj")).unwrap();
+        let home = fs::canonicalize(&home).unwrap();
+        let pkg = home.join("go/pkg");
+        let extra_deny = vec![pkg.join("mod/sec"), pkg.join("new/sub/sec")];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+        let py = r#"
+import ctypes, os, sys
+home, proj = sys.argv[1], sys.argv[2]
+pkg = home + "/go/pkg"
+libc = ctypes.CDLL(None, use_errno=True)
+def swap(a, b):
+    return libc.renamex_np(a.encode(), b.encode(), 2) == 0
+def grab(d, out):
+    for root, _, files in os.walk(d):
+        for f in files:
+            try:
+                out.append(open(os.path.join(root, f)).read())
+            except OSError:
+                pass
+leaked, broke = [], []
+for src in [pkg + "/mod", pkg, home + "/go"]:
+    try:
+        os.rename(src, proj + "/moved")
+        grab(proj + "/moved", leaked)
+        broke.append("rename " + src)
+    except OSError:
+        pass
+    if swap(src, proj + "/swapdir"):
+        grab(proj + "/swapdir", leaked)
+        broke.append("swap " + src)
+try:
+    os.close(os.open(pkg + "/mod/sec/new.txt", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    broke.append("excl")
+except OSError:
+    pass
+os.symlink(pkg + "/mod/sec", proj + "/link")
+grab(proj + "/link", leaked)
+os.makedirs(proj + "/elsewhere/sub/sec")
+for make in [lambda: os.symlink(proj + "/elsewhere", pkg + "/new"), lambda: os.mkdir(pkg + "/new")]:
+    try:
+        make()
+        broke.append("create ancestor")
+    except OSError:
+        pass
+os.mkdir(pkg + "/ok")
+print("CONTROL_OK" if os.path.isdir(pkg + "/ok") else "CONTROL_FAIL")
+print("BROKE " + ",".join(broke) if broke or leaked else "HELD")
+"#;
+        let script = tmp.join("probe.py");
+        fs::write(&script, py).unwrap();
+        let cmd = format!(
+            "/usr/bin/python3 -I '{}' '{}' '{}' 2>&1",
+            script.display(),
+            home.display(),
+            project.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_dir_all(&base).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("CONTROL_OK"),
+            "tool dir must stay writable: {output}"
+        );
+        assert!(output.contains("HELD"), "deny path escaped: {output}");
+    }
+
     /// #597: the #477 carve-out re-allows `.env` reads in the Go module cache,
     /// and must not reopen a `--deny-path` inside it. A module outside the
     /// deny keeps the carve-out.

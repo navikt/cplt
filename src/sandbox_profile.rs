@@ -2942,18 +2942,31 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
             .chain(&files)
             .filter_map(|s| s.get(1).map(PathBuf::from)),
     );
-    // User deny paths too: a rename of a writable ancestor would move the
-    // denied content to a path the deny no longer names.
-    targets.extend(
-        config
-            .extra_deny
-            .iter()
-            .map(|p| crate::config::canonicalize_deepest(p)),
-    );
     // And HOME itself when it lies inside a writable tree: `~/.ssh` is denied
     // whether or not it exists, so pin every ancestor of it, HOME included.
     targets.push(crate::config::canonicalize_deepest(Path::new(config.home_dir)).join(".ssh"));
     emit_resolved_deny_pins(sb, config, &targets);
+    // User deny paths: a rename of a writable ancestor, the tree root included,
+    // would move the denied content to a path the deny no longer names.
+    let user: Vec<PathBuf> = config
+        .extra_deny
+        .iter()
+        .map(|p| crate::config::canonicalize_deepest(p))
+        .collect();
+    let (mut unlink, mut create) = super::user_deny_pins(config, &user);
+    for (v, op, label) in [
+        (&mut unlink, "file-write-unlink", "no rename"),
+        (&mut create, "file-write-create", "no create"),
+    ] {
+        v.sort();
+        v.dedup();
+        if !v.is_empty() {
+            sbpl!(sb, ";; Ancestors of user deny paths — {label}");
+        }
+        for d in v.iter() {
+            sbpl!(sb, "(deny {op} (literal \"{}\"))", d.display());
+        }
+    }
     for path in config.extra_deny {
         let p = path.to_string_lossy();
         sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");
