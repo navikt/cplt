@@ -551,12 +551,15 @@ mod e2e_tests {
     // Doctor is findings-first: a header a maintainer can trust (version, OS,
     // agent and where the choice came from, config layers, enforcement), then
     // only what will fail, then the verdict. The inventory is `--verbose`.
+    //
+    // Doctor dials out to check proxy reachability (#1130); tests that are
+    // not about it pass --no-proxy so the suite stays offline-safe.
 
     #[test]
     fn e2e_doctor_exits_successfully() {
         require_copilot!();
         let output = cplt_cmd()
-            .args(["--doctor"])
+            .args(["--no-proxy", "--doctor"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
@@ -913,7 +916,7 @@ mod e2e_tests {
             return;
         }
         let output = cplt_cmd()
-            .args(["--agent", "pi", "doctor"])
+            .args(["--no-proxy", "--agent", "pi", "doctor"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
@@ -982,7 +985,7 @@ mod e2e_tests {
     fn e2e_doctor_subcommand_works() {
         require_copilot!();
         let output = cplt_cmd()
-            .args(["doctor"])
+            .args(["--no-proxy", "doctor"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
@@ -1009,7 +1012,7 @@ mod e2e_tests {
     fn e2e_doctor_flag_shows_deprecation() {
         require_copilot!();
         let output = cplt_cmd()
-            .args(["--doctor"])
+            .args(["--no-proxy", "--doctor"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
@@ -9574,7 +9577,7 @@ paths = [
 
         // Workspace members are inventory, so they live under --verbose.
         let output = cplt_cmd()
-            .args(["doctor", "--verbose"])
+            .args(["--no-proxy", "doctor", "--verbose"])
             .current_dir(dir.path())
             .output()
             .expect("should run");

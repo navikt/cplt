@@ -37,7 +37,10 @@ CASES = [
     ("--yes --quiet --no-audit --no-proxy", ["--yes", "--quiet", "--no-audit", "--no-proxy", "--", "--version"], 364.0, 7),
     ("--yes --quiet", ["--yes", "--quiet", "--", "--version"], 434.0, 7),
     ("--yes (full launch + audit)", ["--yes", "--", "--version"], 666.0, 14),
-    ("doctor", ["doctor"], 327.0, 14),
+    # --no-proxy: doctor's #1130 reachability probe dials out, which would add
+    # network RTT to the row and fail on firewalled machines. The #666
+    # baseline predates the probe, so the row stays comparable without it.
+    ("--no-proxy doctor", ["--no-proxy", "doctor"], 327.0, 14),
     ("check", ["check"], 800.0, 8),
 ]
 

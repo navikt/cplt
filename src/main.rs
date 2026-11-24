@@ -4973,6 +4973,7 @@ fn start_proxy_if_enabled(
     // everything else.
     let allowlist_active = !default_allowlist.is_empty() || allowed_domains_file.is_some();
 
+    proxy::set_dial_notice_quiet(resolved.quiet);
     match proxy::start(proxy::ProxyOptions {
         port: resolved.proxy_port,
         blocked_file,
@@ -9087,18 +9088,19 @@ fn split_host_port(target: &str) -> (String, u16) {
 /// Best-effort outbound reachability check (cplt runs outside the sandbox).
 /// Only used for an ALLOWED target to confirm "cplt is not blocking this";
 /// never affects the decision.
-fn probe_reachable(host: &str, port: u16) -> String {
-    use std::net::ToSocketAddrs;
-    let addr = format!("{host}:{port}");
-    let Ok(mut addrs) = addr.to_socket_addrs() else {
-        return format!("policy allows it, but {host} did not resolve here");
-    };
-    let Some(sa) = addrs.next() else {
-        return format!("policy allows it, but {host} did not resolve here");
-    };
-    match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(4)) {
-        Ok(_) => format!("reachable, connected to {sa} then closed"),
-        Err(_) => "policy allows it, but the host was not reachable from here".to_string(),
+fn probe_reachable(
+    net_policy: &proxy::NetPolicy,
+    host: &str,
+    port: u16,
+    (upstream, no_proxy): (Option<&proxy::UpstreamProxy>, &[String]),
+) -> String {
+    let budget = std::time::Duration::from_secs(4);
+    match proxy::probe_dial(net_policy, host, port, upstream, no_proxy, budget) {
+        Ok(sa) => format!("reachable, connected to {sa} then closed"),
+        Err((hint, _)) => format!(
+            "policy allows it, but the connection failed: {}",
+            hint.trim_start_matches("[cplt] ")
+        ),
     }
 }
 
@@ -9261,6 +9263,10 @@ fn run_check_command(
             resolved.proxy_forced,
             &dom,
             no_connect,
+            (
+                resolved.proxy_upstream.as_ref(),
+                &resolved.proxy_upstream_no_proxy,
+            ),
             agent_name,
             preset_name,
         ),
@@ -9875,12 +9881,14 @@ fn resolved_ip_verdict(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_net_check(
     net_policy: &proxy::NetPolicy,
     proxy_enabled: bool,
     proxy_forced: bool,
     target: &str,
     no_connect: bool,
+    upstream: (Option<&proxy::UpstreamProxy>, &[String]),
     agent_name: String,
     preset_name: Option<String>,
 ) -> check::Report {
@@ -9908,7 +9916,7 @@ fn build_net_check(
     }
 
     let mut note = if !no_connect && expl.decision == check::Decision::Allowed && proxy_enabled {
-        Some(probe_reachable(&host, port))
+        Some(probe_reachable(net_policy, &host, port, upstream))
     } else {
         None
     };
@@ -10070,6 +10078,51 @@ fn launcher_runs_through_interpreter(launcher: &Path, target: &Path) -> bool {
             words.next().is_some_and(|program| !program.contains(name))
                 && words.any(|word| word.contains(name))
         })
+}
+
+/// Outcome of doctor's reachability probe over its candidate hosts (#1130).
+#[derive(Debug, PartialEq, Eq)]
+enum DoctorProbe {
+    Reachable(String),
+    /// Every candidate failed at the network level: likely a local firewall.
+    Blocked(String),
+    /// Some candidate failed for another reason (did not resolve, upstream
+    /// status, refused after DNS), so a firewall is not established. `net`
+    /// is the first network-level failure, if any: it is never hidden.
+    Inconclusive {
+        why: String,
+        net: Option<String>,
+    },
+}
+
+/// Try each host until one connects. BLOCKING only when every candidate
+/// failed with a network-level class; anything else is a note, because a
+/// dead or unresolvable allowlist entry says nothing about the firewall.
+fn doctor_probe(
+    hosts: &[String],
+    mut dial: impl FnMut(&str) -> Result<(), (String, bool)>,
+) -> DoctorProbe {
+    let mut first_net = None;
+    let mut other = None;
+    for h in hosts {
+        match dial(h) {
+            Ok(()) => return DoctorProbe::Reachable(h.clone()),
+            Err((hint, true)) => {
+                first_net.get_or_insert(hint);
+            }
+            Err((hint, false)) => {
+                other.get_or_insert(hint);
+            }
+        }
+    }
+    match (other, first_net) {
+        (None, Some(hint)) => DoctorProbe::Blocked(hint),
+        (Some(why), net) => DoctorProbe::Inconclusive { why, net },
+        (None, None) => DoctorProbe::Inconclusive {
+            why: "no host to probe".to_string(),
+            net: None,
+        },
+    }
 }
 
 /// `cplt doctor`. Findings first; the inventory only under `--verbose`.
@@ -10343,6 +10396,59 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         // The refusal line carries its own remedy.
         Some(Err(line)) => findings.push(Finding::warning(line, None)),
         None => {}
+    }
+    // ── network: can the proxy dial out at all (#1130)? Doctor may use the
+    // network; a launch never runs this. A local firewall that has not seen
+    // this binary path fails every CONNECT with a bare 502 otherwise.
+    // A policy that fails to build is reported by the policy check below.
+    // Tests set CPLT_TEST_SKIP_NET_PROBE so doctor stays hermetic; release
+    // builds ignore it.
+    if resolved.with_proxy
+        && !(cfg!(debug_assertions) && std::env::var_os("CPLT_TEST_SKIP_NET_PROBE").is_some())
+        && let Ok(net) = build_net_policy(&resolved, active_agent)
+    {
+        match proxy::probe_targets(&net) {
+            Err(reason) => ok.push(format!("proxy upstream: reachability not checked: {reason}")),
+            Ok(hosts) => match doctor_probe(&hosts, |h| {
+                proxy::probe_dial(
+                    &net,
+                    h,
+                    443,
+                    resolved.proxy_upstream.as_ref(),
+                    &resolved.proxy_upstream_no_proxy,
+                    std::time::Duration::from_secs(4),
+                )
+                .map(|_| ())
+            }) {
+                DoctorProbe::Reachable(host) => ok.push(format!("proxy upstream: {host} reachable")),
+                DoctorProbe::Blocked(hint) => findings.push(Finding::blocking(
+                    hint.trim_start_matches("[cplt] ").to_string(),
+                    format!(
+                        "allow this cplt binary in the host firewall. Last resort for a session you \
+                         trust: `cplt {}` gives the agent direct, unfiltered network access and your \
+                         real GitHub token.",
+                        proxy::NO_PROXY_STOPGAP
+                    ),
+                )),
+                DoctorProbe::Inconclusive { why, net: Some(net) } => {
+                    findings.push(Finding::warning(
+                        format!(
+                            "proxy upstream: {} Another candidate failed for a different reason: {}",
+                            net.trim_start_matches("[cplt] "),
+                            why.trim_start_matches("[cplt] ")
+                        ),
+                        None,
+                    ));
+                }
+                DoctorProbe::Inconclusive { why, net: None } => findings.push(Finding::info(
+                    format!(
+                        "proxy upstream: reachability inconclusive: {}",
+                        why.trim_start_matches("[cplt] ")
+                    ),
+                    None,
+                )),
+            },
+        }
     }
     // ── network: the policy `cplt check net` classifies against (#604) ──
     // Static: the same gate, no connection and no sandbox battery.
@@ -17978,6 +18084,7 @@ mod tests {
             false,
             "github.com",
             true, // no_connect
+            (None, &[]),
             "copilot".to_string(),
             None,
         );
@@ -17986,6 +18093,117 @@ mod tests {
             json.contains("BLOCKED-ALLOWLIST"),
             "check must match the live BLOCKED-ALLOWLIST verdict, not report ALLOWED:\n{json}"
         );
+    }
+
+    /// #1132 review: doctor reports BLOCKING only when every candidate failed
+    /// at the network level; a dead or unresolvable host is a note.
+    #[test]
+    fn doctor_probe_blocks_only_on_all_network_failures() {
+        let hosts: Vec<String> = ["a.example", "b.example"].map(String::from).to_vec();
+        let net = |h: &str| Err((format!("net {h}"), true));
+        assert_eq!(
+            doctor_probe(&hosts, net),
+            DoctorProbe::Blocked("net a.example".into())
+        );
+        let first_ok = |h: &str| {
+            if h == "b.example" {
+                Ok(())
+            } else {
+                Err((String::new(), true))
+            }
+        };
+        assert_eq!(
+            doctor_probe(&hosts, first_ok),
+            DoctorProbe::Reachable("b.example".into())
+        );
+        let mixed = |h: &str| Err((format!("x {h}"), h == "a.example"));
+        assert_eq!(
+            doctor_probe(&hosts, mixed),
+            DoctorProbe::Inconclusive {
+                why: "x b.example".into(),
+                net: Some("x a.example".into())
+            },
+            "a network-level failure next to an unresolvable candidate is kept, not hidden"
+        );
+        let unresolvable = |h: &str| Err((format!("x {h}"), false));
+        assert_eq!(
+            doctor_probe(&hosts, unresolvable),
+            DoctorProbe::Inconclusive {
+                why: "x a.example".into(),
+                net: None
+            },
+            "no network-level failure: inconclusive without a dial to name"
+        );
+        assert!(matches!(
+            doctor_probe(&[], net),
+            DoctorProbe::Inconclusive { .. }
+        ));
+    }
+
+    /// #1132 review: with no upstream configured, `check net` must not blame
+    /// an upstream, and must not nest a `[cplt]` prefix.
+    #[test]
+    fn check_net_failure_note_without_upstream() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let policy = proxy::NetPolicy {
+            allow_localhost_ports: vec![port],
+            ..Default::default()
+        };
+        let note = probe_reachable(&policy, "127.0.0.1", port, (None, &[]));
+        assert!(
+            note.starts_with("policy allows it, but the connection failed: "),
+            "{note}"
+        );
+        assert!(
+            !note.contains("upstream is unreachable") && !note.contains("[cplt]"),
+            "{note}"
+        );
+    }
+
+    /// nav-pilot parses `cplt check --json`: pin the report's field names.
+    #[test]
+    fn check_net_json_shape_is_pinned() {
+        let mut report = build_net_check(
+            &proxy::NetPolicy::default(),
+            true,
+            false,
+            "github.com",
+            true,
+            (None, &[]),
+            "copilot".to_string(),
+            None,
+        );
+        // `note` is optional (absent when None); set it to pin its name.
+        report.items[0].note = Some("reachability".into());
+        let v: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut item: Vec<&str> = v["items"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        item.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "agent",
+                "battery",
+                "enforcing",
+                "items",
+                "over_blocked",
+                "platform",
+                "verified"
+            ],
+            "existing fields may not be renamed or removed"
+        );
+        for k in ["category", "decision", "name", "note", "reason", "target"] {
+            assert!(item.contains(&k), "item field {k} missing: {item:?}");
+        }
+        assert!(v["enforcing"].is_boolean() && v["verified"].is_u64() && v["items"].is_array());
     }
 
     #[test]
