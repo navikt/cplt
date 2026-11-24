@@ -43,7 +43,13 @@ pub fn binary_path() -> PathBuf {
 /// under test is whatever the machine happens to have configured.
 #[must_use]
 pub fn cplt_cmd() -> Command {
-    let mut cmd = Command::new(binary_path());
+    cplt_cmd_at(&binary_path())
+}
+
+/// [`cplt_cmd`] for a copy of the binary at `bin`.
+#[must_use]
+pub fn cplt_cmd_at(bin: &std::path::Path) -> Command {
+    let mut cmd = Command::new(bin);
     cmd.env("CPLT_CONFIG", NO_CONFIG);
     with_scratch_home(&mut cmd);
     // Greppable stderr. The summary pads its columns and colours them, so a
