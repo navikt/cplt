@@ -91,8 +91,9 @@ fn open_beneath(dir: &Path, rel: &Path, check_from: usize) -> std::io::Result<st
             }
             // SAFETY: geteuid has no preconditions and cannot fail.
             let euid = unsafe { libc::geteuid() };
-            if (st.st_uid != euid && st.st_uid != 0) || st.st_mode & 0o022 != 0 {
-                return Err(std::io::Error::other(OpenDir(walked.clone())));
+            let foreign = st.st_uid != euid && st.st_uid != 0;
+            if foreign || st.st_mode & 0o022 != 0 {
+                return Err(std::io::Error::other(OpenDir(walked.clone(), foreign)));
             }
         }
     }
@@ -186,31 +187,60 @@ pub fn load_managed(
     ))
 }
 
-/// `s` for a POSIX shell: escaped for the terminal, quoted unless plain.
+/// `s` as a shell word that names the same bytes and is safe to print.
+/// Each component is quoted on its own, so a plain prefix such as the home
+/// directory stays bare and doctor can still turn it into an expanding `~`.
 fn q(s: &Path) -> String {
-    let e = esc(&s.to_string_lossy());
-    if !e.is_empty()
-        && e.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._-+@%:,=".contains(c))
+    use std::os::unix::ffi::OsStrExt as _;
+    let b = s.as_os_str().as_bytes();
+    if b.is_empty() {
+        return "''".to_string();
+    }
+    b.split(|&c| c == b'/')
+        .map(q_part)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// One path component: bare when plain, single-quoted when printable ASCII,
+/// else `$'..'` with every other byte as `\xHH` (bash and zsh), so no
+/// terminal escaping changes which file the command names.
+fn q_part(b: &[u8]) -> String {
+    if b.iter()
+        .all(|c| c.is_ascii_alphanumeric() || b"._-+@%:,=".contains(c))
     {
-        e
+        String::from_utf8_lossy(b).into_owned()
+    } else if b.iter().all(|c| (0x20..0x7f).contains(c)) {
+        format!("'{}'", String::from_utf8_lossy(b).replace('\'', r"'\''"))
     } else {
-        format!("'{}'", e.replace('\'', r"'\''"))
+        let mut out = String::from("$'");
+        for &c in b {
+            match c {
+                b'\\' | b'\'' => out.extend(['\\', char::from(c)]),
+                0x20..0x7f => out.push(char::from(c)),
+                _ => {
+                    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\\x{c:02x}"));
+                }
+            }
+        }
+        out.push('\'');
+        out
     }
 }
 
-/// A directory on the walk that is not owned by the user or root, or is
-/// group/world-writable. Carries the path so the refusal can say `chmod go-w`.
+/// A directory on the walk that is not owned by the user or root (`.1` is
+/// true), or is group/world-writable. Carries the path for the remedy.
 #[derive(Debug)]
-struct OpenDir(PathBuf);
+struct OpenDir(PathBuf, bool);
 
 impl std::fmt::Display for OpenDir {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the directory {} is not owned by you or root, or is group/world-writable",
-            esc(&self.0.to_string_lossy())
-        )
+        let why = if self.1 {
+            "is not owned by you or root"
+        } else {
+            "is group/world-writable"
+        };
+        write!(f, "the directory {} {why}", esc(&self.0.to_string_lossy()))
     }
 }
 
@@ -267,7 +297,7 @@ pub fn load_managed_from(
                     ""
                 }
             ),
-            &format!("Launch with HOME unset or equal to {}.", q(&home)),
+            &format!("Launch with HOME set to {}.", q(&home)),
         ));
     }
     let under = || refuse(&format!("it must lie under ~/{TRUSTED_DIR}"), &dir_hint);
@@ -314,7 +344,15 @@ pub fn load_managed_from(
     // so a hop flipped after the canonicalize above cannot swap the file.
     let file = open_managed(&trusted, rel).map_err(|e| {
         if let Some(d) = e.get_ref().and_then(|r| r.downcast_ref::<OpenDir>()) {
-            refuse(&d.to_string(), &format!("Run: chmod go-w {}", q(&d.0)))
+            let fix = if d.1 {
+                format!(
+                    "Recreate {} as your own directory (or have root `chown` it to you), then have the wrapper rewrite the file.",
+                    q(&d.0)
+                )
+            } else {
+                format!("Run: chmod go-w {}", q(&d.0))
+            };
+            refuse(&d.to_string(), &fix)
         } else if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
             refuse(
                 "a component changed into a symlink while it was opened",
@@ -627,6 +665,54 @@ mod tests {
         assert!(h.load(p.as_os_str(), &[]).is_ok());
     }
 
+    /// #1131 review: the shell word names the original bytes.
+    #[test]
+    fn shell_word_preserves_the_path_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        assert_eq!(
+            q(Path::new("/a/b.toml")),
+            "/a/b.toml",
+            "plain path stays bare"
+        );
+        assert_eq!(
+            q(Path::new(r"/a/x\ y")),
+            r"/a/'x\ y'",
+            "one backslash stays one"
+        );
+        assert_eq!(
+            q(Path::new("/a/x'y")),
+            r"/a/'x'\''y'",
+            "quote is closed and escaped"
+        );
+        assert_eq!(
+            q(Path::new(std::ffi::OsStr::from_bytes(b"/a/\\\n\xff'"))),
+            r"/a/$'\\\x0a\xff\''",
+            "control and non-UTF-8 bytes become \\xHH"
+        );
+        // Doctor abbreviates the home; the tilde must stay outside any quote.
+        assert_eq!(
+            crate::doctor::tilde_in_text(
+                &format!("Run: chmod 644 {}", q(Path::new("/home/u/m d/a b.toml"))),
+                Path::new("/home/u"),
+            ),
+            "Run: chmod 644 ~/'m d'/'a b.toml'",
+            "doctor keeps the operand expandable"
+        );
+    }
+
+    /// #1131 review: a foreign-owned directory is not fixed by chmod.
+    #[test]
+    fn open_dir_names_its_own_cause() {
+        let d = OpenDir(PathBuf::from("/x"), true).to_string();
+        assert!(
+            d.contains("not owned by you or root"),
+            "ownership cause: {d}"
+        );
+        assert!(!d.contains("writable"), "no mode cause: {d}");
+        let d = OpenDir(PathBuf::from("/x"), false).to_string();
+        assert!(d.contains("group/world-writable"), "mode cause: {d}");
+    }
+
     /// #1129: each refusal ends with a fix for its own cause, and the
     /// last-resort unset comes after it.
     #[test]
@@ -659,19 +745,19 @@ mod tests {
             ),
         );
         set(&cplt, 0o755);
-        let other = tempfile::tempdir().unwrap();
-        let e =
-            load_managed_from(p.as_os_str(), Some(h.path()), Some(other.path()), &[]).unwrap_err();
+        // Not a tempdir: on Linux that sits under /tmp and adds the tmp note.
+        let other = Path::new("/nonexistent/cplt-other-home");
+        let e = load_managed_from(p.as_os_str(), Some(h.path()), Some(other), &[]).unwrap_err();
         let home = std::fs::canonicalize(h.path()).unwrap();
-        fix(
-            &e,
-            &format!("Launch with HOME unset or equal to {}", home.display()),
-        );
+        fix(&e, &format!("Launch with HOME set to {}", home.display()));
         assert!(
             e.contains(&format!("your account home is {}", home.display())),
             "{e}"
         );
-        assert!(!e.contains("agent-writable by design"), "{e}");
+        assert!(
+            !e.contains("agent-writable by design"),
+            "tmp note only for a HOME under /tmp: {e}"
+        );
         let e = load_managed_from(
             p.as_os_str(),
             Some(h.path()),
