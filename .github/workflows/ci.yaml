@@ -288,11 +288,21 @@ jobs:
           fi
           echo "Working tree clean — no test artifacts leaked"
 
-  # OpenCode v2 (#710) through cplt with the real, pinned binary and no
-  # credentials. The integration job covers the same ground with a stub; this
-  # checks the real client finds and reaches its own per-session service.
+  # OpenCode v2 (#710) through cplt with each real release in the supported
+  # window and no credentials. The integration job covers the same ground with
+  # a stub; this checks the real client finds and reaches its own per-session
+  # service, and smoke-tests `run` against a stub model, the TUI in a PTY and a
+  # remote MCP stub, with no service left afterwards (#1141).
   opencode-v2-e2e:
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
+    name: opencode-v2-e2e-${{ matrix.opencode }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported window cplt doctor reports: agent::OPENCODE_V2_TESTED
+        # (a unit test keeps the two bounds in step). A bare minor resolves
+        # to its latest patch at run time; a minor not published yet skips.
+        opencode: ["2.0.24", "2.3.2", "2.4"]
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -313,19 +323,34 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Install pinned OpenCode v2
+      - name: Install OpenCode v2
         shell: bash
         run: |
           set -euo pipefail
           # The platform package carries the binary; the @opencode/cli shim
           # only links it from a postinstall script, which stays off.
           prefix="$RUNNER_TEMP/opencode-v2"
-          npm install --ignore-scripts --no-save --prefix "$prefix" "@opencode/cli-darwin-arm64@2.0.24"
-          bin="$prefix/node_modules/@opencode/cli-darwin-arm64/bin/opencode"
+          pkg="@opencode/cli-darwin-arm64"
+          spec="${{ matrix.opencode }}"
+          # Only a bare minor that npm does not have yet skips; any other
+          # failure, and any failure for an exact pin, fails the cell.
+          if ! out=$(npm view "$pkg@$spec" version --json 2>/dev/null); then
+            if [[ "$spec" =~ ^[0-9]+\.[0-9]+$ ]] && jq -e '.error.code == "E404"' <<<"$out" >/dev/null 2>&1; then
+              echo "::notice::OpenCode $spec is not published; skipping this cell"
+              echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::npm view $pkg@$spec failed: $out"
+            exit 1
+          fi
+          ver=$(jq -er 'if type == "array" then .[-1] else . end' <<<"$out")
+          npm install --ignore-scripts --no-save --prefix "$prefix" "$pkg@$ver"
+          bin="$prefix/node_modules/$pkg/bin/opencode"
           "$bin" --version
           echo "CPLT_E2E_OPENCODE_V2=$bin" >> "$GITHUB_ENV"
 
       - name: Run OpenCode v2 e2e tests
+        if: env.OPENCODE_SKIP != '1'
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
         shell: bash
@@ -340,6 +365,14 @@ jobs:
   # The same on Linux (#719): v2 needs bubblewrap, and is refused without it.
   opencode-v2-e2e-linux:
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
+    name: opencode-v2-e2e-linux-${{ matrix.opencode }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported window cplt doctor reports: agent::OPENCODE_V2_TESTED
+        # (a unit test keeps the two bounds in step). A bare minor resolves
+        # to its latest patch at run time; a minor not published yet skips.
+        opencode: ["2.0.24", "2.3.2", "2.4"]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -369,17 +402,32 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp /bin/true
 
-      - name: Install pinned OpenCode v2
+      - name: Install OpenCode v2
         shell: bash
         run: |
           set -euo pipefail
           prefix="$RUNNER_TEMP/opencode-v2"
-          npm install --ignore-scripts --no-save --prefix "$prefix" "@opencode/cli-linux-x64@2.0.24"
-          bin="$prefix/node_modules/@opencode/cli-linux-x64/bin/opencode"
+          pkg="@opencode/cli-linux-x64"
+          spec="${{ matrix.opencode }}"
+          # Only a bare minor that npm does not have yet skips; any other
+          # failure, and any failure for an exact pin, fails the cell.
+          if ! out=$(npm view "$pkg@$spec" version --json 2>/dev/null); then
+            if [[ "$spec" =~ ^[0-9]+\.[0-9]+$ ]] && jq -e '.error.code == "E404"' <<<"$out" >/dev/null 2>&1; then
+              echo "::notice::OpenCode $spec is not published; skipping this cell"
+              echo "OPENCODE_SKIP=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::npm view $pkg@$spec failed: $out"
+            exit 1
+          fi
+          ver=$(jq -er 'if type == "array" then .[-1] else . end' <<<"$out")
+          npm install --ignore-scripts --no-save --prefix "$prefix" "$pkg@$ver"
+          bin="$prefix/node_modules/$pkg/bin/opencode"
           "$bin" --version
           echo "CPLT_E2E_OPENCODE_V2=$bin" >> "$GITHUB_ENV"
 
       - name: Run OpenCode v2 e2e tests
+        if: env.OPENCODE_SKIP != '1'
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
         shell: bash
@@ -388,6 +436,11 @@ jobs:
           cargo test --test integration_linux opencode_v2 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
           if grep -q "SKIPPED (opencode v2)" "$RUNNER_TEMP/test-output.log"; then
             echo "::error::OpenCode v2 tests skipped although the binary is installed"
+            exit 1
+          fi
+          # #1141: the bubblewrap pid namespace ends every session service.
+          if left=$(pgrep -af -- 'serve --service'); then
+            echo "::error::OpenCode service left running after the tests: $left"
             exit 1
           fi
 

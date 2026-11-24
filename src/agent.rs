@@ -340,6 +340,8 @@ pub fn opencode_version(bin: &Path, home: &Path) -> Option<String> {
 }
 
 /// OpenCode v2 releases cplt has run end to end (#1138): `run` and the TUI.
+/// The CI smoke matrix (`opencode-v2-e2e`) runs both bounds; a unit test keeps
+/// them in step.
 pub const OPENCODE_V2_TESTED: (&str, &str) = ("2.0.24", "2.4");
 
 /// A note when `version` is outside [`OPENCODE_V2_TESTED`].
@@ -3757,6 +3759,27 @@ impl std::fmt::Display for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The doctor window and the CI smoke matrix (#1141) name the same bounds.
+    #[test]
+    fn opencode_v2_window_matches_the_ci_matrix() {
+        let ci = include_str!("../.github/workflows/ci.yaml");
+        let rows: Vec<Vec<&str>> = ci
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("opencode: ["))
+            .map(|r| {
+                r.trim_end_matches(']')
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('"'))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rows.len(), 2, "macOS and Linux matrices");
+        for row in rows {
+            assert_eq!(row.first(), Some(&OPENCODE_V2_TESTED.0), "{row:?}");
+            assert_eq!(row.last(), Some(&OPENCODE_V2_TESTED.1), "{row:?}");
+        }
+    }
 
     #[test]
     fn opencode_v2_untested_range() {

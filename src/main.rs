@@ -5793,6 +5793,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
 
     let mut v2_model = None;
+    // Declared after `scratch_guard`, so it drops first (#1141).
+    #[cfg(target_os = "macos")]
+    let mut _v2_service = None;
     let mut v2_tui = Vec::new();
     if opencode_v2 {
         let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
@@ -5803,6 +5806,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         };
         let mut session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        #[cfg(target_os = "macos")]
+        {
+            _v2_service = Some(cplt::opencode_v2::ServiceGuard::new(scratch, session.port));
+        }
         v2_model = std::mem::replace(&mut session.model, Err(())).ok();
         v2_tui = std::mem::take(&mut session.tui);
         if resolved.github_mcp_proxy {

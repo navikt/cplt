@@ -17,9 +17,10 @@
 //!   rules instead, and the port joins the connect allowlist (see
 //!   `sandbox_landlock::hide_files`).
 //!
-//! Both dirs live in the session scratch dir. Removing it at exit takes the
-//! registration with it, and the service shuts itself down within 5 s when its
-//! registration is gone; a crashed session's dir goes with the scratch GC.
+//! Both dirs live in the session scratch dir. The service does not exit when
+//! its registration goes (#1141): on macOS [`ServiceGuard`] stops it when the
+//! session ends, on Linux the bubblewrap pid namespace ends with the session.
+//! A crashed session's dir goes with the scratch GC.
 //! The database (`$XDG_DATA_HOME/opencode/opencode.db`) stays shared with the
 //! host. So are the TUI's favourite models and prompt history (#793): the
 //! host `model.json` is copied in and, when the session changed it, back out
@@ -724,9 +725,8 @@ fn profile_tail(
 
 /// Runs inside the sandbox as `sh -c RUN_WRAPPER <opencode> run …`: start the
 /// session service, then `exec` into `run` so SIGTERM/SIGHUP forwarded to the
-/// child reach it directly. The service is not stopped here: it shuts itself
-/// down within 5 s once its registration (in the session scratch dir) is
-/// gone, which cplt removes at exit.
+/// child reach it directly. The service is not stopped here: cplt stops it
+/// from outside the sandbox when the session ends ([`ServiceGuard`]).
 const RUN_WRAPPER: &str = "\"$0\" service start >/dev/null || exit $?; exec \"$0\" \"$@\"";
 
 /// OpenCode global flags that take no value, and those that take one.
@@ -832,6 +832,109 @@ pub fn host_warnings(home: &Path) -> Vec<String> {
         );
     }
     out
+}
+
+/// Stops the session's own service when dropped (#1141): the service a v2
+/// session starts daemonizes, so it is no child of cplt and outlives the
+/// session otherwise. Hold it until the agent has exited; drop it before the
+/// scratch dir is removed. Covers normal exit, forwarded signals (cplt waits
+/// for the child, then returns) and error returns. macOS only: on Linux v2
+/// runs only under bubblewrap, whose pid namespace takes the service with it
+/// (and whose pids the registration would name, not the host's).
+#[cfg(target_os = "macos")]
+pub struct ServiceGuard {
+    registration: PathBuf,
+    port: u16,
+}
+
+#[cfg(target_os = "macos")]
+impl ServiceGuard {
+    pub fn new(scratch: &Path, port: u16) -> Self {
+        Self {
+            registration: scratch.join("opencode-v2/state/opencode/service.json"),
+            port,
+        }
+    }
+
+    /// The registration, and every path under the session's state dir, is
+    /// agent-writable, so identity rests on neither: the process must be
+    /// sandboxed and listen on the loopback port cplt picked for this
+    /// session. A service the user started outside cplt is not sandboxed;
+    /// another session's service listens on its own port.
+    fn owns(&self, pid: i32) -> bool {
+        sandboxed(pid) && listens_on(pid, self.port)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ServiceGuard {
+    fn drop(&mut self) {
+        let Some(pid) = host_service_pid(&self.registration) else {
+            return;
+        };
+        if !self.owns(pid) {
+            return;
+        }
+        let started = start_time(pid);
+        // SAFETY: plain signals to a pid just checked.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+        }
+        // SIGTERM may have closed the listener, so the port check cannot be
+        // repeated; the start time shows the pid was not reused.
+        if started.is_some() && start_time(pid) == started {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// When `pid` started, as (seconds, microseconds).
+#[cfg(target_os = "macos")]
+fn start_time(pid: i32) -> Option<(u64, u64)> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a live buffer of `size` bytes.
+    let n =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (n == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+/// macOS hides other processes' environments, so ask Seatbelt.
+#[cfg(target_os = "macos")]
+fn sandboxed(pid: i32) -> bool {
+    unsafe extern "C" {
+        fn sandbox_check(
+            pid: libc::pid_t,
+            op: *const libc::c_char,
+            kind: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    // SAFETY: a null operation only asks whether `pid` is sandboxed.
+    unsafe { sandbox_check(pid, std::ptr::null(), 0) == 1 }
+}
+
+/// Whether `pid` holds a TCP listener on `port`. Runs only at teardown, when
+/// a registration names a live process.
+#[cfg(target_os = "macos")]
+fn listens_on(pid: i32, port: u16) -> bool {
+    #[allow(clippy::disallowed_methods)] // absolute path
+    std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-t", "-sTCP:LISTEN"])
+        .arg(format!("-p{pid}"))
+        .arg(format!("-iTCP@127.0.0.1:{port}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == pid.to_string())
+        })
 }
 
 /// The pid in a service registration, if that process is alive.
