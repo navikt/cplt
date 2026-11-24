@@ -494,6 +494,10 @@ impl Broker {
     /// Every `open_url` decision this session (host and reason, no query).
     #[must_use]
     pub fn open_url_records(&self) -> Vec<String> {
+        // A client can disconnect while its opener runs; wait for the record.
+        self.shared
+            .open_limiter
+            .drain(std::time::Duration::from_secs(5));
         self.shared
             .open_records
             .lock()

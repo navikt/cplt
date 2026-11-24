@@ -67,9 +67,28 @@ pub(crate) fn allowed_hosts<'a>(specs: impl Iterator<Item = &'a Spec>) -> Vec<St
 pub(crate) struct Limiter {
     recent: Mutex<VecDeque<Instant>>,
     busy: Arc<AtomicBool>,
+    /// Requests between `serve` entry and their record being written. The
+    /// client may disconnect while its opener still runs, so the report waits
+    /// on this ([`Limiter::drain`]) before reading the records.
+    inflight: std::sync::atomic::AtomicUsize,
+}
+
+struct Inflight<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Limiter {
+    /// Wait up to `max` for pending requests to record their outcome.
+    pub(crate) fn drain(&self, max: std::time::Duration) {
+        let end = Instant::now() + max;
+        while self.inflight.load(Ordering::Acquire) > 0 && Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// Take a slot, or say why not. The returned flag is cleared when the
     /// opener exits.
     fn take(&self, now: Instant) -> Result<Arc<AtomicBool>, &'static str> {
@@ -383,6 +402,31 @@ pub(crate) fn serve(
     log: &super::Log,
     records: &Mutex<Vec<String>>,
 ) {
+    serve_with(
+        reader,
+        reply,
+        hosts,
+        limiter,
+        home,
+        log,
+        records,
+        opener(HOST_OPENER),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_with(
+    reader: &mut impl BufRead,
+    reply: &mut impl Write,
+    hosts: &[String],
+    limiter: &Limiter,
+    home: &Path,
+    log: &super::Log,
+    records: &Mutex<Vec<String>>,
+    host_opener: Option<PathBuf>,
+) {
+    limiter.inflight.fetch_add(1, Ordering::AcqRel);
+    let _inflight = Inflight(&limiter.inflight);
     // Every decision is kept for the post-session report, whatever the log
     // level or file. Host and reason only, never the URL's query.
     let note = |text: String| {
@@ -421,7 +465,7 @@ pub(crate) fn serve(
             }
             refusal(host.as_deref(), why, hosts)
         }
-        Ok(busy) => match opener(HOST_OPENER).map(|o| run_opener(&o, &url, home, &busy)) {
+        Ok(busy) => match host_opener.map(|o| run_opener(&o, &url, home, &busy)) {
             Some(Ok(())) => {
                 // The host only: the query carries OAuth state and PKCE.
                 note(format!("ALLOWED {}", host.as_deref().unwrap_or("")));
@@ -1418,35 +1462,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refusal_flood_never_hides_an_allowed_open() {
-        let records = Mutex::new(Vec::new());
+    fn serve_open(
+        records: &Mutex<Vec<String>>,
+        limiter: &Limiter,
+        url: &str,
+        opener: Option<PathBuf>,
+    ) {
         let log = super::super::Log {
             level: crate::proxy::ProxyLogLevel::None,
             file: None,
         };
-        let ask = |u: &str| {
-            serve(
-                &mut format!("{u}\n").as_bytes(),
-                &mut Vec::new(),
-                &["gw.example".into()],
-                &Limiter::default(),
-                Path::new("/nonexistent"),
-                &log,
-                &records,
-            );
-        };
+        serve_with(
+            &mut format!("{url}\n").as_bytes(),
+            &mut Vec::new(),
+            &["gw.example".into()],
+            limiter,
+            Path::new("/nonexistent"),
+            &log,
+            records,
+            opener,
+        );
+    }
+
+    #[test]
+    fn refusal_flood_never_hides_an_allowed_open() {
+        let records = Mutex::new(Vec::new());
+        let limiter = Limiter::default();
         for _ in 0..300 {
-            ask("https://evil.example/");
+            serve_open(&records, &limiter, "https://evil.example/", None);
         }
-        ask("https://gw.example/ok");
+        serve_open(
+            &records,
+            &limiter,
+            "https://gw.example/ok",
+            Some("/usr/bin/true".into()),
+        );
         let r = records.into_inner().unwrap();
         assert_eq!(r.len(), MAX_REFUSALS + 2, "{r:?}");
         assert!(r.contains(&"...and 100 more refusals".to_string()));
-        assert!(
-            r.iter()
-                .any(|t| !t.starts_with("DENIED") && !t.starts_with("...")),
-            "the open is recorded: {r:?}"
-        );
+        assert_eq!(r.last().map(String::as_str), Some("ALLOWED gw.example"));
+    }
+
+    /// Copilot review on #1124: the report waits for a slow opener whose
+    /// client already left.
+    #[test]
+    fn drain_waits_for_a_slow_opener_before_the_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cplt-slow-opener-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let slow = dir.join("slow");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 1\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let records = Mutex::new(Vec::new());
+        let limiter = Limiter::default();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                serve_open(
+                    &records,
+                    &limiter,
+                    "https://gw.example/ok",
+                    Some(slow.clone()),
+                );
+            });
+            while limiter.inflight.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
+            assert!(records.lock().unwrap().is_empty(), "opener still running");
+            limiter.drain(std::time::Duration::from_secs(10));
+            assert_eq!(*records.lock().unwrap(), ["ALLOWED gw.example"]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
