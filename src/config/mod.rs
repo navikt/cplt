@@ -39,13 +39,13 @@ pub use managed::{
     account_home, load_managed, load_managed_from,
 };
 pub(crate) use path::MAXSYMLINKS;
-pub use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;
 pub use path::{
     CustomConfigVerdict, allow_path_credential_hop, approval_dirs, approval_file,
     classify_custom_config, collapse_tilde, config_dir, config_path, credential_hop_message,
     default_config_contents, expand_tilde, xdg_config_root,
 };
+pub use path::{canonicalize_deepest, firmlink_canonical};
 pub use registry::{
     BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,
     layer_only_flag, lookup_key,

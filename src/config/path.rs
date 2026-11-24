@@ -729,17 +729,58 @@ pub(super) fn resolve_config_path(
     config_dir: Option<&PathBuf>,
 ) -> Result<PathBuf, ConfigError> {
     let full = anchored(path, config_dir);
-    std::fs::canonicalize(&full).map_err(|_| {
-        ConfigError::Validation(format!(
-            "path does not exist or is inaccessible: {}",
-            full.display()
-        ))
-    })
+    std::fs::canonicalize(&full)
+        .map(|c| firmlink_canonical(&c))
+        .map_err(|_| {
+            ConfigError::Validation(format!(
+                "path does not exist or is inaccessible: {}",
+                full.display()
+            ))
+        })
+}
+
+/// Map `/System/Volumes/Data/<x>` to `/<x>` when both name the same file.
+///
+/// `canonicalize` leaves the macOS firmlink spelling alone, but Seatbelt
+/// matches the vnode's canonical path (`/Users/...`), so a rule naming the
+/// firmlink form matches nothing. A deny written that way would be silently
+/// inert; every overlap check would miss it too. Identity (dev, ino) decides,
+/// never the string alone. No-op off macOS and for any other path.
+pub fn firmlink_canonical(path: &Path) -> PathBuf {
+    #[cfg(unix)]
+    if let Ok(rest) = path.strip_prefix("/System/Volumes/Data") {
+        use std::os::unix::fs::MetadataExt;
+        let short = Path::new("/").join(rest);
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(path), std::fs::metadata(&short))
+            && (a.dev(), a.ino()) == (b.dev(), b.ino())
+        {
+            return short;
+        }
+    }
+    path.to_path_buf()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmlink_canonical_maps_only_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        // Not under the prefix: untouched.
+        assert_eq!(firmlink_canonical(&real), real);
+        // Missing under the prefix: untouched (cannot prove identity).
+        let ghost = Path::new("/System/Volumes/Data/nonexistent-cplt-x");
+        assert_eq!(firmlink_canonical(ghost), ghost);
+        #[cfg(target_os = "macos")]
+        {
+            let fl = Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+            if fl.exists() {
+                assert_eq!(firmlink_canonical(&fl), real);
+            }
+        }
+    }
 
     #[test]
     fn expand_tilde_replaces_home() {

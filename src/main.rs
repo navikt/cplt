@@ -1846,13 +1846,15 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     paths
         .iter()
         .map(|p| {
-            std::fs::canonicalize(p).with_context(|| {
-                format!(
-                    "--deny-path {} cannot be resolved.\n\
+            std::fs::canonicalize(p)
+                .map(|c| config::firmlink_canonical(&c))
+                .with_context(|| {
+                    format!(
+                        "--deny-path {} cannot be resolved.\n\
                      Silently dropping deny rules is a security risk.",
-                    p.display()
-                )
-            })
+                        p.display()
+                    )
+                })
         })
         .collect()
 }

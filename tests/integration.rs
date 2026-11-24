@@ -5306,6 +5306,38 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A deny named through the `/System/Volumes/Data` firmlink spelling is
+    /// normalised to the canonical path Seatbelt matches, so the file stays
+    /// unreadable. Without that the rule is accepted and matches nothing.
+    #[test]
+    fn real_profile_deny_path_firmlink_spelling_is_enforced() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-deny-firmlink-{}", std::process::id()));
+        let project = tmp.join("proj");
+        let denied = project.join("secret");
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(denied.join("data.txt"), "top-secret\n").unwrap();
+        let project = fs::canonicalize(&project).unwrap();
+        let denied = fs::canonicalize(&denied).unwrap();
+        let spelled = Path::new("/System/Volumes/Data").join(denied.strip_prefix("/").unwrap());
+        assert!(spelled.exists(), "firmlink spelling must resolve");
+        let normalised = cplt::config::firmlink_canonical(&fs::canonicalize(&spelled).unwrap());
+        assert_eq!(normalised, denied);
+        let home = home_dir();
+        let extra_deny = vec![normalised];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+        let cmd = format!("cat '{}/data.txt' 2>&1; echo EXIT:$?", denied.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            !output.contains("top-secret") && output.contains("Operation not permitted"),
+            "firmlink-spelled deny must hold, got: {output}"
+        );
+    }
+
     /// A `--deny-path` inside the project keeps its content denied when the
     /// agent renames or swaps (`renamex_np` RENAME_SWAP) a writable ancestor.
     #[test]
