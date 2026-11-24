@@ -31,9 +31,23 @@ permission error (`Operation not permitted`, `Permission denied`, or
 Typical cases are `yarn global add`, a Gradle toolchain download into
 `~/.gradle/jdks` (already blocked before), or a script that edits
 `~/.gradle/gradle.properties`. Make that change outside cplt. If a build
-needs to write another cache directory under one of these homes, grant that
-directory alone with `--allow-write ~/.gradle/<dir>` (or `allow.write` in the
-config) and open an issue so it can become a default.
+needs to write another cache directory under one of these homes, create it
+outside cplt and grant that directory alone (the sandbox cannot create it in
+the read-only parent):
+
+```sh
+mkdir -p ~/.gradle/<dir>
+cplt --allow-write ~/.gradle/<dir>
+```
+
+Or put it in `allow.write` in the config, and open an issue so it can become
+a default.
+
+A writable tool directory reached through a symlink (at its own name, or
+because `~/.gradle` itself is a link) is no longer granted: cplt warns and
+skips it, since a sandboxed session could have planted that link. If you made
+the link, point the tool's `*_HOME` variable (for example `GRADLE_USER_HOME`)
+at the real directory, or grant the target with `--allow-write`.
 
 
 `~/.npm` is read-only too, except `_cacache/`, `_logs/` and `_npx/`. npm

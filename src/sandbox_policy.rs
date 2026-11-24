@@ -3181,7 +3181,7 @@ pub const HOST_EXEC_TOOL_PATHS: &[HostExecPath] = &[
     },
     HostExecPath {
         path: ".npm/_cacache",
-        host_use: "tarball cache, integrity-checked against the lockfile on read",
+        host_use: "tarball cache; integrity-checked on read only when a lockfile pins the hash",
         handling: HostExec::Gap("npm install writes the cache"),
     },
     HostExecPath {
