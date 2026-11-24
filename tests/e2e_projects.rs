@@ -81,7 +81,10 @@ mod project_tests {
         );
         assert!(!stderr.contains("Starting Copilot in sandbox"), "{stderr}");
 
-        let out = command(&editor_path).arg("doctor").output().unwrap();
+        let out = command(&editor_path)
+            .args(["--no-proxy", "doctor"])
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "{stdout}");
         assert!(stdout.contains("Copilot's editor launcher"), "{stdout}");
@@ -100,7 +103,10 @@ mod project_tests {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{stderr}");
         assert!(stderr.contains("Copilot's editor launcher"), "{stderr}");
-        let out = command(&editor_path).arg("doctor").output().unwrap();
+        let out = command(&editor_path)
+            .args(["--no-proxy", "doctor"])
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "{stdout}");
         assert!(stdout.contains("Copilot's editor launcher"), "{stdout}");
@@ -112,7 +118,7 @@ mod project_tests {
         ])
         .unwrap();
         let out = command(&recovered_path)
-            .args(["doctor", "--verbose"])
+            .args(["--no-proxy", "doctor", "--verbose"])
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);

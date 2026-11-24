@@ -360,7 +360,9 @@ internal-artifacts.example.com
 
 To keep the agent away from one of its own hosts anyway, put it on the blocklist, which is checked after the allowlist and wins.
 
-`cplt doctor` checks the agent's hosts against your policy, plus the package registries when an allowlist is active, without going to the network. One warning names up to three blocked hosts with their status (`BLOCKED` for a blocklist entry, `BLOCKED-ALLOWLIST` for a registry missing from a plain `allowed_domains`), counts the rest ("9 more"), and gives one fix per cause.
+`cplt doctor` checks the agent's hosts against your policy, plus the package registries when an allowlist is active. That policy check stays off the network. One warning names up to three blocked hosts with their status (`BLOCKED` for a blocklist entry, `BLOCKED-ALLOWLIST` for a registry missing from a plain `allowed_domains`), counts the rest ("9 more"), and gives one fix per cause.
+
+With the proxy on, doctor also dials out once to check that the proxy can reach the network: `api.github.com` when the policy allows it, then up to three concrete allowlisted hosts. It reports a blocking finding only when every host it tried failed at the network level (timeout, refused, reset, denied by the local system, no route). That usually means a local firewall such as Little Snitch has not allowed this cplt binary. A host that does not resolve, or an upstream proxy that answers with an error, gives a note instead. `cplt --no-proxy doctor` skips the check.
 
 > **Setting `allowed_domains` is what turns the allowlist on, not the file's contents.** The two ways to say "no allowlist" are not the same thing:
 >

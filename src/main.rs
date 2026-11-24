@@ -4973,6 +4973,7 @@ fn start_proxy_if_enabled(
     // everything else.
     let allowlist_active = !default_allowlist.is_empty() || allowed_domains_file.is_some();
 
+    proxy::set_dial_notice_quiet(resolved.quiet);
     match proxy::start(proxy::ProxyOptions {
         port: resolved.proxy_port,
         blocked_file,
@@ -9096,7 +9097,10 @@ fn probe_reachable(
     let budget = std::time::Duration::from_secs(4);
     match proxy::probe_dial(net_policy, host, port, upstream, no_proxy, budget) {
         Ok(sa) => format!("reachable, connected to {sa} then closed"),
-        Err(hint) => format!("policy allows it, but upstream is unreachable: {hint}"),
+        Err((hint, _)) => format!(
+            "policy allows it, but the connection failed: {}",
+            hint.trim_start_matches("[cplt] ")
+        ),
     }
 }
 
@@ -10076,6 +10080,44 @@ fn launcher_runs_through_interpreter(launcher: &Path, target: &Path) -> bool {
         })
 }
 
+/// Outcome of doctor's reachability probe over its candidate hosts (#1130).
+#[derive(Debug, PartialEq, Eq)]
+enum DoctorProbe {
+    Reachable(String),
+    /// Every candidate failed at the network level: likely a local firewall.
+    Blocked(String),
+    /// Some candidate failed for another reason (did not resolve, upstream
+    /// status, refused after DNS), so a firewall is not established.
+    Inconclusive(String),
+}
+
+/// Try each host until one connects. BLOCKING only when every candidate
+/// failed with a network-level class; anything else is a note, because a
+/// dead or unresolvable allowlist entry says nothing about the firewall.
+fn doctor_probe(
+    hosts: &[String],
+    mut dial: impl FnMut(&str) -> Result<(), (String, bool)>,
+) -> DoctorProbe {
+    let mut first_net = None;
+    let mut other = None;
+    for h in hosts {
+        match dial(h) {
+            Ok(()) => return DoctorProbe::Reachable(h.clone()),
+            Err((hint, true)) => {
+                first_net.get_or_insert(hint);
+            }
+            Err((hint, false)) => {
+                other.get_or_insert(hint);
+            }
+        }
+    }
+    match (other, first_net) {
+        (None, Some(hint)) => DoctorProbe::Blocked(hint),
+        (Some(why), _) => DoctorProbe::Inconclusive(why),
+        (None, None) => DoctorProbe::Inconclusive("no host to probe".to_string()),
+    }
+}
+
 /// `cplt doctor`. Findings first; the inventory only under `--verbose`.
 ///
 /// Built from the launch's own resolution (`resolve_context`, `HostProbe`,
@@ -10355,20 +10397,27 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     if resolved.with_proxy
         && let Ok(net) = build_net_policy(&resolved, active_agent)
     {
-        match proxy::probe_target(&net) {
+        match proxy::probe_targets(&net) {
             Err(reason) => ok.push(format!("proxy upstream: reachability not checked: {reason}")),
-            Ok(host) => match proxy::probe_dial(
-                &net,
-                &host,
-                443,
-                resolved.proxy_upstream.as_ref(),
-                &resolved.proxy_upstream_no_proxy,
-                std::time::Duration::from_secs(4),
-            ) {
-                Ok(_) => ok.push(format!("proxy upstream: {host} reachable")),
-                Err(hint) => findings.push(Finding::blocking(
+            Ok(hosts) => match doctor_probe(&hosts, |h| {
+                proxy::probe_dial(
+                    &net,
+                    h,
+                    443,
+                    resolved.proxy_upstream.as_ref(),
+                    &resolved.proxy_upstream_no_proxy,
+                    std::time::Duration::from_secs(4),
+                )
+                .map(|_| ())
+            }) {
+                DoctorProbe::Reachable(host) => ok.push(format!("proxy upstream: {host} reachable")),
+                DoctorProbe::Blocked(hint) => findings.push(Finding::blocking(
                     hint.trim_start_matches("[cplt] ").to_string(),
                     "allow this cplt binary in the host firewall, or launch with --no-proxy as a stopgap",
+                )),
+                DoctorProbe::Inconclusive(why) => ok.push(format!(
+                    "proxy upstream: reachability inconclusive: {}",
+                    why.trim_start_matches("[cplt] ")
                 )),
             },
         }
@@ -18016,6 +18065,103 @@ mod tests {
             json.contains("BLOCKED-ALLOWLIST"),
             "check must match the live BLOCKED-ALLOWLIST verdict, not report ALLOWED:\n{json}"
         );
+    }
+
+    /// #1132 review: doctor reports BLOCKING only when every candidate failed
+    /// at the network level; a dead or unresolvable host is a note.
+    #[test]
+    fn doctor_probe_blocks_only_on_all_network_failures() {
+        let hosts: Vec<String> = ["a.example", "b.example"].map(String::from).to_vec();
+        let net = |h: &str| Err((format!("net {h}"), true));
+        assert_eq!(
+            doctor_probe(&hosts, net),
+            DoctorProbe::Blocked("net a.example".into())
+        );
+        let first_ok = |h: &str| {
+            if h == "b.example" {
+                Ok(())
+            } else {
+                Err((String::new(), true))
+            }
+        };
+        assert_eq!(
+            doctor_probe(&hosts, first_ok),
+            DoctorProbe::Reachable("b.example".into())
+        );
+        let mixed = |h: &str| Err((format!("x {h}"), h == "a.example"));
+        assert_eq!(
+            doctor_probe(&hosts, mixed),
+            DoctorProbe::Inconclusive("x b.example".into()),
+            "an unresolvable candidate makes it a note, not BLOCKING"
+        );
+        assert!(matches!(
+            doctor_probe(&[], net),
+            DoctorProbe::Inconclusive(_)
+        ));
+    }
+
+    /// #1132 review: with no upstream configured, `check net` must not blame
+    /// an upstream, and must not nest a `[cplt]` prefix.
+    #[test]
+    fn check_net_failure_note_without_upstream() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let policy = proxy::NetPolicy {
+            allow_localhost_ports: vec![port],
+            ..Default::default()
+        };
+        let note = probe_reachable(&policy, "127.0.0.1", port, (None, &[]));
+        assert!(
+            note.starts_with("policy allows it, but the connection failed: "),
+            "{note}"
+        );
+        assert!(
+            !note.contains("upstream is unreachable") && !note.contains("[cplt]"),
+            "{note}"
+        );
+    }
+
+    /// nav-pilot parses `cplt check --json`: pin the report's field names.
+    #[test]
+    fn check_net_json_shape_is_pinned() {
+        let report = build_net_check(
+            &proxy::NetPolicy::default(),
+            true,
+            false,
+            "github.com",
+            true,
+            (None, &[]),
+            "copilot".to_string(),
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut item: Vec<&str> = v["items"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        item.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "agent",
+                "battery",
+                "enforcing",
+                "items",
+                "over_blocked",
+                "platform",
+                "verified"
+            ],
+            "existing fields may not be renamed or removed"
+        );
+        for k in ["category", "decision", "name", "reason", "target"] {
+            assert!(item.contains(&k), "item field {k} missing: {item:?}");
+        }
+        assert!(v["enforcing"].is_boolean() && v["verified"].is_u64() && v["items"].is_array());
     }
 
     #[test]

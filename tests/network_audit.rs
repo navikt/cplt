@@ -224,16 +224,7 @@ mod tests {
     /// names the cause and the fix, once however many requests fail.
     #[test]
     fn unreachable_upstream_prints_one_notice_per_session() {
-        let project = project();
-        let output = command(&project)
-            .args(["--with-proxy", "--proxy-upstream", &dead_upstream()])
-            .args([
-                "exec", "--", "/bin/sh", "-c",
-                "for i in 1 2 3; do /usr/bin/curl --silent --show-error --max-time 5 --proxy \"$HTTPS_PROXY\" --noproxy '' https://example.com/; done",
-            ])
-            .output()
-            .unwrap();
-        let stderr = stderr(&output);
+        let stderr = unreachable_upstream_session("--no-quiet");
         assert!(stderr.contains("response 502"), "{stderr}");
         assert_eq!(
             stderr.matches("the proxy could not reach").count(),
@@ -242,6 +233,28 @@ mod tests {
         );
         assert!(stderr.contains("connection refused"), "{stderr}");
         assert!(stderr.contains("Little Snitch"), "{stderr}");
+    }
+
+    /// Three requests to one dead upstream through a session's proxy.
+    fn unreachable_upstream_session(quiet: &str) -> String {
+        let project = project();
+        let output = command(&project)
+            .args([quiet, "--with-proxy", "--proxy-upstream", &dead_upstream()])
+            .args([
+                "exec", "--", "/bin/sh", "-c",
+                "for i in 1 2 3; do /usr/bin/curl --silent --show-error --max-time 5 --proxy \"$HTTPS_PROXY\" --noproxy '' https://example.com/; done",
+            ])
+            .output()
+            .unwrap();
+        stderr(&output)
+    }
+
+    /// #1132 review: `--quiet` silences the notice; the 502 still fails.
+    #[test]
+    fn unreachable_upstream_notice_respects_quiet() {
+        let stderr = unreachable_upstream_session("--quiet");
+        assert!(stderr.contains("response 502"), "{stderr}");
+        assert!(!stderr.contains("the proxy could not reach"), "{stderr}");
     }
 
     #[test]

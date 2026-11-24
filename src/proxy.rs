@@ -1545,21 +1545,49 @@ pub fn dial_failure_hint(host: &str, class: DialFailure) -> String {
         |p| p.display().to_string().escape_default().to_string(),
     );
     format!(
-        "[cplt] the proxy could not reach {} ({}). This is not a cplt policy block. \
-         A local firewall (e.g. Little Snitch) may block this cplt binary; allow {exe}, \
-         or run `cplt doctor`. --no-proxy works as a stopgap.",
+        "[cplt] the proxy could not reach {} ({}); this is not a cplt policy block. \
+         If requests keep failing, a local firewall (e.g. Little Snitch) may block {exe}: \
+         allow it, or run `cplt doctor`. --no-proxy works as a stopgap.",
         host.escape_default(),
         class.label()
     )
 }
 
+/// Suppresses the terminal notice; set from `--quiet` / `sandbox.quiet`.
+static DIAL_NOTICE_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Silence the dial-failure terminal notice (the 502 body still explains).
+pub fn set_dial_notice_quiet(quiet: bool) {
+    DIAL_NOTICE_QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Most dial-failure notices one session prints.
+const DIAL_NOTICE_CAP: usize = 3;
+
+/// Whether to print the notice for (`class`, `host`): once per pair, at most
+/// [`DIAL_NOTICE_CAP`] per session. Per pair, so an agent dialling one dead
+/// allowed host cannot use up the notice a later real failure needs.
+fn dial_notice_due(
+    seen: &std::sync::Mutex<std::collections::HashSet<String>>,
+    class: DialFailure,
+    host: &str,
+) -> bool {
+    let mut seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.len() < DIAL_NOTICE_CAP && seen.insert(format!("{class:?}\0{host}"))
+}
+
 /// The 502 for a failed upstream dial, with [`dial_failure_hint`] as its body
-/// so curl -v and gh show the cause. Prints the hint to the terminal once per
-/// failure class per session, so a retry loop does not flood it.
+/// so curl -v and gh show the cause. Prints the hint to the terminal once
+/// per (class, host), capped per session, unless quiet.
 fn dial_failure_response(host: &str, class: DialFailure) -> Vec<u8> {
     let hint = dial_failure_hint(host, class);
-    // The NUL prefix keeps these keys apart from the host names in the cache.
-    if first_hint_for(&format!("\0dial:{class:?}")) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    if !DIAL_NOTICE_QUIET.load(std::sync::atomic::Ordering::Relaxed)
+        && dial_notice_due(SEEN.get_or_init(Default::default), class, host)
+    {
         eprintln!("{hint}");
     }
     format!(
@@ -1570,7 +1598,9 @@ fn dial_failure_response(host: &str, class: DialFailure) -> Vec<u8> {
 }
 
 /// Dial `host:port` the way the live proxy would, for `cplt doctor` and
-/// `cplt check net`. `Err` is the hint.
+/// `cplt check net`. `Err` is the hint and whether the failure was
+/// network-level (timeout, refused, reset, denied, no route), the only kind
+/// doctor treats as a firewall problem.
 ///
 /// It takes the live proxy's own route: the loopback carve-out and `no_proxy`
 /// (`proxy.upstream_no_proxy` merged with ambient `NO_PROXY`) go direct, and
@@ -1584,7 +1614,7 @@ pub fn probe_dial(
     upstream: Option<&UpstreamProxy>,
     no_proxy: &[String],
     budget: Duration,
-) -> Result<std::net::SocketAddr, String> {
+) -> Result<std::net::SocketAddr, (String, bool)> {
     let host = normalize_hostname(host);
     let localhost_opt_in =
         policy.allow_localhost_any || policy.allow_localhost_ports.contains(&port);
@@ -1601,46 +1631,58 @@ pub fn probe_dial(
     );
     let shown = host.escape_default();
     match (route, upstream) {
-        (ConnectRoute::Refuse(Refusal::DnsFail), _) => Err(format!("{shown} did not resolve here")),
-        (ConnectRoute::Refuse(r), _) => Err(format!(
-            "the proxy refuses {shown} after DNS ({}), so it was not dialled",
-            r.status()
+        (ConnectRoute::Refuse(Refusal::DnsFail), _) => {
+            Err((format!("{shown} did not resolve here"), false))
+        }
+        (ConnectRoute::Refuse(r), _) => Err((
+            format!(
+                "the proxy refuses {shown} after DNS ({}), so it was not dialled",
+                r.status()
+            ),
+            false,
         )),
         (ConnectRoute::Direct(addrs), _) => connect_any_within(&addrs, budget)
             .map(|(_, addr, _)| addr)
-            .map_err(|(_, class)| probe_hint(&host, class)),
+            .map_err(|(_, class)| (probe_hint(&host, class), class != DialFailure::Other)),
         (ConnectRoute::Upstream, Some(u)) => probe_upstream(&host, port, u, budget),
         // classify_resolved returns Upstream only when asked to.
-        (ConnectRoute::Upstream, None) => Err(format!("{shown} has no route")),
+        (ConnectRoute::Upstream, None) => Err((format!("{shown} has no route"), false)),
     }
 }
 
-/// The host doctor probes reachability with: `api.github.com` when the
-/// pre-DNS policy permits it, else the first allowlisted domain that does,
-/// else `Err(reason)` so the caller skips the probe instead of dialling
-/// something the user's policy excludes.
-pub fn probe_target(policy: &NetPolicy) -> Result<String, String> {
+/// The hosts doctor probes reachability with: `api.github.com` when the
+/// pre-DNS policy permits it, then up to three concrete allowlisted hosts
+/// that it permits. Wildcard entries are skipped: they name no host to dial.
+/// `Err(reason)` when none qualify, so the caller skips the probe instead of
+/// dialling something the user's policy excludes.
+pub fn probe_targets(policy: &NetPolicy) -> Result<Vec<String>, String> {
     let verdict = classify_connect(policy, "api.github.com", 443);
+    let mut hosts = Vec::new();
     if verdict.is_allowed() {
-        return Ok("api.github.com".to_string());
+        hosts.push("api.github.com".to_string());
     }
-    policy
-        .allowed_domains
-        .iter()
-        .find(|d| classify_connect(policy, d, 443).is_allowed())
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "api.github.com is {} by the proxy policy and no allowlisted host is probeable",
-                verdict.status()
-            )
-        })
+    hosts.extend(
+        policy
+            .allowed_domains
+            .iter()
+            .filter(|d| !d.contains('*') && !d.starts_with('.') && d.contains('.'))
+            .filter(|d| *d != "api.github.com" && classify_connect(policy, d, 443).is_allowed())
+            .take(3)
+            .cloned(),
+    );
+    if hosts.is_empty() {
+        return Err(format!(
+            "api.github.com is {} by the proxy policy and no allowlisted host is probeable",
+            verdict.status()
+        ));
+    }
+    Ok(hosts)
 }
 
 /// [`dial_failure_hint`] without the advice to run doctor: the caller is
 /// doctor or check.
 fn probe_hint(host: &str, class: DialFailure) -> String {
-    dial_failure_hint(host, class).replace(", or run `cplt doctor`", "")
+    dial_failure_hint(host, class).replace("allow it, or run `cplt doctor`.", "allow it.")
 }
 
 /// The upstream leg of [`probe_dial`]: dial the upstream, send the CONNECT the
@@ -1650,16 +1692,23 @@ fn probe_upstream(
     port: u16,
     upstream: &UpstreamProxy,
     budget: Duration,
-) -> Result<std::net::SocketAddr, String> {
+) -> Result<std::net::SocketAddr, (String, bool)> {
     let deadline = Instant::now() + budget;
     let proxy = upstream.host.escape_default();
     let target = host.escape_default();
     let addrs = resolve_socket_addrs(&upstream.host, upstream.port);
     if addrs.is_empty() {
-        return Err(format!("the upstream proxy {proxy} did not resolve here"));
+        return Err((
+            format!("the upstream proxy {proxy} did not resolve here"),
+            false,
+        ));
     }
-    let (mut stream, addr, _) = connect_any_within(&addrs, budget)
-        .map_err(|(_, class)| probe_hint(&upstream.host, class))?;
+    let (mut stream, addr, _) = connect_any_within(&addrs, budget).map_err(|(_, class)| {
+        (
+            probe_hint(&upstream.host, class),
+            class != DialFailure::Other,
+        )
+    })?;
     let left = deadline
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(1));
@@ -1668,6 +1717,7 @@ fn probe_upstream(
     let status = stream
         .write_all(upstream.connect_request(host, port).as_bytes())
         .and_then(|()| read_upstream_connect_status(&mut stream, Some(deadline)));
+    // The upstream answered TCP, so what follows is not a firewall block.
     match status {
         Ok(Some(c)) if (200..300).contains(&c) => Ok(addr),
         Ok(Some(407)) => Err(format!(
@@ -1696,6 +1746,7 @@ fn probe_upstream(
             e.to_string().escape_default()
         )),
     }
+    .map_err(|m| (m, false))
 }
 
 /// The verdict of the proxy's pre-DNS CONNECT policy gates.
@@ -6550,8 +6601,18 @@ mod tests {
             body.contains("connect denied by the local system"),
             "{body}"
         );
-        // Once per class per session: a second failure of the same class is quiet.
-        assert!(!first_hint_for("\0dial:Denied"));
+        // Once per (class, host), capped per session: a dead host repeated
+        // cannot silence a later failure on another host.
+        let seen = std::sync::Mutex::default();
+        assert!(dial_notice_due(&seen, DialFailure::Denied, "dead.example"));
+        assert!(!dial_notice_due(&seen, DialFailure::Denied, "dead.example"));
+        assert!(dial_notice_due(&seen, DialFailure::Denied, "real.example"));
+        assert!(dial_notice_due(&seen, DialFailure::Timeout, "real.example"));
+        assert!(
+            !dial_notice_due(&seen, DialFailure::Refused, "fourth.example"),
+            "capped at DIAL_NOTICE_CAP per session"
+        );
+        assert!(hint.contains("If requests keep failing"), "{hint}");
     }
 
     /// #1130: an allowed target whose dial fails gets a 502 that names the
@@ -6573,6 +6634,8 @@ mod tests {
             Duration::from_secs(2),
         )
         .unwrap_err();
+        assert!(err.1, "a refused dial is network-level");
+        let err = err.0;
         assert!(
             err.contains("connection refused") && err.contains("Little Snitch"),
             "probe must name the refused dial and the firewall hint"
@@ -6657,7 +6720,8 @@ mod tests {
         );
 
         let (u, _h) = canned_upstream("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
-        let err = probe(&u).unwrap_err();
+        let (err, net) = probe(&u).unwrap_err();
+        assert!(!net, "a 407 is not network-level");
         assert!(err.contains("407"), "407 must be named");
         assert!(
             !err.contains("Little Snitch"),
@@ -6665,7 +6729,7 @@ mod tests {
         );
 
         let (u, _h) = canned_upstream("HTTP/1.1 403 Forbidden\r\n\r\n");
-        let err = probe(&u).unwrap_err();
+        let err = probe(&u).unwrap_err().0;
         assert!(err.contains("status 403"), "other statuses must be named");
 
         // Accepts but never answers: a timeout, not a pass.
@@ -6679,7 +6743,8 @@ mod tests {
             &[],
             Duration::from_millis(500),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .0;
         assert!(
             err.contains("did not answer"),
             "silent upstream must time out"
@@ -6714,7 +6779,8 @@ mod tests {
             &[],
             Duration::from_millis(1500),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .0;
         assert!(
             start.elapsed() < Duration::from_millis(2800),
             "slow-drip upstream must be cut off at the budget, took {:?}",
@@ -6726,24 +6792,34 @@ mod tests {
         );
     }
 
-    /// Review of #1132: doctor's probe target obeys the pre-DNS policy.
+    /// Review of #1132: doctor's probe targets obey the pre-DNS policy,
+    /// skip wildcards and stop at api.github.com plus three hosts.
     #[test]
-    fn probe_target_respects_policy() {
+    fn probe_targets_respect_policy() {
         let open = NetPolicy {
             allowed_ports: vec![443],
             ..Default::default()
         };
-        assert_eq!(probe_target(&open).unwrap(), "api.github.com");
+        assert_eq!(probe_targets(&open).unwrap(), ["api.github.com"]);
         let blocked = NetPolicy {
             allowed_ports: vec![443],
             blocked_domains: vec!["api.github.com".into()],
-            allowed_domains: vec!["example.org".into()],
+            allowed_domains: [
+                "*.wild.example",
+                ".dot.example",
+                "a.example",
+                "b.example",
+                "c.example",
+                "d.example",
+            ]
+            .map(String::from)
+            .to_vec(),
             ..Default::default()
         };
         assert_eq!(
-            probe_target(&blocked).unwrap(),
-            "example.org",
-            "must fall back to an allowed host"
+            probe_targets(&blocked).unwrap(),
+            ["a.example", "b.example", "c.example"],
+            "wildcards skipped, capped at three"
         );
         let none = NetPolicy {
             allowed_ports: vec![443],
@@ -6751,7 +6827,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            probe_target(&none)
+            probe_targets(&none)
                 .unwrap_err()
                 .contains("BLOCKED-ALLOWLIST"),
             "no probeable host must skip with the reason"
@@ -6774,8 +6850,9 @@ mod tests {
         let budget = Duration::from_secs(2);
 
         // Loopback without an opt-in: refused after DNS, never dialled.
-        let err =
-            probe_dial(&NetPolicy::default(), "127.0.0.1", port, None, &[], budget).unwrap_err();
+        let err = probe_dial(&NetPolicy::default(), "127.0.0.1", port, None, &[], budget)
+            .unwrap_err()
+            .0;
         assert!(err.contains("BLOCKED-PRIVATE"), "loopback must be refused");
         assert!(
             listener.accept().is_err(),
@@ -6813,6 +6890,8 @@ mod tests {
             budget,
         )
         .unwrap_err();
+        assert!(!err.1, "DNS failure is not network-level");
+        let err = err.0;
         assert!(
             err.contains("did not resolve"),
             "no_proxy host must go direct"
@@ -6825,7 +6904,8 @@ mod tests {
             &[],
             budget,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .0;
         assert!(
             err.contains("connection refused"),
             "other hosts use the upstream"
