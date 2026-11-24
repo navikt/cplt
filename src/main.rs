@@ -12177,7 +12177,21 @@ fn run_config_set_via(
     {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
         for val in values {
-            let path = config::expand_tilde(val);
+            let mut path = config::expand_tilde(val);
+            // Same canonical form the launch checks, so a symlink to `/` or
+            // `/.nofollow` is refused here too. A path that does not exist yet
+            // keeps its spelling.
+            match config::canonicalize_strict(&path) {
+                Ok(c) => path = c,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    ui::error(&format!(
+                        "{key} {val} resolves to the filesystem root, which cplt refuses. \
+                         Name a specific path instead."
+                    ));
+                    return ExitCode::FAILURE;
+                }
+                Err(_) => {}
+            }
             if let Err(e) = sandbox::validate_grant_path(key, &path, &home) {
                 ui::error(&e);
                 return ExitCode::FAILURE;

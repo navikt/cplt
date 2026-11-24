@@ -8374,10 +8374,11 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("allow.exec {wide} must be refused"));
             assert!(error.contains("allow.exec"), "{error}");
-            assert!(
-                error.contains("defeats the sandbox") || error.contains("filesystem root"),
-                "{error}"
-            );
+            if wide == "/" {
+                assert!(error.contains("resolves to the filesystem root"), "{error}");
+            } else {
+                assert!(error.contains("defeats the sandbox"), "{error}");
+            }
         }
     }
 

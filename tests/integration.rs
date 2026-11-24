@@ -7194,6 +7194,63 @@ except Exception as e:
         );
     }
 
+    /// An allow grant on a symlink to `/` is refused from every source: the
+    /// CLI, user config and a trusted `.cplt.toml`.
+    #[test]
+    fn binary_allow_symlink_to_root_is_refused() {
+        let (tmp, home, project, _) = firmlink_fixture();
+        std::os::unix::fs::symlink("/", project.join("rootlink")).unwrap();
+        let link = project.join("rootlink");
+        let link = link.to_string_lossy().into_owned();
+        let cfg = tmp.path().join("config.toml");
+        for (flag, key) in [("--allow-read", "read"), ("--allow-write", "write")] {
+            let (out, err) = firmlink_profile(&home, &project, None, &[flag, &link]);
+            assert!(
+                !out.contains("(subpath \"/\")") && err.contains("filesystem root"),
+                "CLI {flag}:\n{err}\n{out}"
+            );
+            fs::write(&cfg, format!("[allow]\n{key} = [\"{link}\"]\n")).unwrap();
+            let (out, err) = firmlink_profile(&home, &project, Some(&cfg), &[]);
+            assert!(
+                !out.contains("(subpath \"/\")") && err.contains("filesystem root"),
+                "config {key}:\n{err}\n{out}"
+            );
+            let trust_err = commit_and_trust(
+                &home,
+                &project,
+                &format!("[propose.allow]\n{key} = [\"rootlink\"]\n"),
+            );
+            let (out, err) = firmlink_profile(&home, &project, None, &[]);
+            assert!(
+                !out.contains("(subpath \"/\")")
+                    && format!("{trust_err}{err}").contains("filesystem root"),
+                "repo {key}:\n{trust_err}{err}\n{out}"
+            );
+        }
+    }
+
+    /// `cplt config set` refuses a root-resolving grant at write time (#306).
+    #[test]
+    fn binary_config_set_refuses_root_grants() {
+        let (_tmp, home, project, _) = firmlink_fixture();
+        std::os::unix::fs::symlink("/", project.join("rootlink")).unwrap();
+        let link = project.join("rootlink").to_string_lossy().into_owned();
+        for key in ["allow.read", "allow.write"] {
+            for val in [link.as_str(), "/.nofollow", "/.nofollow/.nofollow"] {
+                let out = firmlink_cmd(&home)
+                    .current_dir(&project)
+                    .args(["config", "set", key, val])
+                    .output()
+                    .expect("cplt config set");
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    !out.status.success() && err.contains("filesystem root"),
+                    "{key} {val}: {err}"
+                );
+            }
+        }
+    }
+
     /// `cplt trust` shows where an obfuscated proposal path resolves, so a
     /// reviewer never approves `/.nofollow/...` without seeing the real path.
     #[test]
