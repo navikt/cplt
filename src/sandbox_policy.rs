@@ -4944,6 +4944,23 @@ const ENV_TOOL_HINT_DENIED_COMPONENTS: &[&str] = &[
     "pack",
 ];
 
+/// The shell line to paste when an env-set tool dir must move. PNPM_HOME gets
+/// pnpm's own platform default; any other variable is removed where it is set,
+/// so the tool falls back to its default directory, which the sandbox already knows. Never names
+/// a path, so it cannot point into `~/.config/cplt` or echo an env value.
+#[must_use]
+pub fn env_dir_move_fix(var: &str) -> String {
+    match var {
+        "PNPM_HOME" if cfg!(target_os = "macos") => {
+            "export PNPM_HOME=\"$HOME/Library/pnpm\"".to_string()
+        }
+        "PNPM_HOME" => "export PNPM_HOME=\"$HOME/.local/share/pnpm\"".to_string(),
+        _ => format!(
+            "remove {var} from wherever it is set (shell rc, .envrc, mise.toml); in bash or zsh: unset {var}"
+        ),
+    }
+}
+
 /// Whether an env-set tool dir that failed only the positive rule may be
 /// offered back as a one-step `cplt config set allow.write <dir>` fix.
 ///
@@ -6023,6 +6040,32 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// The move hint is a pasteable shell line, names no path under cplt's
+    /// state dir, and never echoes the variable's current value.
+    #[test]
+    fn env_dir_move_fix_is_a_pasteable_line() {
+        let pnpm = super::env_dir_move_fix("PNPM_HOME");
+        let want = if cfg!(target_os = "macos") {
+            "export PNPM_HOME=\"$HOME/Library/pnpm\""
+        } else {
+            "export PNPM_HOME=\"$HOME/.local/share/pnpm\""
+        };
+        assert_eq!(pnpm, want);
+        let home = std::path::Path::new("/Users/someone");
+        let target = pnpm
+            .split('"')
+            .nth(1)
+            .unwrap()
+            .replace("$HOME", "/Users/someone");
+        assert!(super::cplt_state_dir_grant(home, std::path::Path::new(&target)).is_none());
+        assert!(!target.contains(".config"));
+        let go = super::env_dir_move_fix("GOCACHE");
+        assert!(
+            go.contains("mise.toml") && go.ends_with("unset GOCACHE"),
+            "{go}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn env_tool_dir_hint_refuses_dangling_persistence_link() {

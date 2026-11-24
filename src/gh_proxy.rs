@@ -3505,7 +3505,7 @@ fn gate_with_scope_resolver_for(
             // the small thing that opens this one command.
             guidance: if cmd.command == "pr" && cmd.subcommand.as_deref() == Some("merge") {
                 format!(
-                    "Reason: {}. `cplt config set gh_guard.allow_pr_merge true` lets the agent \
+                    "Reason: {}. `cplt config set --force gh_guard.allow_pr_merge true` (weakens the sandbox) lets the agent \
                      merge its own pull requests into a branch whose rulesets require an \
                      approving review that a new push dismisses; `--admin` stays refused.",
                     result.reason
@@ -3518,7 +3518,7 @@ fn gate_with_scope_resolver_for(
                      scope-checked. REST GET reads via `gh api` work against any repository \
                      (pass `-X GET` when using `-f`/`-F` query parameters, without `--input`). \
                      If a raw write is genuinely needed, \
-                     `cplt config set gh_guard.allow_api_write true` opens writes to \
+                     `cplt config set --force gh_guard.allow_api_write true` (weakens the sandbox) opens writes to \
                      repositories in scope and nothing else — it is far narrower than \
                      turning the guard off. `gh api DELETE` stays refused either way.",
                     result.reason

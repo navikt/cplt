@@ -3305,7 +3305,7 @@ print('BIND_OK')
             assert!(!all.contains("AGENT_RAN"), "{flag}: agent ran: {all}");
             assert!(all.contains(want), "{flag}: want {want:?}: {all}");
             assert!(
-                all.contains("proxy.netns = false"),
+                all.contains("cplt config set --force proxy.netns false"),
                 "{flag}: no fix named: {all}"
             );
         }

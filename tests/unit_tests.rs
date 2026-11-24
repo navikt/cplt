@@ -12350,3 +12350,395 @@ fn config_set_refuses_socket_over_state_dir() {
         "ancestor write grant stays warn-only"
     );
 }
+
+/// Whether the `#[cfg(test)]` just read applies to an item (a test module,
+/// fn, impl, ...), whose body is then a fixture. On a struct field, enum
+/// variant, match arm or statement it applies to that alone, so the next
+/// braced item is production code and must still be scanned.
+fn cfg_test_item_follows(c: &[char]) -> bool {
+    const ITEMS: &[&str] = &[
+        "mod",
+        "fn",
+        "impl",
+        "struct",
+        "enum",
+        "const",
+        "static",
+        "use",
+        "trait",
+        "type",
+        "macro_rules!",
+        "thread_local!",
+        "async",
+        "unsafe",
+        "extern",
+    ];
+    let mut j = 0;
+    let word = |j: &mut usize| {
+        let start = *j;
+        while *j < c.len() && (c[*j].is_alphanumeric() || c[*j] == '_' || c[*j] == '!') {
+            *j += 1;
+        }
+        c[start..*j].iter().collect::<String>()
+    };
+    let skip_trivia = |j: &mut usize| loop {
+        while *j < c.len() && c[*j].is_whitespace() {
+            *j += 1;
+        }
+        if c[*j..].starts_with(&['/', '/']) {
+            while *j < c.len() && c[*j] != '\n' {
+                *j += 1;
+            }
+        } else if c[*j..].starts_with(&['/', '*']) {
+            while *j + 1 < c.len() && !(c[*j] == '*' && c[*j + 1] == '/') {
+                *j += 1;
+            }
+            *j += 2;
+        } else if c[*j..].starts_with(&['#', '[']) {
+            let mut depth = 0;
+            loop {
+                match c[*j] {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            *j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                *j += 1;
+            }
+        } else {
+            break;
+        }
+    };
+    skip_trivia(&mut j);
+    let mut w = word(&mut j);
+    if w == "pub" {
+        if c.get(j) == Some(&'(') {
+            while c[j] != ')' {
+                j += 1;
+            }
+            j += 1;
+        }
+        skip_trivia(&mut j);
+        w = word(&mut j);
+    }
+    ITEMS.contains(&w.as_str())
+}
+
+#[test]
+fn rust_string_literals_skips_only_cfg_test_items() {
+    let src = r#"
+struct S {
+    #[cfg(test)]
+    field: u8,
+}
+fn real_after_field() { let _ = "HINT_A"; }
+enum E {
+    #[cfg(test)]
+    Variant { x: u8 },
+    Other,
+}
+fn real_after_variant() {
+    match 1 {
+        #[cfg(test)]
+        0 => {}
+        _ => {}
+    }
+    let _ = "HINT_B";
+}
+#[cfg(test)]
+fn only_in_tests() { let _ = "FIXTURE_A"; }
+fn real_after_test_fn() { let _ = "HINT_C"; }
+#[cfg(test)]
+#[allow(clippy::all)]
+// a comment
+pub(crate) mod tests { fn t() { let _ = "FIXTURE_B"; let _ = '}'; } }
+fn real_after_test_mod() { let _ = "HINT_D"; }
+"#;
+    let lits = rust_string_literals(src);
+    for want in ["HINT_A", "HINT_B", "HINT_C", "HINT_D"] {
+        assert!(
+            lits.iter().any(|l| l == want),
+            "{want} not scanned: {lits:?}"
+        );
+    }
+    for fixture in ["FIXTURE_A", "FIXTURE_B"] {
+        assert!(
+            !lits.iter().any(|l| l == fixture),
+            "{fixture} scanned: {lits:?}"
+        );
+    }
+}
+
+/// The contents of every string literal in Rust source, unescaped, with
+/// comments skipped. Handles `\`-newline continuations, raw strings, byte
+/// strings, char literals and lifetimes, so no quote or backtick inside a
+/// literal or comment can shift what counts as a string.
+fn rust_string_literals(src: &str) -> Vec<String> {
+    let c: Vec<char> = src.chars().collect();
+    let (mut i, mut out) = (0, Vec::new());
+    // Brace depth in code, and the depth a `#[cfg(test)]` module opened at:
+    // literals inside it are fixtures, not hints.
+    let (mut depth, mut test_pending, mut in_test): (usize, bool, Option<usize>) = (0, false, None);
+    while i < c.len() {
+        let at = |w: &str| c[i..].iter().take(w.len()).copied().eq(w.chars());
+        if at("#[cfg(test)]") {
+            i += "#[cfg(test)]".len();
+            test_pending = cfg_test_item_follows(&c[i..]);
+            continue;
+        }
+        match c[i] {
+            '{' => {
+                if test_pending && in_test.is_none() {
+                    in_test = Some(depth);
+                }
+                test_pending = false;
+                depth += 1;
+                i += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if in_test == Some(depth) {
+                    in_test = None;
+                }
+                i += 1;
+            }
+            ';' => {
+                // `#[cfg(test)] use ...;` or `fn x();`: the attribute is spent.
+                test_pending = false;
+                i += 1;
+            }
+            '/' if c.get(i + 1) == Some(&'/') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                let mut depth = 0;
+                while i < c.len() {
+                    if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            '\'' => {
+                // Char literal ('x', '\n', '\'', '\u{..}') or a lifetime.
+                if c.get(i + 1) == Some(&'\\') {
+                    i += 2;
+                    while i < c.len() && c[i] != '\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if c.get(i + 2) == Some(&'\'') {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            'r' | 'b'
+                if (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_')) && {
+                    let mut j = i + usize::from(c[i] == 'b');
+                    if c.get(j) == Some(&'r') {
+                        j += 1;
+                        while c.get(j) == Some(&'#') {
+                            j += 1;
+                        }
+                    }
+                    j > i
+                        && c.get(j) == Some(&'"')
+                        && (c[i] == 'b' || c[i + 1] == '#' || c[i + 1] == '"')
+                } =>
+            {
+                let mut j = i + usize::from(c[i] == 'b');
+                if c.get(j) == Some(&'r') {
+                    let mut hashes = 0;
+                    j += 1;
+                    while c[j] == '#' {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    j += 1;
+                    let start = j;
+                    loop {
+                        if c[j] == '"' && (0..hashes).all(|h| c.get(j + 1 + h) == Some(&'#')) {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if in_test.is_none() {
+                        out.push(c[start..j].iter().collect());
+                    }
+                    i = j + 1 + hashes;
+                } else {
+                    i = j; // a plain byte string: let the '"' arm read it
+                }
+            }
+            '"' => {
+                let mut lit = String::new();
+                i += 1;
+                while c[i] != '"' {
+                    if c[i] == '\\' {
+                        i += 1;
+                        match c[i] {
+                            '\n' => {
+                                while c[i + 1].is_whitespace() {
+                                    i += 1;
+                                }
+                            }
+                            'n' => lit.push('\n'),
+                            't' => lit.push('\t'),
+                            'u' => {
+                                while c[i] != '}' {
+                                    i += 1;
+                                }
+                                lit.push('\u{fffd}');
+                            }
+                            other => lit.push(other),
+                        }
+                    } else {
+                        lit.push(c[i]);
+                    }
+                    i += 1;
+                }
+                if in_test.is_none() {
+                    out.push(lit);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Every `cplt config set|unset ...` in a string literal under `src/`
+/// (unit-test modules excluded) is run through the built binary in a scratch
+/// HOME, config and repo, and must exit 0, so a hint never suggests a
+/// command `cplt config set` refuses (a weakening value without `--force`,
+/// a hard-denied grant, an unknown key). The only exceptions are the
+/// reviewed templates below, which hold placeholders filled in at runtime.
+#[test]
+fn every_hinted_config_command_pastes_and_works() {
+    const TEMPLATES: &[&str] = &[
+        "cplt config set --local {key} {}",
+        "cplt config set --local <KEY> <VALUE>",
+        "cplt config set --local allow.write {t}/<tool>",
+        "cplt config set --local sandbox.repo_dirs {first_path}",
+        "cplt config set --local sandbox.repo_dirs <dir>",
+        "cplt config set --local sandbox.repo_dirs <DIR>",
+        "cplt config set --local",
+        "cplt config set --repo {key}",
+        "cplt config set --repo {key} true --force",
+        "cplt config set --repo <key> true",
+        "cplt config set --repo deny.env <VALUE>",
+        "cplt config set {}.{} {bare}",
+        "cplt config set {}.{} <VALUE>",
+        "cplt config set {flag}{dotted} <value>",
+        "cplt config set {key} <VALUE>",
+        "cplt config set {scope}{key} {} --force",
+        "cplt config set {scope}{key} {}",
+        "cplt config set {scope}{key} {v} --unset",
+        "cplt config set <key> <value>",
+        "cplt config set <KEY> <VALUE>",
+        "cplt config set allow.{kind} {}",
+        "cplt config set gh_guard.hosts <HOST>",
+        "cplt config set shell.skip {name}",
+        "cplt config set shell.skip <agent>",
+        "cplt config set",
+        "cplt config unset {scope}{key} {v}",
+    ];
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    rs_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    files.sort();
+    let mut cmds = Vec::new();
+    for f in &files {
+        let raw = std::fs::read_to_string(f).unwrap();
+        for lit in rust_string_literals(&raw) {
+            for (at, _) in lit.match_indices("cplt config ") {
+                let tail = &lit[at..];
+                if !(tail.starts_with("cplt config set") || tail.starts_with("cplt config unset")) {
+                    continue;
+                }
+                // A command ends at a backtick, line end, `,`, `;`, `(`, `)`
+                // or a sentence-ending `. `.
+                let mut end = tail
+                    .find(['`', '\n', ',', ';', '(', ')'])
+                    .unwrap_or(tail.len());
+                if let Some(dot) = tail[..end].find(". ") {
+                    end = dot;
+                }
+                let cmd = tail[..end].trim_end().trim_end_matches(['.', ':']);
+                cmds.push((f.display().to_string(), cmd.to_string()));
+            }
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let repo = common::temp_repo("navikt/cplt-hint-test");
+    let mut checked = 0;
+    let mut refused = Vec::new();
+    for (file, cmd) in &cmds {
+        if TEMPLATES.contains(&cmd.as_str()) {
+            continue;
+        }
+        let args: Vec<String> = cmd
+            .split_whitespace()
+            .skip(2)
+            .map(|a| a.trim_matches('"').to_string())
+            .collect();
+        let out = common::cplt_cmd()
+            .arg("config")
+            .args(&args)
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", home.path().join("cplt-cfg/config.toml"))
+            .current_dir(repo.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        if !out.status.success() || args.len() < 2 {
+            refused.push(format!(
+                "{file}: {cmd:?} is refused (or is a template missing from TEMPLATES): {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            ));
+        }
+        checked += 1;
+    }
+    assert!(refused.is_empty(), "{}", refused.join("\n"));
+    let stale: Vec<&&str> = TEMPLATES
+        .iter()
+        .filter(|t| !cmds.iter().any(|(_, c)| c == *t))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "templates no hint prints any more: {stale:?}"
+    );
+    assert!(checked >= 20, "only {checked} hinted commands checked");
+}

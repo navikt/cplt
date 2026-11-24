@@ -1994,11 +1994,12 @@ fn merge_tool_path_env_overrides(
         if let Some(prot) = protected {
             ui::warn(&format!(
                 "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
-             added and writes there stay denied. Point {} at a directory outside it.",
+             added and writes there stay denied. Point {} at a directory outside it: {}",
                 ovr.name,
                 path.to_string_lossy().escape_debug(),
                 prot.to_string_lossy().escape_debug(),
-                ovr.name
+                ovr.name,
+                cplt::sandbox::env_dir_move_fix(ovr.name)
             ));
             continue;
         }
@@ -4901,7 +4902,7 @@ fn start_proxy_if_enabled(
                 "conflicting options: proxy.forced ({}) requires the proxy, but it was \
                  explicitly disabled (--no-proxy or proxy.enabled = false). \
                  Remove one of them, or turn forced off with --no-proxy-forced or \
-                 `cplt config set proxy.forced false`.",
+                 `cplt config set --force proxy.forced false` (weakens the sandbox).",
                 resolved
                     .bool_layer("proxy", "forced")
                     .map_or_else(|| "set".to_string(), |l| l.to_string())
@@ -8487,7 +8488,7 @@ fn assemble_sandbox(
     {
         ui::warn(
             "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
-             login. Unlock the keyring at login, or run `cplt config set gh_guard.inject_token true --force`",
+             login. Unlock the keyring at login, or run `cplt config set gh_guard.inject_token true --force` (weakens the sandbox)",
         );
     }
     let env_token = active_agent
@@ -11838,7 +11839,7 @@ fn init_config() -> ExitCode {
             if can_force {
                 ui::info(
                     "proxy.forced = true: all traffic goes through the proxy. Turn it off with \
-                     `cplt config set proxy.forced false`.",
+                     `cplt config set --force proxy.forced false` (weakens the sandbox).",
                 );
             }
             ui::info("Edit it to customize sandbox defaults.");
