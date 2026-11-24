@@ -597,8 +597,8 @@ impl PreparedSandbox {
     /// say why not and how to fix it. The launch refuses on `Err`.
     #[cfg(target_os = "linux")]
     pub fn check_netns(&self) -> Result<(), String> {
-        const OFF: &str =
-            "or run `cplt config set --force proxy.netns false` (weakens the sandbox)";
+        const OFF: &str = "or run `cplt config set --force proxy.netns false` (weakens the \
+            sandbox; if this checkout sets it, `cplt config unset --local proxy.netns`)";
         if self.bwrap_wrapper.as_ref().is_none_or(|w| !w.netns()) {
             let fix = if bubblewrap::check_availability().is_none() {
                 format!("Install it ({})", crate::doctor::BWRAP_INSTALL_HINT)
@@ -620,7 +620,8 @@ impl PreparedSandbox {
         if self.scratch_dir.is_none() {
             return Err(format!(
                 "proxy.netns needs the scratch dir for its proxy socket. \
-                 Run `cplt config set sandbox.scratch_dir true`, {OFF}."
+                 Run `cplt config set sandbox.scratch_dir true` (if this checkout turns it off, \
+                 `cplt config unset --local sandbox.scratch_dir`; drop --no-scratch-dir), {OFF}."
             ));
         }
         Ok(())
@@ -4736,7 +4737,8 @@ fn unenforced_refusal(
     let fix = if bwrap_active {
         "Remove the path from deny.paths.".to_string()
     } else if config.use_bubblewrap == Some(false) {
-        "Run `cplt config unset sandbox.use_bubblewrap` (and drop --no-bubblewrap) so \
+        "Run `cplt config unset sandbox.use_bubblewrap` (if this checkout sets it, \
+         `cplt config unset --local sandbox.use_bubblewrap`; drop --no-bubblewrap) so \
          Bubblewrap masks it."
             .to_string()
     } else if bubblewrap::check_availability().is_none() {
