@@ -1857,6 +1857,18 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
         .collect()
 }
 
+/// Quote `s` for a POSIX shell when it holds anything but plain path characters.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+@%:,=".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// Grant sandbox access to tool paths relocated via env vars (e.g. `GOPATH`,
 /// `CARGO_HOME`, `NODE_PATH`).
 ///
@@ -1930,7 +1942,12 @@ fn merge_tool_path_env_overrides(
         let extra: Vec<&Path> = std::iter::once(project_dir)
             .chain(temp.iter().map(PathBuf::as_path))
             .collect();
-        if !cplt::sandbox::env_tool_dir_allowed(ovr.name, &path, home, ovr.write, &extra) {
+        // Checked first so a refused protected path gets the protected refusal,
+        // never the one-step grant hint.
+        let protected = cplt::sandbox::env_tool_path_protected(home, &path);
+        if protected.is_none()
+            && !cplt::sandbox::env_tool_dir_allowed(ovr.name, &path, home, ovr.write, &extra)
+        {
             // An explicit `allow.*` grant already covers it: nothing to report.
             let reads: &[PathBuf] = if ovr.write { &[] } else { &resolved.allow_read };
             let covered = resolved
@@ -1941,11 +1958,19 @@ fn merge_tool_path_env_overrides(
             // Not gated on `quiet`: `cplt exec` and `cplt doctor` force it, and the
             // tool then fails with a bare EPERM (#1128).
             if !covered {
+                let kind = if ovr.write { "write" } else { "read" };
+                let fix = if cplt::sandbox::env_tool_dir_hint_ok(home, &path) {
+                    format!(
+                        "Move it there, or grant it in one step: cplt config set allow.{kind} {}",
+                        shell_quote(&path.to_string_lossy())
+                    )
+                } else {
+                    format!("Point {} elsewhere.", ovr.name)
+                };
                 ui::warn(&format!(
                     "Ignoring {} = {}: an env-set tool dir is granted only when it is a directory \
                  under ~/.cache, ~/Library/Caches (not a personal-app cache), another cplt \
-                 tool cache, {}the project or /tmp, so no grant is added. Move it there, or \
-                 grant it with `allow.{}` if you mean to.",
+                 tool cache, {}the project or /tmp, so no grant is added. {fix}",
                     ovr.name,
                     path.to_string_lossy().escape_debug(),
                     if ovr.write {
@@ -1953,13 +1978,12 @@ fn merge_tool_path_env_overrides(
                     } else {
                         "a known SDK root (~/.jdks, ~/.dotnet, /usr/lib/jvm, mise, ...), "
                     },
-                    if ovr.write { "write" } else { "read" }
                 ));
             }
             continue;
         }
         // Second layer: never open a protected path.
-        if let Some(prot) = cplt::sandbox::env_tool_path_protected(home, &path) {
+        if let Some(prot) = cplt::sandbox::protected {
             ui::warn(&format!(
                 "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
              added and writes there stay denied. Point {} at a directory outside it.",
@@ -17559,6 +17583,14 @@ mod tests {
             matches!(warned, GateEffect::ExecPlain { notice: Some(_) }),
             "warn mode must let the force push through with a notice, got {warned:?}"
         );
+    }
+
+    #[test]
+    fn shell_quote_quotes_only_when_needed() {
+        assert_eq!(shell_quote("/Users/a/pnpm"), "/Users/a/pnpm");
+        assert_eq!(shell_quote("/Users/a/my pnpm"), "'/Users/a/my pnpm'");
+        assert_eq!(shell_quote("/a/it's"), r"'/a/it'\''s'");
+        assert_eq!(shell_quote("/a/$x"), "'/a/$x'");
     }
 
     // ── the host probe seam (`HostProbe` / `accept_tool_dir`) ───────────────

@@ -3958,6 +3958,50 @@ pub fn env_tool_path_protected(home: &Path, path: &Path) -> Option<PathBuf> {
         })
 }
 
+/// Home paths an "Ignoring <VAR>" warning must never suggest granting with
+/// `cplt config set allow.write`, even though the deny lists do not close
+/// them: persistence points (launch agents, user `bin` dirs, everything under
+/// `~/.config`, which holds shell config and cplt's own) and `~/Library/Caches`
+/// itself, whose only rejected children are personal-app caches.
+const ENV_TOOL_NO_HINT_SUBPATHS: &[&str] = &[
+    "Library/LaunchAgents",
+    "Library/Caches",
+    "Library/Application Support",
+    "Library/Preferences",
+    ".config",
+    ".local/bin",
+    "bin",
+];
+
+/// Whether an env-set tool dir that failed only the positive rule may be
+/// offered back as a one-step `cplt config set allow.write <dir>` fix.
+///
+/// Fails closed: no hint when `path` is `$HOME` or above it, a protected or
+/// cplt state path ([`env_tool_path_protected`]), at, above or inside an
+/// [`ENV_TOOL_NO_HINT_SUBPATHS`] entry in `$HOME` or the passwd home, or
+/// when its text would need escaping to print.
+#[must_use]
+pub fn env_tool_dir_hint_ok(home: &Path, path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    if text.escape_debug().to_string() != text || !tool_override_path_is_safe(path, home) {
+        return false;
+    }
+    if env_tool_path_protected(home, path).is_some() {
+        return false;
+    }
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_ascii_lowercase());
+    let me = lower(path);
+    let homes = std::iter::once(home.to_path_buf()).chain(config::account_home());
+    !homes
+        .flat_map(|h| {
+            let canon = std::fs::canonicalize(&h).unwrap_or(h.clone());
+            [h, canon]
+        })
+        .flat_map(|h| ENV_TOOL_NO_HINT_SUBPATHS.iter().map(move |rel| h.join(rel)))
+        .map(|d| lower(&d))
+        .any(|d| me.starts_with(&d) || d.starts_with(&me))
+}
+
 /// Validate that a path is safe for interpolation into SBPL profile strings.
 /// Returns an error if the path contains characters that could break or inject SBPL rules.
 pub fn validate_sbpl_path(path: &Path) -> Result<(), String> {

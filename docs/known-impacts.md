@@ -351,14 +351,17 @@ SDK vars such as `JAVA_HOME` may also point at a known SDK root (`~/.sdkman`,
 `.envrc` can set these variables, so a dir elsewhere is refused with a warning:
 
 ```text
-Ignoring GOPATH = /Users/you/work/gopath: an env-set tool dir is granted only when ...
+Ignoring GOPATH = /Users/you/work/gopath: an env-set tool dir is granted only when ... Move it there, or grant it in one step: cplt config set allow.write /Users/you/work/gopath
 ```
 
-To keep using it, do one of these:
+The warning ends with the command to run (`allow.read` for an SDK). Run it
+once and the next launch grants the dir (#1104). Or move the dir under
+`~/.cache`, for example `GOPATH=~/.cache/gopath`.
 
-- Move it under `~/.cache`, for example `GOPATH=~/.cache/gopath`.
-- Grant it once: `cplt config set allow.write ~/work/gopath` (or `allow.read`
-  for an SDK).
+No grant is offered when the dir is protected or a persistence point: a
+credential dir such as `~/.ssh`, cplt's own `~/.config/cplt` or anything else
+under `~/.config`, `~/Library/LaunchAgents`, `~/bin`, `~/.local/bin`, `$HOME`
+or a parent of it. There the warning says to point the variable elsewhere.
 
 ## cplt's state directory inside a writable tree (behaviour change)
 

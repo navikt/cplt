@@ -12674,6 +12674,84 @@ mod agent_stubs {
         extra_args: &'static str,
     }
 
+    /// An env tool dir refused only by the positive rule (#1104) ends its
+    /// warning with a `cplt config set allow.write <dir>` line. Running that
+    /// line makes the next launch grant the dir. A protected, persistence or
+    /// cplt-state path, or `$HOME`, never gets the hint.
+    #[test]
+    fn e2e_env_tool_dir_hint_is_one_step() {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-hint-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let proj = h.join("work/proj");
+        for d in ["pnpm", ".ssh/x", "Library/LaunchAgents", ".config/cplt/x"] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let cmd = |var: &str, val: &std::path::Path| {
+            let mut c = cplt_cmd();
+            c.env_remove("CPLT_CONFIG")
+                .current_dir(&proj)
+                .env("HOME", &h)
+                .env("XDG_CONFIG_HOME", h.join(".config"))
+                .env("XDG_STATE_HOME", h.join(".local/state"))
+                .env("XDG_DATA_HOME", h.join(".local/share"))
+                .env("XDG_CACHE_HOME", h.join(".cache"))
+                .env("XDG_RUNTIME_DIR", h.join("run"))
+                .env(var, val);
+            c
+        };
+        let warning = |var: &str, val: &std::path::Path| {
+            let out = cmd(var, val).arg("--print-profile").output().unwrap();
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .find(|l| l.contains(&format!("Ignoring {var} =")))
+                .map(str::to_string)
+        };
+        for (var, rel) in [
+            ("GOCACHE", ".ssh/x"),
+            ("GOCACHE", "Library/LaunchAgents"),
+            ("GOCACHE", ".config/cplt/x"),
+            ("GOCACHE", ""),
+        ] {
+            let w = warning(var, &h.join(rel)).expect("the refusal should be reported");
+            assert!(!w.contains("config set"), "no grant hint for ~/{rel}: {w}");
+        }
+        let pnpm = h.join("pnpm");
+        let w = warning("PNPM_HOME", &pnpm).expect("PNPM_HOME=~/pnpm should be refused");
+        let hint = w
+            .split_once("in one step: cplt ")
+            .map(|(_, rest)| rest.trim().to_string())
+            .expect("PNPM_HOME=~/pnpm should end with a one-step hint");
+        assert_eq!(hint, format!("config set allow.write {}", pnpm.display()));
+        let args: Vec<&str> = hint.split(' ').collect();
+        assert!(
+            cmd("PNPM_HOME", &pnpm)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            warning("PNPM_HOME", &pnpm),
+            None,
+            "the grant should silence it"
+        );
+        let out = cmd("PNPM_HOME", &pnpm)
+            .args(["exec", "--", "/usr/bin/touch"])
+            .arg(pnpm.join("f"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the dir should be writable after the hint"
+        );
+        assert!(pnpm.join("f").exists());
+    }
+
     /// `GOCACHE=~/.config` is outside every env tool-dir root (#1104): it is
     /// dropped with a warning naming GOCACHE, and cplt's state dir stays
     /// unwritable (#1095).
