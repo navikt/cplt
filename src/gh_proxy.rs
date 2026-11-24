@@ -134,6 +134,12 @@ fn token_withheld_reason_for(
             "GitHub token withheld: --hostname names a non-github.com host."
         } else if args.iter().any(|a| decode_stable(a).is_none()) {
             "GitHub token withheld: cplt could not decode an argument (failing closed)."
+        } else if any_templated_host(args) {
+            "GitHub token withheld: a placeholder ({owner}, {repo}, {branch}) in the gh api endpoint could choose the host."
+        } else if args.iter().any(|a| non_ascii_host(a, false)) {
+            "GitHub token withheld: a URL names a host with non-ASCII characters."
+        } else if repo_flag_non_ascii(args) {
+            "GitHub token withheld: -R/--repo names a host with non-ASCII characters (HOST/OWNER/REPO or git@HOST:OWNER/REPO)."
         } else if args.iter().any(|a| names_token_tenant(a)) {
             "GitHub token withheld: an argument mentions a non-github.com GitHub host (ghe.com / github.localhost). Use --body-file for text that names one."
         } else {
@@ -165,7 +171,7 @@ fn github_token_allowed_for(
             let (named, ambiguous) = scan_hostnames(args);
             ambiguous || named.iter().any(|h| !h.eq_ignore_ascii_case(DEFAULT_GH_HOST))
         }
-        || args.iter().any(|a| names_token_tenant(a))
+        || arg_names_untrusted_host(args)
         // These iterate every host in hosts.yml without `--hostname`, tenants
         // included; `exec_real` adds `--hostname github.com` via
         // [`pin_auth_hostname`] so the token can ride along.
@@ -236,6 +242,180 @@ fn decode_stable(s: &str) -> Option<String> {
         decoded = next;
     }
     None
+}
+
+/// Whether any argument names a tenant, a non-ASCII host or a templated URL
+/// host. Each withholds the github.com token; `exec_real` says so in one line.
+#[must_use]
+pub fn arg_names_untrusted_host(args: &[&str]) -> bool {
+    args.iter()
+        .any(|a| names_token_tenant(a) || non_ascii_host(a, false))
+        || any_templated_host(args)
+        || repo_flag_non_ascii(args)
+}
+
+/// Whether any `gh api` argument lets a placeholder choose a host. The
+/// no-scheme clauses apply to every positional word: a `-F owner={owner}` field
+/// or a `--jq` filter is a value, not a URL (the documented graphql idiom).
+fn any_templated_host(args: &[&str]) -> bool {
+    if !is_api(args) {
+        return false;
+    }
+    let values = api_flag_values(args);
+    args.iter()
+        .enumerate()
+        .any(|(i, a)| templated_host(a, !values.contains(&i)))
+}
+
+/// Indices of words that are flags or the values of gh api's value-taking
+/// flags. Everything else is checked as a possible endpoint, so fails closed:
+/// an unknown flag consumes no value, and a short cluster such as `-iX GET` or
+/// `-iXGET` gives its value letter the rest of the word or the next word.
+fn api_flag_values(args: &[&str]) -> Vec<usize> {
+    const LONG: &[&str] = &[
+        "--method",
+        "--header",
+        "--raw-field",
+        "--field",
+        "--jq",
+        "--template",
+        "--input",
+        "--preview",
+        "--hostname",
+        "--cache",
+    ];
+    const SHORT: &[char] = &['X', 'H', 'f', 'F', 'q', 't', 'p'];
+    let Some(root) = root_command(args).0 else {
+        return Vec::new();
+    };
+    let mut out: Vec<usize> = (0..=root).collect();
+    let mut i = root + 1;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            out.push(i);
+            break;
+        }
+        let mut takes_next = false;
+        if let Some(long) = a.strip_prefix("--") {
+            takes_next = !long.contains('=') && LONG.contains(&a);
+            out.push(i);
+        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            // When unsure whether a word is consumed, do not consume it: a
+            // cluster with `=` (`-i=t`, `-X=GET`) carries its own value.
+            if !cluster.contains('=')
+                && let Some(pos) = cluster.find(SHORT)
+            {
+                takes_next = pos + 1 == cluster.len();
+            }
+            out.push(i);
+        }
+        if takes_next && i + 1 < args.len() {
+            out.push(i + 1);
+            i += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Values of `-R`/`--repo`: only there does a scheme-less `HOST/OWNER/REPO` or
+/// scp `user@HOST:OWNER/REPO` name a host.
+fn repo_flag_values<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if *a == "-R" || *a == "--repo" {
+            out.extend(it.next().copied());
+        } else if let Some(v) = a.strip_prefix("--repo=").or_else(|| a.strip_prefix("-R")) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Whether a `-R` value names a non-ASCII host, in `HOST/O/R` or scp form.
+fn repo_flag_non_ascii(args: &[&str]) -> bool {
+    repo_flag_values(args).iter().any(|v| {
+        if v.contains("://") {
+            return false; // read by non_ascii_host as a URL
+        }
+        let host = match v.split_once(':') {
+            Some((user_host, _)) if !user_host.contains('/') => {
+                user_host.rsplit('@').next().unwrap_or("")
+            }
+            _ if v.matches('/').count() == 2 => v.split('/').next().unwrap_or(""),
+            _ => return false,
+        };
+        non_ascii_host(host, true)
+    })
+}
+
+/// gh expands placeholders only for `gh api`; in a `--body` they are text.
+fn is_api(args: &[&str]) -> bool {
+    root_command(args).0.is_some_and(|r| args[r] == "api")
+}
+
+/// Whether `arg` lets a gh placeholder (`{owner}`, `:repo`, ...) choose a host.
+/// gh expands these after the guard reads argv, so a branch or remote name can
+/// turn an approved host into any other host, or supply the scheme itself:
+/// owner `https:` and branch `evil.ghe.com` make `{owner}//{branch}/user` a URL.
+/// So refuse a placeholder in a URL scheme or authority (any brace counts), a
+/// placeholder next to `//` when the URL has no literal scheme, and a placeholder in the first segment of an endpoint.
+fn templated_host(arg: &str, endpoint: bool) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    let placeholder = |s: &str| {
+        [
+            "{owner}", "{repo}", "{branch}", ":owner", ":repo", ":branch",
+        ]
+        .iter()
+        .any(|p| s.contains(p))
+    };
+    if let Some((scheme, rest)) = lower.split_once("://") {
+        let authority = url_authority(rest);
+        return placeholder(scheme) || authority.contains(['{', '}']) || placeholder(authority);
+    }
+    endpoint
+        && placeholder(&lower)
+        && (lower.contains("//")
+            || (!lower.contains(char::is_whitespace)
+                && placeholder(lower.split('/').next().unwrap_or(""))))
+}
+
+/// The authority of a URL after `://`. Whitespace ends it too, so prose after a
+/// URL in a `--body` or `--title` is not read as part of the host.
+fn url_authority(rest: &str) -> &str {
+    rest.split(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+        .next()
+        .unwrap_or("")
+}
+
+/// Whether `arg` names a host with a non-ASCII character: a URL's authority,
+/// or the whole argument when `whole` (a `--hostname` value). Go folds Unicode
+/// (`İ` to `i`, the Kelvin sign to `k`) and punycodes such a host, so no ASCII
+/// comparison against github.com can be trusted on it (#1082). Percent escapes
+/// are decoded as Go's url package does; still changing after 4 rounds fails
+/// closed.
+fn non_ascii_host(arg: &str, whole: bool) -> bool {
+    let host = if whole {
+        arg
+    } else if let Some((_, rest)) = arg.split_once("://") {
+        url_authority(rest).rsplit('@').next().unwrap_or("")
+    } else {
+        return false;
+    };
+    let mut decoded = host.to_string();
+    for _ in 0..4 {
+        if !decoded.is_ascii() {
+            return true;
+        }
+        let next = percent_decode(&decoded);
+        if next == decoded {
+            return false;
+        }
+        decoded = next;
+    }
+    true
 }
 
 fn percent_decode(s: &str) -> String {
@@ -2918,6 +3098,56 @@ fn gate_with_scope_resolver_for(
         });
     }
 
+    // gh expands placeholders inside a URL host after this check, so no
+    // host comparison below can hold for one, whatever scope_check says.
+    if any_templated_host(args) {
+        return Err(Refusal {
+            headline: "'gh' was given a URL whose host contains a placeholder.".to_string(),
+            guidance: "Write the host out in full, for example 'https://api.github.com/...'."
+                .to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
+    // A non-ASCII host defeats every ASCII comparison below, whatever
+    // scope_check says (#1082).
+    // An ambiguous `gh auth` prefix hides which value gh takes as the host,
+    // so every argument counts as one then.
+    let auth_ambiguous = cmd.command == "auth" && scan_hostnames(args).1;
+    if args
+        .iter()
+        .any(|a| non_ascii_host(a, false) || (auth_ambiguous && non_ascii_host(a, true)))
+        || repo_flag_non_ascii(args)
+        || requested_hostnames(args)
+            .iter()
+            .any(|h| non_ascii_host(h, true))
+    {
+        return Err(Refusal {
+            headline: "'gh' was given a host with non-ASCII characters.".to_string(),
+            guidance: "Spell the GitHub host in ASCII, for example 'github.com'.".to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
+    // `-h` before a `gh auth` subcommand may swallow the subcommand name, so
+    // the guard and gh can read different hosts (#1106).
+    if policy.scope_check
+        && cmd.command == "auth"
+        && root_command(args)
+            .0
+            .and_then(|r| args.get(r + 1))
+            .is_some_and(|a| a.starts_with('-'))
+        && scan_hostnames(args).1
+    {
+        return Err(Refusal {
+            headline: "'gh auth' arguments are ambiguous.".to_string(),
+            guidance: "Put flags after the subcommand, for example \
+                'gh auth status --hostname github.com'."
+                .to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
     // The GraphQL check names repositories as `owner/name`, without a host,
     // so it is only sound against github.com.
     if cmd.command == "api"
@@ -3489,7 +3719,7 @@ pub fn check_merge_protection(
 /// `-h=x`/`-hx`, or at the end of a bool cluster like `-ah`. Missing it let
 /// `gh auth status -h x.ghe.com` past the host checks with the github.com token
 /// (#1049).
-fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
+pub fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
     scan_hostnames(args).0
 }
 
@@ -3616,6 +3846,11 @@ fn misplaced_flag<'a>(args: &[&'a str]) -> Option<&'a str> {
         if !a.starts_with('-') {
             return None;
         }
+        // cobra gives `-R` under `repo` the next word even where the guard's
+        // subcommand hint reads it as valueless (#1105).
+        if args[root] == "repo" && (a.starts_with("--repo") || a.starts_with("-R")) {
+            return Some(a);
+        }
         match a {
             "-R" | "-h" | "--repo" | "--hostname" => i += 1,
             "--help" => {}
@@ -3703,6 +3938,7 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
         while k < j {
             k += match args[k] {
                 "-h" | "--hostname" => 2,
+                "--help" => 1,
                 a if a.starts_with("-h") || a.starts_with("--hostname=") => 1,
                 _ => break,
             };
@@ -3746,11 +3982,11 @@ fn scan_hostnames<'a>(args: &'a [&str]) -> (Vec<&'a str>, bool) {
             for (pos, c) in cluster.char_indices() {
                 if AUTH_SHORT_VALUE.contains(c) {
                     let value = &cluster[pos + 1..];
-                    let value = value.strip_prefix('=').unwrap_or(value);
-                    let value = if value.is_empty() {
-                        iter.next().unwrap_or("")
-                    } else {
-                        value
+                    // pflag: `-h=` is an empty value, not the next argument.
+                    let value = match value.strip_prefix('=') {
+                        Some(v) => v,
+                        None if value.is_empty() => iter.next().unwrap_or(""),
+                        None => value,
                     };
                     if c == 'h' {
                         found.push(value);
@@ -7444,6 +7680,10 @@ mod tests {
         assert!(
             r(&["pr", "create", "--body", "see x.ghe.com"], None, None).contains("--body-file")
         );
+        assert!(r(&["api", "https://{owner}.example/x"], None, None).contains("placeholder"));
+        assert!(r(&["api", "https://gİthub.com/x"], None, None).contains("a URL names"));
+        assert!(r(&["pr", "list", "-R", "git@gİthub.com:o/r"], None, None).contains("-R/--repo"));
+        assert!(r(&["pr", "list", "-R", "gİthub.com/o/r"], None, None).contains("-R/--repo"));
         assert!(r(&["pr", "list"], None, None).contains("could reach"));
     }
 
@@ -7839,6 +8079,319 @@ mod tests {
             ..on
         };
         assert!(gate_with_scope_resolver(&["pr", "merge", "1"], &unscoped, scope, None).is_err());
+    }
+
+    #[test]
+    fn non_ascii_api_host_is_refused_and_gets_no_token() {
+        // #1082: Go folds `İ` to `i` and punycodes the host.
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let hosts = vec!["github.com".to_string()];
+        for url in [
+            "https://api.g\u{130}thub.com/repos/o/r",
+            "https://api.g%C4%B0thub.com/repos/o/r",
+            "https://api.github.com\u{212a}/repos/o/r",
+        ] {
+            let args = ["api", url];
+            for p in [&off, &GatePolicy::default()] {
+                assert!(
+                    gate_with_scope_resolver(&args, p, scope, None).is_err(),
+                    "{url}"
+                );
+            }
+            assert!(
+                !github_token_allowed_for(&args, None, None, &hosts),
+                "{url}"
+            );
+        }
+        for args in [
+            &["api", "--hostname", "g\u{130}thub.com", "repos/o/r"][..],
+            &["repo", "view", "https://g\u{130}thub.com/o/r"],
+            &["auth", "-h", "status", "status", "-h", "g\u{130}thub.com"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_err(),
+                "{args:?}"
+            );
+        }
+        assert!(github_token_allowed_for(
+            &["api", "https://api.github.com/repos/o/r"],
+            None,
+            None,
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn placeholder_in_url_host_is_refused_and_gets_no_token() {
+        // gh expands these after the guard reads argv: a branch named `İ` or
+        // `evil.ghe.com` turned an approved host into another one.
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let hosts = vec!["github.com".to_string()];
+        for url in [
+            "https://api.g{branch}thub.com/user",
+            "https://api.g{owner}thub.com/user",
+            "https://{branch}.github.com/user",
+            "https://api.g:branch.github.com/user",
+            "https://api.g:OWNER.github.com/user",
+            "https://api.:repo.com/user",
+            "https://api.{branch}/user",
+            "https://x@api.{repo}/user",
+        ] {
+            let args = ["api", url];
+            for p in [&off, &GatePolicy::default()] {
+                assert!(
+                    gate_with_scope_resolver(&args, p, scope, None).is_err(),
+                    "{url}"
+                );
+            }
+            assert!(
+                !github_token_allowed_for(&args, None, None, &hosts),
+                "{url}"
+            );
+        }
+        // Fable: a placeholder can supply the scheme (owner `https:`, branch
+        // `evil.ghe.com`), so `{owner}//{branch}/user` becomes a URL.
+        for ep in [
+            "{owner}//{branch}/user",
+            ":repo//:branch/user",
+            "{OWNER}//{Branch}/user",
+            "{owner}/{branch}",
+            ":owner",
+            "{repo}://x/user",
+        ] {
+            let args = ["api", ep];
+            for p in [&off, &GatePolicy::default()] {
+                assert!(
+                    gate_with_scope_resolver(&args, p, scope, None).is_err(),
+                    "{ep}"
+                );
+            }
+            assert!(!github_token_allowed_for(&args, None, None, &hosts), "{ep}");
+        }
+        // Placeholders in the path stay usable.
+        for ep in [
+            "https://api.github.com/repos/{owner}/{repo}",
+            "repos/{owner}/{repo}/pulls",
+            "/repos/:owner/:repo/branches/:branch",
+        ] {
+            assert!(
+                github_token_allowed_for(&["api", ep], None, None, &hosts),
+                "{ep}"
+            );
+        }
+        assert!(
+            gate_with_scope_resolver(&["api", "repos/{owner}/{repo}/pulls"], &off, scope, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn placeholders_in_api_values_are_not_endpoints() {
+        let hosts = vec!["github.com".to_string()];
+        let idiom = [
+            "api",
+            "graphql",
+            "-F",
+            "owner={owner}",
+            "-F",
+            "name={repo}",
+            "-f",
+            "query={ __typename }",
+        ];
+        for args in [
+            &idiom[..],
+            &["api", "graphql", "-F", "owner=:owner", "-f", "query=q"],
+            &["api", "repos/o/r/pulls", "-f", "title={branch}"],
+            &["api", "repos/o/r/issues", "-f", "body=see // {owner}"],
+            &["api", "repos/o/r/pulls", "--jq", ".[] | {owner} // empty"],
+            &["api", "-if", "title={branch}", "repos/o/r/pulls"],
+            &["api", "-iX", "GET", "repos/o/r"],
+            &["api", "-X=GET", "repos/o/r"],
+        ] {
+            assert!(!any_templated_host(args), "{args:?}");
+            assert!(
+                github_token_allowed_for(args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["api", "{owner}//{branch}/user"][..],
+            &["api", "-X", "GET", "{owner}//{branch}/user"],
+            &["api", "-f", "a=b", "--", "{owner}//{branch}/user"],
+            &["api", "-iX", "GET", "{owner}//{branch}/user"],
+            &["api", "-iXGET", "{owner}//{branch}/user"],
+            &["api", "-i=t", "{owner}//{branch}/user"],
+            &["api", "-i=f", "{owner}//{branch}/user"],
+            &["api", "-i=F", "{owner}//{branch}/user"],
+            &["api", "-ii=t", "{owner}//{branch}/user"],
+            &["api", "-X=GET", "{owner}//{branch}/user"],
+            &["api", "-iH", "A: b", "{owner}//{branch}/user"],
+            &["api", "--paginate", "-iq", ".", "{owner}//{branch}/user"],
+            &["api", "graphql", "-f", "u=https://{owner}.ghe.com/x"],
+        ] {
+            assert!(any_templated_host(args), "{args:?}");
+            assert!(
+                !github_token_allowed_for(args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_slash_non_ascii_only_in_repo_flag() {
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        for args in [
+            &["pr", "checkout", "\u{e6}rlig/fix/x"][..],
+            &["pr", "create", "--head", "B\u{e6}rum/x/y"],
+            &["issue", "create", "--body-file", "\u{f8}ving/notat/a.md"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_ok(),
+                "{args:?}"
+            );
+            assert!(!arg_names_untrusted_host(args), "{args:?}");
+        }
+        for args in [
+            &["pr", "view", "1", "-R", "git@g\u{130}thub.com:o/r"][..],
+            &["pr", "view", "1", "--repo=g\u{130}thub.com/o/r"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_err(),
+                "{args:?}"
+            );
+            assert!(arg_names_untrusted_host(args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_host_in_repo_flag_is_refused() {
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let hosts = vec!["github.com".to_string()];
+        let args = ["pr", "view", "1", "-R", "g\u{130}thub.com/o/r"];
+        assert!(gate_with_scope_resolver(&args, &off, scope, None).is_err());
+        assert!(!github_token_allowed_for(&args, None, None, &hosts));
+        let ok = ["pr", "view", "1", "-R", "github.com/o/r"];
+        assert!(gate_with_scope_resolver(&ok, &off, scope, None).is_ok());
+    }
+
+    #[test]
+    fn prose_after_url_is_not_read_as_host() {
+        // Fable: the authority was cut only at `/ ? #`, so Norwegian prose
+        // after a URL counted as host and blocked ordinary comments.
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let hosts = vec!["github.com".to_string()];
+        for args in [
+            &[
+                "issue",
+                "comment",
+                "1",
+                "--body",
+                "Se https://nav.no for mer informasjon på norsk",
+            ][..],
+            &[
+                "pr",
+                "create",
+                "--title",
+                "Støtte for https://nav.no – ny lenke",
+            ],
+            &[
+                "issue",
+                "comment",
+                "1",
+                "--body",
+                "Se https://nav.no {branch} på norsk",
+            ],
+            &[
+                "pr",
+                "comment",
+                "1",
+                "-R",
+                "o/r",
+                "--body",
+                "See https://{branch}.example/run/1",
+            ],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_ok(),
+                "{args:?}"
+            );
+            assert!(!arg_names_untrusted_host(args), "{args:?}");
+        }
+        for url in [
+            "https://g\u{130}thub.com/o/r på norsk",
+            "https://{branch}.github.com/user ok",
+        ] {
+            let args = ["api", url];
+            assert!(
+                gate_with_scope_resolver(&args, &off, scope, None).is_err(),
+                "{url}"
+            );
+            assert!(
+                !github_token_allowed_for(&args, None, None, &hosts),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_flag_before_repo_subcommand_is_refused() {
+        // #1105: cobra resolves `gh repo -R view new view` as `repo create`.
+        for args in [
+            &["repo", "-R", "view", "new", "view"][..],
+            &["repo", "--repo", "view", "new", "view"],
+            &["repo", "-Ro/r", "view"],
+            &["repo", "--repo=o/r", "view"],
+        ] {
+            assert_eq!(misplaced_flag(args), Some(args[1]), "{args:?}");
+        }
+        assert_eq!(misplaced_flag(&["repo", "view", "-R", "o/r"]), None);
+    }
+
+    #[test]
+    fn ambiguous_auth_hostname_argv_is_refused() {
+        // #1106: the first `-h` swallows `status`; gh uses the later host.
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let on = GatePolicy::default();
+        for args in [
+            &["auth", "-h", "status", "status", "-h", "evil.example"][..],
+            &["auth", "-h", "status", "status", "-hevil.ghe.com"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &on, scope, None).is_err(),
+                "{args:?}"
+            );
+        }
+        // `-h=` is an empty value, not the next argument.
+        assert_eq!(
+            scan_hostnames(&["auth", "status", "-h=", "github.com"]).0,
+            vec![""]
+        );
+        assert!(
+            gate_with_scope_resolver(&["auth", "status", "-h", "github.com"], &on, scope, None)
+                .is_ok()
+        );
+        // `--help` takes no value, so it cannot swallow the subcommand.
+        assert!(gate_with_scope_resolver(&["auth", "--help", "status"], &on, scope, None).is_ok());
     }
 
     #[test]

@@ -1071,7 +1071,9 @@ fn gh_gate_pins_github_host_with_token_and_withholds_it_for_tenant_argv() {
     std::fs::create_dir_all(&token_dir).unwrap();
     std::fs::write(token_dir.join(".gh-exec-token"), "gho_github_token\n").unwrap();
 
-    let run = |args: &[&str]| {
+    let no_token_dir = temp.path().join("no-tokens");
+    std::fs::create_dir_all(&no_token_dir).unwrap();
+    let run_with = |args: &[&str], dir: &std::path::Path| {
         let out = cplt_cmd()
             .arg("gh-gate")
             .arg("--real-gh")
@@ -1083,7 +1085,7 @@ fn gh_gate_pins_github_host_with_token_and_withholds_it_for_tenant_argv() {
             .env_remove("GH_HOST")
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
-            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, &token_dir)
+            .env(cplt::sandbox::GH_TOKEN_DIR_ENV, dir)
             .output()
             .expect("cplt gh-gate should run");
         assert!(
@@ -1096,6 +1098,7 @@ fn gh_gate_pins_github_host_with_token_and_withholds_it_for_tenant_argv() {
             String::from_utf8_lossy(&out.stderr).to_string(),
         )
     };
+    let run = |args: &[&str]| run_with(args, &token_dir);
 
     let (out, err) = run(&["repo", "list"]);
     assert_eq!(out, "github.com|gho_github_token|repo list");
@@ -1111,7 +1114,15 @@ fn gh_gate_pins_github_host_with_token_and_withholds_it_for_tenant_argv() {
             out.starts_with("||"),
             "token must be withheld for {tenant:?}: {out}"
         );
-        assert!(err.contains("GitHub token withheld"), "{tenant:?}: {err}");
+        // Exactly one notice: a second path once printed it twice.
+        assert_eq!(
+            err.matches("GitHub token withheld").count(),
+            1,
+            "{tenant:?}: {err}"
+        );
+        // No cached token: nothing was withheld, so no notice.
+        let (_, err) = run_with(tenant, &no_token_dir);
+        assert!(!err.contains("GitHub token withheld"), "{tenant:?}: {err}");
     }
 }
 
