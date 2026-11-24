@@ -248,8 +248,8 @@ fn decode_stable(s: &str) -> Option<String> {
 /// host. Each withholds the github.com token; `exec_real` says so in one line.
 #[must_use]
 pub fn arg_names_untrusted_host(args: &[&str]) -> bool {
-    args.iter()
-        .any(|a| names_token_tenant(a) || non_ascii_host(a, false))
+    args.iter().any(|a| names_token_tenant(a))
+        || host_words(args).iter().any(|a| non_ascii_host(a, false))
         || any_templated_host(args)
         || repo_flag_non_ascii(args)
 }
@@ -319,6 +319,22 @@ fn api_flag_values(args: &[&str]) -> Vec<usize> {
     out
 }
 
+/// Words gh reads as a host: the `gh api` endpoint and repository selectors.
+/// Prose in a `--body` that merely contains a URL is not one (`«https://nav.no»`).
+fn host_words<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
+    let mut out = repo_selector_values(args);
+    if is_api(args) {
+        let values = api_flag_values(args);
+        out.extend(
+            args.iter()
+                .enumerate()
+                .filter(|(i, _)| !values.contains(i))
+                .map(|(_, a)| (*a).into()),
+        );
+    }
+    out
+}
+
 /// Values of `-R`/`--repo`: only there does a scheme-less `HOST/OWNER/REPO` or
 /// scp `user@HOST:OWNER/REPO` name a host.
 fn repo_flag_values<'a>(args: &[&'a str]) -> Vec<&'a str> {
@@ -364,12 +380,18 @@ fn repo_selector_values<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> 
         {
             let rest = &args[at + 1..];
             let end = rest.iter().position(|a| *a == "--").unwrap_or(rest.len());
-            out.extend(
-                rest[..end]
-                    .iter()
-                    .filter(|a| !a.starts_with('-'))
-                    .map(|a| (*a).into()),
-            );
+            let mut operands: Vec<&str> = rest[..end]
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .copied()
+                .collect();
+            // Words after `--` are operands too, dashes and all.
+            operands.extend(rest.get(end + 1..).unwrap_or_default());
+            // `gh repo clone REPO [DIR]`: the second operand is a directory.
+            if sub == "clone" {
+                operands.truncate(1);
+            }
+            out.extend(operands.into_iter().map(Into::into));
         }
     }
     out
@@ -382,12 +404,16 @@ fn repo_flag_non_ascii(args: &[&str]) -> bool {
         if v.contains("://") {
             return false; // read by non_ascii_host as a URL
         }
-        let host = match v.split_once(':') {
-            Some((user_host, _)) if !user_host.contains('/') => {
-                user_host.rsplit('@').next().unwrap_or("")
+        let host = match v.split_once('@') {
+            // scp form `user@HOST:O/R` or `user@HOST/O:R`: the host ends at `:` or `/`.
+            Some((user, after)) if !user.contains(['/', ':']) => {
+                after.split([':', '/']).next().unwrap_or("")
             }
-            _ if v.matches('/').count() == 2 => v.split('/').next().unwrap_or(""),
-            _ => return false,
+            _ => match v.split_once(':') {
+                Some((host, _)) if !host.contains('/') => host,
+                _ if v.matches('/').count() == 2 => v.split('/').next().unwrap_or(""),
+                _ => return false,
+            },
         };
         non_ascii_host(host, true)
     })
@@ -420,14 +446,16 @@ fn templated_host(arg: &str, endpoint: bool) -> bool {
     endpoint
         && placeholder(&lower)
         && (lower.contains("//")
-            || (!lower.contains(char::is_whitespace)
+            || (!lower.contains(|c: char| c.is_ascii_whitespace())
                 && placeholder(lower.split('/').next().unwrap_or(""))))
 }
 
-/// The authority of a URL after `://`. Whitespace ends it too, so prose after a
-/// URL in a `--body` or `--title` is not read as part of the host.
+/// The authority of a URL after `://`. ASCII whitespace ends it too, so prose
+/// after a URL in a `--body` is not read as part of the host. Unicode
+/// whitespace does not: Go's url parser keeps it in the host, so cutting there
+/// would check `x` while gh sends the token to `x\u{3000}.gİthub.com`.
 fn url_authority(rest: &str) -> &str {
-    rest.split(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+    rest.split(|c: char| matches!(c, '/' | '?' | '#') || c.is_ascii_whitespace())
         .next()
         .unwrap_or("")
 }
@@ -3156,9 +3184,8 @@ fn gate_with_scope_resolver_for(
     // An ambiguous `gh auth` prefix hides which value gh takes as the host,
     // so every argument counts as one then.
     let auth_ambiguous = cmd.command == "auth" && scan_hostnames(args).1;
-    if args
-        .iter()
-        .any(|a| non_ascii_host(a, false) || (auth_ambiguous && non_ascii_host(a, true)))
+    if host_words(args).iter().any(|a| non_ascii_host(a, false))
+        || (auth_ambiguous && args.iter().any(|a| non_ascii_host(a, true)))
         || repo_flag_non_ascii(args)
         || requested_hostnames(args)
             .iter()
@@ -8349,6 +8376,85 @@ mod tests {
         for args in [
             &["pr", "checkout", "\u{e6}rlig/fix/x"][..],
             &["repo", "view", "navikt/cplt"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_ok(),
+                "{args:?}"
+            );
+            assert!(!arg_names_untrusted_host(args), "{args:?}");
+            assert!(
+                github_token_allowed_for(args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Review of #1109 at 6b50cb29: Unicode whitespace stays in a Go URL host,
+    /// prose glued to a URL is not a host, and `--`, scp `user@HOST/O:R` and
+    /// clone's directory operand are read the way gh reads them.
+    #[test]
+    fn unicode_space_hosts_and_prose_urls() {
+        // Clone is gated off by default policy, so check its host reading directly.
+        assert!(!repo_flag_non_ascii(&[
+            "repo",
+            "clone",
+            "o/r",
+            "m\u{e5}l/dir/x"
+        ]));
+        assert!(repo_flag_non_ascii(&[
+            "repo",
+            "clone",
+            "g\u{130}thub.com/o/r",
+            "d"
+        ]));
+        let scope = || Ok(vec!["o/r".to_string(), "navikt/cplt".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        let mut refused: Vec<Vec<String>> = Vec::new();
+        for sp in ['\u{3000}', '\u{a0}', '\u{85}', '\u{2002}', '\u{2028}'] {
+            for scheme in ["http", "https"] {
+                refused.push(vec![
+                    "api".into(),
+                    format!("{scheme}://x{sp}.g\u{130}thub.com/user"),
+                ]);
+                refused.push(vec![
+                    "api".into(),
+                    format!("{scheme}://x{sp}.{{branch}}/user"),
+                ]);
+            }
+        }
+        for a in [
+            &["repo", "view", "--", "g\u{130}thub.com/o/r"][..],
+            &["pr", "view", "1", "-R", "git@g\u{130}thub.com/o:r"],
+            &["api", "https://bl\u{e5}b\u{e6}r.no/x"],
+            &["repo", "view", "https://g\u{130}thub.com/o/r"],
+        ] {
+            refused.push(a.iter().map(ToString::to_string).collect());
+        }
+        for args in &refused {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert!(
+                gate_with_scope_resolver(&args, &off, scope, None).is_err(),
+                "{args:?}"
+            );
+            assert!(
+                !github_token_allowed_for(&args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &[
+                "pr",
+                "comment",
+                "1",
+                "--body",
+                "Se \u{ab}https://nav.no\u{bb}",
+            ][..],
+            &["pr", "comment", "1", "--body", "https://nav.no\u{2014}og"],
+            &["issue", "create", "--body", "https://bl\u{e5}b\u{e6}r.no/x"],
         ] {
             assert!(
                 gate_with_scope_resolver(args, &off, scope, None).is_ok(),
