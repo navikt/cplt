@@ -788,7 +788,7 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
     let mut tail = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(real) = cur.canonicalize() {
+        if let Ok(real) = crate::config::canonicalize_strict(cur) {
             return tail.iter().rev().fold(real, |p, c| p.join(c));
         }
         match (cur.parent(), cur.file_name()) {

@@ -2045,6 +2045,13 @@ fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Opti
     // `../ssh/id_ed25519` in a repo that holds the linked `~/.ssh`, still
     // resolves inside the repository.
     let spelled = config_dir.join(lexically_normalized(&expand_tilde(path_str)));
+    if super::nofollow_names_symlink(&spelled) {
+        ui::warn(&format!(
+            "{key} entry {path_str:?} {}",
+            super::NOFOLLOW_LINK_MESSAGE
+        ));
+        return None;
+    }
     if let Some(target) = allow_path_credential_hop(&spelled) {
         ui::warn(&format!(
             "{key} entry {path_str:?} {}",

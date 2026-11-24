@@ -1593,7 +1593,7 @@ fn validate_repo_dirs(
     for (raw, source) in &named {
         let raw = raw.as_path();
         let named_as = source.describe(raw);
-        let dir = std::fs::canonicalize(raw)
+        let dir = config::canonicalize_strict(raw)
             .map_err(|e| anyhow::anyhow!("Cannot resolve {named_as}: {e}"))?;
 
         // The FINAL component must not be a symlink. The project dir is
@@ -1823,9 +1823,14 @@ fn prompt_confirm(auto_yes: bool, quiet: bool, agent: cplt::agent::Agent) -> Res
 fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
     paths
         .iter()
-        .filter_map(|p| match std::fs::canonicalize(p) {
+        .filter_map(|p| match config::canonicalize_strict(p) {
             Ok(c) => {
                 let spelled = std::path::absolute(p).unwrap_or_default();
+                if config::nofollow_names_symlink(&spelled) {
+                    let why = config::NOFOLLOW_LINK_MESSAGE;
+                    ui::warn(&format!("{flag_name} path {} {why}", p.display()));
+                    return None;
+                }
                 if let Some(target) = config::allow_path_credential_hop(&spelled) {
                     let why = config::credential_hop_message(&target);
                     ui::warn(&format!("{flag_name} path {} {why}", p.display()));
@@ -1846,7 +1851,7 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     paths
         .iter()
         .map(|p| {
-            std::fs::canonicalize(p).with_context(|| {
+            config::canonicalize_strict(p).with_context(|| {
                 format!(
                     "--deny-path {} cannot be resolved.\n\
                      Silently dropping deny rules is a security risk.",
@@ -3383,7 +3388,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
     // Resolve project directory
     let project_dir = match &cli.project_dir {
-        Some(p) => std::fs::canonicalize(p)
+        Some(p) => config::canonicalize_strict(p)
             .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
         None => match cplt::git::project_root(Path::new(".")) {
             Ok(root) => std::fs::canonicalize(&root).unwrap_or(root),
@@ -12219,7 +12224,21 @@ fn run_config_set_via(
     {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
         for val in values {
-            let path = config::expand_tilde(val);
+            let mut path = config::expand_tilde(val);
+            // Same canonical form the launch checks, so a symlink to `/` or
+            // `/.nofollow` is refused here too. A path that does not exist yet
+            // keeps its spelling.
+            match config::canonicalize_strict(&path) {
+                Ok(c) => path = c,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    ui::error(&format!(
+                        "{key} {val} resolves to the filesystem root, which cplt refuses. \
+                         Name a specific path instead."
+                    ));
+                    return ExitCode::FAILURE;
+                }
+                Err(_) => {}
+            }
             if let Err(e) = sandbox::validate_grant_path(key, &path, &home) {
                 ui::error(&e);
                 return ExitCode::FAILURE;
@@ -13605,6 +13624,19 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
     })
 }
 
+/// A `.cplt.toml` path as written, plus where it resolves when that differs,
+/// so a reviewer never approves `/.nofollow/...` or a symlink without seeing
+/// the path the rule will actually name.
+fn spelled_with_canonical(raw: &str, dir: &Path) -> String {
+    let spelled = dir.join(config::expand_tilde(raw));
+    let canonical = config::canonicalize_deepest(&spelled);
+    if canonical == spelled {
+        raw.to_string()
+    } else {
+        format!("{raw}  (resolves to {})", canonical.display())
+    }
+}
+
 fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoConfig) -> ExitCode {
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
     let trust_entry = trust::load_trust(project_dir);
@@ -13636,7 +13668,10 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
         println!("{blue}[cplt]{nc}  {green}[deny]{nc} {LABEL_DENY_APPLIED}");
         for p in &loaded.config.deny.paths {
-            println!("{blue}[cplt]{nc}    path: {p}");
+            println!(
+                "{blue}[cplt]{nc}    path: {}",
+                spelled_with_canonical(p, &loaded.dir)
+            );
         }
         for v in &loaded.config.deny.env {
             println!("{blue}[cplt]{nc}    env:  {v}");
@@ -13695,6 +13730,18 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             println!("{blue}[cplt]{nc}    {key:<35} {status}");
             if !approved && let Some(cost) = repo_config::propose_key_cost(key) {
                 println!("{blue}[cplt]{nc}      {dim}{cost}{nc}");
+            }
+            let paths = match key {
+                "allow.read" => &loaded.config.propose.allow.read,
+                "allow.write" => &loaded.config.propose.allow.write,
+                "allow.socket" => &loaded.config.propose.allow.socket,
+                _ => &Vec::new(),
+            };
+            for p in paths {
+                println!(
+                    "{blue}[cplt]{nc}      {}",
+                    spelled_with_canonical(p, &loaded.dir)
+                );
             }
             if key == "repos" {
                 for line in proposed_repo_lines(project_dir, loaded, trust_entry.as_ref()) {
