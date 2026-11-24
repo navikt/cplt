@@ -3855,49 +3855,54 @@ mod tests {
 
     #[test]
     fn cache_exec_and_cypress_state_rules_are_opened_nofollow() {
-        let project = PathBuf::from("/fake/user/project");
-        let home = PathBuf::from("/fake/user");
-        let subdirs = vec!["Cypress".to_string(), "ms-playwright".to_string()];
-        let nofollow_paths = |policy: &LandlockPolicy| {
-            let mut paths: Vec<_> = policy
-                .fs_rules
-                .iter()
-                .filter(|rule| rule.nofollow)
-                .map(|rule| rule.path.clone())
-                // Writable AppDir roots are nofollow too; this test is about the rest.
-                .filter(|p| {
-                    !policy::app_dirs()
-                        .iter()
-                        .any(|d| d.write_paths(&home).contains(p))
-                })
-                .collect();
-            paths.sort();
-            paths
-        };
+        // Under the env lock: the expected list and the policy must both see
+        // the same XDG dirs (a concurrent test moving XDG_CONFIG_HOME made
+        // `~/.config/pnpm` slip past the AppDir filter).
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
+            let subdirs = vec!["Cypress".to_string(), "ms-playwright".to_string()];
+            let nofollow_paths = |policy: &LandlockPolicy| {
+                let mut paths: Vec<_> = policy
+                    .fs_rules
+                    .iter()
+                    .filter(|rule| rule.nofollow)
+                    .map(|rule| rule.path.clone())
+                    // Writable AppDir roots are nofollow too; this test is about the rest.
+                    .filter(|p| {
+                        !policy::app_dirs()
+                            .iter()
+                            .any(|d| d.write_paths(&home).contains(p))
+                    })
+                    .collect();
+                paths.sort();
+                paths
+            };
 
-        let mut config = test_config(&project, &home);
-        config.allow_cache_exec = &subdirs;
-        assert_eq!(
-            nofollow_paths(&generate_policy(&config)),
-            vec![
-                home.join(".cache/Cypress"),
-                home.join(".cache/ms-playwright"),
-                policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env),
-            ]
-        );
+            let mut config = test_config(&project, &home);
+            config.allow_cache_exec = &subdirs;
+            assert_eq!(
+                nofollow_paths(&generate_policy(&config)),
+                vec![
+                    home.join(".cache/Cypress"),
+                    home.join(".cache/ms-playwright"),
+                    policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env),
+                ]
+            );
 
-        // `allow_cache_exec_any` grants the whole cache; it needs the flag as
-        // much as a single entry does.
-        config.allow_cache_exec = &[];
-        config.allow_cache_exec_any = true;
-        assert_eq!(
-            nofollow_paths(&generate_policy(&config)),
-            vec![home.join(".cache")]
-        );
+            // `allow_cache_exec_any` grants the whole cache; it needs the flag as
+            // much as a single entry does.
+            config.allow_cache_exec = &[];
+            config.allow_cache_exec_any = true;
+            assert_eq!(
+                nofollow_paths(&generate_policy(&config)),
+                vec![home.join(".cache")]
+            );
 
-        // No cache exec, no nofollow rule: nothing else changes how it opens.
-        config.allow_cache_exec_any = false;
-        assert!(nofollow_paths(&generate_policy(&config)).is_empty());
+            // No cache exec, no nofollow rule: nothing else changes how it opens.
+            config.allow_cache_exec_any = false;
+            assert!(nofollow_paths(&generate_policy(&config)).is_empty());
+        });
     }
 
     #[test]
