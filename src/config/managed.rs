@@ -341,11 +341,13 @@ pub fn load_managed_from(
     // at the one boundary launch, `check`, `doctor` and `config show` share,
     // so they agree. Linux has no such deny: the grant still refuses.
     #[cfg(target_os = "macos")]
-    let writable: Vec<PathBuf> = writable
+    let kept: Vec<PathBuf> = writable
         .iter()
         .filter(|r| crate::sandbox::cplt_state_ancestor_grant(&home, r).is_none())
         .cloned()
         .collect();
+    #[cfg(target_os = "macos")]
+    let writable = kept.as_slice();
     crate::sandbox::resolve_unwritable(path, &writable).map_err(|()| {
         let tree = writable
             .iter()
