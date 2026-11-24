@@ -4748,7 +4748,7 @@ fn unenforced_refusal(
     };
     Some(format!(
         "Refusing to launch: these deny paths cannot be enforced on this host:\n{}\n{fix}\n\
-         Or launch with a warning instead: cplt config set sandbox.refuse_unenforced false",
+         Or launch with a warning instead: cplt config set sandbox.refuse_unenforced false (weakens the sandbox)",
         lines.join("\n")
     ))
 }
@@ -5161,7 +5161,7 @@ fn prepare_impl(
              restrict outbound connections, and no proxy is configured, so the network \
              restriction would not apply. Enable the proxy (--with-proxy) or upgrade to \
              kernel 6.7+, or launch with a warning instead: \
-             cplt config set sandbox.refuse_unenforced false"
+             cplt config set sandbox.refuse_unenforced false (weakens the sandbox)"
                 .to_string(),
         );
     }
@@ -5359,7 +5359,7 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
                         "sandbox.protect_pnpm_config: {e}\n\
                              pnpm's config dir comes from XDG_CONFIG_HOME (default ~/.config). \
                              Point it at a path without those characters, or run \
-                             `cplt config set sandbox.protect_pnpm_config false`."
+                             `cplt config set sandbox.protect_pnpm_config false` (weakens the sandbox)."
                     )
                 })?;
             }

@@ -12351,14 +12351,159 @@ fn config_set_refuses_socket_over_state_dir() {
     );
 }
 
-/// Every literal `cplt config set|unset ...` that cplt prints is pasted into
-/// the real binary, in a scratch HOME and repo, and must exit 0. A hint can
-/// then never suggest a command `cplt config set` refuses (a weakening value
-/// without `--force`, a hard-denied grant, an unknown key). Templates with
-/// placeholders are skipped by name; anything else the parser cannot read
-/// fails the test.
+/// The contents of every string literal in Rust source, unescaped, with
+/// comments skipped. Handles `\`-newline continuations, raw strings, byte
+/// strings, char literals and lifetimes, so no quote or backtick inside a
+/// literal or comment can shift what counts as a string.
+fn rust_string_literals(src: &str) -> Vec<String> {
+    let c: Vec<char> = src.chars().collect();
+    let (mut i, mut out) = (0, Vec::new());
+    while i < c.len() {
+        match c[i] {
+            '/' if c.get(i + 1) == Some(&'/') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                let mut depth = 0;
+                while i < c.len() {
+                    if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            '\'' => {
+                // Char literal ('x', '\n', '\'', '\u{..}') or a lifetime.
+                if c.get(i + 1) == Some(&'\\') {
+                    i += 2;
+                    while i < c.len() && c[i] != '\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if c.get(i + 2) == Some(&'\'') {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            'r' | 'b'
+                if (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_')) && {
+                    let mut j = i + usize::from(c[i] == 'b');
+                    if c.get(j) == Some(&'r') {
+                        j += 1;
+                        while c.get(j) == Some(&'#') {
+                            j += 1;
+                        }
+                    }
+                    j > i
+                        && c.get(j) == Some(&'"')
+                        && (c[i] == 'b' || c[i + 1] == '#' || c[i + 1] == '"')
+                } =>
+            {
+                let mut j = i + usize::from(c[i] == 'b');
+                if c.get(j) == Some(&'r') {
+                    let mut hashes = 0;
+                    j += 1;
+                    while c[j] == '#' {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    j += 1;
+                    let start = j;
+                    loop {
+                        if c[j] == '"' && (0..hashes).all(|h| c.get(j + 1 + h) == Some(&'#')) {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    out.push(c[start..j].iter().collect());
+                    i = j + 1 + hashes;
+                } else {
+                    i = j; // a plain byte string: let the '"' arm read it
+                }
+            }
+            '"' => {
+                let mut lit = String::new();
+                i += 1;
+                while c[i] != '"' {
+                    if c[i] == '\\' {
+                        i += 1;
+                        match c[i] {
+                            '\n' => {
+                                while c[i + 1].is_whitespace() {
+                                    i += 1;
+                                }
+                            }
+                            'n' => lit.push('\n'),
+                            't' => lit.push('\t'),
+                            'u' => {
+                                while c[i] != '}' {
+                                    i += 1;
+                                }
+                                lit.push('\u{fffd}');
+                            }
+                            other => lit.push(other),
+                        }
+                    } else {
+                        lit.push(c[i]);
+                    }
+                    i += 1;
+                }
+                out.push(lit);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Every `cplt config set|unset ...` in a string literal under `src/`
+/// (unit-test modules excluded) is run through the built binary in a scratch
+/// HOME, config and repo, and must exit 0, so a hint never suggests a
+/// command `cplt config set` refuses (a weakening value without `--force`,
+/// a hard-denied grant, an unknown key). The only exceptions are the
+/// reviewed templates below, which hold placeholders filled in at runtime.
 #[test]
 fn every_hinted_config_command_pastes_and_works() {
+    const TEMPLATES: &[&str] = &[
+        "cplt config set --local {key} {}",
+        "cplt config set --local <KEY> <VALUE>",
+        "cplt config set --local allow.write {t}/<tool>",
+        "cplt config set --local sandbox.repo_dirs {expected_child}",
+        "cplt config set --local sandbox.repo_dirs {first_path}",
+        "cplt config set --local sandbox.repo_dirs <dir>",
+        "cplt config set --local sandbox.repo_dirs <DIR>",
+        "cplt config set --local",
+        "cplt config set --repo {key} true --force",
+        "cplt config set --repo <key> true",
+        "cplt config set --repo deny.env <VALUE>",
+        "cplt config set {}.{} {bare}",
+        "cplt config set {}.{} <VALUE>",
+        "cplt config set {flag}{dotted} <value>",
+        "cplt config set {key} <VALUE>",
+        "cplt config set {scope}{key} {} --force",
+        "cplt config set {scope}{key} {}",
+        "cplt config set {scope}{key} {v} --unset",
+        "cplt config set <key> <value>",
+        "cplt config set <KEY> <VALUE>",
+        "cplt config set allow.{kind} {}",
+        "cplt config set gh_guard.hosts <HOST>",
+        "cplt config set shell.skip {name}",
+        "cplt config set shell.skip <agent>",
+        "cplt config set",
+        "cplt config unset {scope}{key} {v}",
+    ];
     fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
@@ -12374,28 +12519,27 @@ fn every_hinted_config_command_pastes_and_works() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut files,
     );
+    files.sort();
     let mut cmds = Vec::new();
     for f in &files {
         let raw = std::fs::read_to_string(f).unwrap();
-        // Hints only: drop the unit tests and comments, join `\` line wraps.
         let code = raw.split("#[cfg(test)]\nmod tests").next().unwrap();
-        let code: String = code
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut joined = String::new();
-        let mut rest = code.as_str();
-        while let Some(i) = rest.find("\\\n") {
-            joined.push_str(&rest[..i]);
-            rest = rest[i + 2..].trim_start();
-        }
-        joined.push_str(rest);
-        for (i, part) in joined.split('`').enumerate() {
-            if i % 2 == 1
-                && (part.starts_with("cplt config set ") || part.starts_with("cplt config unset "))
-            {
-                cmds.push((f.display().to_string(), part.to_string()));
+        for lit in rust_string_literals(code) {
+            for (at, _) in lit.match_indices("cplt config ") {
+                let tail = &lit[at..];
+                if !(tail.starts_with("cplt config set") || tail.starts_with("cplt config unset")) {
+                    continue;
+                }
+                // A command ends at a backtick, line end, `,`, `;`, `(`, `)`
+                // or a sentence-ending `. `.
+                let mut end = tail
+                    .find(['`', '\n', ',', ';', '(', ')'])
+                    .unwrap_or(tail.len());
+                if let Some(dot) = tail[..end].find(". ") {
+                    end = dot;
+                }
+                let cmd = tail[..end].trim_end().trim_end_matches(['.', ':']);
+                cmds.push((f.display().to_string(), cmd.to_string()));
             }
         }
     }
@@ -12404,23 +12548,16 @@ fn every_hinted_config_command_pastes_and_works() {
     let mut checked = 0;
     let mut refused = Vec::new();
     for (file, cmd) in &cmds {
-        let is_template = ["{", "<", "...", "|", "HOST", "KEY"]
-            .iter()
-            .any(|t| cmd.contains(t));
-        if is_template {
+        if TEMPLATES.contains(&cmd.as_str()) {
             continue;
         }
-        // Shell quotes, as printed inside a Rust string literal.
-        let unquoted = cmd.replace("\\\"", "");
-        let args: Vec<&str> = unquoted.split_whitespace().skip(2).collect();
-        let known = |a: &&str| ["--force", "--local", "--repo", "--unset"].contains(a);
-        let plain: Vec<&&str> = args[1..].iter().filter(|a| !known(a)).collect();
-        assert!(
-            !plain.is_empty() && plain.iter().all(|a| !a.starts_with('-')),
-            "{file}: cannot parse hinted command `{cmd}`"
-        );
+        let args: Vec<String> = cmd
+            .split_whitespace()
+            .skip(2)
+            .map(|a| a.trim_matches('"').to_string())
+            .collect();
         let out = common::cplt_cmd()
-            .args(["config"])
+            .arg("config")
             .args(&args)
             .env("HOME", home.path())
             .env("CPLT_CONFIG", home.path().join("cplt-cfg/config.toml"))
@@ -12428,14 +12565,17 @@ fn every_hinted_config_command_pastes_and_works() {
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
-        if !out.status.success() {
+        if !out.status.success() || args.len() < 2 {
             refused.push(format!(
-                "{file}: hinted `{cmd}` is refused: {}",
+                "{file}: {cmd:?} is refused (or is a template missing from TEMPLATES): {}",
                 String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
             ));
         }
         checked += 1;
     }
     assert!(refused.is_empty(), "{}", refused.join("\n"));
-    assert!(checked >= 10, "only {checked} hinted commands checked");
+    assert!(checked >= 20, "only {checked} hinted commands checked");
 }

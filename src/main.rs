@@ -8488,7 +8488,7 @@ fn assemble_sandbox(
     {
         ui::warn(
             "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
-             login. Unlock the keyring at login, or run `cplt config set gh_guard.inject_token true --force`",
+             login. Unlock the keyring at login, or run `cplt config set gh_guard.inject_token true --force` (weakens the sandbox)",
         );
     }
     let env_token = active_agent

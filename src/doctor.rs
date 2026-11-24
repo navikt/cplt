@@ -1397,7 +1397,7 @@ pub fn refuse_unenforced_nudge(
              refuse the launch instead.",
             Some(
                 "cplt config set sandbox.refuse_unenforced true, or \
-                 `cplt config set sandbox.refuse_unenforced false` to keep the warning and \
+                 `cplt config set sandbox.refuse_unenforced false` (weakens the sandbox) to keep the warning and \
                  silence this"
                     .to_string(),
             ),
@@ -1422,7 +1422,7 @@ pub fn copilot_persistence_nudge(
              approvals skip prompts there. New configs deny both (see SECURITY.md).",
             Some(
                 "cplt config set sandbox.allow_copilot_host_persistence false, or \
-                 `cplt config set --force sandbox.allow_copilot_host_persistence true` to \
+                 `cplt config set --force sandbox.allow_copilot_host_persistence true` (weakens the sandbox) to \
                  keep them writable and silence this"
                     .to_string(),
             ),
