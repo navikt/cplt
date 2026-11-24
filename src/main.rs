@@ -8150,8 +8150,30 @@ fn assemble_sandbox(
         for r in &found.rejected {
             ui::warn(&r.line());
         }
+        let log = cplt::mcp_broker::Log {
+            level: resolved.proxy_log_level,
+            file: resolved.proxy_log_file.clone(),
+        };
         if found.specs.is_empty() {
-            return None;
+            // #1091: with no specs, macOS still runs the broker for its host
+            // opener alone, so OAuth links (an MCP gateway, `gh auth login
+            // --web`) reach the browser without `lsopen`. Not with
+            // `--allow-browser`, where the agent's own `open` already works
+            // for every host, nor with `sandbox.mcp_broker = false`.
+            if !cplt::mcp_broker::OPEN_URL_HOST_OPENER
+                || !resolved.mcp_broker
+                || resolved.allow_browser
+                || cplt::mcp_broker::opener_config_writable(&policy, home_dir).is_some()
+            {
+                return None;
+            }
+            return cplt::mcp_broker::Broker::start(
+                Vec::new(),
+                home_dir,
+                log,
+                &resolved.allow_private_domains,
+            )
+            .ok();
         }
         let mut refused = sandbox::mcp_broker_refusal(&sandbox_config);
         // A launch, not `--print-profile`: offer the host fix, then judge again.
@@ -8177,13 +8199,14 @@ fn assemble_sandbox(
             ));
             return None;
         }
-        let log = cplt::mcp_broker::Log {
-            level: resolved.proxy_log_level,
-            file: resolved.proxy_log_file.clone(),
-        };
-        let broker = cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
-            .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
-            .ok()?;
+        let broker = cplt::mcp_broker::Broker::start(
+            found.specs,
+            home_dir,
+            log,
+            &resolved.allow_private_domains,
+        )
+        .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
+        .ok()?;
         if cplt::mcp_broker::OPEN_URL_HOST_OPENER
             && broker.open_url_enabled()
             && let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir)

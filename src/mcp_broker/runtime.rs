@@ -292,15 +292,27 @@ fn refuse_oauth_remotes_unless_claimed(specs: Vec<Spec>, claimed: bool) -> Vec<S
 }
 
 impl Shared {
+    /// macOS serves the op in every broker session (#1091), so a refused
+    /// host gets the fix line instead of a silent failure. Linux has no host
+    /// opener; its shim only prints, and only takes over when some host is
+    /// allowed, so `xdg-open` keeps working as before otherwise.
     fn open_url_enabled(&self) -> bool {
-        !self.open_hosts.is_empty() && !self.open_off.load(Ordering::Acquire)
+        (super::open_url::HOST_OPENER || !self.open_hosts.is_empty())
+            && !self.open_off.load(Ordering::Acquire)
     }
 }
 
 impl Broker {
     /// Bind the socket and serve `specs`. The child's egress goes through the
     /// proxy on `proxy_port`, whose allowlist already holds the specs' hosts.
-    pub fn start(specs: Vec<Spec>, home: &Path, log: Log) -> Result<Self, String> {
+    /// `open_domains`: the session's `proxy.allow_private_domains`, which
+    /// `open_url` may open with their subdomains (#1091).
+    pub fn start(
+        specs: Vec<Spec>,
+        home: &Path,
+        log: Log,
+        open_domains: &[String],
+    ) -> Result<Self, String> {
         // No brokered mechanism uses OAuth yet (#1017): reserve the callback port
         // only once one does, so existing sessions keep binding freely.
         let oauth_guard =
@@ -362,7 +374,8 @@ impl Broker {
             };
             servers.insert(server.spec.id.clone(), server);
         }
-        let open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
+        let mut open_hosts = super::open_url::allowed_hosts(servers.values().map(|s| &s.spec));
+        open_hosts.extend(super::open_url::private_domain_entries(open_domains));
         // A crashed broker's children left their temp dirs behind (#1072).
         #[cfg(target_os = "macos")]
         sweep_child_temp_dirs(home);
@@ -2472,13 +2485,38 @@ mod tests {
                 level: crate::proxy::ProxyLogLevel::None,
                 file: None,
             },
+            &[],
         )
         .unwrap()
     }
 
-    /// #910: no oauth-remote spec, no `open_url`: the op line is answered
-    /// as an unknown id and the launcher installs no shims.
+    /// #1091: on macOS every broker serves `open_url`; a host outside
+    /// `allow_private_domains` is refused with the fix, and nothing opens.
     #[test]
+    #[cfg(target_os = "macos")]
+    fn open_url_refuses_an_unlisted_host_with_the_fix() {
+        let b = cat_broker();
+        assert!(b.open_url_enabled());
+        let mut s = UnixStream::connect(b.socket()).unwrap();
+        write!(
+            s,
+            "{}\nhttps://evil.example/\n",
+            super::super::open_url::OP_LINE
+        )
+        .unwrap();
+        let mut answer = String::new();
+        BufReader::new(s).read_line(&mut answer).unwrap();
+        assert!(
+            answer.contains("cplt config set proxy.allow_private_domains evil.example"),
+            "{answer}"
+        );
+    }
+
+    /// #910: no oauth-remote spec and no private domain: on Linux the op line
+    /// is answered as an unknown id and the launcher installs no shims. On
+    /// macOS the op is served (#1091) and refuses the host.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
     fn open_url_is_off_without_an_oauth_spec() {
         let b = cat_broker();
         assert!(!b.open_url_enabled());
@@ -2765,6 +2803,7 @@ mod tests {
                 level: crate::proxy::ProxyLogLevel::None,
                 file: None,
             },
+            &[],
         )
         .unwrap()
     }

@@ -786,6 +786,21 @@ note that it runs without elevated privileges; `/bin/ps` there usually has no
 such bit and is plain ALLOWED
 ([#620](https://github.com/navikt/cplt/issues/620)).
 
+## Browser login from inside the sandbox (OAuth)
+
+On macOS, cplt opens a login link in your browser when a tool inside the sandbox asks for it (`open <url>`, `$BROWSER`, `gh auth login --web`, a remote MCP server's OAuth flow). It opens only `https://` links whose host is in `proxy.allow_private_domains`, or a subdomain of one. Any other link is refused with the line to fix it:
+
+```bash
+cplt config set proxy.allow_private_domains intern.dev.nav.no
+```
+
+Only the first link needs to be allowed, the authorize URL of the MCP gateway. The redirect to your identity provider (such as `login.microsoftonline.com`) happens in the browser, so you never allow the identity provider's host. The browser then calls the tool's loopback listener (`http://127.0.0.1:<port>/` or `http://localhost:<port>/`) inside the sandbox; that works on macOS and on Linux.
+
+- At most 3 links a minute are opened.
+- Off with `sandbox.mcp_broker = false`, and not needed with `allow_browser`.
+- Linux has no host opener: the link is printed for you to open, and only during an MCP OAuth flow.
+- Known gap: with `proxy.netns` on (Linux), the browser's callback cannot reach the tool inside the sandbox's network namespace, so the login does not complete.
+
 ## Localhost blocking
 
 Localhost outbound is blocked by default on macOS, so sandboxed processes cannot connect to local services. On Linux, Landlock rules are port numbers only and cannot pin to localhost, so a local service on an allowed port is reachable; use `--with-proxy` for SSRF protection, and see [Linux limitations](../SECURITY.md#linux-specific-limitations).

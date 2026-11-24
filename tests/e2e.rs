@@ -12597,6 +12597,65 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             );
         }
     }
+    /// #1091: a sandboxed `open <https url>` reaches the host opener through
+    /// the broker for a host under `allow_private_domains`, with no MCP spec,
+    /// and is refused with the fix line for any other host.
+    #[test]
+    fn e2e_open_url_reaches_host_opener_only_for_private_domains() {
+        if !sandbox_usable() {
+            return;
+        }
+        let work = home_temp_dir("open-url");
+        let project = work.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let record = work.path().join("opened");
+        let opener = work.path().join("fake-open");
+        std::fs::write(
+            &opener,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--allow-private-domain",
+                "intern.example",
+                "--project-dir",
+                &project.to_string_lossy(),
+                "--",
+                "-c",
+                "open 'https://gw.intern.example/authorize?a=1&b=2'; echo rc=$?; \
+                 open https://evil.example/x; echo rc=$?",
+            ])
+            .env("CPLT_TEST_OPENER", &opener)
+            .output()
+            .expect("binary should run");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(out.contains("rc=0\nrc=1"), "stdout: {out}\nstderr: {err}");
+        assert!(
+            err.contains("cplt config set proxy.allow_private_domains evil.example"),
+            "stderr: {err}"
+        );
+        // The opener runs detached; give it a moment to write.
+        for _ in 0..50 {
+            if record.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let opened = std::fs::read_to_string(&record).unwrap_or_default();
+        assert_eq!(opened, "https://gw.intern.example/authorize?a=1&b=2\n");
+    }
 }
 
 /// #728 One stub per agent, end to end through the real sandbox. The stub

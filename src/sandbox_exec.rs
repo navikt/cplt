@@ -1330,6 +1330,16 @@ fn install_open_url_shims(cmd: &mut Command, sandbox: &crate::sandbox::PreparedS
             return;
         }
     }
+    // gh reads GH_BROWSER then BROWSER, Python's webbrowser reads BROWSER;
+    // point them at the shim unless the session already set them (#1091).
+    if let Some(shim) = crate::mcp_broker::OPEN_URL_SHIMS.first() {
+        let shim = dir.join(shim);
+        for key in ["BROWSER", "GH_BROWSER"] {
+            if !cmd.get_envs().any(|(k, _)| k == key) {
+                cmd.env(key, &shim);
+            }
+        }
+    }
     prepend_path(cmd, &[&dir]);
 }
 

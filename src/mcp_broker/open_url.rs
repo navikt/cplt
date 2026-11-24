@@ -118,11 +118,53 @@ pub(crate) fn check(url: &str, hosts: &[String]) -> Result<(), &'static str> {
         Some(_) => return Err("port other than 443"),
     };
     let host = host.to_ascii_lowercase();
-    if hosts.contains(&host) {
+    // An entry with a leading `.` is an `allow_private_domains` domain: the
+    // proxy's own matcher (the domain and its subdomains, not siblings).
+    let allowed = hosts.iter().any(|h| match h.strip_prefix('.') {
+        Some(d) => crate::proxy::is_domain_match(&host, &[d.to_string()]),
+        None => *h == host,
+    });
+    if allowed {
         Ok(())
     } else {
-        Err("host not allowed")
+        Err(HOST_NOT_ALLOWED)
     }
+}
+
+const HOST_NOT_ALLOWED: &str = "host not allowed";
+
+/// `proxy.allow_private_domains` as [`check`] entries (#1091). The session's
+/// effective list, managed layer included, already normalised and stripped of
+/// IP entries by config resolution.
+#[must_use]
+pub fn private_domain_entries(domains: &[String]) -> Vec<String> {
+    domains
+        .iter()
+        .map(|d| crate::proxy::normalize_hostname(d))
+        .filter(|d| !d.is_empty())
+        .map(|d| format!(".{d}"))
+        .collect()
+}
+
+/// The answer for a refused URL: for a host outside the list, name it and
+/// the one-line fix.
+fn refusal(url: &str, why: &str) -> String {
+    match host_of(url).filter(|_| why == HOST_NOT_ALLOWED) {
+        Some(h) => {
+            format!(
+                "denied: {h} is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains {h}"
+            )
+        }
+        None => format!("denied: {why}"),
+    }
+}
+
+/// The lowercased host of a URL that passed [`check`]'s shape rules.
+fn host_of(url: &str) -> Option<String> {
+    url.strip_prefix("https://")
+        .and_then(|r| r.split(['/', '?', '#']).next())
+        .and_then(|a| a.split(':').next())
+        .map(str::to_ascii_lowercase)
 }
 
 /// macOS only (owner decision 2026-11-17): LaunchServices picks the handler
@@ -265,6 +307,12 @@ fn collect_links(
 
 /// The host opener: `/usr/bin/open` on macOS, none elsewhere.
 fn opener(macos: bool) -> Option<PathBuf> {
+    // Debug builds only, for the e2e suite: a fake opener from the parent's
+    // own environment (the user's, never the agent's). Release ignores it.
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os("CPLT_TEST_OPENER").filter(|_| macos) {
+        return Some(p.into());
+    }
     macos.then(|| "/usr/bin/open".into())
 }
 
@@ -282,12 +330,15 @@ pub(crate) fn serve(
     };
     let answer = match check(&url, hosts).and_then(|()| limiter.take(Instant::now())) {
         Err(why) => {
-            log.line("open_url", &format!("DENIED {why}"));
-            format!("denied: {why}")
+            let host = host_of(&url).unwrap_or_default();
+            log.line("open_url", &format!("DENIED {host} {why}"));
+            refusal(&url, why)
         }
         Ok(busy) => match opener(HOST_OPENER).map(|o| spawn_opener(&o, &url, home, busy)) {
             Some(Ok(())) => {
-                log.line("open_url", "ALLOWED");
+                // The host only: the query carries OAuth state and PKCE.
+                let host = host_of(&url).unwrap_or_default();
+                log.line("open_url", &format!("ALLOWED {host}"));
                 "ok".to_string()
             }
             Some(Err(e)) => {
@@ -505,6 +556,56 @@ mod tests {
         ] {
             assert_eq!(check(u, &hosts()), Err(why), "{u:?}");
         }
+    }
+
+    /// #1091: `allow_private_domains` entries match the host and its
+    /// subdomains, as the proxy does, and nothing else.
+    #[test]
+    fn private_domains_allow_host_and_subdomains_only() {
+        let d = private_domain_entries(&["Intern.Dev.Nav.No.".into(), String::new()]);
+        assert_eq!(d, vec![".intern.dev.nav.no".to_string()]);
+        for u in [
+            "https://intern.dev.nav.no/",
+            "https://fleet-gateway.intern.dev.nav.no/authorize?x=1",
+            "https://A.B.INTERN.DEV.NAV.NO:443/",
+        ] {
+            assert_eq!(check(u, &d), Ok(()), "{u}");
+        }
+        for (u, why) in [
+            ("https://evilintern.dev.nav.no/", HOST_NOT_ALLOWED),
+            ("https://dev.nav.no/", HOST_NOT_ALLOWED),
+            ("https://intern.dev.nav.no.evil/", HOST_NOT_ALLOWED),
+            ("https://xn--intrn-dev-nav-no/", HOST_NOT_ALLOWED),
+            (
+                "http://fleet-gateway.intern.dev.nav.no/",
+                "URL must be https",
+            ),
+            ("javascript://intern.dev.nav.no/", "URL must be https"),
+            ("https://u@intern.dev.nav.no/", "userinfo in URL"),
+            (
+                "https://int\u{e9}rn.dev.nav.no/",
+                "URL must be printable ASCII",
+            ),
+            ("https://x.intern%2edev.nav.no/", "percent-encoded host"),
+            (
+                "https://intern.dev.nav.no/\u{1b}[2J",
+                "URL must be printable ASCII",
+            ),
+        ] {
+            assert_eq!(check(u, &d), Err(why), "{u:?}");
+        }
+    }
+
+    #[test]
+    fn refusal_names_the_host_and_the_fix() {
+        assert_eq!(
+            refusal("https://Gh.Example:443/login?x", HOST_NOT_ALLOWED),
+            "denied: gh.example is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains gh.example"
+        );
+        assert_eq!(
+            refusal("http://x/", "URL must be https"),
+            "denied: URL must be https"
+        );
     }
 
     #[test]
@@ -1011,7 +1112,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "denied: host not allowed\n"
+            "denied: evil.example is not allowed to open in the host browser. To allow it: cplt config set proxy.allow_private_domains evil.example\n"
         );
     }
 }
