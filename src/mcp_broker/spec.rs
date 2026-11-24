@@ -208,7 +208,8 @@ pub fn file_name(id: &str) -> String {
     format!("{}.json", id.replace('/', "__"))
 }
 
-fn remote_gate_enabled() -> bool {
+/// The `CPLT_MCP_REMOTE` gate (#909).
+pub fn remote_gate_enabled() -> bool {
     if std::env::var(REMOTE_GATE_ENV).as_deref() == Ok("1") {
         return true;
     }
@@ -681,49 +682,77 @@ pub struct Detected {
     pub rejected: Vec<Rejected>,
     /// Skipped by `--no-mcp-broker`.
     pub disabled: Vec<String>,
-    /// A gh-token remote was among `disabled`: GitHub MCP is off (#909).
-    pub remote_disabled: bool,
+    /// A gh-token remote was disabled: (spec, why, fix). GitHub MCP falls
+    /// back to the built-in endpoint, with a warning (#1115).
+    pub remote_disabled: Option<(String, String, String)>,
     /// A spec that declares (or may declare) a gh-token remote was refused at
-    /// load: its line. GitHub MCP is then off, never the built-in endpoint,
-    /// which would serve the token without that spec's `tools.allow` (#909).
+    /// load. GitHub MCP falls back to the built-in endpoint, which serves the
+    /// token without that spec's `tools.allow`, and says so loudly (#1115).
     pub remote_refused: Option<Rejected>,
 }
 
 impl Detected {
+    /// `sandbox.mcp_broker = false` (#1115 item 1): keep only the gh-token
+    /// spec's presence, so GitHub MCP warns that the spec is not applied.
+    pub fn broker_off(&mut self) {
+        let off = std::mem::take(&mut self.remotes);
+        if let Some(s) = off.first() {
+            self.remote_disabled = Some((
+                s.id.clone(),
+                "sandbox.mcp_broker = false".into(),
+                "set sandbox.mcp_broker = true".into(),
+            ));
+        }
+        self.disabled.extend(off.into_iter().map(|s| s.id));
+    }
+
     /// The GitHub MCP toggles (`sandbox.github_mcp_proxy = false`,
     /// `--no-github-mcp-proxy`) alias the remote specs' `disabled[]` ids.
     pub fn disable_remotes(&mut self) {
         let off = std::mem::take(&mut self.remotes);
-        self.remote_disabled |= !off.is_empty();
+        if let Some(s) = off.first() {
+            self.remote_disabled = Some((
+                s.id.clone(),
+                "the GitHub MCP proxy is off".into(),
+                "drop --no-github-mcp-proxy / sandbox.github_mcp_proxy = false".into(),
+            ));
+        }
         self.disabled.extend(off.into_iter().map(|s| s.id));
     }
 }
 
+const UNREADABLE_DIR: &str = "cannot read the spec dir";
+
 /// The gh-token spec this launch's GitHub MCP serves (#909). `Ok(None)`: no
-/// spec, so the built-in endpoint serves. `Err(line)`: a spec exists but
-/// cannot serve, so GitHub MCP is off. Disabled means off: never a fallback
-/// to the built-in endpoint, which would serve the token without the spec's
-/// `tools.allow`.
+/// spec. `Err(why)`: a spec exists but cannot serve; `why` is one short line
+/// (what, reason, fix) with no claim about who serves instead (#1115).
 pub fn github_spec(
     found: &Detected,
     home: &Path,
     writable: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<Option<Spec>, String> {
-    const OFF: &str = "GitHub MCP is off for this session";
+    let e = |s: &str| s.escape_debug().to_string();
+    let unusable = |file: &str, reason: &str, fix: &str| {
+        // An unreadable spec dir is refused under the dir's path.
+        let what = if reason.starts_with(UNREADABLE_DIR) {
+            format!("a gh-token spec in {}", e(file))
+        } else {
+            format!("the gh-token spec {}", e(file))
+        };
+        format!("{what} is not used ({}); fix: {}", e(reason), e(fix))
+    };
     if let Some(r) = &found.remote_refused {
-        return Err(format!("{OFF}: {}", r.line()));
+        return Err(unusable(&r.file, &r.reason, &r.fix));
     }
-    if found.remote_disabled {
-        return Err(format!(
-            "{OFF}: its gh-token spec is disabled. Drop --no-mcp-broker <id> \
-             (and --no-github-mcp-proxy / sandbox.github_mcp_proxy = false) to turn it on."
-        ));
+    if let Some((id, why, fix)) = &found.remote_disabled {
+        return Err(unusable(id, why, fix));
     }
     if found.remotes.len() > 1 {
         let ids: Vec<&str> = found.remotes.iter().map(|s| s.id.as_str()).collect();
-        return Err(format!(
-            "{OFF}: more than one gh-token spec ({}) is ambiguous. Remove all but one.",
-            ids.join(", ")
+        return Err(unusable(
+            &ids.join(", "),
+            "more than one gh-token spec is ambiguous",
+            "remove all but one",
         ));
     }
     let mut f = Detected {
@@ -732,9 +761,39 @@ pub fn github_spec(
     };
     drop_writable(&mut f, home, writable);
     if let Some(r) = f.rejected.first() {
-        return Err(format!("{OFF}: {}", r.line()));
+        return Err(unusable(&r.file, &r.reason, &r.fix));
     }
     Ok(f.remotes.pop())
+}
+
+/// The launch line for an unusable spec. Only `served` (the built-in
+/// endpoint was actually installed) may claim the fallback (#1115).
+pub fn unusable_line(why: &str, served: bool) -> String {
+    if served {
+        format!(
+            "GitHub MCP is served by the built-in endpoint without the spec's restrictions \
+             (tools.allow is NOT applied; read-only and lockdown are still forced): {why}"
+        )
+    } else {
+        format!("GitHub MCP: {why}")
+    }
+}
+
+/// GitHub MCP for a launch: `serve` installs the endpoint (with the spec when
+/// usable) and says whether it did; an unusable spec gets one `warn` line.
+pub fn launch_github(
+    found: &Detected,
+    home: &Path,
+    writable: impl Fn(&Path) -> Option<PathBuf>,
+    serve: impl FnOnce(Option<&Spec>) -> bool,
+    mut warn: impl FnMut(&str),
+) -> bool {
+    let spec = github_spec(found, home, writable);
+    let served = serve(spec.as_ref().ok().and_then(Option::as_ref));
+    if let Err(why) = &spec {
+        warn(&unusable_line(why, served));
+    }
+    served
 }
 
 /// Load every spec in `dir`. A file in `writable` (a tree the sandbox can
@@ -763,8 +822,21 @@ pub(crate) fn load_with_gate(
     oauth_gate: bool,
 ) -> Detected {
     let mut out = Detected::default();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Only a missing dir means no specs (#1115 item 3): an unreadable one
+        // may hide a gh-token spec, so GitHub MCP warns.
+        Err(e) if oauth_gate && e.kind() != std::io::ErrorKind::NotFound => {
+            let r = Rejected {
+                file: dir.display().to_string(),
+                reason: format!("{UNREADABLE_DIR} ({e})"),
+                fix: format!("make {} readable, or remove it", dir.display()),
+            };
+            out.remote_refused = Some(r.clone());
+            out.rejected.push(r);
+            return out;
+        }
+        Err(_) => return out,
     };
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let real_dir = canon(dir);
@@ -843,7 +915,13 @@ pub(crate) fn load_with_gate(
         };
         match result {
             Ok(spec) if disabled.contains(&spec.id) => {
-                out.remote_disabled |= spec.remote.is_some();
+                if spec.remote.is_some() && out.remote_disabled.is_none() {
+                    out.remote_disabled = Some((
+                        spec.id.clone(),
+                        "skipped by --no-mcp-broker".into(),
+                        format!("drop --no-mcp-broker {}", spec.id),
+                    ));
+                }
                 out.disabled.push(spec.id);
             }
             Ok(spec) if !seen.insert(spec.id.clone()) => {}
@@ -1393,6 +1471,144 @@ pub(crate) mod tests {
             true,
         );
         github_spec(&found, dir.path(), |_| None)
+    }
+
+    /// #1115: every way a gh-token spec cannot serve falls back to the
+    /// built-in endpoint with one warning naming the spec, the reason, the
+    /// unapplied restrictions and the fix.
+    #[test]
+    fn unusable_gh_spec_falls_back_loudly_once() {
+        let check = |found: &Detected, file: &str, why: &str| {
+            for served in [true, false] {
+                let mut lines = Vec::new();
+                let mut got = Some(None);
+                launch_github(
+                    found,
+                    Path::new("/nohome"),
+                    |_| None,
+                    |s| {
+                        got = Some(s.cloned());
+                        served
+                    },
+                    |l| lines.push(l.to_string()),
+                );
+                assert!(got.unwrap().is_none());
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                let l = &lines[0];
+                for want in [file, why, "fix: "] {
+                    assert!(l.contains(want), "{want} missing: {l}");
+                }
+                // Only a served launch claims the built-in fallback.
+                for claim in ["built-in endpoint", "NOT applied", "tools.allow"] {
+                    assert_eq!(l.contains(claim), served, "{claim}: {l}");
+                }
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), gh_root().to_string()).unwrap();
+        let res = |n: &str| Some(PathBuf::from("/opt/homebrew/bin").join(n));
+        let id = FILE.trim_end_matches(".json").replace("__", "/");
+        // Refused at load.
+        let w = [dir.path().to_path_buf()];
+        check(
+            &load_with_gate(dir.path(), &w, &[], res, true),
+            FILE,
+            "writable in the sandbox",
+        );
+        // Disabled by --no-mcp-broker.
+        let d = load_with_gate(dir.path(), &[], std::slice::from_ref(&id), res, true);
+        check(&d, &id, "--no-mcp-broker");
+        // Broker off (sandbox.mcp_broker = false).
+        let mut b = load_with_gate(dir.path(), &[], &[], res, true);
+        b.broker_off();
+        assert!(b.remotes.is_empty());
+        check(&b, &id, "sandbox.mcp_broker = false");
+        // The GitHub MCP toggle.
+        let mut t = load_with_gate(dir.path(), &[], &[], res, true);
+        t.disable_remotes();
+        check(&t, &id, "proxy is off");
+        // Ambiguous.
+        let mut a = load_with_gate(dir.path(), &[], &[], res, true);
+        a.remotes.push(a.remotes[0].clone());
+        check(&a, &id, "ambiguous");
+        // Refused by the final policy.
+        let ok = load_with_gate(dir.path(), &[], &[], res, true);
+        let mut lines = 0;
+        let mut got = Some(None);
+        launch_github(
+            &ok,
+            dir.path(),
+            |_| Some(dir.path().into()),
+            |s| {
+                got = Some(s.cloned());
+                true
+            },
+            |_| lines += 1,
+        );
+        assert!(got.unwrap().is_none() && lines == 1);
+        // Invalid.
+        let mut bad = gh_root();
+        bad["_meta"][META_KEY]["tools"]["alow"] = json!(["get_me"]);
+        std::fs::write(dir.path().join(FILE), bad.to_string()).unwrap();
+        check(
+            &load_with_gate(dir.path(), &[], &[], res, true),
+            FILE,
+            "alow",
+        );
+        // A usable spec: no warning.
+        std::fs::write(dir.path().join(FILE), gh_root().to_string()).unwrap();
+        let ok = load_with_gate(dir.path(), &[], &[], res, true);
+        let mut got = None;
+        launch_github(
+            &ok,
+            dir.path(),
+            |_| None,
+            |s| {
+                got = s.cloned();
+                true
+            },
+            |l| panic!("{l}"),
+        );
+        assert!(got.is_some());
+    }
+
+    /// #1115 item 3: an unreadable spec dir warns; a missing one, or the
+    /// gate off, does not.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_spec_dir_falls_back_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let res = |_: &str| None;
+        let missing = dir.path().join("none");
+        assert!(
+            github_spec(
+                &load_with_gate(&missing, &[], &[], res, true),
+                dir.path(),
+                |_| None
+            )
+            .unwrap()
+            .is_none()
+        );
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            return; // root reads it anyway
+        }
+        let off = load_with_gate(&locked, &[], &[], res, false);
+        assert!(off.remote_refused.is_none() && off.rejected.is_empty());
+        let e = github_spec(
+            &load_with_gate(&locked, &[], &[], res, true),
+            dir.path(),
+            |_| None,
+        )
+        .unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            e.contains("cannot read the spec dir") && e.starts_with("a gh-token spec in "),
+            "{e}"
+        );
     }
 
     #[test]
