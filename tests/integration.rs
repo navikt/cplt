@@ -5019,6 +5019,9 @@ int main(int argc, char **argv) {
             ".m2/repository",
             ".yarn/bin",
             ".yarn/berry",
+            ".npm/_cacache",
+            ".npm/_logs",
+            ".npm/_npx",
         ] {
             fs::create_dir_all(home.join(d)).unwrap();
         }
@@ -5040,6 +5043,10 @@ int main(int argc, char **argv) {
             (".gradle/wrapper/x", true),
             (".m2/repository/x", true),
             (".yarn/berry/x", true),
+            (".npm/_update-notifier-last-checked", false),
+            (".npm/_cacache/x", true),
+            (".npm/_logs/x", true),
+            (".npm/_npx/x", true),
         ] {
             let cmd = format!("echo x > '{}' 2>&1; echo EXIT:$?", home.join(rel).display());
             let (out, _) = run_sandboxed(&profile, &cmd);
@@ -5048,6 +5055,70 @@ int main(int argc, char **argv) {
             }
         }
         fs::remove_file(&profile).ok();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// `sandbox.readonly_host_tool_paths`: wrapper distributions, Kotlin/Native
+    /// toolchains and the overlay subtrees (pre-commit envs, .NET global
+    /// tools, NuGet config and plugins) are write-denied, while the caches
+    /// next to them stay writable. With the key off they are all writable.
+    #[test]
+    fn real_profile_readonly_host_tool_paths_key() {
+        require_sandbox!();
+        let mk = |prefix| {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .unwrap()
+        };
+        let (project_dir, home_dir) = (mk(".cplt-rohost-project-"), mk(".cplt-rohost-home-"));
+        let project = fs::canonicalize(project_dir.path()).unwrap();
+        let home = fs::canonicalize(home_dir.path()).unwrap();
+        let keyed = [
+            ".gradle/wrapper/x",
+            ".m2/wrapper/x",
+            ".konan/x",
+            ".cache/pre-commit/x",
+            ".dotnet/tools/x",
+            ".nuget/NuGet/NuGet.Config",
+            ".nuget/plugins/x",
+        ];
+        let open = [
+            ".gradle/caches/x",
+            ".cache/pip/x",
+            ".dotnet/x.dotnetFirstUseSentinel",
+            ".nuget/packages/x",
+            ".npm/_npx/x",
+        ];
+        for rel in keyed.iter().chain(&open) {
+            fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
+        }
+        let mut failures = Vec::new();
+        for key in [false, true] {
+            let mut dirs: Vec<_> = cplt::sandbox::HOME_TOOL_DIRS
+                .iter()
+                .map(|d| d.resolve(&home, &[]))
+                .collect();
+            if key {
+                cplt::sandbox::apply_readonly_host_tool_paths(&mut dirs);
+            }
+            let mut opts = default_opts(&project, &home);
+            opts.existing_home_tool_dirs = Some(&dirs);
+            opts.readonly_host_tool_paths = key;
+            let profile = write_real_profile(&opts);
+            for (rel, want_ok) in keyed
+                .iter()
+                .map(|r| (r, !key))
+                .chain(open.iter().map(|r| (r, true)))
+            {
+                let cmd = format!("echo x > '{}' 2>&1; echo EXIT:$?", home.join(rel).display());
+                let (out, _) = run_sandboxed(&profile, &cmd);
+                if out.contains("EXIT:0") != want_ok {
+                    failures.push(format!("key={key} {rel}: want_ok={want_ok} out={out:?}"));
+                }
+            }
+            fs::remove_file(&profile).ok();
+        }
         assert!(failures.is_empty(), "{failures:?}");
     }
 
