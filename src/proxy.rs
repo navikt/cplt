@@ -1542,6 +1542,8 @@ impl DialFailure {
     }
 }
 
+/// Shown only in doctor's BLOCKING finding, never in the notice or 502 body:
+/// an agent can trigger those and would relay the flags.
 /// The flags that launch without the proxy when `proxy.forced` and
 /// `proxy.inject_github_token` are on (the generated default).
 pub const NO_PROXY_STOPGAP: &str = "--no-proxy --no-proxy-forced --no-inject-github-token";
@@ -1556,9 +1558,8 @@ pub fn dial_failure_hint(host: &str, class: DialFailure) -> String {
     );
     format!(
         "[cplt] the proxy could not reach {} ({}); this is not a cplt policy block. \
-         If requests keep failing, a local firewall (e.g. Little Snitch) may block {exe}: \
-         allow it, or run `cplt doctor`. As a stopgap, `{NO_PROXY_STOPGAP}` works, \
-         but it turns off proxy enforcement and GitHub token masking.",
+         If other hosts fail too, a local firewall (e.g. Little Snitch) may block {exe}: \
+         allow it there, then run `cplt doctor` to confirm.",
         host.escape_default(),
         class.label()
     )
@@ -1576,8 +1577,9 @@ pub fn set_dial_notice_quiet(quiet: bool) {
 const DIAL_NOTICE_CAP: usize = 3;
 
 /// Whether to print the notice for (`class`, `host`): once per pair, at most
-/// [`DIAL_NOTICE_CAP`] per session. Per pair, so an agent dialling one dead
-/// allowed host cannot use up the notice a later real failure needs.
+/// [`DIAL_NOTICE_CAP`] per session. Per pair, so one dead allowed host
+/// repeated cannot use up the notices; but up to three distinct dead allowed
+/// hosts can, and a later real failure then shows only in its 502 body.
 fn dial_notice_due(
     seen: &std::sync::Mutex<std::collections::HashSet<String>>,
     class: DialFailure,
@@ -1729,7 +1731,10 @@ pub fn probe_targets(policy: &NetPolicy) -> Result<Vec<String>, String> {
 /// [`dial_failure_hint`] without the advice to run doctor: the caller is
 /// doctor or check.
 fn probe_hint(host: &str, class: DialFailure) -> String {
-    dial_failure_hint(host, class).replace("allow it, or run `cplt doctor`.", "allow it.")
+    dial_failure_hint(host, class).replace(
+        "allow it there, then run `cplt doctor` to confirm.",
+        "allow it there.",
+    )
 }
 
 /// The upstream leg of [`probe_dial`]: dial the upstream, send the CONNECT the
@@ -6643,6 +6648,10 @@ mod tests {
         ] {
             assert!(hint.contains(needle), "{needle}: {hint}");
         }
+        assert!(
+            !hint.contains("--no-proxy"),
+            "the agent-visible hint must not name protection-disabling flags: {hint}"
+        );
         let exe = std::env::current_exe().unwrap().display().to_string();
         assert!(hint.contains(&exe.escape_default().to_string()), "{hint}");
 

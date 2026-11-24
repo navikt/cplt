@@ -263,6 +263,7 @@ mod tests {
         let output = cplt_cmd()
             .current_dir(project.path())
             .env("NO_COLOR", "1")
+            .env_remove("CPLT_TEST_SKIP_NET_PROBE")
             .args([
                 "--with-proxy",
                 "--proxy-upstream",
@@ -275,6 +276,11 @@ mod tests {
         assert!(!output.status.success(), "{out}");
         assert!(out.contains("the proxy could not reach 127.0.0.1"), "{out}");
         assert!(out.contains("blocking"), "{out}");
+        assert_eq!(
+            out.matches("--no-inject-github-token").count(),
+            1,
+            "doctor names the last-resort flags once: {out}"
+        );
     }
 
     #[test]

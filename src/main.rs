@@ -10087,8 +10087,12 @@ enum DoctorProbe {
     /// Every candidate failed at the network level: likely a local firewall.
     Blocked(String),
     /// Some candidate failed for another reason (did not resolve, upstream
-    /// status, refused after DNS), so a firewall is not established.
-    Inconclusive(String),
+    /// status, refused after DNS), so a firewall is not established. `net`
+    /// is the first network-level failure, if any: it is never hidden.
+    Inconclusive {
+        why: String,
+        net: Option<String>,
+    },
 }
 
 /// Try each host until one connects. BLOCKING only when every candidate
@@ -10113,8 +10117,11 @@ fn doctor_probe(
     }
     match (other, first_net) {
         (None, Some(hint)) => DoctorProbe::Blocked(hint),
-        (Some(why), _) => DoctorProbe::Inconclusive(why),
-        (None, None) => DoctorProbe::Inconclusive("no host to probe".to_string()),
+        (Some(why), net) => DoctorProbe::Inconclusive { why, net },
+        (None, None) => DoctorProbe::Inconclusive {
+            why: "no host to probe".to_string(),
+            net: None,
+        },
     }
 }
 
@@ -10394,7 +10401,10 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // network; a launch never runs this. A local firewall that has not seen
     // this binary path fails every CONNECT with a bare 502 otherwise.
     // A policy that fails to build is reported by the policy check below.
+    // Tests set CPLT_TEST_SKIP_NET_PROBE so doctor stays hermetic; release
+    // builds ignore it.
     if resolved.with_proxy
+        && !(cfg!(debug_assertions) && std::env::var_os("CPLT_TEST_SKIP_NET_PROBE").is_some())
         && let Ok(net) = build_net_policy(&resolved, active_agent)
     {
         match proxy::probe_targets(&net) {
@@ -10414,14 +10424,28 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                 DoctorProbe::Blocked(hint) => findings.push(Finding::blocking(
                     hint.trim_start_matches("[cplt] ").to_string(),
                     format!(
-                        "allow this cplt binary in the host firewall. As a stopgap, launch with `{}`: \
-                         it turns off proxy enforcement and GitHub token masking",
+                        "allow this cplt binary in the host firewall. Last resort for a session you \
+                         trust: `cplt {}` gives the agent direct, unfiltered network access and your \
+                         real GitHub token.",
                         proxy::NO_PROXY_STOPGAP
                     ),
                 )),
-                DoctorProbe::Inconclusive(why) => ok.push(format!(
-                    "proxy upstream: reachability inconclusive: {}",
-                    why.trim_start_matches("[cplt] ")
+                DoctorProbe::Inconclusive { why, net: Some(net) } => {
+                    findings.push(Finding::warning(
+                        format!(
+                            "proxy upstream: {} Another candidate failed for a different reason: {}",
+                            net.trim_start_matches("[cplt] "),
+                            why.trim_start_matches("[cplt] ")
+                        ),
+                        None,
+                    ));
+                }
+                DoctorProbe::Inconclusive { why, net: None } => findings.push(Finding::info(
+                    format!(
+                        "proxy upstream: reachability inconclusive: {}",
+                        why.trim_start_matches("[cplt] ")
+                    ),
+                    None,
                 )),
             },
         }
@@ -18095,12 +18119,24 @@ mod tests {
         let mixed = |h: &str| Err((format!("x {h}"), h == "a.example"));
         assert_eq!(
             doctor_probe(&hosts, mixed),
-            DoctorProbe::Inconclusive("x b.example".into()),
-            "an unresolvable candidate makes it a note, not BLOCKING"
+            DoctorProbe::Inconclusive {
+                why: "x b.example".into(),
+                net: Some("x a.example".into())
+            },
+            "a network-level failure next to an unresolvable candidate is kept, not hidden"
+        );
+        let unresolvable = |h: &str| Err((format!("x {h}"), false));
+        assert_eq!(
+            doctor_probe(&hosts, unresolvable),
+            DoctorProbe::Inconclusive {
+                why: "x a.example".into(),
+                net: None
+            },
+            "no network-level failure: inconclusive without a dial to name"
         );
         assert!(matches!(
             doctor_probe(&[], net),
-            DoctorProbe::Inconclusive(_)
+            DoctorProbe::Inconclusive { .. }
         ));
     }
 
@@ -18162,7 +18198,7 @@ mod tests {
             ],
             "existing fields may not be renamed or removed"
         );
-        for k in ["category", "decision", "name", "reason", "target"] {
+        for k in ["category", "decision", "name", "note", "reason", "target"] {
             assert!(item.contains(&k), "item field {k} missing: {item:?}");
         }
         assert!(v["enforcing"].is_boolean() && v["verified"].is_u64() && v["items"].is_array());
