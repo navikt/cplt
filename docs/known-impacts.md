@@ -521,6 +521,15 @@ Tools that compile then execute from `$TMPDIR` are **blocked by default**, becau
 
 **JVM note:** on macOS the JVM ignores `TMPDIR`. It reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which always returns `/var/folders/...`. So cplt injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch> -Djava.rmi.server.hostname=localhost -Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS`, which puts Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction on the scratch dir. The RMI hostname flag keeps the Kotlin daemon's Java RMI traffic on `localhost`. The `preferIPv4Stack` flag forces pure IPv4 sockets, because Java's dual-stack IPv6 sockets produce IPv4-mapped addresses that SBPL cannot match, which breaks the sandbox's localhost filtering. Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags. For inline mocking (MockK, Mockito, ByteBuddy), also add `--allow-jvm-attach`. See [JVM Attach API](#jvm-attach-api).
 
+**Gradle needs loopback.** The Gradle client, daemon and test workers talk over `127.0.0.1` on ports the OS picks at run time, even under `--no-daemon`. The default profile blocks loopback connects, so `gradle build`, `gradle test` and `./gradlew` fail with `Could not connect to the Gradle daemon` or `java.net.SocketException: Operation not permitted`. A fixed `allow.localhost` port cannot cover them, and neither Seatbelt nor Landlock can limit a connect to ports the sandbox itself listens on, so cplt grants nothing by default. When it sees `build.gradle(.kts)`, `settings.gradle(.kts)` or `gradlew` in the project, it prints the fix at launch. For a team, propose it in the committed `.cplt.toml`:
+
+```toml
+[propose]
+allow_localhost_any = true
+```
+
+For yourself, run `cplt config set sandbox.allow_localhost_any true`; for one run, pass `--allow-localhost-any`. This opens every loopback port, including local databases and dev servers; on Linux it also lifts the Landlock TCP connect filter. `proxy.forced` overrides it, so Gradle builds do not work under forced proxying.
+
 **Gradle/JVM still failing?** Some JVM native libraries, `libjli.dylib` and JNI libs among them, call `dlopen` on the system temp dir *before* `JAVA_TOOL_OPTIONS` takes effect. If you see "Operation not permitted" during JVM startup itself rather than during the Gradle build, add `--allow-tmp-exec`:
 
 ```bash
