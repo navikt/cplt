@@ -129,7 +129,7 @@ pub use policy::{
     TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, XDG_PINNED_MARKER,
     active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
     copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_ancestor_grant, cplt_state_dir,
-    cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
+    cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
     cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
     env_tool_dir_allowed, env_tool_dir_hint_ok, env_tool_path_protected, env_tool_temp_roots,
     exec_write_conflicts, first_party_read_target, grant_is_refused, home_config_link_targets,

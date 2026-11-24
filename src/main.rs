@@ -14230,36 +14230,39 @@ fn lapsed_approval_notice(stored: Option<&trust::TrustEntry>, lapsed: &[&str]) -
     }
 }
 
-/// The first proposed `allow.write` entry that is, contains or lies inside
-/// cplt's state dir (`$HOME`'s or the passwd home's), as a line, and whether
-/// it is refused (at or inside: no launch can honour it) or only warned (above).
+/// A proposed `allow.write` entry that is, contains or lies inside cplt's
+/// state dir (`$HOME`'s or the passwd home's), as a line, and whether it is
+/// refused (at or inside: no launch can honour it) or only warned (above).
+/// Every entry is checked for a refusal first, with the launch's own
+/// predicates (resolved, so a symlink alias counts), so a warned ancestor
+/// earlier in the list cannot hide a refused entry after it.
 fn state_dir_write_proposal(
     project_dir: &std::path::Path,
     writes: &[String],
 ) -> Option<(String, bool)> {
-    let states: Vec<PathBuf> = [
-        std::env::var_os("HOME").map(PathBuf::from),
-        config::account_home(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|h| h.join(".config/cplt"))
-    .collect();
-    writes.iter().find_map(|w| {
-        let path = project_dir.join(config::expand_tilde(w));
-        let state = states.iter().find(|s| sandbox::overlaps_state(&path, s))?;
-        // The state dir itself counts as inside, as at launch (`validate_grant_path`).
-        if path.starts_with(state) {
-            return Some((
-                format!(
-                    "allow.write entry {w:?} in .cplt.toml lies inside cplt's state \
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let paths: Vec<(&String, PathBuf)> = writes
+        .iter()
+        .map(|w| (w, project_dir.join(config::expand_tilde(w))))
+        .collect();
+    let refused = paths
+        .iter()
+        .find_map(|(w, p)| sandbox::cplt_state_dir_grant(&home, p).map(|state| (*w, state)));
+    if let Some((w, state)) = refused {
+        return Some((
+            format!(
+                "allow.write entry {w:?} in .cplt.toml lies inside cplt's state \
                      directory {}, so it cannot be approved. Approve the other keys by name \
                      (`cplt trust accept <key>`), or ask the repository to narrow that entry.",
-                    state.display()
-                ),
-                true,
-            ));
-        }
+                state.display()
+            ),
+            true,
+        ));
+    }
+    paths.iter().find_map(|(w, p)| {
+        let state = sandbox::cplt_state_ancestor_grant(&home, p)?;
         Some((
             format!(
                 "allow.write entry {w:?} in .cplt.toml covers cplt's state directory {}. \
@@ -16113,6 +16116,33 @@ mod tests {
                 assert_eq!(got, Some(refused), "{w}");
             }
             assert!(state_dir_write_proposal(p, &["build".into(), "~/.cache/x".into()]).is_none());
+            // Copilot OKcK: a warned ancestor first must not hide a refused entry.
+            let got = state_dir_write_proposal(
+                p,
+                &["~/.config".into(), "~/.config/cplt/managed.d".into()],
+            );
+            assert_eq!(
+                got.map(|(_, r)| r),
+                Some(true),
+                "a later entry inside the state dir must refuse"
+            );
+        });
+    }
+
+    /// Copilot OKcK: a symlink alias into the state dir is refused too.
+    #[test]
+    fn trust_accept_refuses_a_symlink_alias_into_the_state_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::create_dir_all(home.join(".config/cplt/managed.d")).unwrap();
+        std::os::unix::fs::symlink(home.join(".config/cplt"), home.join("alias")).unwrap();
+        temp_env::with_var("HOME", Some(&home), || {
+            let got = state_dir_write_proposal(&home, &["~/alias/managed.d".into()]);
+            assert_eq!(
+                got.map(|(_, r)| r),
+                Some(true),
+                "a symlink alias into the state dir must refuse"
+            );
         });
     }
     use clap::Parser;
