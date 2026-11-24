@@ -4897,6 +4897,7 @@ fn prepare_impl(
         worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        push_hint: None,
         open_url_hosts: Vec::new(),
         extra_env: Vec::new(),
         opencode_v2: false,
