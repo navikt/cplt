@@ -4984,34 +4984,75 @@ finally:
     }
 
     /// `pnpm/dlx` with `~/.cache/pnpm` a symlink: `~/.cache/pnpm` is also a
-    /// writable application directory, and a writable app root reached through
-    /// a symlink is not granted, so its target never becomes writable. The
-    /// dlx entry is then granted read+execute at the target, never write+execute.
+    /// writable application directory, never granted through a symlink, so
+    /// an explicit cache-exec entry below it stops the launch and nothing is
+    /// written at the link target.
     #[test]
     fn landlock_refuses_cache_exec_link_into_a_writable_tree() {
         require_landlock!();
         let project = create_test_project();
         let home = home_with_linked_caches(".cplt-cache-link-pnpm-", "pnpm");
         let target = home.path().join("elsewhere");
-        let script = format!(
-            "sh {t}/dlx/run.sh; touch {t}/dlx/planted && echo WROTE || echo NO_WRITE",
-            t = target.display()
-        );
-        let (_code, stdout, stderr) = run_sandboxed_home_with_flags(
+        let script = format!("touch {}/dlx/planted; echo LAUNCHED", target.display());
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
             project.path(),
             home.path(),
             &["--allow-cache-exec", "pnpm/dlx"],
             &script,
         );
         assert!(
-            stdout.contains("NO_WRITE") && !stdout.contains("WROTE"),
-            "the link target must not be writable — stdout: {stdout} stderr: {stderr}"
+            code != 0 && !stdout.contains("LAUNCHED"),
+            "stdout: {stdout} stderr: {stderr}"
         );
         assert!(
-            stderr.contains("a writable application directory is never granted through a symlink"),
+            stderr.contains("replace it with a real directory"),
             "stderr: {stderr}"
         );
         assert!(!target.join("dlx/planted").exists());
+    }
+
+    /// uv's data dir is read-only with its existing tools still executable,
+    /// and the uv cache stays writable.
+    fn assert_uv_data_read_only_cache_writable(bwrap_flag: &str) {
+        let project = create_test_project();
+        let home = home_outside_tmp(".cplt-uv-home-");
+        let data = home.path().join(".local/share/uv");
+        let cache = home.path().join(".cache/uv");
+        write_probe(&data.join("tools/t/bin/t"), "uv-tool-ran");
+        fs::create_dir_all(&cache).unwrap();
+        let script = format!(
+            "{d}/tools/t/bin/t; touch {d}/new && echo DATA_W || echo DATA_RO; \
+             touch {c}/new && echo CACHE_W || echo CACHE_RO",
+            d = data.display(),
+            c = cache.display()
+        );
+        let (_code, stdout, stderr) =
+            run_sandboxed_home_with_flags(project.path(), home.path(), &[bwrap_flag], &script);
+        assert!(
+            stdout.contains("uv-tool-ran"),
+            "{bwrap_flag}: {stdout} {stderr}"
+        );
+        assert!(
+            stdout.contains("DATA_RO"),
+            "{bwrap_flag}: {stdout} {stderr}"
+        );
+        assert!(
+            stdout.contains("CACHE_W"),
+            "{bwrap_flag}: {stdout} {stderr}"
+        );
+        assert!(!data.join("new").exists());
+    }
+
+    #[test]
+    fn landlock_uv_data_read_only_cache_writable() {
+        require_landlock!();
+        assert_uv_data_read_only_cache_writable("--no-bubblewrap");
+    }
+
+    #[test]
+    fn bwrap_uv_data_read_only_cache_writable() {
+        require_bwrap!();
+        assert_uv_data_read_only_cache_writable("--use-bubblewrap");
     }
 
     /// Whatever the key says, a link aimed at a tree cplt keeps from the agent

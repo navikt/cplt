@@ -994,13 +994,16 @@ fn validate_cache_exec_dirs(
             ));
         }
         if let Some(root) = policy::under_refused_app_root(config.home_dir, &named) {
-            crate::ui::warn(&format!(
-                "Not granting allow_cache_exec path {}: it is inside {}, which resolves \
-                 through a symlink and is not granted. Remove the link to use it.",
+            return Err(format!(
+                "allow_cache_exec path {} is inside {}, which resolves through a symlink to \
+                 {}. cplt never grants a writable application directory through a symlink, \
+                 so it cannot grant this entry either. If you made the link, replace it with \
+                 a real directory; otherwise remove it, or drop {} from allow_cache_exec.",
                 named.display(),
-                root.display()
+                root.display(),
+                crate::config::canonicalize_deepest(&root).display(),
+                named.strip_prefix(&cache_base).unwrap_or(&named).display()
             ));
-            continue;
         }
         if linked {
             if let Some(why) = cache_exec_target_refusal(config, rules(), &resolved, &actual_base) {
@@ -1146,7 +1149,13 @@ fn cache_exec_target_refusal(
         let path = canonicalize_deepest(&rule.path);
         let cache = in_cache(&rule.path, &path)
             && (target == cache_base || rule.access.write || rule.access.create_dirs);
-        if !rule.nofollow && !cache && overlaps(&path) {
+        // Only the cache-exec and Cypress rules are skipped; writable AppDir
+        // roots are `nofollow` too but are grants a target must not overlap.
+        let cache_exec_rule = rule.nofollow
+            && (rule.path.starts_with(&home_cache)
+                || rule.path
+                    == policy::cypress_app_data_dir_with_env(home, config.copilot_cache_env));
+        if !cache_exec_rule && !cache && overlaps(&path) {
             return Some(format!(
                 "it overlaps {}, which the sandbox already grants",
                 path.display()
@@ -6353,10 +6362,10 @@ mod tests {
     }
 
     /// An `allow_cache_exec` entry below a symlinked writable app root
-    /// (`~/.cache/pnpm -> elsewhere`) gets no grant: not in the launch grants,
-    /// not in the Landlock policy, and nothing at the link target.
+    /// (`~/.cache/pnpm -> elsewhere`) gets no Landlock rule and refuses the
+    /// launch, with or without `sandbox.refuse_cache_exec_links`.
     #[test]
-    fn cache_exec_under_a_refused_app_root_is_dropped() {
+    fn cache_exec_under_a_refused_app_root_is_refused() {
         crate::with_env_lock_no_xdg(|| {
             let (_guard, root) = copilot_cache_tree();
             let home = root.join("home");
@@ -6378,14 +6387,10 @@ mod tests {
                     && named.starts_with(&r.path)
                     && r.path != home.join(".cache"))));
             if cfg!(target_os = "linux") {
+                // An explicit entry is refused, never silently dropped.
                 let base = std::cell::OnceCell::from(lp);
-                let grants = validate_cache_exec_dirs(&config, &base).unwrap();
-                assert!(
-                    !grants
-                        .iter()
-                        .any(|(n, c)| *n == named || c.starts_with(&elsewhere)),
-                    "{grants:?}"
-                );
+                let err = validate_cache_exec_dirs(&config, &base).unwrap_err();
+                assert!(err.contains("replace it with a real directory"), "{err}");
 
                 // With sandbox.refuse_cache_exec_links set, the link still stops the launch.
                 config.refuse_cache_exec_links = true;

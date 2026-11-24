@@ -707,8 +707,17 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 // read permission mirrors SBPL: only paths in read_paths() get file-read*.
                 // A write-only path (not in read_paths) does not get read access.
                 let readable = read.contains(&path);
+                // A writable root names the canonical path just checked and is
+                // opened with RESOLVE_NO_SYMLINKS (inode-checked under bwrap),
+                // so a link swapped in after the check fails the launch
+                // instead of moving the write grant onto its target.
+                let (nofollow, path) = if writable {
+                    (true, crate::config::canonicalize_deepest(&path))
+                } else {
+                    (false, path)
+                };
                 fs_rules.push(FsRule {
-                    nofollow: false,
+                    nofollow,
                     path,
                     access: FsAccess {
                         read: readable,
@@ -3855,6 +3864,12 @@ mod tests {
                 .iter()
                 .filter(|rule| rule.nofollow)
                 .map(|rule| rule.path.clone())
+                // Writable AppDir roots are nofollow too; this test is about the rest.
+                .filter(|p| {
+                    !policy::app_dirs()
+                        .iter()
+                        .any(|d| d.write_paths(&home).contains(p))
+                })
                 .collect();
             paths.sort();
             paths
@@ -6143,6 +6158,29 @@ mod tests {
                 found,
                 "With existing_app_dirs=None, at least one mise app dir path should appear in policy"
             );
+        });
+    }
+
+    #[test]
+    fn uv_data_rule_is_read_exec_and_cache_rule_writable_nofollow() {
+        crate::with_env_lock_no_xdg(|| {
+            let home = PathBuf::from("/fake/user");
+            let project = home.join("project");
+            let config = test_config(&project, &home);
+            let policy = generate_policy(&config);
+            let rule = |p: &str| {
+                policy
+                    .fs_rules
+                    .iter()
+                    .find(|r| r.path == home.join(p))
+                    .unwrap_or_else(|| panic!("no rule for {p}"))
+            };
+            let data = rule(".local/share/uv");
+            assert!(data.access.read && data.access.execute && !data.access.write);
+            let cache = rule(".cache/uv");
+            assert!(cache.access.write);
+            // A swapped-in link after the check must fail the open, not move the grant.
+            assert!(cache.nofollow);
         });
     }
 

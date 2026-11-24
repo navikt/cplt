@@ -5908,6 +5908,49 @@ print("BROKE " + ",".join(broke) if broke else "HELD")
         );
     }
 
+    /// uv's data dir: existing tools run, writes fail. The uv cache stays
+    /// writable. The fake home sits under `target/`, since exec under the
+    /// temp dir is denied by design.
+    #[test]
+    fn real_profile_uv_data_read_only_cache_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        // Home and project are siblings: a home inside the project is writable.
+        let fake_home = root.join("home");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let uv = cplt::sandbox::app_dirs()
+            .iter()
+            .find(|d| d.application == "uv")
+            .unwrap();
+        let data = uv
+            .read_paths(&fake_home)
+            .into_iter()
+            .find(|p| p.ends_with("share/uv"))
+            .unwrap();
+        let cache = uv.write_paths(&fake_home)[0].clone();
+        let tool = data.join("tools/t/bin/t");
+        fs::create_dir_all(tool.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(&tool, "#!/bin/sh\necho uv-tool-ran\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = write_real_profile(&default_opts(&project, &fake_home));
+        let cmd = format!(
+            "'{t}'; echo x > '{d}/new' && echo DATA_W || echo DATA_RO; \
+             echo x > '{c}/new' && echo CACHE_W || echo CACHE_RO",
+            t = tool.display(),
+            d = data.display(),
+            c = cache.display()
+        );
+        let (out, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_file(&profile).ok();
+        assert!(out.contains("uv-tool-ran"), "{out}");
+        assert!(out.contains("DATA_RO"), "{out}");
+        assert!(out.contains("CACHE_W"), "{out}");
+    }
+
     // ── Localhost blocking ────────────────────────────────────────
 
     #[test]
