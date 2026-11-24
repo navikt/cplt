@@ -790,6 +790,23 @@ pub fn refused_writable_app_root(home: &Path, path: &Path) -> Option<PathBuf> {
     moved.then_some(target)
 }
 
+/// The path a writable [`APP_DIRS`] rule names: `$HOME` (or, outside it,
+/// the root's parent) resolved, the writable components below it spelled
+/// as-is. Resolving the whole path again after [`refused_writable_app_root`]
+/// accepted it would follow a link swapped in since; spelled as-is, the
+/// no-symlink open refuses such a link instead.
+#[must_use]
+pub fn writable_app_root_rule_path(home: &Path, path: &Path) -> PathBuf {
+    let canon = config::canonicalize_deepest;
+    match path.strip_prefix(home) {
+        Ok(rel) => canon(home).join(rel),
+        Err(_) => match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => canon(parent).join(name),
+            _ => path.to_path_buf(),
+        },
+    }
+}
+
 /// The refused writable [`APP_DIRS`] root `path` sits in, if any. A grant
 /// derived from such a root (an `allow_cache_exec` entry below
 /// `~/.cache/pnpm`) would follow the same link, so it is dropped too.
@@ -6102,6 +6119,20 @@ mod tests {
         std::fs::create_dir_all(h2.join("real")).unwrap();
         std::os::unix::fs::symlink(h2.join("real"), h2.join(".cache")).unwrap();
         assert!(refused_writable_app_root(&h2, &h2.join(".cache/uv")).is_some());
+    }
+
+    #[test]
+    fn writable_app_root_rule_path_does_not_follow_a_swapped_link() {
+        let home = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let root = home.join(".cache/uv");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(writable_app_root_rule_path(&home, &root), root);
+        // Swapped for a link after the check: the rule still names the link,
+        // which the no-symlink open then refuses.
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::create_dir_all(home.join(".config/autostart")).unwrap();
+        std::os::unix::fs::symlink(home.join(".config/autostart"), &root).unwrap();
+        assert_eq!(writable_app_root_rule_path(&home, &root), root);
     }
 
     #[test]

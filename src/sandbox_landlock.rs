@@ -712,7 +712,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 // so a link swapped in after the check fails the launch
                 // instead of moving the write grant onto its target.
                 let (nofollow, path) = if writable {
-                    (true, crate::config::canonicalize_deepest(&path))
+                    (true, policy::writable_app_root_rule_path(home, &path))
                 } else {
                     (false, path)
                 };
