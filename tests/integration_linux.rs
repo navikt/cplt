@@ -4984,29 +4984,34 @@ finally:
     }
 
     /// `pnpm/dlx` with `~/.cache/pnpm` a symlink: `~/.cache/pnpm` is also a
-    /// writable application directory, so its target is a writable tree
-    /// outside the cache, and write+execute there is refused even with the
-    /// key off.
+    /// writable application directory, and a writable app root reached through
+    /// a symlink is not granted, so its target never becomes writable. The
+    /// dlx entry is then granted read+execute at the target, never write+execute.
     #[test]
     fn landlock_refuses_cache_exec_link_into_a_writable_tree() {
         require_landlock!();
         let project = create_test_project();
         let home = home_with_linked_caches(".cplt-cache-link-pnpm-", "pnpm");
-        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+        let target = home.path().join("elsewhere");
+        let script = format!(
+            "sh {t}/dlx/run.sh; touch {t}/dlx/planted && echo WROTE || echo NO_WRITE",
+            t = target.display()
+        );
+        let (_code, stdout, stderr) = run_sandboxed_home_with_flags(
             project.path(),
             home.path(),
             &["--allow-cache-exec", "pnpm/dlx"],
-            "echo LAUNCHED",
+            &script,
         );
         assert!(
-            code != 0 && !stdout.contains("LAUNCHED"),
-            "stdout: {stdout}"
+            stdout.contains("NO_WRITE") && !stdout.contains("WROTE"),
+            "the link target must not be writable — stdout: {stdout} stderr: {stderr}"
         );
         assert!(
-            stderr.contains("will not grant write and execute there")
-                && stderr.contains("which the sandbox already grants"),
+            stderr.contains("a writable application directory is never granted through a symlink"),
             "stderr: {stderr}"
         );
+        assert!(!target.join("dlx/planted").exists());
     }
 
     /// Whatever the key says, a link aimed at a tree cplt keeps from the agent
