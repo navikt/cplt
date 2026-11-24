@@ -5892,6 +5892,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         )
     {
         ui::warn(&hint);
+        // Said again when the push fails, not only at launch (#1144).
+        prepared.set_push_hint(hint);
     }
 
     // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
@@ -10880,6 +10882,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // The same decision `cplt check exec` and the launch make, for this repo.
     let named: Vec<&Path> = repo_paths.iter().map(PathBuf::as_path).collect();
     let exec_ctx = check::ExecContext::for_launch(&resolved, &project_dir, &named);
+    let mut gh_write_allowed: Vec<&str> = Vec::new();
     for (label, cmd) in [
         ("push feature", "git push origin HEAD:cplt-doctor-probe"),
         ("push main", "git push origin HEAD:main"),
@@ -10888,6 +10891,9 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         let argv: Vec<String> = cmd.split(' ').map(String::from).collect();
         let e = check::explain_exec(&argv, &exec_ctx);
         println!("guard:       {label:<14}{}", e.decision.as_str());
+        if label == "pr merge" && e.decision == check::Decision::Allowed {
+            gh_write_allowed.push(label);
+        }
         // A blocked feature-branch push breaks the branch-and-PR workflow;
         // the other two are blocked by design and need no explanation. A repo
         // with no remote has nowhere to push, so that block is no finding.
@@ -11006,28 +11012,31 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     // The agent's own login only: git's HTTPS credentials are the push line.
     println!("auth:        agent login: {auth_line}");
     findings.extend(auth_finding);
-    let push = doctor::push_remote(
+    let helper_env = push_helper_env(
+        &resolved,
+        active_agent,
+        macos && active_agent.needs_keychain() && keychain_substitute.is_none(),
         &project_dir,
-        cplt::gh_proxy::gh_hosts(),
-        push_helper_env(
-            &resolved,
-            active_agent,
-            macos && active_agent.needs_keychain() && keychain_substitute.is_none(),
-            &project_dir,
-            &home_dir,
-        ),
+        &home_dir,
     );
+    // An exported GH_TOKEN/GITHUB_TOKEN reaches gh too (#1144), not only a
+    // stored login; same env builder and deny_env as the launch.
+    let gh_token = doctor::gh_token_reachable(auth.gh_cli_auth, &helper_env);
+    let push = doctor::push_remote(&project_dir, cplt::gh_proxy::gh_hosts(), helper_env);
     println!(
         "push:        {}",
         // The remote name comes from agent-writable git config.
         sanitize_terminal_text(&doctor::push_line(
             push.as_ref(),
             resolved.gh_guard.enabled,
-            auth.gh_cli_auth
+            gh_token
         ))
     );
     let guard_fix = doctor::gh_guard_fix(cli.no_gh_guard);
     if let Some(hint) = doctor::push_hint(push.as_ref(), resolved.gh_guard.enabled, guard_fix) {
+        for label in &gh_write_allowed {
+            println!("guard:       {}", doctor::no_credentials_note(label));
+        }
         findings.push(Finding::warning(hint, Some(guard_fix.to_string())));
     }
     println!();

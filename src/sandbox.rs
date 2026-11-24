@@ -413,6 +413,10 @@ pub struct PreparedSandbox {
     /// The MCP broker socket, for the `open_url` shims (#910). Set with
     /// [`Self::set_mcp_socket`].
     pub(crate) mcp_socket: Option<PathBuf>,
+    /// The launch's HTTPS push hint (#1144), repeated by a last-resort git
+    /// credential helper when the push actually fails. Set with
+    /// [`Self::set_push_hint`].
+    pub(crate) push_hint: Option<String>,
     /// Hosts the `open_url` shims accept.
     pub(crate) open_url_hosts: Vec<String>,
     /// Set on the child last, after the sandbox environment (OpenCode v2, #710).
@@ -478,6 +482,11 @@ impl PreparedSandbox {
     pub fn open_url_shim_dir(&self) -> Option<PathBuf> {
         self.mcp_socket.as_ref()?;
         Some(self.scratch_dir.as_deref()?.join("open-url-bin"))
+    }
+
+    /// Install the push-hint credential helper in the child (#1144).
+    pub fn set_push_hint(&mut self, hint: String) {
+        self.push_hint = Some(hint);
     }
 
     /// The MCP broker socket the `open`/`xdg-open` shims forward to.
@@ -3105,6 +3114,7 @@ fn prepare_impl(
         worktree_root: None,
         worktree_socket: None,
         mcp_socket: None,
+        push_hint: None,
         open_url_hosts: Vec::new(),
         extra_env: Vec::new(),
         opencode_v2: false,

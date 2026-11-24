@@ -671,6 +671,82 @@ mod e2e_tests {
         );
     }
 
+    /// #1144: when the push hint fires, git's credential prompt repeats it on
+    /// stderr and fills nothing. With the guard on, the helper is absent.
+    #[test]
+    fn e2e_push_hint_credential_helper_repeats_the_fix() {
+        const LINE: &str = "cplt: git push to https://github.com will fail";
+        let home = crate::common::make_config_home("push-hint-helper");
+        let repo = crate::common::temp_repo("navikt/probe");
+        let fill = "printf 'protocol=https\\nhost=github.com\\npath=navikt/probe.git\\n\\n' \
+                    | git credential fill; git config --get-regexp '^credential' || true";
+        let run = |args: &[&str]| {
+            let (out, err, _) = crate::common::launch(&home, repo.path(), args);
+            (out, err)
+        };
+        let (out, err) = run(&[
+            "--no-gh-guard",
+            "--no-git-guard",
+            "--agent",
+            "shell",
+            "--yes",
+            "--",
+            "-c",
+            fill,
+        ]);
+        // The launch warning also contains the hint; the helper's own line
+        // carries the `cplt: ` prefix and names the fix.
+        assert!(
+            err.contains(LINE) && err.contains("drop --no-gh-guard"),
+            "stderr:\n{err}"
+        );
+        assert!(!out.contains("password="), "fills nothing:\n{out}");
+        assert!(out.contains("cplt-push-hint-credential"), "{out}");
+
+        let (out, _) = run(&[
+            "--no-git-guard",
+            "--agent",
+            "shell",
+            "--yes",
+            "--",
+            "-c",
+            fill,
+        ]);
+        assert!(
+            !out.contains("cplt-push-hint-credential"),
+            "guard on: no hint helper\n{out}"
+        );
+    }
+
+    /// #1144: doctor counts an exported GH_TOKEN with the guard on, and marks
+    /// an allowed `pr merge` as credential-less with the guard off.
+    #[test]
+    fn e2e_doctor_counts_exported_token_and_marks_write_ops() {
+        let home = crate::common::make_config_home("doctor-token");
+        let repo = crate::common::temp_repo("navikt/probe");
+        let doctor = |args: &[&str]| {
+            let mut cmd = crate::common::cplt_local(&home, repo.path());
+            let o = cmd
+                .env("GH_TOKEN", "ghp_probe")
+                .args(args)
+                .args(["--agent", "shell", "doctor"])
+                .output()
+                .expect("cplt should run");
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        let on = doctor(&["--pass-env", "GH_TOKEN"]);
+        assert!(on.contains("gh token for github.com found"), "{on}");
+        let denied = doctor(&["--pass-env", "GH_TOKEN", "--deny-env", "GH_TOKEN"]);
+        assert!(denied.contains("no gh token"), "{denied}");
+
+        let off = doctor(&["--no-gh-guard"]);
+        assert!(off.contains("pr merge      ALLOWED"), "{off}");
+        assert!(
+            off.contains("allowed by policy; no GitHub credentials reachable in the sandbox"),
+            "{off}"
+        );
+    }
+
     /// #1121: gh's own credential helper answers inside the sandbox once a
     /// token is passed in, so the push hint must not fire then.
     #[test]

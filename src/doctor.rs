@@ -1770,6 +1770,20 @@ pub fn push_hint(push: Option<&PushRemote>, gh_guard: bool, fix: &str) -> Option
     })
 }
 
+/// Whether gh in the sandbox has a token: a stored login, or an exported
+/// `GH_TOKEN`/`GITHUB_TOKEN` that survives the launch's env and `deny_env`.
+#[must_use]
+pub fn gh_token_reachable(stored_login: bool, env: &HelperEnv) -> bool {
+    stored_login || env.gh_token
+}
+
+/// The note under a gh write operation the policy allows while the `push:`
+/// line says no credentials reach the sandbox (#1144).
+#[must_use]
+pub fn no_credentials_note(label: &str) -> String {
+    format!("{label:<14}allowed by policy; no GitHub credentials reachable in the sandbox")
+}
+
 /// `cplt doctor`'s `push:` line.
 #[must_use]
 pub fn push_line(push: Option<&PushRemote>, gh_guard: bool, gh_token: bool) -> String {
@@ -1805,6 +1819,33 @@ pub fn push_line(push: Option<&PushRemote>, gh_guard: bool, gh_token: bool) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_token_counts_as_gh_token() {
+        let mut env = HelperEnv::from(false);
+        assert!(!gh_token_reachable(false, &env));
+        assert!(gh_token_reachable(true, &env));
+        env.gh_token = true;
+        assert!(gh_token_reachable(false, &env));
+        let p = PushRemote {
+            remote: "origin".into(),
+            url: "https://github.com/o/r.git".into(),
+            https_host: Some("github.com".into()),
+            usable_helpers: vec![],
+        };
+        assert!(
+            push_line(Some(&p), true, gh_token_reachable(false, &env))
+                .contains("gh token for github.com found")
+        );
+    }
+
+    #[test]
+    fn write_op_note_says_policy_allows_but_no_credentials() {
+        assert_eq!(
+            no_credentials_note("pr merge"),
+            "pr merge      allowed by policy; no GitHub credentials reachable in the sandbox"
+        );
+    }
     use crate::sandbox::{FsAccess, FsRule};
 
     #[test]
