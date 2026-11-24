@@ -6176,13 +6176,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &mut prepared,
         probe.root_agents_md.as_deref(),
     );
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(broker) = &worktree_broker {
         broker
             .set_sandbox(&mut prepared)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = &worktree_broker;
 
     // Compute hardening categories for environment sanitization
@@ -16256,10 +16256,10 @@ mod tests {
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
     }
 
-    /// #574 review: the launch path refuses the key off macOS, for a global
-    /// and a local key alike, before creating anything.
+    /// #574 review: the launch path refuses the key off macOS and Linux, for
+    /// a global and a local key alike, before creating anything.
     #[test]
-    fn managed_worktree_root_is_refused_on_linux() {
+    fn managed_worktree_root_is_refused_off_macos_and_linux() {
         let home = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("tempdir");
         let ok = std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
@@ -16280,11 +16280,11 @@ mod tests {
                 true,
                 home.path(),
                 repo.path(),
-                "linux",
+                "freebsd",
                 cplt::worktrees::DEFAULT_WALK_MAX_DIRS,
             )
-            .expect_err("refused on linux");
-            assert!(err.to_string().contains("macOS-only"), "{err}");
+            .expect_err("refused off macOS and Linux");
+            assert!(err.to_string().contains("macOS or Linux"), "{err}");
         }
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
     }

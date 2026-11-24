@@ -1702,6 +1702,12 @@ fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
     if probe >= 3 {
         keep.push(probe);
     }
+    // Linux worktree broker (#965): the sandbox reaches the broker only
+    // through this inherited socketpair end. No filesystem path is granted.
+    let broker = crate::worktree_broker::INHERITED_FD.load(std::sync::atomic::Ordering::Acquire);
+    if broker >= 3 {
+        keep.push(broker);
+    }
 
     // SAFETY: the closure runs between fork and exec. `seal_fds` makes only
     // `fcntl` calls — no allocation, no locks, async-signal-safe.

@@ -1,4 +1,4 @@
-//! Parent-side broker for `cplt worktree add <name> <ref>` (#531, macOS only).
+//! Parent-side broker for `cplt worktree add <name> <ref>` (#531 macOS, #965 Linux).
 //!
 //! `git worktree add` inside the sandbox writes the checkout, the admin dir and
 //! the `.git` pointer under agent control, and the root is checked only after
@@ -14,10 +14,14 @@
 //! worktree. The broker writes no refs, so a failed request never has to delete
 //! one.
 //!
-//! Authority: the socket lives in a directory outside every granted root, and
-//! the sandbox may connect to that one path only. There is no secret. The client
-//! is the sandboxed agent, the same authority the sandbox already grants, so a
-//! token would add nothing.
+//! Authority on macOS: the socket lives in a directory outside every granted
+//! root, and the sandbox may connect to that one path only. On Linux, Landlock
+//! below ABI v9 cannot gate `connect(2)` to a pathname socket, so there is no
+//! path at all: the sandbox inherits one end of a `SOCK_SEQPACKET` socketpair,
+//! and each client passes the broker a fresh stream over it (`SCM_RIGHTS`).
+//! Only processes that inherited that descriptor can reach the broker. There is
+//! no secret. The client is the sandboxed agent, the same authority the sandbox
+//! already grants, so a token would add nothing.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -26,6 +30,8 @@ use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixListener;
@@ -66,7 +72,7 @@ const STAGING_DIR: &str = ".staging";
 
 /// One request from the client. Unknown fields are refused, so a future client
 /// cannot silently ask for something this broker ignores.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -103,6 +109,9 @@ pub struct Context {
     home: Option<std::ffi::OsString>,
     xdg_config_home: Option<std::ffi::OsString>,
     read_policy: Arc<OnceLock<String>>,
+    /// The final session Landlock rules, the Linux counterpart of `read_policy`.
+    #[cfg(target_os = "linux")]
+    landlock: Arc<OnceLock<crate::sandbox::LandlockPolicy>>,
     protected: ProtectedTree,
     /// `<base>/<fingerprint>`, the directory worktrees are published into.
     root: PathBuf,
@@ -143,6 +152,8 @@ impl Context {
             home: std::env::var_os("HOME"),
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             read_policy: Arc::new(OnceLock::new()),
+            #[cfg(target_os = "linux")]
+            landlock: Arc::new(OnceLock::new()),
             protected: BTreeMap::new(),
             root: root.to_path_buf(),
         };
@@ -172,20 +183,63 @@ impl Context {
             .set(profile.to_string())
             .map_err(|_| "worktree broker read policy was already installed".into())
     }
+
+    /// Linux: install the session Landlock rules the broker's git runs under.
+    /// Refused when any rule reaches the private staging area: Landlock cannot
+    /// take it back out of a granted tree, so the agent could read or swap a
+    /// checkout in flight. The broker is then off, never running unconfined.
+    #[cfg(target_os = "linux")]
+    pub fn set_landlock_policy(
+        &self,
+        policy: crate::sandbox::LandlockPolicy,
+    ) -> Result<(), String> {
+        let staging = std::fs::canonicalize(&self.base)
+            .unwrap_or_else(|_| self.base.clone())
+            .join(STAGING_DIR);
+        if let Some(rule) = policy.fs_rules.iter().find(|r| {
+            (r.access.read || r.access.write || r.access.create_dirs)
+                && (staging.starts_with(&r.path)
+                    || std::fs::canonicalize(&r.path).is_ok_and(|p| staging.starts_with(p)))
+        }) {
+            return Err(format!(
+                "the session grants {}, which covers the broker's private staging in {}; \
+                 narrow that grant to use cplt worktree add",
+                rule.path.display(),
+                staging.display()
+            ));
+        }
+        self.landlock
+            .set(policy)
+            .map_err(|_| "worktree broker Landlock policy was already installed".into())
+    }
 }
 
 /// A running broker. Dropping it stops the worker and removes the socket after
 /// request cancellation and cleanup. Filesystem cleanup is outside the budget.
 #[derive(Debug)]
 pub struct Broker {
+    /// macOS: the socket path. Linux: `fd:<n>`, the inherited descriptor.
     socket: PathBuf,
     #[cfg(target_os = "macos")]
     _socket_dir: crate::scratch::SessionSocketDir,
+    /// Linux: the end the sandbox inherits. Close-on-exec everywhere except
+    /// the sandbox spawn, where `seal_inherited_fds` keeps it (see
+    /// [`INHERITED_FD`]).
+    #[cfg(target_os = "linux")]
+    _client_end: OwnedFd,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     #[cfg(target_os = "macos")]
     read_policy: Arc<OnceLock<String>>,
+    #[cfg(target_os = "linux")]
+    landlock: Context,
 }
+
+/// Linux: the descriptor the sandbox spawn must keep open, or `-1`. Published
+/// for the same reason as `audit::SETTLE_PROBE_FD`: the seal is the one choke
+/// point every spawn path shares. A missed keep fails closed (no broker).
+pub(crate) static INHERITED_FD: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
 
 impl Broker {
     /// Reuse the short private socket-directory guard. The session profile pins
@@ -221,11 +275,52 @@ impl Broker {
         })
     }
 
-    /// Off macOS the key is refused before a launch gets here, so this is only
-    /// reached by a bug. It fails rather than running without the sandbox rule.
-    #[cfg(not(target_os = "macos"))]
+    /// Linux (#965): no socket path is granted. The sandbox inherits one end
+    /// of a `SOCK_SEQPACKET` socketpair; a client sends a fresh stream socket
+    /// over it and speaks the same one-line protocol on that stream.
+    #[cfg(target_os = "linux")]
+    pub fn start(ctx: Context) -> Result<Self, String> {
+        secure_dir(&ctx.base, "worktree base")?;
+        let mut fds = [-1; 2];
+        // SAFETY: socketpair writes two descriptors into the array on success.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "cannot create the broker socketpair: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: both descriptors were just created and are owned here only.
+        let (server, client) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let socket = PathBuf::from(format!("fd:{}", client.as_raw_fd()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let policy_ctx = ctx.clone();
+        let thread = std::thread::Builder::new()
+            .name("cplt-worktree-broker".into())
+            .spawn(move || serve_fd(&server, &ctx, &worker_stop))
+            .map_err(|e| format!("cannot start the worktree broker thread: {e}"))?;
+        INHERITED_FD.store(client.as_raw_fd(), Ordering::Release);
+        Ok(Self {
+            socket,
+            _client_end: client,
+            stop,
+            thread: Some(thread),
+            landlock: policy_ctx,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn start(_ctx: Context) -> Result<Self, String> {
-        Err("the worktree broker is macOS-only".into())
+        Err("the worktree broker needs macOS or Linux".into())
     }
 
     /// The socket path. The sandbox profile grants connect to this exact path.
@@ -235,7 +330,6 @@ impl Broker {
     }
 
     /// Capture the final session policy, after all PreparedSandbox amendments.
-    /// Linux never starts this broker and must not treat a policy summary as SBPL.
     #[cfg(target_os = "macos")]
     pub fn set_sandbox(&self, sandbox: &mut crate::sandbox::PreparedSandbox) -> Result<(), String> {
         sandbox.protect_worktree_staging();
@@ -243,14 +337,29 @@ impl Broker {
             .set(crate::sandbox::describe(sandbox).to_string())
             .map_err(|_| "worktree broker read policy was already installed".into())
     }
+
+    /// Linux: capture the final session Landlock rules for the broker's git.
+    #[cfg(target_os = "linux")]
+    pub fn set_sandbox(&self, sandbox: &mut crate::sandbox::PreparedSandbox) -> Result<(), String> {
+        self.landlock
+            .set_landlock_policy(sandbox.landlock_policy().clone())
+    }
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        let _ = INHERITED_FD.compare_exchange(
+            self._client_end.as_raw_fd(),
+            -1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        #[cfg(target_os = "macos")]
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -271,7 +380,94 @@ fn serve(listener: &UnixListener, ctx: &Context, stop: &AtomicBool) {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// Linux accept loop: each datagram on the inherited socketpair must carry
+/// exactly one descriptor, an `AF_UNIX` stream socket, which is then served
+/// exactly like an accepted macOS connection. Anything else is closed unread.
+#[cfg(target_os = "linux")]
+fn serve_fd(server: &OwnedFd, ctx: &Context, stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        match recv_stream(server) {
+            Some(stream) => handle(ctx, stream, stop),
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// One datagram from the socketpair, non-blocking. `None` when there was
+/// nothing, or when it was not exactly one stream socket (any received
+/// descriptors are closed on drop).
+#[cfg(target_os = "linux")]
+fn recv_stream(server: &OwnedFd) -> Option<UnixStream> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    // Room for several descriptors, so a datagram carrying more than one is
+    // seen whole and refused rather than silently truncated.
+    let mut control = [0u64; 16];
+    // SAFETY: zeroed msghdr is a valid empty header; the pointers set below
+    // outlive the recvmsg call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&control) as _;
+    // SAFETY: msg points at live buffers; MSG_CMSG_CLOEXEC keeps received
+    // descriptors out of every later spawn.
+    let n = unsafe {
+        libc::recvmsg(
+            server.as_raw_fd(),
+            &raw mut msg,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    let mut fds = Vec::new();
+    // SAFETY: the CMSG macros walk the control buffer recvmsg just filled,
+    // bounded by msg_controllen.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&raw const msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(c).cast::<libc::c_int>();
+                let len = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                for i in 0..len / std::mem::size_of::<libc::c_int>() {
+                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                }
+            }
+            c = libc::CMSG_NXTHDR(&raw const msg, c);
+        }
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 || fds.len() != 1 {
+        return None;
+    }
+    let fd = fds.pop()?;
+    let opt = |name| {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: v and len are live locals of the sizes getsockopt expects.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                name,
+                (&raw mut v).cast(),
+                &raw mut len,
+            )
+        };
+        (rc == 0).then_some(v)
+    };
+    if opt(libc::SO_DOMAIN) != Some(libc::AF_UNIX) || opt(libc::SO_TYPE) != Some(libc::SOCK_STREAM)
+    {
+        return None;
+    }
+    Some(UnixStream::from(fd))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 /// Serve one connection: read one request, answer once, close.
 fn handle(ctx: &Context, stream: UnixStream, stop: &AtomicBool) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
@@ -302,7 +498,7 @@ fn handle(ctx: &Context, stream: UnixStream, stop: &AtomicBool) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_request(stream: &UnixStream, stop: &AtomicBool) -> Result<Request, String> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut line = Vec::new();
@@ -1175,9 +1371,44 @@ fn sandbox_git(ctx: &Context, cmd: Command, staging: Option<&Path>) -> Result<Co
     Ok(wrapped)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux: the same session rules the agent runs under, plus read and write
+/// (never execute) on this request's private staging directory, applied to
+/// the broker's git between fork and exec.
+#[cfg(target_os = "linux")]
+fn sandbox_git(ctx: &Context, mut cmd: Command, staging: Option<&Path>) -> Result<Command, String> {
+    use crate::sandbox::{FsAccess, FsRule};
+    use std::os::unix::process::CommandExt as _;
+    let mut policy = ctx
+        .landlock
+        .get()
+        .ok_or("worktree broker session Landlock policy is not installed")?
+        .clone();
+    if let Some(staging) = staging {
+        policy.fs_rules.push(FsRule {
+            path: staging.to_path_buf(),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+                create_dirs: true,
+            },
+            nofollow: false,
+        });
+    }
+    let pre = crate::sandbox::landlock_mod::precompute(policy)?;
+    cmd.stdin(Stdio::null());
+    // SAFETY: apply_precomputed is the same hook the agent spawn uses; it
+    // makes raw syscalls on data prepared in the parent.
+    unsafe {
+        cmd.pre_exec(move || crate::sandbox::landlock_mod::apply_precomputed(&pre));
+    }
+    Ok(cmd)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn sandbox_git(_ctx: &Context, _cmd: Command, _staging: Option<&Path>) -> Result<Command, String> {
-    Err("the worktree broker is macOS-only".into())
+    Err("the worktree broker needs macOS or Linux".into())
 }
 
 /// Private metadata has no commondir, includes, filters or promisor remotes.
@@ -1539,9 +1770,41 @@ fn publish(staging: &Path, name: &str, root: &Path) -> Result<(), String> {
     Err(format!("cannot publish the worktree: {err}"))
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux: `renameat2(RENAME_NOREPLACE)`, the counterpart of `RENAME_EXCL`.
+/// Called through `syscall(2)` so it does not depend on the libc wrapper
+/// (older glibc and musl lack it).
+#[cfg(target_os = "linux")]
+fn publish(staging: &Path, name: &str, root: &Path) -> Result<(), String> {
+    let src_dir = open_dir(staging)?;
+    let dst_dir = open_dir(root)?;
+    let c_name = CString::new(name).map_err(|_| "worktree name contains a NUL byte")?;
+    // SAFETY: both descriptors are open directories owned here for the call;
+    // the name is a NUL-terminated C string that outlives it.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            src_dir.as_raw_fd(),
+            c_name.as_ptr(),
+            dst_dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        return Err(format!(
+            "{name} already exists in the managed worktree root; choose another name"
+        ));
+    }
+    Err(format!("cannot publish the worktree: {err}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn publish(_staging: &Path, _name: &str, _root: &Path) -> Result<(), String> {
-    Err("the worktree broker is macOS-only".into())
+    Err("the worktree broker needs macOS or Linux".into())
 }
 
 /// Poll the base lock within the request budget; shutdown also cancels a wait.
@@ -1691,16 +1954,63 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn client_os_error(os: &str) -> Option<String> {
-    if os == "macos" {
+    if os == "macos" || os == "linux" {
         return None;
     }
-    let platform = if os == "linux" { "Linux" } else { os };
     Some(format!(
-        "cplt worktree: worktrees inside the sandbox are unsupported on {platform}: the \
-         parent-side worktree broker is currently macOS-only (the Seatbelt + socket flow \
-         and kernel protected-path enforcement inside worktrees are not wired on {platform} \
-         yet). Prepare worktrees outside cplt."
+        "cplt worktree: worktrees inside the sandbox are unsupported on {os}: the \
+         parent-side worktree broker runs on macOS and Linux only. Prepare worktrees outside cplt."
     ))
+}
+
+/// Reach the broker named by [`SOCKET_ENV`]: a socket path on macOS, or
+/// `fd:<n>` on Linux, the inherited socketpair end.
+fn connect(socket: &std::ffi::OsStr) -> std::io::Result<UnixStream> {
+    #[cfg(target_os = "linux")]
+    if let Some(n) = socket.to_str().and_then(|s| s.strip_prefix("fd:")) {
+        let fd: libc::c_int = n
+            .parse()
+            .ok()
+            .filter(|&fd| fd > 2)
+            .ok_or_else(|| std::io::Error::other(format!("bad broker descriptor {n:?}")))?;
+        return send_stream(fd);
+    }
+    UnixStream::connect(socket)
+}
+
+/// Make a stream pair, pass one end to the broker over the inherited
+/// `SOCK_SEQPACKET` descriptor, keep the other.
+#[cfg(target_os = "linux")]
+fn send_stream(fd: libc::c_int) -> std::io::Result<UnixStream> {
+    let (ours, theirs) = UnixStream::pair()?;
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+    let mut control = vec![0u64; space.div_ceil(8)];
+    // SAFETY: zeroed msghdr is valid; every pointer set below outlives sendmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    // SAFETY: the control buffer holds one SCM_RIGHTS header with one int.
+    let rc = unsafe {
+        let c = libc::CMSG_FIRSTHDR(&raw const msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>(), theirs.as_raw_fd());
+        libc::sendmsg(fd, &raw const msg, libc::MSG_NOSIGNAL)
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    drop(theirs);
+    Ok(ours)
 }
 
 /// The sandboxed side of `cplt worktree add`. Sends one request to the socket
@@ -1717,11 +2027,11 @@ pub fn run_client(name: &str, reference: &str, branch: Option<&str>) -> ExitCode
     let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|s| !s.is_empty()) else {
         eprintln!(
             "cplt worktree: not available here. It needs a cplt session with \
-             sandbox.allow_git_worktrees on, on macOS."
+             sandbox.allow_git_worktrees on."
         );
         return ExitCode::FAILURE;
     };
-    let stream = match UnixStream::connect(&socket) {
+    let stream = match connect(&socket) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cplt worktree: cannot reach the worktree broker: {e}");
@@ -1876,12 +2186,11 @@ mod tests {
     }
 
     #[test]
-    fn client_os_error_explains_linux_unsupported_and_why() {
+    fn client_os_error_allows_macos_and_linux_only() {
         assert_eq!(client_os_error("macos"), None);
-        let linux = client_os_error("linux").expect("linux must be rejected");
-        assert!(linux.contains("unsupported on Linux"), "{linux}");
-        assert!(linux.contains("macOS-only"), "{linux}");
-        assert!(linux.contains("Seatbelt + socket"), "{linux}");
-        assert!(linux.contains("Prepare worktrees outside cplt"), "{linux}");
+        assert_eq!(client_os_error("linux"), None);
+        let other = client_os_error("freebsd").expect("other systems are refused");
+        assert!(other.contains("macOS and Linux only"), "{other}");
+        assert!(other.contains("Prepare worktrees outside cplt"), "{other}");
     }
 }

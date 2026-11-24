@@ -221,7 +221,8 @@ pub struct SandboxConfig<'a> {
     pub managed_worktree_root: Option<&'a Path>,
     /// The broker socket for `cplt worktree add` (#531), granted outbound as
     /// one exact path. `Some` only with the managed root on, and only from
-    /// `assemble_sandbox` after the broker has bound it.
+    /// `assemble_sandbox` after the broker has bound it. On Linux this is
+    /// `fd:<n>`, an inherited descriptor, and grants nothing (#965).
     pub worktree_socket: Option<&'a Path>,
     /// The MCP broker socket for `cplt mcp-stdio` (#824), granted outbound as
     /// one exact path, like `worktree_socket`. macOS only.
@@ -576,6 +577,12 @@ impl PreparedSandbox {
     pub fn set_mcp_socket(&mut self, socket: &Path, hosts: &[String]) {
         self.mcp_socket = Some(socket.to_path_buf());
         self.open_url_hosts = hosts.to_vec();
+    }
+
+    /// The final Landlock rules, for the worktree broker's git (#965).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn landlock_policy(&self) -> &landlock_mod::LandlockPolicy {
+        &self.policy
     }
 
     /// Reapply after late agent-specific grants, before capturing the broker's
