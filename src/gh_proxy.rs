@@ -249,7 +249,9 @@ fn decode_stable(s: &str) -> Option<String> {
 #[must_use]
 pub fn arg_names_untrusted_host(args: &[&str]) -> bool {
     args.iter().any(|a| names_token_tenant(a))
-        || host_words(args).iter().any(|a| non_ascii_host(a, false))
+        // Any URL in any word, prose included: gh derives the host from URL
+        // operands no per-command table lists (`gh pr view URL`).
+        || args.iter().any(|a| non_ascii_host(a, false))
         || any_templated_host(args)
         || repo_flag_non_ascii(args)
 }
@@ -331,6 +333,74 @@ fn host_words<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
                 .filter(|(i, _)| !values.contains(i))
                 .map(|(_, a)| (*a).into()),
         );
+    } else {
+        // A positional URL is read as a host (`gh pr view https://HOST/o/r/pull/1`).
+        out.extend(
+            positional_operands(args)
+                .into_iter()
+                .filter(|a| {
+                    a.split_once("://")
+                        .is_some_and(|(s, _)| !s.contains(char::is_whitespace))
+                })
+                .map(Into::into),
+        );
+    }
+    out
+}
+
+/// Long flags that consume the next word for a `(command, subcommand)`.
+/// Unlisted flags consume nothing, so their value is checked as an operand.
+fn subcommand_long_value_flags(command: &str, subcommand: Option<&str>) -> &'static [&'static str] {
+    match (command, subcommand) {
+        ("repo", Some("view")) => &["--repo", "--branch", "--json", "--jq", "--template"],
+        ("repo", Some("clone")) => &["--upstream-remote-name"],
+        ("repo", Some("fork")) => &["--remote-name", "--org", "--fork-name"],
+        _ => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--json",
+            "--jq",
+            "--template",
+        ],
+    }
+}
+
+/// Operands after the subcommand of a non-`gh api` command. Flag arity comes
+/// from the same per-subcommand tables `parse_command` uses for `-R`; when
+/// unsure, a word is not consumed, so it is checked as an operand.
+fn positional_operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let Some(root) = root_command(args).0 else {
+        return Vec::new();
+    };
+    let command = args[root];
+    let rest = &args[root + 1..];
+    let sub = find_subcommand_hint(command, rest);
+    let (short, long) = (
+        subcommand_short_value_flags(command, sub),
+        subcommand_long_value_flags(command, sub),
+    );
+    let mut out = Vec::new();
+    let mut seen_sub = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i];
+        if a == "--" {
+            out.extend(&rest[i + 1..]);
+            break;
+        }
+        let takes_next = if a.starts_with("--") {
+            long.contains(&a)
+        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            matches!(scan_short_cluster(cluster, short), Some((_, None)))
+        } else {
+            if seen_sub || sub.is_none() {
+                out.push(a);
+            }
+            seen_sub = true;
+            false
+        };
+        i += 1 + usize::from(takes_next);
     }
     out
 }
@@ -366,8 +436,7 @@ const REPO_OPERAND_SUBCOMMANDS: &[&str] = &[
 
 /// Every value that can name the repository's host: `-R`/`--repo` values (the
 /// plain scan plus `parse_command`, which knows clustered `-cR`), and the
-/// non-flag words of a `gh repo` subcommand that takes a repository operand.
-/// Over-collecting a flag value there only over-refuses an odd-looking word.
+/// operands of a `gh repo` subcommand that takes a repository operand.
 fn repo_selector_values<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> {
     let mut out: Vec<std::borrow::Cow<str>> =
         repo_flag_values(args).into_iter().map(Into::into).collect();
@@ -376,17 +445,8 @@ fn repo_selector_values<'a>(args: &[&'a str]) -> Vec<std::borrow::Cow<'a, str>> 
         if cmd.command == "repo"
             && let Some(sub) = cmd.subcommand.as_deref()
             && REPO_OPERAND_SUBCOMMANDS.contains(&sub)
-            && let Some(at) = args.iter().position(|a| *a == sub)
         {
-            let rest = &args[at + 1..];
-            let end = rest.iter().position(|a| *a == "--").unwrap_or(rest.len());
-            let mut operands: Vec<&str> = rest[..end]
-                .iter()
-                .filter(|a| !a.starts_with('-'))
-                .copied()
-                .collect();
-            // Words after `--` are operands too, dashes and all.
-            operands.extend(rest.get(end + 1..).unwrap_or_default());
+            let mut operands = positional_operands(args);
             // `gh repo clone REPO [DIR]`: the second operand is a directory.
             if sub == "clone" {
                 operands.truncate(1);
@@ -467,13 +527,13 @@ fn url_authority(rest: &str) -> &str {
 /// are decoded as Go's url package does; still changing after 4 rounds fails
 /// closed.
 fn non_ascii_host(arg: &str, whole: bool) -> bool {
-    let host = if whole {
-        arg
-    } else if let Some((_, rest)) = arg.split_once("://") {
-        url_authority(rest).rsplit('@').next().unwrap_or("")
-    } else {
-        return false;
-    };
+    if !whole {
+        // Every URL in the word, not just the first.
+        return arg.split("://").skip(1).any(|rest| {
+            non_ascii_host(url_authority(rest).rsplit('@').next().unwrap_or(""), true)
+        });
+    }
+    let host = arg;
     let mut decoded = host.to_string();
     for _ in 0..4 {
         if !decoded.is_ascii() {
@@ -1648,6 +1708,7 @@ fn subcommand_short_value_flags(command: &str, subcommand: Option<&str>) -> &'st
         ("variable", Some("list" | "get")) => &['R', 'e', 'q', 'o', 't'],
         ("repo", Some("view")) => &['b', 'q', 't'],
         ("repo", Some("list")) => &['q', 'l', 'L', 't'],
+        ("repo", Some("clone")) => &['R', 'u'],
         _ => &['R', 'B', 'H', 'F', 'T', 'L', 'S', 't', 'b', 'l', 'm', 'q'],
     }
 }
@@ -8344,6 +8405,49 @@ mod tests {
         }
     }
 
+    /// Review of #1109: URL operands name a host (`gh pr view URL`), and flag
+    /// values follow the per-subcommand arity tables, not a skip-after-flag guess.
+    #[test]
+    fn url_operands_and_flag_values_follow_flag_arity() {
+        let scope = || Ok(vec!["o/r".to_string(), "navikt/cplt".to_string()]);
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let hosts = vec![DEFAULT_GH_HOST.to_string()];
+        for args in [
+            &["pr", "view", "https://g\u{130}thub.com/o/r/pull/1"][..],
+            &["issue", "view", "https://g\u{130}thub.com/o/r/issues/1"],
+            &["repo", "clone", "-u", "upstream", "g\u{130}thub.com/o/r"],
+        ] {
+            assert!(
+                gate_with_scope_resolver(args, &off, scope, None).is_err(),
+                "{args:?}"
+            );
+            assert!(
+                !github_token_allowed_for(args, None, None, &hosts),
+                "{args:?}"
+            );
+        }
+        let ok = |args: &[&str]| gate_with_scope_resolver(args, &off, scope, None).is_ok();
+        let branch = ["repo", "view", "o/r", "--branch", "\u{e6}rlig/fix/x"];
+        assert!(ok(&branch));
+        assert!(github_token_allowed_for(&branch, None, None, &hosts));
+        // Prose: a non-ASCII URL is not refused, but costs the token.
+        let prose = [
+            "pr",
+            "comment",
+            "1",
+            "--body",
+            "Se https://bl\u{e5}b\u{e6}r.no",
+        ];
+        assert!(ok(&prose));
+        assert!(!github_token_allowed_for(&prose, None, None, &hosts));
+        let ascii = ["pr", "comment", "1", "--body", "Se https://nav.no"];
+        assert!(ok(&ascii));
+        assert!(github_token_allowed_for(&ascii, None, None, &hosts));
+    }
+
     /// Review of #1109: clustered `-cR` and positional repository operands
     /// name a host too, so both reach the non-ASCII refusal and withholding.
     #[test]
@@ -8445,6 +8549,8 @@ mod tests {
                 "{args:?}"
             );
         }
+        // A URL in prose runs, but a non-ASCII character in what Go would
+        // read as its host (even trailing punctuation) costs the token.
         for args in [
             &[
                 "pr",
@@ -8460,9 +8566,8 @@ mod tests {
                 gate_with_scope_resolver(args, &off, scope, None).is_ok(),
                 "{args:?}"
             );
-            assert!(!arg_names_untrusted_host(args), "{args:?}");
             assert!(
-                github_token_allowed_for(args, None, None, &hosts),
+                !github_token_allowed_for(args, None, None, &hosts),
                 "{args:?}"
             );
         }
