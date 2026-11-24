@@ -5660,6 +5660,60 @@ paths = [
         assert!(!all.contains('\x1b') && !all.contains('\r'), "{all:?}");
     }
 
+    /// Bidi overrides reorder what the reader sees: refused in an entry and
+    /// in a symlink target, and printed escaped.
+    #[test]
+    fn e2e_repo_refusal_escapes_bidi_marks() {
+        let repo = temp_repo("test-org/bidi");
+        let out = cplt_cmd()
+            .args(["config", "set", "--repo", "allow.read", "a\u{202e}b"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
+        assert!(!repo.path().join(".cplt.toml").exists());
+
+        let outside = tempfile::tempdir().unwrap();
+        let evil = outside.path().join("x\u{202e}y");
+        std::fs::create_dir(&evil).unwrap();
+        let link = outside.path().join("bidi-link");
+        std::os::unix::fs::symlink(&evil, &link).unwrap();
+        let link = link.to_str().unwrap();
+        let out = cplt_cmd()
+            .args(["config", "set", "--repo", "allow.read", link])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
+        assert!(stderr.contains("\\u{202e}"), "{stderr:?}");
+        std::fs::write(
+            repo.path().join(".cplt.toml"),
+            format!("[propose.allow]\nread = [{link:?}]\n"),
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", ".cplt.toml"]));
+        assert!(git_ok(repo.path(), &["commit", "-qm", "c"]));
+        let show = cplt_cmd()
+            .args(["trust"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&show.stdout),
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(
+            all.contains("REFUSED") && all.contains("\\u{202e}"),
+            "{all:?}"
+        );
+        assert!(!all.contains('\u{202e}'), "{all:?}");
+    }
+
     #[test]
     fn e2e_config_set_repo_deny_paths() {
         let repo = make_repo_dir("set-repo-deny");
