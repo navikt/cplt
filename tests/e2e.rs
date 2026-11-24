@@ -569,6 +569,153 @@ mod e2e_tests {
         );
     }
 
+    /// #1121: an HTTPS GitHub remote with the gh guard off and no helper gets
+    /// one launch line with the command; running that command clears it. SSH
+    /// gets nothing, and doctor's `push:` line says which case it is.
+    #[test]
+    fn e2e_https_push_hint_names_the_gh_guard_command() {
+        const HINT: &str = "git push to https://github.com will fail";
+        const FIX: &str = "cplt config set gh_guard.enabled true";
+        let home = crate::common::make_config_home("push-hint");
+        let repo = crate::common::temp_repo("navikt/probe");
+        let run = |args: &[&str]| {
+            let (out, err, _) = crate::common::launch(&home, repo.path(), args);
+            format!("{out}{err}")
+        };
+        let session = ["--agent", "shell", "--yes", "--", "-c", "true"];
+
+        run(&["config", "set", "gh_guard.enabled", "false", "--force"]);
+        let out = run(&session);
+        assert!(out.contains(HINT) && out.contains(FIX), "{out}");
+        let doctor = run(&["--agent", "shell", "doctor"]);
+        assert!(
+            doctor.contains("push:        origin (https://github.com): no usable credential helper, gh guard off"),
+            "{doctor}"
+        );
+
+        let fix: Vec<&str> = FIX.split(' ').skip(1).collect();
+        run(&fix);
+        let out = run(&session);
+        assert!(
+            !out.contains(HINT),
+            "the printed command must clear the hint:\n{out}"
+        );
+        assert!(run(&["--agent", "shell", "doctor"]).contains("gh guard on"));
+
+        // Off by the flag: the fix is to drop the flag, not `config set`.
+        let out = run(&[
+            "--no-gh-guard",
+            "--agent",
+            "shell",
+            "--yes",
+            "--",
+            "-c",
+            "true",
+        ]);
+        assert!(
+            out.contains(HINT) && out.contains("drop --no-gh-guard"),
+            "{out}"
+        );
+        // osxkeychain cannot answer without the session's Keychain grant,
+        // which the shell never gets: the hint still fires.
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "credential.helper", "osxkeychain"]
+        ));
+        let out = run(&[
+            "--no-gh-guard",
+            "--agent",
+            "shell",
+            "--yes",
+            "--",
+            "-c",
+            "true",
+        ]);
+        assert!(out.contains(HINT), "osxkeychain without the grant:\n{out}");
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "--unset", "credential.helper"]
+        ));
+
+        run(&["config", "set", "gh_guard.enabled", "false", "--force"]);
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:navikt/probe.git"
+            ]
+        ));
+        let out = run(&session);
+        assert!(!out.contains(HINT), "SSH remote: no hint:\n{out}");
+        assert!(run(&["--agent", "shell", "doctor"]).contains("not HTTPS to a GitHub host"));
+
+        // The remote name is agent-writable: no escape reaches the terminal.
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "remote.pushDefault", "x\x1b[2Jy"]
+        ));
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "remote.x\x1b[2Jy.url", "git@github.com:o/r.git"]
+        ));
+        let doctor = run(&["--agent", "shell", "doctor"]);
+        let push = doctor.lines().find(|l| l.starts_with("push:")).unwrap();
+        assert!(
+            !push.contains('\x1b') && push.contains("x\u{fffd}[2Jy"),
+            "{push:?}"
+        );
+    }
+
+    /// #1121: gh's own credential helper answers inside the sandbox once a
+    /// token is passed in, so the push hint must not fire then.
+    #[test]
+    fn e2e_push_hint_counts_gh_helper_when_token_is_passed() {
+        const HINT: &str = "git push to https://github.com will fail";
+        let home = crate::common::make_config_home("push-hint-token");
+        let repo = crate::common::temp_repo("navikt/probe");
+        let _ = crate::common::launch(
+            &home,
+            repo.path(),
+            &["config", "set", "gh_guard.enabled", "false", "--force"],
+        );
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &["config", "credential.helper", "!gh auth git-credential"]
+        ));
+        let run = |pass: bool, deny: bool| {
+            let mut cmd = crate::common::cplt_local(&home, repo.path());
+            cmd.env("GH_TOKEN", "ghp_probe")
+                .args(["--agent", "shell", "--yes"]);
+            if pass {
+                cmd.args(["--pass-env", "GH_TOKEN"]);
+            }
+            if deny {
+                cmd.args(["--deny-env", "GH_TOKEN"]);
+            }
+            let o = cmd
+                .args(["--", "-c", "true"])
+                .output()
+                .expect("cplt should run");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
+        assert!(
+            run(false, false).contains(HINT),
+            "token not passed: hint fires"
+        );
+        let out = run(true, false);
+        assert!(!out.contains(HINT), "token passed: no hint\n{out}");
+        assert!(
+            run(true, true).contains(HINT),
+            "passed but denied: the child has no token, hint fires"
+        );
+    }
+
     #[test]
     fn e2e_doctor_header_names_agent_config_and_enforcement() {
         // No require_copilot!: the header prints whatever is installed, and
@@ -618,7 +765,7 @@ mod e2e_tests {
             "the settings line reports the user's quiet, not doctor's own.\nstdout: {stdout}"
         );
         assert!(
-            stdout.contains("auth:        none (the shell needs no login)"),
+            stdout.contains("auth:        agent login: none (the shell needs no login)"),
             "the auth line is per agent.\nstdout: {stdout}"
         );
         assert!(

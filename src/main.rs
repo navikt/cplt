@@ -2560,6 +2560,48 @@ fn linux_login_hint(
     })
 }
 
+/// What the child will have that decides whether a git credential helper
+/// answers (#1121): the launch's own env builder, so --pass-env and
+/// --inherit-env count.
+fn push_helper_env(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    keychain: bool,
+    project_dir: &Path,
+    home: &Path,
+) -> cplt::doctor::HelperEnv {
+    let parent: Vec<(String, String)> = std::env::vars().collect();
+    let env = cplt::sandbox::build_sandbox_env(
+        &parent,
+        &resolved.pass_env,
+        resolved.inherit_env,
+        &[],
+        None,
+        None,
+        agent,
+    );
+    // The launch strips `deny_env` after the builder (sandbox_exec.rs).
+    let has = |k: &str| {
+        if resolved.deny_env.iter().any(|d| d == k) {
+            false
+        } else if let Some((_, v)) = env.vars.iter().rev().find(|(n, _)| n == k) {
+            !v.trim().is_empty()
+        } else if env.clear_first || env.remove.iter().any(|n| n == k) {
+            false
+        } else {
+            std::env::var(k).is_ok_and(|v| !v.trim().is_empty())
+        }
+    };
+    cplt::doctor::HelperEnv {
+        keychain,
+        gh_token: has("GH_TOKEN") || has("GITHUB_TOKEN"),
+        askpass: has("GIT_ASKPASS") || has("SSH_ASKPASS"),
+        linux: cfg!(target_os = "linux"),
+        project_dir: project_dir.to_path_buf(),
+        home: home.to_path_buf(),
+    }
+}
+
 /// The agent's own login variable that reaches the child, for doctor's
 /// `auth:` line. Only the agent's own: GH_TOKEN is not Claude's login, and
 /// OpenCode's gh vars feed `OPENCODE_AUTH_CONTENT` instead (#1092).
@@ -5792,6 +5834,31 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             prepared.keychain_substitute().is_some(),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // HTTPS push to GitHub with nothing to answer git's credential prompt
+    // (#1121). One git config read, and only while the gh guard is off.
+    if !resolved.gh_guard.enabled
+        && let Some(hint) = cplt::doctor::push_hint(
+            cplt::doctor::push_remote(
+                &project_dir,
+                cplt::gh_proxy::gh_hosts(),
+                push_helper_env(
+                    &resolved,
+                    active_agent,
+                    cfg!(target_os = "macos")
+                        && active_agent.needs_keychain()
+                        && prepared.keychain_substitute().is_none(),
+                    &project_dir,
+                    &home_dir,
+                ),
+            )
+            .as_ref(),
+            false,
+            cplt::doctor::gh_guard_fix(cli.no_gh_guard),
+        )
+    {
+        ui::warn(&hint);
     }
 
     // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
@@ -10678,8 +10745,33 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     if let Some(line) = keychain_line {
         println!("keychain:    {line}");
     }
-    println!("auth:        {auth_line}");
+    // The agent's own login only: git's HTTPS credentials are the push line.
+    println!("auth:        agent login: {auth_line}");
     findings.extend(auth_finding);
+    let push = doctor::push_remote(
+        &project_dir,
+        cplt::gh_proxy::gh_hosts(),
+        push_helper_env(
+            &resolved,
+            active_agent,
+            macos && active_agent.needs_keychain() && keychain_substitute.is_none(),
+            &project_dir,
+            &home_dir,
+        ),
+    );
+    println!(
+        "push:        {}",
+        // The remote name comes from agent-writable git config.
+        sanitize_terminal_text(&doctor::push_line(
+            push.as_ref(),
+            resolved.gh_guard.enabled,
+            auth.gh_cli_auth
+        ))
+    );
+    let guard_fix = doctor::gh_guard_fix(cli.no_gh_guard);
+    if let Some(hint) = doctor::push_hint(push.as_ref(), resolved.gh_guard.enabled, guard_fix) {
+        findings.push(Finding::warning(hint, Some(guard_fix.to_string())));
+    }
     println!();
     println!("{}", doctor::PASTE_HINT);
     println!();
