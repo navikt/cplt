@@ -1499,6 +1499,214 @@ mod e2e_tests {
         (cmd, fake_dir)
     }
 
+    /// #1157: a fake agent exiting 3 leaves a summary with that exit code, the
+    /// path never reaches the sandbox, and the exit line is printed.
+    #[test]
+    fn e2e_session_summary_written_on_exit_3() {
+        require_sandbox!();
+        let fake = fake_agent(
+            "copilot",
+            "env | grep -c CPLT_SESSION_SUMMARY || true\nexit 3\n",
+        );
+        let out_dir = home_temp_dir("summary");
+        let path = out_dir.path().join("summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .args(["--", "--version"])
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .env("CPLT_SESSION_SUMMARY_HOSTS", "nav.no,,bad host")
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "stderr: {stderr}");
+        assert_eq!(stdout.trim(), "0", "summary env leaked into the sandbox");
+        assert!(stderr.contains("exit 3"), "{stderr}");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("summary written"))
+                .unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["agent"], "copilot");
+        assert_eq!(v["exit_code"], 3);
+        assert_eq!(v["agent_exit_reason"], "exit");
+        assert!(v["startup_ms"].is_u64(), "{v}");
+        assert!(
+            v["warnings_shown"]
+                .as_array()
+                .unwrap()
+                .contains(&"warn.session-summary-hosts-malformed".into()),
+            "{v}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// #1157: a link chain through the project (`out/l1 -> proj/l2 ->
+    /// elsewhere`) is refused: the agent could re-aim `proj/l2`, though both
+    /// ends lie outside every grant.
+    #[test]
+    fn e2e_session_summary_refuses_a_link_chain_through_the_project() {
+        require_sandbox!();
+        let fake = fake_agent("copilot", "exit 0\n");
+        let out = home_temp_dir("summary-out");
+        let elsewhere = home_temp_dir("summary-elsewhere");
+        let l2 = fake.path().join("l2");
+        std::os::unix::fs::symlink(elsewhere.path(), &l2).unwrap();
+        std::os::unix::fs::symlink(&l2, out.path().join("l1")).unwrap();
+        let path = out.path().join("l1/summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not writing the session summary"),
+            "{stderr}"
+        );
+        assert!(!elsewhere.path().join("summary.json").exists());
+    }
+
+    /// #1157: `repo_config` is recorded on a quiet launch too, from the
+    /// config the launch loaded (this checkout commits a `.cplt.toml`).
+    #[test]
+    fn e2e_session_summary_repo_config_recorded_when_quiet() {
+        require_sandbox!();
+        let fake = fake_agent("copilot", "exit 0\n");
+        let out = home_temp_dir("summary-quiet");
+        let path = out.path().join("summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--accept-repo-config",
+                "--project-dir",
+            ])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}: {stderr}")),
+        )
+        .unwrap();
+        assert_eq!(v["repo_config"], "trusted", "{v}");
+        assert_eq!(v["agent_exit_reason"], "exit");
+    }
+
+    /// #1164: a tree only the macOS profile grants (a relocated pnpm store
+    /// under a non-default `XDG_DATA_HOME`) is refused too: the check reads
+    /// the profile's own write grants, not only the policy model.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn e2e_session_summary_refuses_a_profile_only_write_grant() {
+        require_sandbox!();
+        let fake = fake_agent("copilot", "exit 0\n");
+        let data = home_temp_dir("summary-xdg-data");
+        let store = data.path().join("pnpm/store");
+        std::fs::create_dir_all(&store).unwrap();
+        let path = store.join("summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("XDG_DATA_HOME", data.path())
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not writing the session summary"),
+            "{stderr}"
+        );
+        assert!(!path.exists());
+    }
+
+    /// #1157: a launch that fails before the path check (no agent binary)
+    /// writes no summary.
+    #[test]
+    fn e2e_session_summary_not_written_on_early_setup_failure() {
+        require_sandbox!();
+        let out_dir = home_temp_dir("summary-fail");
+        let path = out_dir.path().join("summary.json");
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", "/usr/bin:/bin")
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        assert!(!output.status.success());
+        assert!(
+            !path.exists(),
+            "summary written before the path was checked"
+        );
+    }
+
+    /// #1157: a summary path inside the project (a write grant) is refused,
+    /// and nothing is written without the env var.
+    #[test]
+    fn e2e_session_summary_refused_inside_write_grant() {
+        require_sandbox!();
+        let fake = fake_agent("copilot", "exit 0\n");
+        let path = fake.path().join("summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not writing the session summary"),
+            "{stderr}"
+        );
+        assert!(!path.exists(), "summary written inside a write grant");
+        assert!(!stderr.contains("agent exited"), "{stderr}");
+    }
+
     #[test]
     fn e2e_env_strips_cloud_credentials() {
         require_sandbox!();

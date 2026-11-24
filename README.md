@@ -582,6 +582,7 @@ Variables cplt itself reads:
 | --- | --- |
 | `CPLT_CONFIG` | Use this config file instead of `~/.config/cplt/config.toml`. See [docs/configuration.md](docs/configuration.md#precedence) |
 | `CPLT_MANAGED_CONFIG` | Absolute path to a managed config from a wrapper (nav-pilot). Adds its `proxy.allow_private_domains` to yours; accepted only under `~/.config/cplt/managed.d/`. See [docs/configuration.md](docs/configuration.md#managed-config-from-a-wrapper-cplt_managed_config) |
+| `CPLT_SESSION_SUMMARY` | Absolute path where cplt writes a JSON summary of the session at exit, for a wrapper (nav-pilot). Never passed into the sandbox. `CPLT_SESSION_SUMMARY_HOSTS` names DNS suffixes whose blocked hostnames may appear in it. See [docs/configuration.md](docs/configuration.md#session-summary-for-a-wrapper-cplt_session_summary) |
 
 | Flag | What it does |
 | --- | --- |

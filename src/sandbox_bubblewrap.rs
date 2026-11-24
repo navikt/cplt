@@ -1469,9 +1469,10 @@ pub(crate) fn resolve(
                 if e.starts_with("bwrap test failed") {
                     PROBE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                crate::ui::warn(&format!(
-                    "Bubblewrap unavailable ({e}). Using Landlock + seccomp only."
-                ));
+                crate::ui::warn_id(
+                    "warn.bubblewrap-unavailable",
+                    &format!("Bubblewrap unavailable ({e}). Using Landlock + seccomp only."),
+                );
                 Ok(None)
             }
         },

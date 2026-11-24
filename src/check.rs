@@ -297,8 +297,16 @@ pub fn writable_tree_over(policy: &LandlockPolicy, home: &Path, path: &Path) -> 
     policy
         .fs_rules
         .iter()
-        .filter(|r| r.access.write && within(path, &r.path))
-        .map(|r| r.path.clone())
+        .filter(|r| r.access.write)
+        .filter_map(|r| {
+            if within(path, &r.path) {
+                return Some(r.path.clone());
+            }
+            // The policy says `/tmp` where the kernel sees `/private/tmp`: a
+            // resolved path only matches the root in canonical form too.
+            let canonical = std::fs::canonicalize(&r.path).ok()?;
+            (canonical != r.path && within(path, &canonical)).then_some(canonical)
+        })
         .max_by_key(|p| p.as_os_str().len())
 }
 
@@ -1566,6 +1574,26 @@ mod tests {
             precreate_dirs: vec![],
             plain_file: None,
         }
+    }
+
+    /// A grant root named through a symlink (`/tmp` for `/private/tmp`)
+    /// still covers the resolved path.
+    #[cfg(unix)]
+    #[test]
+    fn writable_tree_over_matches_a_symlinked_root_in_canonical_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = t.join("private-tmp");
+        std::fs::create_dir(&real).unwrap();
+        let alias = t.join("tmp");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let p = policy(vec![rule(alias.to_str().unwrap(), true, true, false)]);
+        let home = t.join("home");
+        assert_eq!(
+            writable_tree_over(&p, &home, &real.join("x/s.json")),
+            Some(real.clone())
+        );
+        assert_eq!(writable_tree_over(&p, &home, &t.join("other/s.json")), None);
     }
 
     /// #385 F04: a list file outside every writable tree is still the agent's

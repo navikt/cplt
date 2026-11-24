@@ -653,6 +653,7 @@ impl AuditReport {
                 ..
             } => (duration, exit_code),
         };
+        crate::session_summary::mark_exit_reported();
         let ended = format!(
             "Session ended (exit {exit_code}, {})",
             human_duration(*duration)

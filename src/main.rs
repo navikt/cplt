@@ -3737,6 +3737,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
                 repo_trusted = true;
+                cplt::session_summary::set_repo_config("trusted");
                 // --accept-repo-config approves for ONE run and persists
                 // nothing. `repos` is the opposite shape: approving it writes
                 // named roots into the local config, which outlives the run. A
@@ -3758,6 +3759,19 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 repo_trusted =
                     !trust::granted_keys(entry.as_ref(), verdict, &loaded.config.propose)
                         .is_empty();
+                // #1157: recorded whatever `quiet` says; the warnings below are not.
+                cplt::session_summary::set_repo_config(
+                    if matches!(
+                        verdict,
+                        trust::Verdict::Status(trust::ApprovalStatus::Changed)
+                    ) {
+                        "changed"
+                    } else if repo_trusted {
+                        "trusted"
+                    } else {
+                        "untrusted"
+                    },
+                );
                 let proposes_nothing =
                     repo_config::proposed_keys(&loaded.config.propose).is_empty();
                 let nothing_proposed = !loaded.propose_dropped && proposes_nothing;
@@ -5520,7 +5534,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Handle --doctor: run diagnostics and exit (works on all platforms)
     // DEPRECATED: use `cplt doctor` subcommand instead
     if cli.doctor {
-        ui::warn("--doctor is deprecated, use `cplt doctor` instead");
+        ui::warn_id(
+            "warn.doctor-flag-deprecated",
+            "--doctor is deprecated, use `cplt doctor` instead",
+        );
         return Ok(run_doctor(&cli, false, false));
     }
 
@@ -5550,6 +5567,36 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         repo_trusted,
         configured_quiet: _,
     } = resolve_context(&cli, false)?;
+
+    // #1157: only a real launch writes a summary, never an inspection.
+    if !cli.print_profile && mcp_status.is_none() {
+        let summary_path = cplt::session_summary::path_from_env();
+        cplt::session_summary::begin(active_agent.binary_name());
+        cplt::session_summary::set_managed_layer_used(resolved.managed.is_some());
+        cplt::session_summary::set_settings(
+            config::BOOL_KEYS
+                .iter()
+                .zip(&resolved.bool_layers)
+                .filter(|(_, layer)| **layer != config::ConfigLayer::Baseline)
+                .map(|(row, _)| format!("{}.{}", row.section, row.key))
+                .collect(),
+        );
+        if summary_path.is_some() {
+            let raw = std::env::var(cplt::session_summary::HOSTS_ENV).unwrap_or_default();
+            let (_, bad) = cplt::session_summary::parse_suffixes(&raw);
+            if bad > 0 {
+                ui::warn_id(
+                    "warn.session-summary-hosts-malformed",
+                    &format!(
+                        "{} ignores {bad} malformed entr{}: give DNS suffixes such as nav.no, \
+                         separated by commas.",
+                        cplt::session_summary::HOSTS_ENV,
+                        if bad == 1 { "y" } else { "ies" }
+                    ),
+                );
+            }
+        }
+    }
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths).map_err(anyhow::Error::msg)?;
@@ -5705,7 +5752,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             line.as_deref().unwrap_or(""),
         ) && let Some(line) = &line
         {
-            ui::warn(line);
+            ui::warn_id("hint.otlp-vendor-auth", line);
         }
     }
     // `cplt mcp status`: the same specs, judged by this launch's final policy.
@@ -5872,10 +5919,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .add_opencode_v2(session)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         for w in cplt::opencode_v2::host_warnings(&home_dir) {
-            ui::warn(&w);
+            ui::warn_id("warn.opencode-v2-host", &w);
         }
         if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
-            ui::warn(&w);
+            ui::warn_id("warn.opencode-v2-first-run", &w);
         }
         if let Some(w) = cplt::doctor::opencode_v2_auth_content_note(
             &cli.pass_env,
@@ -5883,7 +5930,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             resolved.inherit_env,
             std::env::var_os("OPENCODE_AUTH_CONTENT").is_some(),
         ) {
-            ui::warn(&w);
+            ui::warn_id("hint.opencode-v2-auth-content", &w);
         }
     }
 
@@ -5961,7 +6008,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             cplt::doctor::gh_guard_fix(cli.no_gh_guard),
         )
     {
-        ui::warn(&hint);
+        ui::warn_id("hint.push-gh-guard", &hint);
         // The fix is said again when git asks for credentials (#1144).
         prepared.set_push_hint(cplt::doctor::gh_guard_fix(cli.no_gh_guard).to_string());
     }
@@ -5999,17 +6046,62 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     .join(", ")
             )
         };
-        ui::warn(&format!(
-            "the {active_agent} binary at {} sits under {}, which the sandbox makes writable. \
+        ui::warn_id(
+            "warn.agent-binary-writable",
+            &format!(
+                "the {active_agent} binary at {} sits under {}, which the sandbox makes writable. \
              cplt spawns the agent binary OUTSIDE the sandbox, as you, so an agent that \
              rewrites it there gets unsandboxed execution on your next cplt launch — no \
              approval, no prompt. {advice}",
-            agent_bin.display(),
-            tree.display()
-        ));
+                agent_bin.display(),
+                tree.display()
+            ),
+        );
     }
 
     warn_shim_target_without_exec(&policy, &agent_bin);
+
+    // #1157: the parent writes the summary after the session, so a path the
+    // sandbox can write would let the agent plant a link or a file there first.
+    if let Some(path) = cplt::session_summary::path_from_env()
+        && cplt::session_summary::launched()
+    {
+        // The profile's own write grants too: on macOS it grants trees the
+        // policy model does not carry (a relocated pnpm store).
+        let mut writable = policy.clone();
+        writable
+            .fs_rules
+            .extend(
+                prepared
+                    .emitted_write_roots()
+                    .into_iter()
+                    .map(|path| cplt::sandbox::FsRule {
+                        nofollow: false,
+                        path,
+                        access: cplt::sandbox::FsAccess {
+                            read: false,
+                            write: true,
+                            execute: false,
+                            ioctl: false,
+                            create_dirs: false,
+                        },
+                    }),
+            );
+        match cplt::session_summary::path_refusal(&path, |p| {
+            cplt::check::writable_tree_on_path(&writable, &home_dir, p)
+        }) {
+            Ok(checked) => cplt::session_summary::set_path(checked),
+            Err(why) => ui::warn_id(
+                "warn.session-summary-path-refused",
+                &format!(
+                    "not writing the session summary to {}: {why}. Point {} outside the \
+                     project and every write grant.",
+                    path.display(),
+                    cplt::session_summary::ENV
+                ),
+            ),
+        }
+    }
 
     // Preflight: verify the sandbox mechanism works on this system
     if !resolved.no_validate {
@@ -6026,7 +6118,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Print comprehensive summary and confirm before launching Copilot
     let confirm = if resolved.quiet {
         if !unapproved_proposals.is_empty() {
-            ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
+            ui::warn_id(
+                "hint.untrusted-repo-config",
+                &untrusted_repo_config_notice(unapproved_proposals.len()),
+            );
         }
         None
     } else {
@@ -6131,7 +6226,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         && let Some(scratch) = prepared.scratch_dir()
         && let Err(e) = brief::claude_brief_args(&mut copilot_args, scratch)
     {
-        ui::warn(&e);
+        ui::warn_id("warn.claude-brief", &e);
     }
 
     // #1138: v2 `run` needs the session service started for it.
@@ -6208,11 +6303,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     );
     if let Some(guard) = managed_guard {
         if let Some(line) = guard.finish() {
-            ui::warn(&line);
+            ui::warn_id("warn.managed-guard", &line);
         }
         // Only a probe that ran can say the tree is still alive (#1126).
         if needs_snapshot && !settled {
-            ui::warn(config::UNSETTLED_MANAGED_WARNING);
+            ui::warn_id("warn.managed-unsettled", config::UNSETTLED_MANAGED_WARNING);
         }
     }
     if let Some((own, before)) = &v2_model {
@@ -6224,12 +6319,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .filter(|f| !before.contains(f))
         {
             let added = sanitize_terminal_text(added);
-            ui::warn(&format!(
-                "Copilot now trusts {added}: this session added it to \
+            ui::warn_id(
+                "warn.copilot-trusted-folder",
+                &format!(
+                    "Copilot now trusts {added}: this session added it to \
                  ~/.copilot/config.json trustedFolders, so host sessions there skip the \
                  trust prompt. Remove it from that file if you did not choose \
                  \"remember this folder\"."
-            ));
+                ),
+            );
         }
     }
     cplt::opencode_v2::save_tui(&v2_tui);
@@ -6275,12 +6373,22 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         let _ = child.wait();
     }
 
+    cplt::session_summary::finish(exit_code);
     Ok(ExitCode::from(exit_code))
 }
 
 fn main() -> ExitCode {
+    cplt::session_summary::mark_process_start();
     let cli = Cli::parse();
-    match run(cli) {
+    let result = run(cli);
+    if result.is_err() {
+        cplt::session_summary::setup_failed();
+    }
+    cplt::session_summary::write_if_requested();
+    if let Some(line) = cplt::session_summary::exit_line() {
+        ui::info(&line);
+    }
+    match result {
         Ok(code) => code,
         Err(e) => {
             // Broken pipe (e.g. `cplt config show | head`) — exit silently per Unix convention.

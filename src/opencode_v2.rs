@@ -1259,6 +1259,34 @@ mod tests {
 
     use super::*;
 
+    /// #1164: the history grant v2 really emits counts as a write grant, so
+    /// the session summary cannot be aimed at it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prompt_history_grant_is_a_write_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let scratch = home.join("scratch");
+        let launch = home.join("proj");
+        std::fs::create_dir_all(&launch).unwrap();
+        // Pinned, whatever the ambient env: an inherited XDG_STATE_HOME would
+        // otherwise point the test (and its write) somewhere else.
+        let (state, config) = (home.join("state"), home.join("config"));
+        let history = state.join("opencode/prompt-history.jsonl");
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::write(&history, "").unwrap();
+        let session = temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some(state.as_os_str())),
+                ("XDG_CONFIG_HOME", Some(config.as_os_str())),
+                ("OPENCODE_CONFIG_DIR", None),
+            ],
+            || prepare(&scratch, &home, &launch).unwrap(),
+        );
+        let grants = crate::sandbox::write_grant_paths(&session.sbpl_before_denies);
+        assert!(grants.contains(&history), "{grants:?}");
+    }
+
     #[test]
     fn host_service_pid_needs_a_live_process() {
         let tmp = tempfile::tempdir().unwrap();
