@@ -2910,6 +2910,11 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         sbpl!(sb, "(deny file-read* (literal \"{p}\"))");
         sbpl!(sb, "(deny file-write* (literal \"{p}\"))");
     }
+    // clonefile(2) on a directory authorises only the top directory, not the
+    // files inside it, so a read-denied file under a readable directory would
+    // ride along. File clones stay allowed (they check read on the source), and
+    // copyfile/`cp -c -R` fall back to per-file clones when this refuses.
+    sbpl!(sb, "(deny file-clone (vnode-type DIRECTORY))");
     // `bsd.sb` allows `file-read-metadata` everywhere, and that named operation
     // outranks the `file-read*` deny above, so a denied `~/.npmrc` still stats
     // as present. yarn 1 checks existence before it reads every npmrc on the

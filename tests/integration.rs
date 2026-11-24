@@ -2647,6 +2647,47 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A directory clone must not carry a read-denied file out with it, while
+    /// an ordinary file clone (APFS copy-on-write, used by build tools) works.
+    #[test]
+    fn real_profile_clone_cannot_copy_read_denied_files() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let base = temp.path().join(".cplt-worktrees");
+        let staging = base.join(".staging");
+        let root = base.join("managed");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("private"), "secret\n").unwrap();
+        fs::write(temp.path().join("plain"), "plain\n").unwrap();
+        let home = home_dir();
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.managed_worktree_root = Some(&root);
+        let profile = write_real_profile(&opts);
+        let t = temp.path().display();
+        let clone = |src: &str, dst: &str| {
+            python_inline_command(&format!(
+                "import ctypes,sys\nc=ctypes.CDLL(None).clonefile\nsys.exit(c({src:?}.encode(),{dst:?}.encode(),0))"
+            ))
+        };
+        let script = format!(
+            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; {}; cat '{t}/fileclone' 2>/dev/null && echo FILE_OK; {}; cat '{t}/filecopy' 2>/dev/null && echo LEAK",
+            clone(&base.display().to_string(), &format!("{t}/dirclone")),
+            clone(&format!("{t}/plain"), &format!("{t}/fileclone")),
+            clone(
+                &staging.join("private").display().to_string(),
+                &format!("{t}/filecopy")
+            ),
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(!output.contains("LEAK"), "{output}");
+        assert!(output.contains("FILE_OK"), "{output}");
+    }
+
     #[test]
     fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
         require_sandbox!();
