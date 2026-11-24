@@ -826,14 +826,6 @@ fn denied_entry(
     })
 }
 
-/// Credential files inside otherwise-allowed HOME_TOOL_DIRS.
-/// These are denied by default because they typically contain registry
-/// credentials (Nexus/Artifactory passwords, API tokens, master passwords).
-/// Unlike DENIED_FILES, these can be overridden with `--allow-read` or
-/// `allow.read` in config.toml for developers using private registries.
-///
-/// On Linux (Landlock), this deny is NOT enforceable — Landlock cannot deny
-/// subpaths within allowed directories. See SECURITY.md for details.
 /// Package-manager caches, relative to `$HOME`, that may be the source of a
 /// directory clone on macOS. Downloaded packages only: none may contain, or be
 /// inside, a read-denied path.
@@ -851,6 +843,14 @@ pub const CLONE_CACHE_DIRS: &[&str] = &[
     ".cache/uv",
 ];
 
+/// Credential files inside otherwise-allowed HOME_TOOL_DIRS.
+/// These are denied by default because they typically contain registry
+/// credentials (Nexus/Artifactory passwords, API tokens, master passwords).
+/// Unlike DENIED_FILES, these can be overridden with `--allow-read` or
+/// `allow.read` in config.toml for developers using private registries.
+///
+/// On Linux (Landlock), this deny is NOT enforceable — Landlock cannot deny
+/// subpaths within allowed directories. See SECURITY.md for details.
 pub const DENIED_HOME_SUBPATHS: &[&str] = &[
     ".m2/settings.xml",
     ".m2/settings-security.xml",

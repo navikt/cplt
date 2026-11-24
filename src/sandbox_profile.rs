@@ -2919,7 +2919,10 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // default backend has no fallback), so re-allow directory clones whose
     // source is one of those caches. They hold downloaded packages, never a
     // read-denied path (`clone_cache_dirs_hold_no_denied_path` pins that).
-    for p in CLONE_CACHE_DIRS.iter().flat_map(|d| spell(d, false)) {
+    for p in CLONE_CACHE_DIRS
+        .iter()
+        .flat_map(|d| clone_cache_spellings(home, d))
+    {
         sbpl!(
             sb,
             "(allow file-clone (require-all (vnode-type DIRECTORY) (subpath \"{p}\")))"
@@ -3040,6 +3043,42 @@ fn resolved(path: PathBuf) -> PathBuf {
 fn home_spellings(home: &str, rel: &str) -> Vec<String> {
     let named = Path::new(home).join(rel);
     spellings(&named, &crate::config::canonicalize_deepest(&named))
+}
+
+/// Spellings for a directory-clone allow on a `CLONE_CACHE_DIRS` entry.
+///
+/// Never a resolved symlink target: these caches sit in agent-writable dirs, so
+/// a session could point one at a dir holding read-denied files and have the
+/// next launch allow cloning it. A symlink anywhere between `$HOME` and the
+/// cache gets no allow at all. The canonical `$HOME` spelling is kept, since
+/// `$HOME` itself is not the agent's to move.
+fn clone_cache_spellings(home: &str, rel: &str) -> Vec<String> {
+    let mut walk = PathBuf::from(home);
+    for part in Path::new(rel).components() {
+        walk.push(part);
+        match std::fs::symlink_metadata(&walk) {
+            Ok(m) if m.file_type().is_symlink() => {
+                crate::ui::warn(&format!(
+                    "{} is a symlink, so package managers cannot clone directories out of ~/{rel}. \
+                     Remove the symlink, or use `bun install --backend copyfile`.",
+                    walk.display()
+                ));
+                return Vec::new();
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let named = Path::new(home).join(rel);
+    let mut out = vec![named.clone()];
+    if let Ok(h) = std::fs::canonicalize(home) {
+        out.push(h.join(rel));
+    }
+    out.dedup();
+    out.into_iter()
+        .filter(|p| validate_sbpl_path(p).is_ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// [`home_spellings`] for a path already resolved.

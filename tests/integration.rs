@@ -2700,6 +2700,50 @@ int main(int argc, char **argv) {
         assert!(output.contains("cached\nCACHE_OK"), "{output}");
     }
 
+    /// A cache dir swapped for a symlink must not make its target a clone
+    /// source: the target can hold read-denied files.
+    #[test]
+    fn real_profile_symlinked_clone_cache_grants_no_clone() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let base = temp.path().join(".cplt-worktrees");
+        let staging = base.join(".staging");
+        let root = base.join("managed");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("private"), "secret\n").unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".bun/install")).unwrap();
+        std::os::unix::fs::symlink(&base, home.join(".bun/install/cache")).unwrap();
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.managed_worktree_root = Some(&root);
+        let profile = write_real_profile(&opts);
+        let text = fs::read_to_string(&profile).unwrap();
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.contains("allow file-clone") && l.contains(".cplt-worktrees")),
+            "{text}"
+        );
+        let t = temp.path().display();
+        let script = format!(
+            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; echo DONE",
+            python_inline_command(&format!(
+                "import ctypes,sys\nc=ctypes.CDLL(None).clonefile\nsys.exit(c({:?}.encode(),{:?}.encode(),0))",
+                home.join(".bun/install/cache").display().to_string(),
+                format!("{t}/dirclone")
+            ))
+            .replacen("python3", "/usr/bin/python3", 1)
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(!output.contains("LEAK"), "{output}");
+        assert!(output.contains("DONE"), "{output}");
+    }
+
     #[test]
     fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
         require_sandbox!();
