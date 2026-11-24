@@ -1994,11 +1994,12 @@ fn merge_tool_path_env_overrides(
         if let Some(prot) = protected {
             ui::warn(&format!(
                 "Ignoring {} = {}: it reaches {}, which the sandbox protects, so no grant is \
-             added and writes there stay denied. Point {} at a directory outside it.",
+             added and writes there stay denied. Point {} at a directory outside it: {}",
                 ovr.name,
                 path.to_string_lossy().escape_debug(),
                 prot.to_string_lossy().escape_debug(),
-                ovr.name
+                ovr.name,
+                cplt::sandbox::env_dir_move_fix(ovr.name)
             ));
             continue;
         }

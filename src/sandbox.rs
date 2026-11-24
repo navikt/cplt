@@ -133,18 +133,18 @@ pub use policy::{
     copilot_ro_protect_paths, cplt_exe_no_exec_dir, cplt_state_ancestor_grant, cplt_state_dir,
     cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
     cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
-    ensure_split_tool_dirs, env_tool_dir_allowed, env_tool_dir_hint_ok, env_tool_path_protected,
-    env_tool_path_readonly_host, env_tool_temp_roots, exec_write_conflicts,
-    first_party_read_target, gradle_loopback_hint, grant_is_refused, home_config_link_targets,
-    home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays, linux_docker_socket_paths,
-    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
-    missing_wrapper_dist_hint, nested_alternation, no_cache_env, no_exec_temp_dir_over,
-    no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs, pin_legacy_state_dir_if_inside,
-    playwright_runtime_intent, process_env, readonly_wrapper_lock_files, refused_writable_app_root,
-    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
-    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, wrapper_lock_files, xdg_runtime_dir_env,
-    xdg_state_dir,
+    ensure_split_tool_dirs, env_dir_move_fix, env_tool_dir_allowed, env_tool_dir_hint_ok,
+    env_tool_path_protected, env_tool_path_readonly_host, env_tool_temp_roots,
+    exec_write_conflicts, first_party_read_target, gradle_loopback_hint, grant_is_refused,
+    home_config_link_targets, home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays,
+    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
+    no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
+    pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
+    readonly_wrapper_lock_files, refused_writable_app_root, relocatable_tool_prefix,
+    report_state_pinned, shim_ro_protect_paths, socket_mask_paths, state_pinned_message,
+    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
+    validate_sbpl_path, wrapper_lock_files, xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -597,7 +597,7 @@ impl PreparedSandbox {
     /// say why not and how to fix it. The launch refuses on `Err`.
     #[cfg(target_os = "linux")]
     pub fn check_netns(&self) -> Result<(), String> {
-        const OFF: &str = "or set proxy.netns = false";
+        const OFF: &str = "or run `cplt config set proxy.netns false`";
         if self.bwrap_wrapper.as_ref().is_none_or(|w| !w.netns()) {
             let fix = if bubblewrap::check_availability().is_none() {
                 format!("Install it ({})", crate::doctor::BWRAP_INSTALL_HINT)
@@ -619,7 +619,7 @@ impl PreparedSandbox {
         if self.scratch_dir.is_none() {
             return Err(format!(
                 "proxy.netns needs the scratch dir for its proxy socket. \
-                 Set sandbox.scratch_dir = true, {OFF}."
+                 Run `cplt config set sandbox.scratch_dir true`, {OFF}."
             ));
         }
         Ok(())
@@ -949,9 +949,10 @@ fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
                 return Err(format!(
                     "pnpm package-manager-store {} overlaps writable tool directory {}. \
                      A nested writable executable store would let the agent drop and run \
-                     a binary; move PNPM_HOME outside writable cache trees.",
+                     a binary; move PNPM_HOME outside writable cache trees: {}",
                     package_store.path.display(),
-                    writable.path.display()
+                    writable.path.display(),
+                    policy::env_dir_move_fix("PNPM_HOME")
                 ));
             }
         }
@@ -4734,7 +4735,8 @@ fn unenforced_refusal(
     let fix = if bwrap_active {
         "Remove the path from deny.paths.".to_string()
     } else if config.use_bubblewrap == Some(false) {
-        "Remove sandbox.use_bubblewrap = false (or --no-bubblewrap) so Bubblewrap masks it."
+        "Run `cplt config unset sandbox.use_bubblewrap` (and drop --no-bubblewrap) so \
+         Bubblewrap masks it."
             .to_string()
     } else if bubblewrap::check_availability().is_none() {
         format!("Install bubblewrap: {}.", crate::doctor::BWRAP_INSTALL_HINT)
