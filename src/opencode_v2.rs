@@ -1166,15 +1166,20 @@ mod tests {
         let scratch = home.join("scratch");
         let launch = home.join("proj");
         std::fs::create_dir_all(&launch).unwrap();
-        let history =
-            xdg_base("XDG_STATE_HOME", &home, ".local/state").join("opencode/prompt-history.jsonl");
-        if !history.starts_with(&home) {
-            // An inherited XDG_STATE_HOME would make this write the real file.
-            return;
-        }
+        // Pinned, whatever the ambient env: an inherited XDG_STATE_HOME would
+        // otherwise point the test (and its write) somewhere else.
+        let (state, config) = (home.join("state"), home.join("config"));
+        let history = state.join("opencode/prompt-history.jsonl");
         std::fs::create_dir_all(history.parent().unwrap()).unwrap();
         std::fs::write(&history, "").unwrap();
-        let session = prepare(&scratch, &home, &launch).unwrap();
+        let session = temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some(state.as_os_str())),
+                ("XDG_CONFIG_HOME", Some(config.as_os_str())),
+                ("OPENCODE_CONFIG_DIR", None),
+            ],
+            || prepare(&scratch, &home, &launch).unwrap(),
+        );
         let grants = crate::sandbox::write_grant_paths(&session.sbpl_before_denies);
         assert!(grants.contains(&history), "{grants:?}");
     }
