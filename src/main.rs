@@ -8087,6 +8087,10 @@ fn assemble_sandbox(
         cli.observe_domains,
     );
 
+    // Writable cache dirs under read-only tool roots must exist before the
+    // grants are built; the sandbox can no longer create them.
+    sandbox::ensure_split_tool_dirs(home_dir);
+
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
     // init script so sandboxed builds keep the preferIPv4Stack workaround for
     // the daemon and Test/JavaExec forks (WorkerExecutor forks have no

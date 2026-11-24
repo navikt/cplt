@@ -4994,6 +4994,62 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Files host builds run or obey later (Gradle init scripts and
+    /// properties, Maven settings and toolchains, Yarn classic global bins)
+    /// must not be writable, while the cache subdirs a sandboxed build fills
+    /// stay writable.
+    #[test]
+    fn real_profile_denies_writes_to_host_executed_tool_paths() {
+        require_sandbox!();
+        // Both outside the temp roots, which are writable wholesale.
+        let mk = |prefix| {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .unwrap()
+        };
+        let (project_dir, home_dir) = (mk(".cplt-hostexec-project-"), mk(".cplt-hostexec-home-"));
+        let project = fs::canonicalize(project_dir.path()).unwrap();
+        let home = home_dir.path().to_path_buf();
+        for d in [
+            ".gradle/init.d",
+            ".gradle/caches",
+            ".gradle/wrapper",
+            ".m2/repository",
+            ".yarn/bin",
+            ".yarn/berry",
+        ] {
+            fs::create_dir_all(home.join(d)).unwrap();
+        }
+        let home = fs::canonicalize(&home).unwrap();
+        let profile = write_real_profile(&default_opts(&project, &home));
+
+        let mut failures = Vec::new();
+        for (rel, want_ok) in [
+            (".gradle/init.d/x.gradle", false),
+            (".gradle/init.gradle", false),
+            (".gradle/init.gradle.kts", false),
+            (".gradle/gradle.properties", false),
+            (".gradle/jdks", false),
+            (".m2/settings.xml", false),
+            (".m2/toolchains.xml", false),
+            (".m2/extensions.xml", false),
+            (".yarn/bin/x", false),
+            (".gradle/caches/x", true),
+            (".gradle/wrapper/x", true),
+            (".m2/repository/x", true),
+            (".yarn/berry/x", true),
+        ] {
+            let cmd = format!("echo x > '{}' 2>&1; echo EXIT:$?", home.join(rel).display());
+            let (out, _) = run_sandboxed(&profile, &cmd);
+            if out.contains("EXIT:0") != want_ok {
+                failures.push(format!("{rel}: want_ok={want_ok} out={out:?}"));
+            }
+        }
+        fs::remove_file(&profile).ok();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     // ── sandbox.allow_build_credentials (#463) ──────────────────
 
     /// The three build credential files, planted with sentinels in a

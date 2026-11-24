@@ -4485,6 +4485,95 @@ fi
         );
     }
 
+    /// A real `gradle build` inside the sandbox still works with `~/.gradle`
+    /// read-only outside its cache subdirs, and the session cannot plant an
+    /// init script that the next host build would run. Uses a throwaway HOME
+    /// and GRADLE_USER_HOME, never the developer's ~/.gradle.
+    #[test]
+    fn project_gradle_build_with_read_only_gradle_home() {
+        require_sandbox!();
+        if !gradle_available() {
+            eprintln!("SKIPPED: gradle not available");
+            return;
+        }
+        let scaffold = |name: &str| {
+            let p = TempProject::new(name);
+            p.write_file("settings.gradle.kts", "rootProject.name = \"p\"\n");
+            p.write_file("build.gradle.kts", "plugins { java }\n");
+            p.write_file("src/main/java/a/A.java", "package a; public class A {}\n");
+            p
+        };
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-e2e-gradlehome-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = fs::canonicalize(home.keep()).unwrap();
+        // Host precheck in its own project and Gradle home: a JDK/Gradle
+        // mismatch on this machine is not a sandbox failure.
+        let host = scaffold("gradle-host");
+        let host_ok = Command::new("gradle")
+            .args(["build", "--no-daemon", "-q"])
+            .current_dir(host.path())
+            .env("HOME", &home)
+            .env("GRADLE_USER_HOME", home.join("host-gradle"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !host_ok {
+            fs::remove_dir_all(&home).ok();
+            eprintln!("SKIPPED: gradle cannot build a plain Java project on this host");
+            return;
+        }
+        let gradle_home = home.join(".gradle");
+        fs::create_dir_all(gradle_home.join("init.d")).unwrap();
+        let project = scaffold("gradle-ro");
+        project.git_init();
+        // The fake HOME moves mise/sdkman roots away from where the JDK and
+        // Gradle live, so grant both explicitly.
+        let mut reads: Vec<String> = Vec::new();
+        if let Ok(jh) = std::env::var("JAVA_HOME") {
+            reads.extend(["--allow-read".into(), jh]);
+        }
+        let which = Command::new("/usr/bin/which")
+            .arg("gradle")
+            .output()
+            .unwrap();
+        let gradle = fs::canonicalize(String::from_utf8_lossy(&which.stdout).trim()).unwrap();
+        let gradle_root = gradle.parent().and_then(Path::parent).unwrap();
+        reads.extend([
+            "--allow-read".into(),
+            gradle_root.to_string_lossy().into_owned(),
+        ]);
+        let out = cplt_cmd()
+            .args(["--yes", "--no-validate", "--agent", "shell", "--allow-localhost-any"])
+            .args(&reads)
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args([
+                "--",
+                "-c",
+                "gradle build --no-daemon -q >/dev/null 2>&1 && echo BUILD_OK; \
+                 (echo x > \"$GRADLE_USER_HOME/init.d/evil.gradle\") 2>/dev/null && echo WROTE_INIT; \
+                 (echo x > \"$GRADLE_USER_HOME/gradle.properties\") 2>/dev/null && echo WROTE_PROPS; true",
+            ])
+            .env("HOME", &home)
+            .env("GRADLE_USER_HOME", &gradle_home)
+            .output()
+            .expect("run cplt");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let caches = gradle_home.join("caches").is_dir();
+        let planted = gradle_home.join("init.d/evil.gradle").exists();
+        fs::remove_dir_all(&home).ok();
+        assert!(
+            stdout.contains("BUILD_OK"),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(caches, "the build must fill ~/.gradle/caches");
+        assert!(
+            !stdout.contains("WROTE") && !planted,
+            "host-run Gradle files must stay read-only: {stdout}"
+        );
+    }
+
     /// Verify GRADLE_MACOS_SANDBOX=off is injected inside the sandbox.
     /// Gradle 9+ runs its own sandbox-exec which conflicts with cplt's sandbox.
     /// cplt disables it automatically.

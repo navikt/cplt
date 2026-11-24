@@ -15,6 +15,28 @@ standalone install over editor launchers, even when the editor appears first
 in PATH. Check the selected path with `cplt doctor --verbose`, then launch
 `cplt`. Keep `sandbox.keychain_substitute` enabled.
 
+## Gradle, Maven and Yarn homes are read-only outside their caches
+
+Inside cplt, `~/.gradle` and `~/.m2` are read-only except for the
+directories a build fills: `caches/`, `wrapper/`, `native/`, `daemon/` and
+`.tmp/` under `~/.gradle`, and `repository/` and `wrapper/` under `~/.m2`.
+`~/.yarn` is read-only except `berry/`. Host builds run or obey the other
+files there (`init.d/`, `init.gradle`, `gradle.properties`, `settings.xml`,
+`toolchains.xml`, Yarn classic's global `bin/`), so a sandboxed session must
+not be able to change them.
+
+A build or command inside cplt that writes one of those files now fails with a
+permission error (`Operation not permitted`, `Permission denied`, or
+`Read-only file system` under bubblewrap).
+Typical cases are `yarn global add`, a Gradle toolchain download into
+`~/.gradle/jdks` (already blocked before), or a script that edits
+`~/.gradle/gradle.properties`. Make that change outside cplt. If a build
+needs to write another cache directory under one of these homes, grant that
+directory alone with `--allow-write ~/.gradle/<dir>` (or `allow.write` in the
+config) and open an issue so it can become a default. cplt creates
+the writable subdirectories before launch when `~/.gradle`, `~/.m2` or
+`~/.yarn` exists.
+
 ## Branch tracking is silently dropped
 
 `.git/config` is write-denied on macOS (it is a `core.hooksPath` and

@@ -5836,8 +5836,8 @@ fn profile_gradle_has_map_exec_only() {
         ".gradle should NOT have process-exec allow"
     );
     assert!(
-        p.contains("(deny process-exec (subpath \"/Users/test/.gradle\"))"),
-        ".gradle should have explicit process-exec DENY (writable dir)"
+        p.contains("(deny process-exec (subpath \"/Users/test/.gradle/caches\"))"),
+        ".gradle/caches should have explicit process-exec DENY (writable dir)"
     );
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.gradle\"))"),
@@ -5847,10 +5847,20 @@ fn profile_gradle_has_map_exec_only() {
         !p.contains("(deny file-map-executable (subpath \"/Users/test/.gradle\"))"),
         ".gradle should NOT deny file-map-executable (JNI needs it)"
     );
+    // The root holds init.d, init.gradle* and gradle.properties, which host
+    // builds run or obey; only the cache subdirs are writable.
     assert!(
-        p.contains("(allow file-write* (subpath \"/Users/test/.gradle\"))"),
-        ".gradle should have file-write* for build caches"
+        !p.contains("(allow file-write* (subpath \"/Users/test/.gradle\"))"),
+        ".gradle root must not be writable"
     );
+    for sub in ["caches", "wrapper", "native", "daemon", ".tmp"] {
+        assert!(
+            p.contains(&format!(
+                "(allow file-write* (subpath \"/Users/test/.gradle/{sub}\"))"
+            )),
+            ".gradle/{sub} should have file-write* for build caches"
+        );
+    }
 }
 
 #[test]
@@ -5883,8 +5893,12 @@ fn profile_pyenv_has_exec() {
 fn profile_yarn_is_write_only() {
     let p = default_profile();
     assert!(
-        p.contains("(allow file-write* (subpath \"/Users/test/.yarn\"))"),
-        ".yarn should have file-write* for global cache"
+        p.contains("(allow file-write* (subpath \"/Users/test/.yarn/berry\"))"),
+        ".yarn/berry should have file-write* for global cache"
+    );
+    assert!(
+        !p.contains("(allow file-write* (subpath \"/Users/test/.yarn\"))"),
+        ".yarn root holds Yarn classic's global bin/ and must not be writable"
     );
     assert!(
         !p.contains("(allow process-exec (subpath \"/Users/test/.yarn\"))"),
@@ -5895,12 +5909,12 @@ fn profile_yarn_is_write_only() {
         ".yarn should NOT have file-map-executable"
     );
     assert!(
-        p.contains("(deny process-exec (subpath \"/Users/test/.yarn\"))"),
-        ".yarn should have explicit process-exec DENY (writable dir)"
+        p.contains("(deny process-exec (subpath \"/Users/test/.yarn/berry\"))"),
+        ".yarn/berry should have explicit process-exec DENY (writable dir)"
     );
     assert!(
-        p.contains("(deny file-map-executable (subpath \"/Users/test/.yarn\"))"),
-        ".yarn should have explicit file-map-executable DENY (writable dir)"
+        p.contains("(deny file-map-executable (subpath \"/Users/test/.yarn/berry\"))"),
+        ".yarn/berry should have explicit file-map-executable DENY (writable dir)"
     );
 }
 

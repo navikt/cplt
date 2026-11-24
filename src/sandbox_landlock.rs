@@ -4067,8 +4067,8 @@ mod tests {
         for rel in [
             ".cargo/registry",
             ".cargo/git",
-            ".gradle",
-            ".m2",
+            ".gradle/caches",
+            ".m2/repository",
             ".nuget",
             "go/pkg",
         ] {
@@ -4090,6 +4090,47 @@ mod tests {
                 !rule.access.execute,
                 "{rel} is writable, so it must not also be executable"
             );
+        }
+    }
+
+    /// `~/.gradle` and `~/.m2` hold files host builds run or obey later, so
+    /// Landlock grants write only to their cache subdirs: it cannot deny
+    /// inside a granted tree, so the root rule itself must be read-only.
+    #[test]
+    fn gradle_and_maven_roots_are_read_only_rules() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let policy = generate_policy(&test_config(&project, &home));
+        let write = |rel: &str| {
+            policy
+                .fs_rules
+                .iter()
+                .filter(|r| r.path == home.join(rel))
+                .any(|r| r.access.write)
+        };
+        for rel in [".gradle", ".m2", ".yarn"] {
+            assert!(!write(rel), "{rel} root must not be writable");
+        }
+        for rel in [
+            ".gradle/caches",
+            ".gradle/wrapper",
+            ".m2/repository",
+            ".yarn/berry",
+        ] {
+            assert!(write(rel), "{rel} must stay writable");
+        }
+        for rule in policy.fs_rules.iter().filter(|r| r.access.write) {
+            for host in [
+                ".gradle/init.d",
+                ".gradle/gradle.properties",
+                ".m2/settings.xml",
+            ] {
+                assert!(
+                    !home.join(host).starts_with(&rule.path),
+                    "{host} under {:?}",
+                    rule.path
+                );
+            }
         }
     }
 
