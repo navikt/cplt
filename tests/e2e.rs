@@ -569,6 +569,54 @@ mod e2e_tests {
         );
     }
 
+    /// #1121: an HTTPS GitHub remote with the gh guard off and no helper gets
+    /// one launch line with the command; running that command clears it. SSH
+    /// gets nothing, and doctor's `push:` line says which case it is.
+    #[test]
+    fn e2e_https_push_hint_names_the_gh_guard_command() {
+        const HINT: &str = "git push to https://github.com will fail";
+        const FIX: &str = "cplt config set gh_guard.enabled true";
+        let home = crate::common::make_config_home("push-hint");
+        let repo = crate::common::temp_repo("navikt/probe");
+        let run = |args: &[&str]| {
+            let (out, err, _) = crate::common::launch(&home, repo.path(), args);
+            format!("{out}{err}")
+        };
+        let session = ["--agent", "shell", "--yes", "--", "-c", "true"];
+
+        run(&["config", "set", "gh_guard.enabled", "false", "--force"]);
+        let out = run(&session);
+        assert!(out.contains(HINT) && out.contains(FIX), "{out}");
+        let doctor = run(&["--agent", "shell", "doctor"]);
+        assert!(
+            doctor.contains("push:        origin (https://github.com): no usable credential helper, gh guard off"),
+            "{doctor}"
+        );
+
+        let fix: Vec<&str> = FIX.split(' ').skip(1).collect();
+        run(&fix);
+        let out = run(&session);
+        assert!(
+            !out.contains(HINT),
+            "the printed command must clear the hint:\n{out}"
+        );
+        assert!(run(&["--agent", "shell", "doctor"]).contains("gh guard on"));
+
+        run(&["config", "set", "gh_guard.enabled", "false", "--force"]);
+        assert!(crate::common::git_ok(
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:navikt/probe.git"
+            ]
+        ));
+        let out = run(&session);
+        assert!(!out.contains(HINT), "SSH remote: no hint:\n{out}");
+        assert!(run(&["--agent", "shell", "doctor"]).contains("not HTTPS to a GitHub host"));
+    }
+
     #[test]
     fn e2e_doctor_header_names_agent_config_and_enforcement() {
         // No require_copilot!: the header prints whatever is installed, and
@@ -618,7 +666,7 @@ mod e2e_tests {
             "the settings line reports the user's quiet, not doctor's own.\nstdout: {stdout}"
         );
         assert!(
-            stdout.contains("auth:        none (the shell needs no login)"),
+            stdout.contains("auth:        agent login: none (the shell needs no login)"),
             "the auth line is per agent.\nstdout: {stdout}"
         );
         assert!(

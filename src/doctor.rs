@@ -1515,6 +1515,141 @@ pub fn exit_nonzero(findings: &[Finding]) -> bool {
     findings.iter().any(|f| f.level == Level::Blocking)
 }
 
+/// The command that turns the gh guard on, as the push hint prints it.
+pub const ENABLE_GH_GUARD: &str = "cplt config set gh_guard.enabled true";
+
+/// What decides whether `git push` over HTTPS can authenticate inside the
+/// sandbox (#1121). Read from git config only: no network, no `gh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushRemote {
+    /// The remote a bare `git push` uses: `remote.pushDefault`, else `origin`.
+    pub remote: String,
+    /// Its push URL (`pushurl`, else `url`).
+    pub url: String,
+    /// The gh guard host the URL is HTTPS to, if any.
+    pub https_host: Option<String>,
+    /// Credential helpers for that host that can answer inside the sandbox
+    /// without the gh guard.
+    pub usable_helpers: Vec<String>,
+}
+
+/// The push remote of `project_dir`, from one hardened `git config --list`.
+///
+/// Scope `command` is skipped: that is the parent's own `CONFIG_OVERRIDES`
+/// (which empties `credential.helper`), not the user's config. System config
+/// is skipped by the hardening too, as it is inside the sandbox.
+///
+/// shortcut: ignores `branch.<b>.pushRemote` and `url.*.insteadOf`; upgrade if
+/// a remote rewritten to HTTPS that way needs the hint.
+#[must_use]
+pub fn push_remote(project_dir: &Path, hosts: &[String]) -> Option<PushRemote> {
+    let out = crate::git::output(project_dir, &["config", "--list", "-z", "--show-scope"])?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_push_remote(&String::from_utf8_lossy(&out.stdout), hosts)
+}
+
+fn parse_push_remote(list: &str, hosts: &[String]) -> Option<PushRemote> {
+    let mut fields = list.split('\0');
+    let mut entries = Vec::new();
+    while let (Some(scope), Some(kv)) = (fields.next(), fields.next()) {
+        if scope == "command" {
+            continue;
+        }
+        let (k, v) = kv.split_once('\n').unwrap_or((kv, ""));
+        entries.push((k.to_ascii_lowercase(), v.to_string()));
+    }
+    let last = |key: &str| {
+        entries
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let remote = last("remote.pushdefault").unwrap_or_else(|| "origin".to_string());
+    let lower = remote.to_ascii_lowercase();
+    let url = last(&format!("remote.{lower}.pushurl"))
+        .or_else(|| last(&format!("remote.{lower}.url")))?;
+    let https_host = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', ':']).next())
+        .map(|h| h.rsplit('@').next().unwrap_or(h).to_ascii_lowercase())
+        .filter(|h| hosts.iter().any(|g| g == h));
+    let mut usable_helpers = Vec::new();
+    if let Some(host) = &https_host {
+        let scoped = format!("credential.https://{host}.helper");
+        for (k, v) in &entries {
+            if k != "credential.helper" && *k != scoped {
+                continue;
+            }
+            // An empty value resets the list, as git does.
+            if v.is_empty() {
+                usable_helpers.clear();
+            } else if !helper_needs_guard(v) {
+                usable_helpers.push(v.clone());
+            }
+        }
+    }
+    Some(PushRemote {
+        remote,
+        url,
+        https_host,
+        usable_helpers,
+    })
+}
+
+/// Helpers that cannot answer inside the sandbox on their own: gh's (its token
+/// store is reached only through the gh guard) and `store`, whose
+/// `~/.git-credentials` the sandbox denies.
+fn helper_needs_guard(helper: &str) -> bool {
+    helper.contains("gh auth git-credential") || helper.split_whitespace().next() == Some("store")
+}
+
+/// The one launch line for an HTTPS GitHub push that nothing can
+/// authenticate, or `None`.
+#[must_use]
+pub fn push_hint(push: Option<&PushRemote>, gh_guard: bool) -> Option<String> {
+    let p = push?;
+    let host = p.https_host.as_deref()?;
+    (!gh_guard && p.usable_helpers.is_empty()).then(|| {
+        format!(
+            "git push to https://{host} will fail: no credential helper works in the \
+             sandbox while the gh guard is off. Turn it on: {ENABLE_GH_GUARD}"
+        )
+    })
+}
+
+/// `cplt doctor`'s `push:` line.
+#[must_use]
+pub fn push_line(push: Option<&PushRemote>, gh_guard: bool, gh_token: bool) -> String {
+    let Some(p) = push else {
+        return "no push remote".to_string();
+    };
+    let Some(host) = p.https_host.as_deref() else {
+        return format!(
+            "{} ({}): not HTTPS to a GitHub host, the gh guard does not apply",
+            p.remote, p.url
+        );
+    };
+    let helpers = if p.usable_helpers.is_empty() {
+        "no usable credential helper".to_string()
+    } else {
+        format!("credential helper {}", p.usable_helpers.join(", "))
+    };
+    let guard = if gh_guard {
+        "gh guard on"
+    } else {
+        "gh guard off"
+    };
+    let token = if gh_token {
+        "gh token for github.com found"
+    } else {
+        "no gh token"
+    };
+    format!("{} (https://{host}): {helpers}, {guard}, {token}", p.remote)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2595,5 +2730,85 @@ mod tests {
             "{local_only:?}"
         );
         assert_eq!(local_only.fix.as_deref(), Some("cplt config init"));
+    }
+
+    fn gh() -> Vec<String> {
+        vec!["github.com".to_string()]
+    }
+
+    fn list(entries: &[(&str, &str, &str)]) -> String {
+        entries
+            .iter()
+            .map(|(s, k, v)| format!("{s}\0{k}\n{v}\0"))
+            .collect()
+    }
+
+    #[test]
+    fn https_remote_with_guard_off_gets_the_hint_and_command() {
+        let p = parse_push_remote(
+            &list(&[("local", "remote.origin.url", "https://github.com/o/r.git")]),
+            &gh(),
+        )
+        .unwrap();
+        let hint = push_hint(Some(&p), false).expect("hint");
+        assert!(
+            hint.ends_with("cplt config set gh_guard.enabled true"),
+            "{hint}"
+        );
+        assert_eq!(push_hint(Some(&p), true), None, "guard on: no hint");
+        assert!(
+            push_line(Some(&p), false, true).contains("no usable credential helper, gh guard off")
+        );
+    }
+
+    #[test]
+    fn ssh_or_other_host_gets_no_hint() {
+        for url in [
+            "git@github.com:o/r.git",
+            "https://gitlab.com/o/r.git",
+            "ssh://github.com/o/r",
+        ] {
+            let p =
+                parse_push_remote(&list(&[("local", "remote.origin.url", url)]), &gh()).unwrap();
+            assert_eq!(push_hint(Some(&p), false), None, "{url}");
+            assert!(push_line(Some(&p), false, false).contains("the gh guard does not apply"));
+        }
+    }
+
+    #[test]
+    fn helpers_and_push_remote_resolve_like_git() {
+        let p = parse_push_remote(
+            &list(&[
+                ("command", "credential.helper", ""),
+                ("global", "credential.helper", "osxkeychain"),
+                ("global", "credential.https://github.com.helper", ""),
+                (
+                    "global",
+                    "credential.https://github.com.helper",
+                    "!/opt/gh auth git-credential",
+                ),
+                ("global", "credential.helper", "store --file x"),
+                ("local", "remote.origin.url", "git@github.com:o/r.git"),
+                ("local", "remote.fork.url", "https://x@GitHub.com/me/r.git"),
+                ("local", "remote.pushDefault", "fork"),
+            ]),
+            &gh(),
+        )
+        .unwrap();
+        assert_eq!(p.remote, "fork");
+        assert_eq!(p.https_host.as_deref(), Some("github.com"));
+        // The empty scoped value reset osxkeychain; gh and store need the guard.
+        assert!(p.usable_helpers.is_empty(), "{:?}", p.usable_helpers);
+        assert!(push_hint(Some(&p), false).is_some());
+        let keychain = parse_push_remote(
+            &list(&[
+                ("global", "credential.helper", "osxkeychain"),
+                ("local", "remote.origin.url", "https://github.com/o/r"),
+            ]),
+            &gh(),
+        )
+        .unwrap();
+        assert_eq!(push_hint(Some(&keychain), false), None);
+        assert_eq!(parse_push_remote(&list(&[]), &gh()), None, "no remote");
     }
 }
