@@ -5529,6 +5529,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     warn_inject_token_without_guard(&resolved);
 
+    // Read-only tool roots and their writable cache dirs must exist before
+    // discovery; the sandbox cannot create them. Real launches only: an
+    // inspection (`--print-profile`, `doctor`) leaves the home untouched.
+    if !cli.print_profile && !cli.doctor {
+        cplt::sandbox::ensure_split_tool_dirs(&home_dir, resolved.readonly_host_tool_paths);
+    }
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir, &repo_paths);
     // After the probe, which adds env-relocated tool grants (GOCACHE, ...) to
@@ -7640,9 +7646,6 @@ impl HostProbe {
         if resolved.allow_build_credentials {
             merge_build_credentials(resolved, home_dir);
         }
-        // Read-only tool roots and their writable cache dirs must exist before
-        // discovery; the sandbox can no longer create them.
-        cplt::sandbox::ensure_split_tool_dirs(home_dir, resolved.readonly_host_tool_paths);
         let mut tool_discovery = discover::discover_tools(home_dir, &tool_roots);
         if resolved.readonly_host_tool_paths {
             cplt::sandbox::apply_readonly_host_tool_paths(
@@ -8642,6 +8645,9 @@ fn prepare_shell_sandbox(
     project_dir: &Path,
     repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
+    if !cli.print_profile {
+        cplt::sandbox::ensure_split_tool_dirs(home_dir, resolved.readonly_host_tool_paths);
+    }
     let mut probe = HostProbe::probe(resolved, home_dir, project_dir, repos.dirs);
     // Like `exec`, `check` never writes the managed block, so it probes
     // without the root AGENTS.md read (#252).
@@ -8819,6 +8825,9 @@ fn run_exec_command(
         mcp_broker,
         mcp_refusal: _,
     } = {
+        if !cli.print_profile {
+            cplt::sandbox::ensure_split_tool_dirs(&home_dir, resolved.readonly_host_tool_paths);
+        }
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir, &repo_paths);
         // `exec` never writes the managed block, so it gets no read on a root
         // AGENTS.md cplt did not write (#252).

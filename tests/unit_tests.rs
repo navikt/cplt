@@ -10272,13 +10272,27 @@ fn deny_nested_git_emits_create_deny_only_when_set() {
 #[test]
 fn readonly_host_tool_paths_adds_only_the_overlay_denies() {
     let base = base_profile_options();
-    let off = generate_profile(&base, &[]);
-    let on = generate_profile(
-        &SandboxConfig {
-            readonly_host_tool_paths: true,
-            ..base_profile_options()
+    // One env lock over both profiles: other tests set XDG_* mid-run, and
+    // tool dirs resolve from them.
+    let (off, on) = temp_env::with_vars_unset(
+        [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+        ],
+        || {
+            let off = generate_profile(&base, &[]);
+            let on = generate_profile(
+                &SandboxConfig {
+                    readonly_host_tool_paths: true,
+                    ..base_profile_options()
+                },
+                &[],
+            );
+            (off, on)
         },
-        &[],
     );
     let header = ";; sandbox.readonly_host_tool_paths";
     assert!(!off.contains(header));
