@@ -102,6 +102,8 @@ struct State {
     exit_code: Option<u8>,
     exit_reason: Option<&'static str>,
     signal: Option<i32>,
+    /// The agent process was spawned (not only the sandbox prepared).
+    spawned: bool,
     /// The audit's "Session ended (exit N)" line already said the code.
     exit_reported: bool,
     net: BTreeMap<&'static str, u64>,
@@ -178,30 +180,42 @@ pub fn set_repo_config(state: &'static str) {
     });
 }
 
-/// The agent is about to be spawned.
-pub fn mark_started() {
-    let ms = since_start().as_millis() as u64;
-    with(|s| {
-        s.startup_ms.get_or_insert(ms);
-    });
-}
-
 /// The post-session report printed the exit code itself.
 pub fn mark_exit_reported() {
     with(|s| s.exit_reported = true);
 }
 
-/// The child was killed by `signal` (recorded by the wait loop).
-pub fn set_signal(signal: i32) {
-    with(|s| s.signal = Some(signal));
+/// The agent process is running (direct spawn, or bwrap confirmed).
+pub fn agent_spawned() {
+    let ms = since_start().as_millis() as u64;
+    with(|s| {
+        s.spawned = true;
+        s.startup_ms.get_or_insert(ms);
+    });
+}
+
+/// The agent exited; `signal` is what killed it, if anything. Replaces any
+/// earlier value, so only the final agent's status counts.
+pub fn agent_exited(signal: Option<i32>) {
+    with(|s| s.signal = signal);
 }
 
 /// The session ended with `code`.
 pub fn finish(code: u8) {
     with(|s| {
         s.exit_code = Some(code);
-        s.exit_reason = Some(if s.signal.is_some() { "signal" } else { "exit" });
+        // No agent ran: a spawn error or a required bwrap that failed. The
+        // error is already printed, so `exit_line` stays quiet.
+        s.exit_reason = Some(exit_reason(s.spawned, s.signal));
     });
+}
+
+fn exit_reason(spawned: bool, signal: Option<i32>) -> &'static str {
+    match (spawned, signal) {
+        (false, _) => "sandbox-setup-failed",
+        (true, Some(_)) => "signal",
+        (true, None) => "exit",
+    }
 }
 
 /// The launch failed before the agent ran.
@@ -767,6 +781,16 @@ mod tests {
             "two-hop link through a grant"
         );
         assert!(ask(&out.join("s.json")).is_ok());
+    }
+
+    /// A spawn error or a required bwrap failing returns 1 without an agent:
+    /// that is a setup failure, not an agent exit.
+    #[test]
+    fn exit_reason_needs_a_spawned_agent() {
+        assert_eq!(exit_reason(false, None), "sandbox-setup-failed");
+        assert_eq!(exit_reason(false, Some(9)), "sandbox-setup-failed");
+        assert_eq!(exit_reason(true, Some(9)), "signal");
+        assert_eq!(exit_reason(true, None), "exit");
     }
 
     #[test]

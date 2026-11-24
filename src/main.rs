@@ -3706,6 +3706,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
                 repo_trusted = true;
+                cplt::session_summary::set_repo_config("trusted");
                 // --accept-repo-config approves for ONE run and persists
                 // nothing. `repos` is the opposite shape: approving it writes
                 // named roots into the local config, which outlives the run. A
@@ -3727,6 +3728,19 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 repo_trusted =
                     !trust::granted_keys(entry.as_ref(), verdict, &loaded.config.propose)
                         .is_empty();
+                // #1157: recorded whatever `quiet` says; the warnings below are not.
+                cplt::session_summary::set_repo_config(
+                    if matches!(
+                        verdict,
+                        trust::Verdict::Status(trust::ApprovalStatus::Changed)
+                    ) {
+                        "changed"
+                    } else if repo_trusted {
+                        "trusted"
+                    } else {
+                        "untrusted"
+                    },
+                );
                 let proposes_nothing =
                     repo_config::proposed_keys(&loaded.config.propose).is_empty();
                 let nothing_proposed = !loaded.propose_dropped && proposes_nothing;
@@ -3804,7 +3818,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // Only the keys whose value changed are pending (#1002);
                         // a change that leaves nothing pending is not news.
                         (Some(t), trust::Verdict::Status(trust::ApprovalStatus::Changed)) => {
-                            cplt::session_summary::set_repo_config("changed");
                             let granted = trust::approved_for(t, &loaded.config.propose);
                             let pending: Vec<&str> =
                                 repo_config::proposed_keys(&loaded.config.propose)
@@ -5528,13 +5541,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if !cli.print_profile && mcp_status.is_none() {
         let summary_path = cplt::session_summary::path_from_env();
         cplt::session_summary::begin(active_agent.binary_name());
-        cplt::session_summary::set_repo_config(if !project_dir.join(".cplt.toml").is_file() {
-            "none"
-        } else if repo_trusted {
-            "trusted"
-        } else {
-            "untrusted"
-        });
         cplt::session_summary::set_managed_layer_used(resolved.managed.is_some());
         cplt::session_summary::set_settings(
             config::BOOL_KEYS
@@ -6153,7 +6159,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let banner = std::sync::Once::new();
     let print_banner = || {
         banner.call_once(|| {
-            cplt::session_summary::mark_started();
             // Detail tier (output policy): the summary line already names the agent.
             if !ui::verbose() {
                 return;

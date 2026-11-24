@@ -1586,6 +1586,42 @@ mod e2e_tests {
         assert!(!elsewhere.path().join("summary.json").exists());
     }
 
+    /// #1157: `repo_config` is recorded on a quiet launch too, from the
+    /// config the launch loaded (this checkout commits a `.cplt.toml`).
+    #[test]
+    fn e2e_session_summary_repo_config_recorded_when_quiet() {
+        require_sandbox!();
+        let fake = fake_agent("copilot", "exit 0\n");
+        let out = home_temp_dir("summary-quiet");
+        let path = out.path().join("summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--accept-repo-config",
+                "--project-dir",
+            ])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}: {stderr}")),
+        )
+        .unwrap();
+        assert_eq!(v["repo_config"], "trusted", "{v}");
+        assert_eq!(v["agent_exit_reason"], "exit");
+    }
+
     /// #1157: a launch that fails before the path check (no agent binary)
     /// writes no summary.
     #[test]

@@ -1559,7 +1559,23 @@ fn restore_terminal_stop_signals() {
 
 /// Forward SIGTERM/SIGHUP to an already-spawned child and wait for it,
 /// translating the exit status to a u8 exit code (128 + signal if killed).
-fn forward_and_wait(mut child: std::process::Child) -> u8 {
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn forward_and_wait(child: std::process::Child) -> u8 {
+    forward_and_wait_status(child).0
+}
+
+/// Wait for the agent itself and record how it ended in the session summary
+/// (#1157). Helper waits (an unconfirmed bwrap) use `forward_and_wait`, so a
+/// discarded helper's signal is never reported as the agent's.
+fn wait_agent(child: std::process::Child) -> u8 {
+    crate::session_summary::agent_spawned();
+    let (code, signal) = forward_and_wait_status(child);
+    crate::session_summary::agent_exited(signal);
+    code
+}
+
+/// [`forward_and_wait`], plus the signal that killed the child, if any.
+fn forward_and_wait_status(mut child: std::process::Child) -> (u8, Option<i32>) {
     let child_pid = child.id() as i32;
     install_signal_forwarding(child_pid);
 
@@ -1586,20 +1602,18 @@ fn forward_and_wait(mut child: std::process::Child) -> u8 {
     }
 
     match child.wait() {
-        Ok(status) => {
-            if let Some(sig) = status.signal() {
-                crate::session_summary::set_signal(sig);
-            }
+        Ok(status) => (
             status
                 .code()
-                .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s)) as u8
-        }
+                .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s)) as u8,
+            status.signal(),
+        ),
         Err(e) => {
             ui::error(&format!("Error waiting for child: {e}"));
             unsafe {
                 libc::kill(child_pid, libc::SIGTERM);
             }
-            1
+            (1, None)
         }
     }
 }
@@ -1797,7 +1811,7 @@ fn spawn_and_wait(cmd: &mut Command) -> u8 {
         }
     };
 
-    let status = forward_and_wait(child);
+    let status = wait_agent(child);
     restore_terminal_stop_signals();
     status
 }
@@ -2470,7 +2484,8 @@ fn exec_bwrap(
     // Not before the spawn: every failure above can fall back, and the
     // fallback's warnings (masks not applied) belong above the banner too.
     on_launch();
-    let code = forward_and_wait(child);
+    crate::session_summary::set_backend("bwrap");
+    let code = wait_agent(child);
     restore_terminal_stop_signals();
     BwrapOutcome::Ran(code)
 }
