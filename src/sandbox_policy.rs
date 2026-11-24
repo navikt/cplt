@@ -3004,6 +3004,44 @@ pub fn missing_wrapper_dist_hint(project: &Path, gradle_home: &Path, m2: &Path) 
     out
 }
 
+/// The launch hint for a Gradle project whose loopback is closed (#1098).
+///
+/// The Gradle client, daemon and test workers talk over 127.0.0.1 on ports the
+/// OS picks at run time, so `allow.localhost` cannot list them, and neither
+/// Seatbelt nor Landlock can scope a connect to "ports this sandbox listens
+/// on". No narrower default is enforceable, so cplt grants nothing and says
+/// which line to add instead. `decided` is true when the key is open or was set
+/// at any layer (CLI, local, global, approved repo proposal): an explicit
+/// `false` is the user's answer, so the hint stays quiet. Only names are
+/// checked: nothing in the agent-writable project is read.
+#[must_use]
+pub fn gradle_loopback_hint(project: &Path, decided: bool, proxy_forced: bool) -> Option<String> {
+    let gradle = [
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+    ]
+    .iter()
+    .any(|f| project.join(f).symlink_metadata().is_ok());
+    if !gradle || (decided && !proxy_forced) {
+        return None;
+    }
+    Some(if proxy_forced {
+        "Gradle project: the Gradle daemon and test workers need loopback ports, \
+         which proxy.forced keeps closed, so gradle builds will fail in this session"
+            .to_string()
+    } else {
+        "Gradle project: the Gradle daemon and test workers need loopback ports cplt \
+         blocks by default. For the team, add `allow_localhost_any = true` under \
+         [propose] in .cplt.toml; for yourself in this repo, run \
+         `cplt config set --local sandbox.allow_localhost_any true` (or `false` to \
+         keep it closed and silence this); for one run, pass --allow-localhost-any"
+            .to_string()
+    })
+}
+
 /// How cplt handles a path under a tool dir that a host tool obeys or runs
 /// later, outside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5963,6 +6001,25 @@ mod tests {
         assert_eq!(
             wrapper_lock_files(tmp.path()),
             [d.join("gradle-8.14-bin.zip.lck")]
+        );
+    }
+
+    #[test]
+    fn gradle_loopback_hint_fires_only_for_gradle_without_localhost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        assert_eq!(gradle_loopback_hint(p, false, false), None);
+        // A dangling symlink still marks the project: names only, no read.
+        std::os::unix::fs::symlink(p.join("missing"), p.join("gradlew")).unwrap();
+        let hint = gradle_loopback_hint(p, false, false).unwrap();
+        assert!(hint.contains("cplt config set --local sandbox.allow_localhost_any true"));
+        assert!(hint.contains("allow_localhost_any = true"));
+        assert!(hint.contains("--allow-localhost-any"));
+        assert_eq!(gradle_loopback_hint(p, true, false), None);
+        assert!(
+            gradle_loopback_hint(p, false, true)
+                .unwrap()
+                .contains("proxy.forced")
         );
     }
 
