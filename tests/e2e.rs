@@ -2505,6 +2505,55 @@ mod e2e_tests {
         assert!(v.to_string().contains("fake-mcp"), "{v}");
     }
 
+    /// #1115: an OpenCode v2 launch with an unusable gh-token spec and no
+    /// GitHub MCP entry warns that the spec is unused, without claiming the
+    /// built-in endpoint serves.
+    #[test]
+    fn e2e_unusable_gh_spec_warns_without_fallback_claim() {
+        let home = home_temp_dir("gh-spec-launch");
+        let home_path = std::fs::canonicalize(home.path()).unwrap();
+        let dir = home_path.join(".config/cplt/mcp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "io.github.nais/nais-mcp";
+        let spec = serde_json::json!({
+            "name": id,
+            "version": "7.0.1",
+            "_meta": {"io.github.navikt/broker": {
+                "v": 1,
+                "credential": "gh-token",
+                "egressHosts": ["api.githubcopilot.com"],
+                "tools": {"allow": ["get_me"], "classes": {}},
+            }},
+            "remotes": [{"type": "streamable-http", "url": "https://api.githubcopilot.com/mcp/readonly"}],
+        });
+        std::fs::write(dir.join("io.github.nais__nais-mcp.json"), spec.to_string()).unwrap();
+        // An `opencode-v2` path component marks v2 without running it.
+        let oc_dir = home_path.join("opencode-v2/bin");
+        std::fs::create_dir_all(&oc_dir).unwrap();
+        let oc = oc_dir.join("opencode");
+        std::fs::write(&oc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&oc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let out = cplt_cmd()
+            .args(["--agent", "opencode", "--no-mcp-broker", id])
+            .env("HOME", &home_path)
+            .env("PATH", format!("{}:/usr/bin:/bin", oc_dir.display()))
+            .env("CPLT_MCP_REMOTE", "1")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("OPENCODE_CONFIG_CONTENT")
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("GitHub MCP: the gh-token spec {id} is not used")),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("built-in endpoint"), "{stderr}");
+    }
+
     /// #857: without `--agent`, status lists OpenCode v2 next to the selected
     /// Copilot; `--agent copilot` keeps it to Copilot.
     #[test]

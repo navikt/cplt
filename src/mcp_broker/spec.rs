@@ -721,38 +721,34 @@ impl Detected {
     }
 }
 
-/// How every fallback line from [`github_spec`] starts.
-pub const FALLBACK_PREFIX: &str = "GitHub MCP: the gh-token spec";
-
 /// The gh-token spec this launch's GitHub MCP serves (#909). `Ok(None)`: no
-/// spec, so the built-in endpoint serves. `Err(line)`: a spec exists but
-/// cannot serve, so the built-in endpoint serves without the spec's
-/// restrictions; `line` is the warning that says so (#1115).
+/// spec. `Err(why)`: a spec exists but cannot serve; `why` is one short line
+/// (what, reason, fix) with no claim about who serves instead (#1115).
 pub fn github_spec(
     found: &Detected,
     home: &Path,
     writable: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<Option<Spec>, String> {
     let e = |s: &str| s.escape_debug().to_string();
-    let fallback = |file: &str, reason: &str, fix: &str| {
-        format!(
-            "{FALLBACK_PREFIX} {} is not used ({}), so the built-in endpoint \
-             serves GitHub MCP this session. The spec's restrictions (tools.allow) are NOT \
-             applied; the built-in endpoint still forces read-only and lockdown. Fix: {}",
-            e(file),
-            e(reason),
-            e(fix)
-        )
+    let unusable = |file: &str, reason: &str, fix: &str| {
+        // An unreadable spec dir is refused under its absolute path; spec
+        // files go by their bare name.
+        let what = if Path::new(file).is_absolute() {
+            format!("a gh-token spec in {}", e(file))
+        } else {
+            format!("the gh-token spec {}", e(file))
+        };
+        format!("{what} is not used ({}); fix: {}", e(reason), e(fix))
     };
     if let Some(r) = &found.remote_refused {
-        return Err(fallback(&r.file, &r.reason, &r.fix));
+        return Err(unusable(&r.file, &r.reason, &r.fix));
     }
     if let Some((id, why, fix)) = &found.remote_disabled {
-        return Err(fallback(id, why, fix));
+        return Err(unusable(id, why, fix));
     }
     if found.remotes.len() > 1 {
         let ids: Vec<&str> = found.remotes.iter().map(|s| s.id.as_str()).collect();
-        return Err(fallback(
+        return Err(unusable(
             &ids.join(", "),
             "more than one gh-token spec is ambiguous",
             "remove all but one",
@@ -764,22 +760,39 @@ pub fn github_spec(
     };
     drop_writable(&mut f, home, writable);
     if let Some(r) = f.rejected.first() {
-        return Err(fallback(&r.file, &r.reason, &r.fix));
+        return Err(unusable(&r.file, &r.reason, &r.fix));
     }
     Ok(f.remotes.pop())
 }
 
-/// [`github_spec`] for a launch: the fallback warning goes to `warn`, once.
-pub fn launch_github_spec(
+/// The launch line for an unusable spec. Only `served` (the built-in
+/// endpoint was actually installed) may claim the fallback (#1115).
+pub fn unusable_line(why: &str, served: bool) -> String {
+    if served {
+        format!(
+            "GitHub MCP is served by the built-in endpoint without the spec's restrictions \
+             (tools.allow is NOT applied; read-only and lockdown are still forced): {why}"
+        )
+    } else {
+        format!("GitHub MCP: {why}")
+    }
+}
+
+/// GitHub MCP for a launch: `serve` installs the endpoint (with the spec when
+/// usable) and says whether it did; an unusable spec gets one `warn` line.
+pub fn launch_github(
     found: &Detected,
     home: &Path,
     writable: impl Fn(&Path) -> Option<PathBuf>,
+    serve: impl FnOnce(Option<&Spec>) -> bool,
     mut warn: impl FnMut(&str),
-) -> Option<Spec> {
-    github_spec(found, home, writable).unwrap_or_else(|line| {
-        warn(&line);
-        None
-    })
+) -> bool {
+    let spec = github_spec(found, home, writable);
+    let served = serve(spec.as_ref().ok().and_then(Option::as_ref));
+    if let Err(why) = &spec {
+        warn(&unusable_line(why, served));
+    }
+    served
 }
 
 /// Load every spec in `dir`. A file in `writable` (a tree the sandbox can
@@ -1465,26 +1478,29 @@ pub(crate) mod tests {
     #[test]
     fn unusable_gh_spec_falls_back_loudly_once() {
         let check = |found: &Detected, file: &str, why: &str| {
-            let mut lines = Vec::new();
-            let spec = launch_github_spec(
-                found,
-                Path::new("/nohome"),
-                |_| None,
-                |l| lines.push(l.to_string()),
-            );
-            assert!(spec.is_none());
-            assert_eq!(lines.len(), 1, "{lines:?}");
-            let l = &lines[0];
-            assert!(l.starts_with(FALLBACK_PREFIX), "{l}");
-            for want in [
-                file,
-                why,
-                "built-in endpoint",
-                "NOT applied",
-                "tools.allow",
-                "Fix: ",
-            ] {
-                assert!(l.contains(want), "{want} missing: {l}");
+            for served in [true, false] {
+                let mut lines = Vec::new();
+                let mut got = Some(None);
+                launch_github(
+                    found,
+                    Path::new("/nohome"),
+                    |_| None,
+                    |s| {
+                        got = Some(s.cloned());
+                        served
+                    },
+                    |l| lines.push(l.to_string()),
+                );
+                assert!(got.unwrap().is_none());
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                let l = &lines[0];
+                for want in [file, why, "fix: "] {
+                    assert!(l.contains(want), "{want} missing: {l}");
+                }
+                // Only a served launch claims the built-in fallback.
+                for claim in ["built-in endpoint", "NOT applied", "tools.allow"] {
+                    assert_eq!(l.contains(claim), served, "{claim}: {l}");
+                }
             }
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1517,8 +1533,18 @@ pub(crate) mod tests {
         // Refused by the final policy.
         let ok = load_with_gate(dir.path(), &[], &[], res, true);
         let mut lines = 0;
-        let spec = launch_github_spec(&ok, dir.path(), |_| Some(dir.path().into()), |_| lines += 1);
-        assert!(spec.is_none() && lines == 1);
+        let mut got = Some(None);
+        launch_github(
+            &ok,
+            dir.path(),
+            |_| Some(dir.path().into()),
+            |s| {
+                got = Some(s.cloned());
+                true
+            },
+            |_| lines += 1,
+        );
+        assert!(got.unwrap().is_none() && lines == 1);
         // Invalid.
         let mut bad = gh_root();
         bad["_meta"][META_KEY]["tools"]["alow"] = json!(["get_me"]);
@@ -1531,8 +1557,18 @@ pub(crate) mod tests {
         // A usable spec: no warning.
         std::fs::write(dir.path().join(FILE), gh_root().to_string()).unwrap();
         let ok = load_with_gate(dir.path(), &[], &[], res, true);
-        let spec = launch_github_spec(&ok, dir.path(), |_| None, |l| panic!("{l}"));
-        assert!(spec.is_some());
+        let mut got = None;
+        launch_github(
+            &ok,
+            dir.path(),
+            |_| None,
+            |s| {
+                got = s.cloned();
+                true
+            },
+            |l| panic!("{l}"),
+        );
+        assert!(got.is_some());
     }
 
     /// #1115 item 3: an unreadable spec dir warns; a missing one, or the
@@ -1569,7 +1605,7 @@ pub(crate) mod tests {
         .unwrap_err();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
-            e.contains("cannot read the spec dir") && e.contains("NOT applied"),
+            e.contains("cannot read the spec dir") && e.starts_with("a gh-token spec in "),
             "{e}"
         );
     }

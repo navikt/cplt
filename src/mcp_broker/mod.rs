@@ -76,10 +76,10 @@ pub use open_url::{
 pub use runtime::{Broker, Log, bwrap_disables_userns};
 pub use shim::run_stdio;
 pub use spec::{
-    Detected, FALLBACK_PREFIX, Spec, detect, drop_writable, github_spec, launch_github_spec, load,
-    remote_gate_enabled, spec_dir,
+    Detected, Spec, detect, drop_writable, github_spec, launch_github, load, remote_gate_enabled,
+    spec_dir, unusable_line,
 };
-pub use status::{run_status, status_json};
+pub use status::{GithubMcp, run_status, status_json};
 
 #[cfg(test)]
 pub(crate) mod test_util {

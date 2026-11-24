@@ -70,8 +70,8 @@ fn gh_token_spec_filters_opencode_github_mcp() {
     // warning naming the spec, the reason and the unapplied restrictions
     // (#1115).
     let fallback = |e: String, why: &str| {
-        assert!(e.starts_with(mcp_broker::FALLBACK_PREFIX), "{e}");
-        assert!(e.contains("NOT applied") && e.contains(why), "{e}");
+        assert!(e.starts_with("the gh-token spec "), "{e}");
+        assert!(e.contains(why) && !e.contains("built-in"), "{e}");
     };
     let off = mcp_broker::load(&mcp_broker::spec_dir(&home), &[], &[ID.into()]);
     fallback(
