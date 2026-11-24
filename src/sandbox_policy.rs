@@ -807,7 +807,9 @@ pub fn app_root_warning(path: &Path, target: &Path) -> String {
     format!(
         "Not granting {}: it resolves through a symlink to {}, and a writable \
          application directory is never granted through a symlink (a sandboxed \
-         session could have planted it). Remove the link, or pass --allow-write {}.",
+         session could have planted it). If you made the link, replace it with a real \
+         directory (move the contents back from {}); cplt does not grant a tool's \
+         *_DIR variable pointed at the target either.",
         path.display(),
         target.display(),
         target.display()

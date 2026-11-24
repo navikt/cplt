@@ -65,23 +65,33 @@ and `uv pip install` into a project venv work as before, and Pythons already
 installed there still run.
 
 `uv tool install` and `uv python install` inside cplt now fail with a
-permission error. Run them outside cplt:
+permission error. Run them in a normal terminal, outside the agent:
 
 ```sh
 uv tool install <tool>
 uv python install 3.13
 ```
 
-Or, knowing that the agent can then change what the host runs, grant it:
+Tools and Pythons already installed there still run inside the sandbox, which
+keeps read and execute on the directory.
 
-```sh
-cplt --allow-write ~/.local/share/uv
-```
+`cplt --allow-write ~/.local/share/uv` lets the agent write there, but
+programs it installs there will not run inside the sandbox: cplt never grants
+execute on an `--allow-write` tree.
 
 A writable application directory reached through a symlink (`~/.cache/uv`,
-`~/.cache/mise`, or `~/.cache` itself being a link) is no longer granted: cplt
-warns and skips it, since a sandboxed session could have planted that link.
-Remove the link, or grant the target with `--allow-write`.
+`~/.local/share/mise`, or `~/.cache` itself being a link) is no longer
+granted: cplt warns and skips it, since a sandboxed session could have planted
+that link. If you made the link, replace it with a real directory, for
+example:
+
+```sh
+rm ~/.cache/uv && mv /path/to/target ~/.cache/uv
+```
+
+Pointing the tool's variable at the target (`UV_CACHE_DIR`, `MISE_DATA_DIR`)
+does not help: cplt does not grant those paths, so the tool fails inside the
+sandbox. `--allow-write` on the target restores writes but not execute.
 
 ## `sandbox.readonly_host_tool_paths` (off by default)
 

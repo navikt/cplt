@@ -6357,44 +6357,46 @@ mod tests {
     /// not in the Landlock policy, and nothing at the link target.
     #[test]
     fn cache_exec_under_a_refused_app_root_is_dropped() {
-        let (_guard, root) = copilot_cache_tree();
-        let home = root.join("home");
-        let elsewhere = root.join("elsewhere");
-        std::fs::create_dir_all(elsewhere.join("dlx")).unwrap();
-        std::fs::create_dir_all(home.join(".cache")).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, home.join(".cache/pnpm")).unwrap();
-        let allow_cache_exec = ["pnpm/dlx".to_string()];
-        let mut config = test_config(&home, &[]);
-        config.existing_home_tool_dirs = Some(&[]);
-        config.allow_cache_exec = &allow_cache_exec;
-        let named = home.join(".cache/pnpm/dlx");
-        assert!(policy::under_refused_app_root(&home, &named).is_some());
-        let lp = landlock_mod::generate_policy(&config);
-        assert!(!lp.fs_rules.iter().any(|r| r.path == named
-            || r.path.starts_with(&elsewhere)
-            || (r.access.write
-                && r.access.execute
-                && named.starts_with(&r.path)
-                && r.path != home.join(".cache"))));
-        if cfg!(target_os = "linux") {
-            let base = std::cell::OnceCell::from(lp);
-            let grants = validate_cache_exec_dirs(&config, &base).unwrap();
-            assert!(
-                !grants
-                    .iter()
-                    .any(|(n, c)| *n == named || c.starts_with(&elsewhere)),
-                "{grants:?}"
-            );
+        crate::with_env_lock_no_xdg(|| {
+            let (_guard, root) = copilot_cache_tree();
+            let home = root.join("home");
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("dlx")).unwrap();
+            std::fs::create_dir_all(home.join(".cache")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, home.join(".cache/pnpm")).unwrap();
+            let allow_cache_exec = ["pnpm/dlx".to_string()];
+            let mut config = test_config(&home, &[]);
+            config.existing_home_tool_dirs = Some(&[]);
+            config.allow_cache_exec = &allow_cache_exec;
+            let named = home.join(".cache/pnpm/dlx");
+            assert!(policy::under_refused_app_root(&home, &named).is_some());
+            let lp = landlock_mod::generate_policy(&config);
+            assert!(!lp.fs_rules.iter().any(|r| r.path == named
+                || r.path.starts_with(&elsewhere)
+                || (r.access.write
+                    && r.access.execute
+                    && named.starts_with(&r.path)
+                    && r.path != home.join(".cache"))));
+            if cfg!(target_os = "linux") {
+                let base = std::cell::OnceCell::from(lp);
+                let grants = validate_cache_exec_dirs(&config, &base).unwrap();
+                assert!(
+                    !grants
+                        .iter()
+                        .any(|(n, c)| *n == named || c.starts_with(&elsewhere)),
+                    "{grants:?}"
+                );
 
-            // With sandbox.refuse_cache_exec_links set, the link still stops the launch.
-            config.refuse_cache_exec_links = true;
-            let base = std::cell::OnceCell::new();
-            let err = validate_cache_exec_dirs(&config, &base).unwrap_err();
-            assert!(
-                err.contains("sandbox.refuse_cache_exec_links is set"),
-                "{err}"
-            );
-        }
+                // With sandbox.refuse_cache_exec_links set, the link still stops the launch.
+                config.refuse_cache_exec_links = true;
+                let base = std::cell::OnceCell::new();
+                let err = validate_cache_exec_dirs(&config, &base).unwrap_err();
+                assert!(
+                    err.contains("sandbox.refuse_cache_exec_links is set"),
+                    "{err}"
+                );
+            }
+        });
     }
 
     /// Seatbelt matches the resolved path, so a relocated cache is harmless
