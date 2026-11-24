@@ -1028,9 +1028,9 @@ Either way, cplt opens the directory it checked without following any symlink wh
 
 ## Read-only tool downloads (`sandbox.readonly_host_tool_paths`)
 
-Some tool directories hold programs that a sandboxed command downloads and your host runs later, outside the sandbox: the distribution `./gradlew` and `./mvnw` unpack, the packages `npx` installs, Kotlin/Native toolchains, pre-commit hook environments, .NET global tools, and NuGet's user config and credential providers. With this key on, the sandbox can read and run them but not write them:
+Some tool directories hold programs that a sandboxed command downloads and your host runs later, outside the sandbox: the distribution `./gradlew` and `./mvnw` unpack, Kotlin/Native toolchains, pre-commit hook environments, .NET global tools, and NuGet's user config and credential providers. With this key on, the sandbox can read and run them but not write them:
 
-- `~/.gradle/wrapper`, `~/.m2/wrapper`, `~/.npm/_npx` and `~/.konan`, on macOS and Linux
+- `~/.gradle/wrapper`, `~/.m2/wrapper` and `~/.konan`, on macOS and Linux
 - `~/.cache/pre-commit`, `~/.dotnet/tools`, `~/.nuget/NuGet` and `~/.nuget/plugins`, on macOS, and on Linux only when Bubblewrap is active
 
 ```bash
@@ -1040,7 +1040,6 @@ cplt config set sandbox.readonly_host_tool_paths true
 Off by default, because it breaks a first download inside the sandbox:
 
 - `./gradlew` or `./mvnw` when the pinned distribution is missing. cplt prints the fix at launch, such as `run ./gradlew --version once outside cplt to download Gradle 8.14`.
-- `npx <package>` for a package not run before. Run it once outside cplt.
 - a first Kotlin/Native build. Run it once outside cplt.
 - `git commit` with pre-commit hooks inside the sandbox: pre-commit takes a lock in `~/.cache/pre-commit` on every run. Commit outside cplt.
 - `dotnet tool install -g`, and a first `dotnet restore` on a machine with no `~/.nuget/NuGet/NuGet.Config`. Run them once outside cplt.

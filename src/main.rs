@@ -7640,11 +7640,26 @@ impl HostProbe {
         if resolved.allow_build_credentials {
             merge_build_credentials(resolved, home_dir);
         }
+        // Read-only tool roots and their writable cache dirs must exist before
+        // discovery; the sandbox can no longer create them.
+        cplt::sandbox::ensure_split_tool_dirs(home_dir, resolved.readonly_host_tool_paths);
         let mut tool_discovery = discover::discover_tools(home_dir, &tool_roots);
         if resolved.readonly_host_tool_paths {
             cplt::sandbox::apply_readonly_host_tool_paths(
                 &mut tool_discovery.existing_home_tool_dirs,
             );
+            // `./gradlew` locks its distribution for writing on every run.
+            for d in tool_discovery
+                .existing_home_tool_dirs
+                .iter()
+                .filter(|d| matches!(d.dir.path, ".gradle/wrapper" | ".m2/wrapper"))
+            {
+                for lock in cplt::sandbox::wrapper_lock_files(&d.path.join("dists")) {
+                    if !resolved.allow_write.contains(&lock) {
+                        resolved.allow_write.push(lock);
+                    }
+                }
+            }
         }
         // Git worktree common directory (shared .git for worktrees).
         let (git_common_dir, git_common_dir_problem) =
@@ -8092,9 +8107,8 @@ fn assemble_sandbox(
         cli.observe_domains,
     );
 
-    // Writable cache dirs under read-only tool roots must exist before the
-    // grants are built; the sandbox can no longer create them.
-    sandbox::ensure_split_tool_dirs(home_dir, resolved.readonly_host_tool_paths);
+    // With wrapper dists read-only, a missing pinned distribution cannot be
+    // downloaded in the sandbox: say how to fetch it before the build fails.
     if resolved.readonly_host_tool_paths {
         let root = |rel: &str| {
             probe

@@ -141,7 +141,8 @@ pub use policy::{
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
     relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
     state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
+    validate_playwright_socket_dir, validate_sbpl_path, wrapper_lock_files, xdg_runtime_dir_env,
+    xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.

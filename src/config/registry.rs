@@ -451,7 +451,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Keep tool downloads and settings that the host runs later read-only in the sandbox: ~/.gradle/wrapper, ~/.m2/wrapper, ~/.npm/_npx, ~/.konan, ~/.cache/pre-commit, ~/.dotnet/tools, ~/.nuget/NuGet and ~/.nuget/plugins. A sandboxed ./gradlew, ./mvnw or npx can then not download what is missing, and pre-commit hooks fail inside the sandbox: run the command once outside cplt. The last four need Bubblewrap on Linux.",
+        description: "Keep tool downloads and settings that the host runs later read-only in the sandbox: ~/.gradle/wrapper, ~/.m2/wrapper, ~/.konan, ~/.cache/pre-commit, ~/.dotnet/tools, ~/.nuget/NuGet and ~/.nuget/plugins. A sandboxed ./gradlew or ./mvnw can then not download what is missing, and pre-commit hooks fail inside the sandbox: run the command once outside cplt. The last four need Bubblewrap on Linux.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1229,7 +1229,7 @@ bool_keys! {
         resolved = |r: &Resolved| r.deny_nested_git;
 
     /// Config-only and off by default (staged rollout, #264): it breaks a
-    /// sandboxed first download of a wrapper distribution, npx package or
+    /// sandboxed first download of a wrapper distribution or
     /// Kotlin/Native toolchain, and pre-commit hooks inside the sandbox.
     readonly_host_tool_paths, "sandbox", "readonly_host_tool_paths",
         cli = |_: &CliFlags| FeatureToggle::UseDefault,

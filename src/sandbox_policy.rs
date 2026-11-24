@@ -2688,8 +2688,8 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
     // npm global cache: packages only, no executables. The root is read-only
     // and only the subdirs npm writes are writable: `_npx` holds packages the
-    // host's next `npx` runs, so `sandbox.readonly_host_tool_paths` takes its
-    // write away (see HOST_EXEC_TOOL_PATHS). npm ignores a failed write of
+    // host's next `npx` runs, but npx needs it writable even for a cached
+    // package (see HOST_EXEC_TOOL_PATHS). npm ignores a failed write of
     // `_update-notifier-last-checked` in the root.
     HomeToolDir {
         path: ".npm",
@@ -2802,8 +2802,8 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
 ];
 
-/// Create the writable children of read-only [`HOME_TOOL_DIRS`] roots
-/// (`~/.gradle/caches`, `~/.m2/repository`, ...) where the root exists.
+/// Create the read-only [`HOME_TOOL_DIRS`] roots that have writable children
+/// (`~/.gradle`, `~/.m2`, `~/.npm`, ...) and those children.
 ///
 /// Runs in the parent before launch. A sandboxed build cannot create them
 /// itself any more, and the backends skip grants for missing paths. Only
@@ -2825,8 +2825,15 @@ pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
         let Some((parent, _)) = child.rsplit_once('/') else {
             continue;
         };
-        let parent_is_root = HOME_TOOL_DIRS.iter().any(|d| d.path == parent);
-        if parent_is_root && home.join(parent).is_dir() {
+        let Some(root) = HOME_TOOL_DIRS.iter().find(|d| d.path == parent) else {
+            continue;
+        };
+        // A read-only root is created too: the sandbox can no longer create
+        // it, and a first `npm install` on a fresh machine would fail.
+        if !root.write {
+            let _ = std::fs::create_dir(home.join(parent));
+        }
+        if home.join(parent).is_dir() {
             let _ = std::fs::create_dir(home.join(child));
         }
     }
@@ -2835,8 +2842,8 @@ pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
 /// Read-only twins of the writable [`HOME_TOOL_DIRS`] entries that
 /// `sandbox.readonly_host_tool_paths` (default off, #264) takes write from.
 /// Each holds a tool or distribution a sandboxed command downloads and the
-/// host runs later: `./gradlew` and `./mvnw` distributions, `npx` packages,
-/// Kotlin/Native toolchains. With the key on, a sandboxed first download
+/// host runs later: `./gradlew` and `./mvnw` distributions and Kotlin/Native
+/// toolchains. With the key on, a sandboxed first download
 /// fails; running the command once outside cplt fills the cache.
 pub const READONLY_HOST_TOOL_TWINS: &[HomeToolDir] = &[
     HomeToolDir {
@@ -2849,12 +2856,6 @@ pub const READONLY_HOST_TOOL_TWINS: &[HomeToolDir] = &[
         path: ".m2/wrapper",
         process_exec: false,
         map_exec: true,
-        write: false,
-    },
-    HomeToolDir {
-        path: ".npm/_npx",
-        process_exec: false,
-        map_exec: false,
         write: false,
     },
     HomeToolDir {
@@ -2891,6 +2892,38 @@ pub fn apply_readonly_host_tool_paths(dirs: &mut [ResolvedToolDir]) {
             d.dir = twin;
         }
     }
+}
+
+/// The existing `<dists>/<name>/<hash>/*.lck` files of a read-only wrapper
+/// tree. `./gradlew` opens its distribution's lock file for writing on every
+/// run, even when the distribution is unpacked, so with
+/// `sandbox.readonly_host_tool_paths` on each one gets a per-file write grant.
+/// A lock file holds nothing that runs. The tree was writable in earlier
+/// sessions, so only plain files count: `symlink_metadata`, never `is_file`.
+#[must_use]
+pub fn wrapper_lock_files(dists: &Path) -> Vec<PathBuf> {
+    let dirs = |p: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for hash_dir in dirs(dists).iter().flat_map(|d| dirs(d)) {
+        for entry in std::fs::read_dir(&hash_dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "lck")
+                && path.symlink_metadata().is_ok_and(|m| m.is_file())
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// The [`HOST_TOOL_RO_OVERLAYS`] under `home`, or none with the key off.
@@ -3118,7 +3151,9 @@ pub const HOST_EXEC_TOOL_PATHS: &[HostExecPath] = &[
     HostExecPath {
         path: ".npm/_npx",
         host_use: "host npx reuses the packages installed here",
-        handling: HostExec::Keyed("a sandboxed npx cannot install a package it has not cached"),
+        handling: HostExec::Gap(
+            "npx writes here even for a cached package: read-only, a cached `npx cowsay` spun until node ran out of heap (npm 11, node 24), and MCP servers start through npx",
+        ),
     },
     HostExecPath {
         path: ".npm/_cacache",
@@ -5878,6 +5913,22 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_lock_files_takes_plain_lck_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("gradle-8.14-bin/abc");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("gradle-8.14-bin.zip.lck"), "").unwrap();
+        std::fs::write(d.join("gradle-8.14-bin.zip.ok"), "").unwrap();
+        std::fs::write(tmp.path().join("x"), "").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("x"), d.join("link.lck")).unwrap();
+        crate::untrusted::tests::mkfifo(&d.join("fifo.lck"));
+        assert_eq!(
+            wrapper_lock_files(tmp.path()),
+            [d.join("gradle-8.14-bin.zip.lck")]
+        );
+    }
+
+    #[test]
     fn missing_wrapper_dist_hint_names_the_version_only_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let (p, g, m) = (
@@ -5954,7 +6005,10 @@ mod tests {
         assert!(h.join(".gradle/caches").is_dir());
         assert!(h.join(".gradle/wrapper").is_dir());
         assert!(!h.join("elsewhere/x").exists());
-        assert!(!h.join(".m2").exists(), "no root, nothing created");
+        // A read-only root with writable children is created; a writable
+        // root without them is not.
+        assert!(h.join(".m2/repository").is_dir());
+        assert!(!h.join(".nuget").exists());
     }
     /// The pinned-state line touches no state file before validation: a
     /// planted symlink or FIFO there must not be written to or block.
