@@ -11985,10 +11985,11 @@ paths = [
 
         /// #1138: v2.2+ `run` never starts the service and falls back to a
         /// private server on a random loopback port, which the profile denies.
-        /// cplt starts the session service first and stops it after, inside
-        /// the sandbox, and the exit code of `run` survives.
+        /// cplt starts the session service first, inside the sandbox, then
+        /// execs into `run`, whose exit code survives. It does not stop the
+        /// service: that shuts itself down once cplt removes its registration.
         #[test]
-        fn run_is_bracketed_by_the_session_service() {
+        fn run_starts_the_session_service_first() {
             require_sandbox!();
             let home = home();
             let stub = home.bin.join("opencode");
@@ -12003,7 +12004,7 @@ paths = [
             let err = String::from_utf8_lossy(&o.stderr);
             assert_eq!(o.status.code(), Some(7), "{err}");
             let calls = std::fs::read_to_string(home.proj.join("calls")).unwrap();
-            assert_eq!(calls, "start\nrun\nstop\n", "{err}");
+            assert_eq!(calls, "start\nrun\n", "{err}");
         }
 
         #[test]
