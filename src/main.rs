@@ -7640,7 +7640,12 @@ impl HostProbe {
         if resolved.allow_build_credentials {
             merge_build_credentials(resolved, home_dir);
         }
-        let tool_discovery = discover::discover_tools(home_dir, &tool_roots);
+        let mut tool_discovery = discover::discover_tools(home_dir, &tool_roots);
+        if resolved.readonly_host_tool_paths {
+            cplt::sandbox::apply_readonly_host_tool_paths(
+                &mut tool_discovery.existing_home_tool_dirs,
+            );
+        }
         // Git worktree common directory (shared .git for worktrees).
         let (git_common_dir, git_common_dir_problem) =
             discover::git_common_dir(home_dir, project_dir, &resolved.allow_write);
@@ -8089,7 +8094,21 @@ fn assemble_sandbox(
 
     // Writable cache dirs under read-only tool roots must exist before the
     // grants are built; the sandbox can no longer create them.
-    sandbox::ensure_split_tool_dirs(home_dir);
+    sandbox::ensure_split_tool_dirs(home_dir, resolved.readonly_host_tool_paths);
+    if resolved.readonly_host_tool_paths {
+        let root = |rel: &str| {
+            probe
+                .existing_home_tool_dirs
+                .iter()
+                .find(|d| d.dir.path == rel)
+                .map_or_else(|| home_dir.join(rel), |d| d.path.clone())
+        };
+        for line in
+            sandbox::missing_wrapper_dist_hint(&probe.project_dir, &root(".gradle"), &root(".m2"))
+        {
+            ui::warn(&line);
+        }
+    }
 
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
     // init script so sandboxed builds keep the preferIPv4Stack workaround for
@@ -8576,6 +8595,7 @@ fn build_sandbox_config<'a>(
         deny_dns: resolved.deny_dns && resolved.proxy_forced,
         netns: resolved.netns,
         deny_nested_git: resolved.deny_nested_git,
+        readonly_host_tool_paths: resolved.readonly_host_tool_paths,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
         refuse_unenforced: resolved.refuse_unenforced,
         proxy_enabled: resolved.with_proxy,
@@ -16422,6 +16442,7 @@ mod tests {
             deny_dns: false,
             netns: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             proxy_enabled: false,

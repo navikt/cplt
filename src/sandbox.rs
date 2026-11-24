@@ -121,21 +121,23 @@ pub use policy::{
     AppDir, AppDirKind, BUILD_CREDENTIAL_FILES, CLONE_CACHE_DIRS, CPLT_STATE_DIR, CacheEnv,
     DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, DockerAccess, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS,
-    HOST_EXEC_TOOL_PATHS, HardeningCategory, HardeningEnvVar, HomeToolDir, HostExec, HostExecPath,
-    LinuxCoverage, OAUTH_CALLBACK_PORT, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES,
+    HOST_EXEC_TOOL_PATHS, HOST_TOOL_RO_OVERLAYS, HardeningCategory, HardeningEnvVar, HomeToolDir,
+    HostExec, HostExecPath, LinuxCoverage, OAUTH_CALLBACK_PORT, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES,
     PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT,
     PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
-    Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
-    TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
-    XDG_PINNED_MARKER, active_tool_dirs, app_dirs, build_credential_grants,
-    copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths,
-    cplt_state_ancestor_grant, cplt_state_dir, cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid,
+    Protected, READONLY_HOST_TOOL_TWINS, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS,
+    SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar,
+    ToolPathOverride, ToolRoot, XDG_PINNED_MARKER, active_tool_dirs, app_dirs,
+    apply_readonly_host_tool_paths, build_credential_grants, copilot_default_pkg_dir,
+    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_ancestor_grant,
+    cplt_state_dir, cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid,
     cypress_app_data_dir, cypress_app_data_dir_with_env, cypress_runtime_intent,
     dir_overlaps_credentials, ensure_split_tool_dirs, env_tool_dir_allowed, env_tool_dir_hint_ok,
     env_tool_path_protected, env_tool_temp_roots, exec_write_conflicts, first_party_read_target,
-    grant_is_refused, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
-    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
+    grant_is_refused, home_config_link_targets, home_tool_dirs, host_tool_ro_overlays,
+    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
+    no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
     relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
     state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
@@ -292,6 +294,10 @@ pub struct SandboxConfig<'a> {
     /// `sandbox.deny_nested_git` (#576): deny creating a `.git` entry below a
     /// writable root. macOS only; Linux has no way to express it.
     pub deny_nested_git: bool,
+    /// `sandbox.readonly_host_tool_paths` (default off, #264): the
+    /// [`HOST_TOOL_RO_OVERLAYS`] are write-denied (SBPL) or bound read-only
+    /// (Bubblewrap). The tool-dir twins are applied in the probe instead.
+    pub readonly_host_tool_paths: bool,
     /// `sandbox.refuse_cache_exec_links`: refuse a cache-exec entry reached
     /// through a symlink inside `~/.cache` rather than grant its target with a
     /// warning. Linux only; see [`validate_cache_exec_dirs`].
@@ -3996,6 +4002,13 @@ fn ro_protect_paths(
     // mise shims above: what the user's next unsandboxed launch runs.
     ro_protect.extend(shim_ro_protect_paths(config.home_dir));
 
+    // sandbox.readonly_host_tool_paths: their parent tool dirs stay writable,
+    // so only the bind can take the write back. Missing paths are skipped.
+    ro_protect.extend(host_tool_ro_overlays(
+        config.home_dir,
+        config.readonly_host_tool_paths,
+    ));
+
     // #328: Copilot's package dirs. macOS write-denies both in the profile;
     // Landlock cannot — `~/.copilot` is granted write wholesale, and
     // `~/.cache/copilot/pkg`'s execute rule unions with the `~/.cache` write
@@ -5722,6 +5735,7 @@ mod tests {
             deny_dns: false,
             netns: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             proxy_enabled: false,

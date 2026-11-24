@@ -1133,6 +1133,7 @@ mod tests {
             deny_dns: false,
             netns: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             proxy_enabled: false,

@@ -29,9 +29,10 @@ use super::policy::{
     XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs, ancestor_alternation, app_dirs,
     colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
     cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
-    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
+    home_config_link_targets, host_tool_ro_overlays, missing_home_config_link_targets,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
+    pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -243,6 +244,7 @@ fn profile_locked(
     // The pnpm rule re-allows its two writable stores, so all security denies
     // below must remain later in the last-match-wins profile.
     emit_path_bin_denies(&mut sb, config.home_dir, config.extra_deny);
+    emit_host_tool_ro_overlays(&mut sb, config);
     emit_shim_dir_denies(&mut sb, config);
     // Keeps the exec-allowed toolchain dirs non-writable even when a user
     // allow.write covers ~/.gradle or ~/.konan (write-then-exec): after every
@@ -2456,6 +2458,26 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path, extra_deny: &[PathBuf]
                     "(allow process-exec (subpath \"{p}/package-manager-store\"))"
                 );
             }
+        }
+    }
+    sbpl!(sb);
+}
+
+/// `sandbox.readonly_host_tool_paths`: subtrees of writable tool dirs that
+/// host tools run or obey (pre-commit envs, .NET global tools, NuGet config
+/// and plugins). Emitted after the tool-dir grants, so the deny wins.
+fn emit_host_tool_ro_overlays(sb: &mut String, config: &SandboxConfig) {
+    let paths = host_tool_ro_overlays(config.home_dir, config.readonly_host_tool_paths);
+    if paths.is_empty() {
+        return;
+    }
+    sbpl!(
+        sb,
+        ";; sandbox.readonly_host_tool_paths: host-run tool paths stay read-only"
+    );
+    for path in paths {
+        if validate_sbpl_path(&path).is_ok() {
+            sbpl!(sb, "(deny file-write* (subpath \"{}\"))", path.display());
         }
     }
     sbpl!(sb);
@@ -5221,6 +5243,7 @@ mod tests {
             deny_dns: false,
             netns: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             proxy_enabled: false,

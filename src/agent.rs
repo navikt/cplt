@@ -7054,7 +7054,7 @@ mod tests {
         assert_eq!(got, vec![hook]);
     }
 
-    /// Links in writable home tool dirs (`~/.cache`, `~/.npm/bin`) are
+    /// Links in writable home tool dirs (`~/.cache`, `~/.npm/_cacache/bin`) are
     /// agent-rewritable too, so scripts reached through them lose their grant;
     /// a plain script elsewhere in home keeps it (#714).
     #[test]
@@ -7063,17 +7063,17 @@ mod tests {
         let home = std::fs::canonicalize(tmp.path()).unwrap();
         let tools = home.join("tools");
         std::fs::create_dir_all(home.join(".cache")).unwrap();
-        std::fs::create_dir_all(home.join(".npm/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".npm/_cacache/bin")).unwrap();
         std::fs::create_dir_all(&tools).unwrap();
         let (a, b, ok) = (tools.join("a.sh"), tools.join("b.js"), tools.join("ok.sh"));
         for f in [&a, &b, &ok] {
             std::fs::write(f, "").unwrap();
         }
         std::os::unix::fs::symlink(&a, home.join(".cache/hook.sh")).unwrap();
-        std::os::unix::fs::symlink(&b, home.join(".npm/bin/mcp")).unwrap();
+        std::os::unix::fs::symlink(&b, home.join(".npm/_cacache/bin/mcp")).unwrap();
         let paths = vec![
             home.join(".cache/hook.sh"),
-            home.join(".npm/bin/mcp"),
+            home.join(".npm/_cacache/bin/mcp"),
             ok.clone(),
         ];
         let mut dirs = script_grants(paths, &home.join("root"), &home, &[]);

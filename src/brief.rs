@@ -1178,6 +1178,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            readonly_host_tool_paths: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
             deny_key_files_by_extension: false,
