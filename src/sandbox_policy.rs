@@ -826,6 +826,23 @@ fn denied_entry(
     })
 }
 
+/// Package-manager caches, relative to `$HOME`, that may be the source of a
+/// directory clone on macOS. Downloaded packages only: none may contain, or be
+/// inside, a read-denied path.
+pub const CLONE_CACHE_DIRS: &[&str] = &[
+    ".bun/install/cache",
+    ".cache/.bun/install/cache",
+    "Library/pnpm/store",
+    ".local/share/pnpm/store",
+    "Library/Caches/pnpm",
+    ".cache/pnpm",
+    "Library/Caches/Yarn",
+    ".cache/yarn",
+    ".npm/_cacache",
+    "Library/Caches/uv",
+    ".cache/uv",
+];
+
 /// Credential files inside otherwise-allowed HOME_TOOL_DIRS.
 /// These are denied by default because they typically contain registry
 /// credentials (Nexus/Artifactory passwords, API tokens, master passwords).

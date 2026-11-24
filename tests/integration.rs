@@ -2647,6 +2647,143 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A directory clone must not carry a read-denied file out with it, while
+    /// an ordinary file clone (APFS copy-on-write, used by build tools) works.
+    #[test]
+    fn real_profile_clone_cannot_copy_read_denied_files() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let base = temp.path().join(".cplt-worktrees");
+        let staging = base.join(".staging");
+        let root = base.join("managed");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("private"), "secret\n").unwrap();
+        fs::write(temp.path().join("plain"), "plain\n").unwrap();
+        let allowed = temp.path().join("allowed/nested/deeper");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::write(allowed.join("file"), "ok\n").unwrap();
+        // A package-manager cache stays a valid directory-clone source (bun).
+        let home = temp.path().join("home");
+        let pkg = home.join(".bun/install/cache/pkg@1.0.0");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("index.js"), "cached\n").unwrap();
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.managed_worktree_root = Some(&root);
+        let profile = write_real_profile(&opts);
+        let t = temp.path().display();
+        let clone = |src: &str, dst: &str| {
+            // The temp HOME hides the developer's python; the system one needs none.
+            python_inline_command(&format!(
+                "import ctypes,sys\nc=ctypes.CDLL(None).clonefile\nsys.exit(c({src:?}.encode(),{dst:?}.encode(),0))"
+            ))
+            .replacen("python3", "/usr/bin/python3", 1)
+        };
+        let script = format!(
+            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; {}; cat '{t}/fileclone' 2>/dev/null && echo FILE_OK; {}; cat '{t}/filecopy' 2>/dev/null && echo LEAK; cp -c -R '{t}/allowed' '{t}/allowed-copy' && cat '{t}/allowed-copy/nested/deeper/file' && echo TREE_OK; {}; cat '{t}/cacheclone/index.js' && echo CACHE_OK",
+            clone(&base.display().to_string(), &format!("{t}/dirclone")),
+            clone(&format!("{t}/plain"), &format!("{t}/fileclone")),
+            clone(
+                &staging.join("private").display().to_string(),
+                &format!("{t}/filecopy")
+            ),
+            clone(&pkg.display().to_string(), &format!("{t}/cacheclone")),
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(!output.contains("LEAK"), "{output}");
+        assert!(output.contains("FILE_OK"), "{output}");
+        assert!(output.contains("ok\nTREE_OK"), "{output}");
+        assert!(output.contains("cached\nCACHE_OK"), "{output}");
+    }
+
+    /// A cache dir swapped for a symlink must not make its target a clone
+    /// source: the target can hold read-denied files.
+    #[test]
+    fn real_profile_symlinked_clone_cache_grants_no_clone() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let base = temp.path().join(".cplt-worktrees");
+        let staging = base.join(".staging");
+        let root = base.join("managed");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("private"), "secret\n").unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".bun/install")).unwrap();
+        std::os::unix::fs::symlink(&base, home.join(".bun/install/cache")).unwrap();
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.managed_worktree_root = Some(&root);
+        let profile = write_real_profile(&opts);
+        let text = fs::read_to_string(&profile).unwrap();
+        let t = temp.path().display();
+        let script = format!(
+            "{}; cat '{t}/dirclone/.staging/private' 2>/dev/null && echo LEAK; echo DONE",
+            python_inline_command(&format!(
+                "import ctypes,sys\nc=ctypes.CDLL(None).clonefile\nsys.exit(c({:?}.encode(),{:?}.encode(),0))",
+                home.join(".bun/install/cache").display().to_string(),
+                format!("{t}/dirclone")
+            ))
+            .replacen("python3", "/usr/bin/python3", 1)
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(!output.contains("LEAK"), "{output}");
+        assert!(output.contains("DONE"), "{output}");
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.contains("allow file-clone") && l.contains(".cplt-worktrees")),
+            "{text}"
+        );
+    }
+
+    /// A `--deny-path` on a file inside a clone cache must not be copied out by
+    /// a directory clone of that cache.
+    #[test]
+    fn real_profile_deny_path_inside_clone_cache_blocks_dir_clone() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let home = temp.path().join("home");
+        let cache = home.join(".bun/install/cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("secret"), "secret\n").unwrap();
+        let denied = [cache.join("secret")];
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.extra_deny = &denied;
+        let profile = write_real_profile(&opts);
+        let text = fs::read_to_string(&profile).unwrap();
+        let t = temp.path().display();
+        let script = format!(
+            "{}; cat '{t}/dirclone/secret' 2>/dev/null && echo LEAK; echo DONE",
+            python_inline_command(&format!(
+                "import ctypes,sys\nc=ctypes.CDLL(None).clonefile\nsys.exit(c({:?}.encode(),{:?}.encode(),0))",
+                cache.display().to_string(),
+                format!("{t}/dirclone")
+            ))
+            .replacen("python3", "/usr/bin/python3", 1)
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(!output.contains("LEAK"), "{output}");
+        assert!(output.contains("DONE"), "{output}");
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.contains("allow file-clone") && l.contains("/home/.bun/install/cache\"")),
+            "{text}"
+        );
+    }
+
     #[test]
     fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
         require_sandbox!();

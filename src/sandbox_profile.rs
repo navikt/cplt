@@ -21,17 +21,17 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
-    HomeToolDir, OAUTH_CALLBACK_PORT, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
-    Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
-    SSH_PRIVATE_KEY_NAMES, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, YARN_CONFIG_DIR,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
-    current_uid, cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex,
-    first_party_read_target, grant_is_refused, home_config_link_targets,
-    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    pnpm_config_dirs, pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    CLONE_CACHE_DIRS, CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES,
+    DENIED_HOME_SUBPATHS, DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES,
+    HOME_CONFIG_FILES, HomeToolDir, OAUTH_CALLBACK_PORT, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT,
+    PathBinDir, Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS,
+    SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES, SYSTEM_READ_FILES, TOOL_READ_DIRS,
+    XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs, ancestor_alternation, app_dirs,
+    colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
+    cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
+    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
+    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
+    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -2961,6 +2961,56 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         sbpl!(sb, "(deny file-read* (literal \"{p}\"))");
         sbpl!(sb, "(deny file-write* (literal \"{p}\"))");
     }
+    // clonefile(2) on a directory authorises only the top directory, not the
+    // files inside it, so a read-denied file under a readable directory would
+    // ride along. File clones stay allowed (they check read on the source), and
+    // copyfile/`cp -c -R` fall back to per-file clones when this refuses.
+    sbpl!(sb, "(deny file-clone (vnode-type DIRECTORY))");
+    // Package managers clone whole directories out of their caches (bun's
+    // default backend has no fallback), so re-allow directory clones whose
+    // source is one of those caches. They hold downloaded packages, never a
+    // read-denied path (`clone_cache_dirs_hold_no_denied_path` pins that).
+    // A user `--deny-path` inside (or around) a cache must not be copied out by
+    // a clone of the whole cache, so such a cache gets no allow, and says so.
+    let mut linked: std::collections::BTreeMap<PathBuf, Vec<&str>> =
+        std::collections::BTreeMap::default();
+    for rel in CLONE_CACHE_DIRS {
+        let spellings = match clone_cache_spellings(home, rel) {
+            Ok(s) => s,
+            Err(link) => {
+                linked.entry(link).or_default().push(rel);
+                continue;
+            }
+        };
+        if let Some(deny) = spellings
+            .iter()
+            .find_map(|p| overlapping_deny(config.extra_deny, Path::new(p)))
+        {
+            if clone_cache_exists(home, rel) {
+                crate::ui::warn(&format!(
+                    "Directory clones out of ~/{rel} are not allowed because of --deny-path {}.",
+                    deny.display()
+                ));
+            }
+            continue;
+        }
+        for p in spellings {
+            sbpl!(
+                sb,
+                "(allow file-clone (require-all (vnode-type DIRECTORY) (subpath \"{p}\")))"
+            );
+        }
+    }
+    for (link, rels) in &linked {
+        let names: Vec<String> = rels.iter().map(|r| format!("~/{r}")).collect();
+        crate::ui::warn(&format!(
+            "{} is a symlink, so package managers cannot clone directories out of {}. \
+             Remove the symlink (bun: or use `bun install --backend copyfile`); \
+             other tools fall back to per-file copies.",
+            link.display(),
+            names.join(", ")
+        ));
+    }
     // `bsd.sb` allows `file-read-metadata` everywhere, and that named operation
     // outranks the `file-read*` deny above, so a denied `~/.npmrc` still stats
     // as present. yarn 1 checks existence before it reads every npmrc on the
@@ -3079,6 +3129,41 @@ fn resolved(path: PathBuf) -> PathBuf {
 fn home_spellings(home: &str, rel: &str) -> Vec<String> {
     let named = Path::new(home).join(rel);
     spellings(&named, &crate::config::canonicalize_deepest(&named))
+}
+
+/// Spellings for a directory-clone allow on a `CLONE_CACHE_DIRS` entry.
+///
+/// Never a resolved symlink target: these caches sit in agent-writable dirs, so
+/// a session could point one at a dir holding read-denied files and have the
+/// next launch allow cloning it. A symlink anywhere between `$HOME` and the
+/// cache gets no allow at all. The canonical `$HOME` spelling is kept, since
+/// `$HOME` itself is not the agent's to move.
+/// A cache that is not there has nothing to clone, so dropping its allow needs no warning.
+fn clone_cache_exists(home: &str, rel: &str) -> bool {
+    std::fs::symlink_metadata(Path::new(home).join(rel)).is_ok()
+}
+
+fn clone_cache_spellings(home: &str, rel: &str) -> Result<Vec<String>, PathBuf> {
+    let mut walk = PathBuf::from(home);
+    for part in Path::new(rel).components() {
+        walk.push(part);
+        match std::fs::symlink_metadata(&walk) {
+            Ok(m) if m.file_type().is_symlink() => return Err(walk),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let named = Path::new(home).join(rel);
+    let mut out = vec![named.clone()];
+    if let Ok(h) = std::fs::canonicalize(home) {
+        out.push(h.join(rel));
+    }
+    out.dedup();
+    Ok(out
+        .into_iter()
+        .filter(|p| validate_sbpl_path(p).is_ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
 }
 
 /// [`home_spellings`] for a path already resolved.
@@ -4156,6 +4241,15 @@ mod mcp_child_profile_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clone_cache_exists_only_for_present_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().to_str().unwrap();
+        assert!(!clone_cache_exists(home, ".bun/install/cache"));
+        std::fs::create_dir_all(t.path().join(".bun/install/cache")).unwrap();
+        assert!(clone_cache_exists(home, ".bun/install/cache"));
+    }
+
     use super::*;
 
     #[test]

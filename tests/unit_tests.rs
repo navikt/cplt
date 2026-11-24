@@ -790,6 +790,42 @@ fn profile_contains_deny_default() {
 }
 
 #[test]
+fn profile_denies_only_directory_clones() {
+    let p = generate_profile(&base_profile_options(), &[]);
+    let clones: Vec<&str> = p.lines().filter(|l| l.contains("file-clone")).collect();
+    // The deny first, then only directory allows scoped to a package cache.
+    assert_eq!(clones[0], "(deny file-clone (vnode-type DIRECTORY))", "{p}");
+    assert!(clones.len() > 1, "{p}");
+    for l in &clones[1..] {
+        assert!(
+            l.starts_with("(allow file-clone (require-all (vnode-type DIRECTORY) (subpath \"")
+                && cplt::sandbox::CLONE_CACHE_DIRS
+                    .iter()
+                    .any(|d| l.contains(d)),
+            "{l}"
+        );
+    }
+}
+
+/// A cache allowed as a directory-clone source must neither contain nor sit
+/// inside a read-denied path, or the clone would carry that path out.
+#[test]
+fn clone_cache_dirs_hold_no_denied_path() {
+    use cplt::sandbox::{CLONE_CACHE_DIRS, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS};
+    let denied = DENIED_DOTFILES
+        .iter()
+        .chain(DENIED_FILES)
+        .chain(DENIED_HOME_SUBPATHS)
+        .chain([&".npmrc"]);
+    for d in denied {
+        for c in CLONE_CACHE_DIRS {
+            let (d, c) = (Path::new(d), Path::new(c));
+            assert!(!d.starts_with(c) && !c.starts_with(d), "{c:?} vs {d:?}");
+        }
+    }
+}
+
+#[test]
 fn profile_allows_tty_ioctl() {
     let p = generate_profile(
         &SandboxConfig {
