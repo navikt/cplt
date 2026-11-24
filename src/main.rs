@@ -18165,7 +18165,7 @@ mod tests {
     /// nav-pilot parses `cplt check --json`: pin the report's field names.
     #[test]
     fn check_net_json_shape_is_pinned() {
-        let report = build_net_check(
+        let mut report = build_net_check(
             &proxy::NetPolicy::default(),
             true,
             false,
@@ -18175,6 +18175,8 @@ mod tests {
             "copilot".to_string(),
             None,
         );
+        // `note` is optional (absent when None); set it to pin its name.
+        report.items[0].note = Some("reachability".into());
         let v: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
