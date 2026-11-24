@@ -115,11 +115,13 @@ pub struct FsRule {
     pub path: PathBuf,
     pub access: FsAccess,
     /// Open `path` without following a symlink in ANY component
-    /// (`openat2(RESOLVE_NO_SYMLINKS)`), and fail the launch if one is there.
+    /// (`openat2(RESOLVE_NO_SYMLINKS)`, or a component walk where seccomp
+    /// refuses openat2), and fail the launch if one is there.
     ///
     /// Set on the cache-exec and Cypress state rules, whose paths sit in a tree
     /// the agent can write, and which `prepare()` rewrites to the canonical path
-    /// it validated. A link swapped in after that check (at the entry, or at an
+    /// it validated, and on writable AppDir roots, which name the path
+    /// `writable_app_root_rule_path` checked. A link swapped in after that check (at the entry, or at an
     /// intermediate component such as `~/.cache/pnpm` for `pnpm/dlx`) would
     /// otherwise move a write (or write+execute) grant onto its target. A flag
     /// on the rule rather than an index list, so removing or filtering rules
@@ -2852,11 +2854,65 @@ pub(crate) fn apply_landlock_and_seccomp_now(
 #[cfg(target_os = "linux")]
 pub(crate) fn open_nofollow_rule(path: &Path) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
     let flags = libc::O_PATH | libc::O_CLOEXEC;
-    match super::openat2_no_symlinks(libc::AT_FDCWD, path, flags, 0) {
+    let opened = match super::openat2_no_symlinks(libc::AT_FDCWD, path, flags, 0) {
+        // A seccomp profile that refuses openat2: walk instead, same guarantee.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
+            open_no_symlinks_walk(path)
+        }
+        r => r,
+    };
+    match opened {
         Ok(fd) => Ok(Some(fd)),
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// `RESOLVE_NO_SYMLINKS` by hand: open each component of an absolute `path`
+/// with `O_PATH | O_NOFOLLOW` relative to the previous one, and fail with
+/// `ELOOP` on a symlink anywhere, the final component included. `..` is
+/// refused too, as it could step back out of a checked directory.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_no_symlinks_walk(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    let open = |dir: libc::c_int, name: &std::ffi::CStr| -> std::io::Result<OwnedFd> {
+        let fd = unsafe {
+            libc::openat(
+                dir,
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut st) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        Ok(fd)
+    };
+    let mut cur = open(libc::AT_FDCWD, c"/")?;
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                let name = std::ffi::CString::new(name.as_bytes())
+                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+                cur = open(cur.as_raw_fd(), &name)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+            }
+        }
+    }
+    Ok(cur)
 }
 
 /// The launch-stopping message for a [`FsRule::nofollow`] rule that could not
@@ -3210,6 +3266,27 @@ mod tests {
     // macOS, and every lookup of a missing name there costs tens of
     // milliseconds. Policy generation resolves dozens of home paths per call,
     // which made this module take minutes on the macOS CI runner.
+
+    /// The openat2 fallback opens a real path and refuses a link at the end
+    /// or in the middle, and a `..` component.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_symlinks_walk_refuses_links_anywhere() {
+        let root = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        assert!(open_no_symlinks_walk(&root.join("real/sub")).is_ok());
+        for bad in [
+            root.join("link"),
+            root.join("link/sub"),
+            root.join("real/../real"),
+        ] {
+            let e = open_no_symlinks_walk(&bad).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{}", bad.display());
+        }
+        let missing = open_no_symlinks_walk(&root.join("real/nope")).unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+    }
 
     /// A seccomp profile that refuses openat2 answers ENOSYS or, in older
     /// Docker profiles, EPERM. Both must name the cause.

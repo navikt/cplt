@@ -93,6 +93,16 @@ example:
 rm ~/.cache/uv && mv /path/to/target ~/.cache/uv
 ```
 
+An explicit `--allow-cache-exec` entry (or `allow_cache_exec` in config)
+inside such a linked directory, for example `pnpm/dlx` with `~/.cache/pnpm` a
+link, now stops the launch with an error naming the link. Replace the link
+with a real directory, or remove the entry.
+
+On Linux, every writable application directory is now opened without
+following symlinks. Where a container's seccomp profile refuses `openat2(2)`,
+cplt walks the path one component at a time instead, so the launch still
+works.
+
 Pointing the tool's variable at the target (`UV_CACHE_DIR`, `MISE_DATA_DIR`)
 does not help: cplt does not grant those paths, so the tool fails inside the
 sandbox. `--allow-write` on the target restores writes but not execute.
