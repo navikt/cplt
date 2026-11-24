@@ -12857,7 +12857,8 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 &project.to_string_lossy(),
                 "--",
                 "-c",
-                "open 'https://gw.intern.example/authorize?a=1&b=2'; echo rc=$?; \
+                // #1158: stdio ignored, as npm `open` (OpenCode) spawns it.
+                "open 'https://gw.intern.example/authorize?a=1&b=2' </dev/null >/dev/null 2>&1; echo rc=$?; \
                  open https://evil.example/x; echo rc=$?",
             ])
             .env("CPLT_TEST_OPENER", &opener)
@@ -12881,6 +12882,41 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
         }
         let opened = std::fs::read_to_string(&record).unwrap_or_default();
         assert_eq!(opened, "-u\nhttps://gw.intern.example/authorize?a=1&b=2\n");
+    }
+
+    /// #1158: with no MCP spec, a sandbox that can write
+    /// `~/Library/Preferences` turns the host opener off, and says so.
+    #[test]
+    fn e2e_open_url_disabled_without_specs_warns() {
+        if !sandbox_usable() {
+            return;
+        }
+        let work = home_temp_dir("open-url-off");
+        let home = std::fs::canonicalize(work.path()).unwrap();
+        let prefs = home.join("Library/Preferences");
+        let project = home.join("p");
+        std::fs::create_dir_all(&prefs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--quiet", "--agent", "shell"])
+            .args(["--allow-private-domain", "intern.example", "--allow-write"])
+            .arg(&prefs)
+            .arg("--project-dir")
+            .arg(&project)
+            .args(["--", "-c", "true"])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("CPLT_TEST_OPENER", "/usr/bin/false")
+            .output()
+            .expect("binary should run");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("MCP login links will not open in the browser: the sandbox can write"),
+            "stderr: {err}"
+        );
     }
 
     /// Copilot review on #1124: `cplt exec` gets the host opener too, with no

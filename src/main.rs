@@ -7544,6 +7544,13 @@ fn managed_layer_writable(
 /// The one line naming the domains the host opener may open in the browser
 /// that this user did not write themselves: approved `.cplt.toml` proposals
 /// and the managed layer (#1091). `None` when every entry is the user's own.
+fn opener_writable_warning(p: &Path) -> String {
+    format!(
+        "MCP login links will not open in the browser: the sandbox can write {}.",
+        p.display()
+    )
+}
+
 fn opener_disclosure(resolved: &config::Resolved) -> Option<String> {
     let mut parts = Vec::new();
     if !resolved.repo_private_domains.is_empty() {
@@ -8372,8 +8379,13 @@ fn assemble_sandbox(
             if !cplt::mcp_broker::OPEN_URL_HOST_OPENER
                 || !resolved.mcp_broker
                 || resolved.allow_browser
-                || cplt::mcp_broker::opener_config_writable(&policy, home_dir).is_some()
             {
+                return None;
+            }
+            // #1158: say why, as the branch with specs does; a silent off
+            // left OAuth links going nowhere with nothing on screen.
+            if let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir) {
+                ui::warn(&opener_writable_warning(&p));
                 return None;
             }
             return cplt::mcp_broker::Broker::start(
@@ -8382,6 +8394,11 @@ fn assemble_sandbox(
                 log,
                 &resolved.allow_private_domains,
             )
+            .inspect_err(|e| {
+                ui::warn(&format!(
+                    "Login links will not open in the browser: the host opener is unavailable: {e}."
+                ));
+            })
             .ok();
         }
         let mut refused = sandbox::mcp_broker_refusal(&sandbox_config);
@@ -8425,10 +8442,7 @@ fn assemble_sandbox(
             && let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir)
         {
             broker.disable_open_url();
-            ui::warn(&format!(
-                "MCP login links will not open in the browser: the sandbox can write {}.",
-                p.display()
-            ));
+            ui::warn(&opener_writable_warning(&p));
         }
         Some(broker)
     });
