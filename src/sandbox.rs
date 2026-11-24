@@ -6604,7 +6604,10 @@ mod tests {
         let Err(error) = prepare(&config) else {
             panic!("an unenforceable deny path must refuse the launch");
         };
-        assert!(error.contains("sandbox.use_bubblewrap = false"), "{error}");
+        assert!(
+            error.contains("cplt config unset sandbox.use_bubblewrap"),
+            "{error}"
+        );
         assert!(error.contains("sandbox.refuse_unenforced false"), "{error}");
         // `cplt check` / `--print-profile` refuse exactly when a launch does.
         let Err(inspected) = prepare_with_pnpm_shadow(&config, None, true) else {
