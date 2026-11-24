@@ -12150,7 +12150,16 @@ fn run_config_set_via(
                 ui::error(&e);
                 return ExitCode::FAILURE;
             }
-            if let Some(w) = sandbox::state_ancestor_warning(key, &path, &home) {
+            if let Some(w) = sandbox::state_ancestor_warning(
+                key,
+                &path,
+                &home,
+                if local {
+                    sandbox::GrantLayer::Local
+                } else {
+                    sandbox::GrantLayer::Global
+                },
+            ) {
                 ui::warn(&w);
             }
             // The exec-overlap refusal needs the resolved config the launch builds,

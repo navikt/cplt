@@ -1425,13 +1425,28 @@ pub fn state_ancestor_layers_warning(
 }
 
 /// The warning `cplt config set` prints for a write grant at or above cplt's
-/// state dir. Accepted, like at launch: see [`exposure_line`].
+/// state dir. Accepted, like at launch: see [`exposure_line`]. The grant is
+/// already saved in `layer` and array `set` appends, so the remedy is that
+/// layer's unset-then-set; a symlink alias keeps its own advice.
 #[must_use]
-pub fn state_ancestor_warning(key: &str, p: &Path, home_dir: &Path) -> Option<String> {
-    (key == "allow.write")
+pub fn state_ancestor_warning(
+    key: &str,
+    p: &Path,
+    home_dir: &Path,
+    layer: GrantLayer,
+) -> Option<String> {
+    let dir = (key == "allow.write")
         .then(|| policy::cplt_state_ancestor_grant(home_dir, p))
-        .flatten()
-        .map(|dir| state_ancestor_refusal(key, p, &dir, home_dir))
+        .flatten()?;
+    Some(if dir.starts_with(p) {
+        exposure_line(
+            &format!("{key} {}", p.display()),
+            &dir,
+            &layer_remedy(p, home_dir, Some(layer)),
+        )
+    } else {
+        state_ancestor_refusal(key, p, &dir, home_dir)
+    })
 }
 
 /// Refuse one grant that no launch can honour, with the reason.
@@ -7674,12 +7689,15 @@ mod tests {
         for p in [h.to_path_buf(), h.join(".config")] {
             assert!(validate_grant_path("allow.write", &p, h).is_ok(), "{p:?}");
             assert!(
-                state_ancestor_warning("allow.write", &p, h).is_some(),
+                state_ancestor_warning("allow.write", &p, h, GrantLayer::Global).is_some(),
                 "{p:?}"
             );
         }
         assert!(validate_grant_path("allow.write", &h.join(".config/cplt"), h).is_err());
-        assert!(state_ancestor_warning("allow.write", &h.join(".config/gh"), h).is_none());
+        assert!(
+            state_ancestor_warning("allow.write", &h.join(".config/gh"), h, GrantLayer::Global)
+                .is_none()
+        );
         assert!(validate_grant_path("allow.write", &h.join(".config/gh"), h).is_ok());
         assert!(validate_grant_path("allow.read", &h.join(".config"), h).is_ok());
         // An env-derived writable tree (agent dir) at launch.
@@ -7717,18 +7735,19 @@ mod tests {
             })
         };
 
-        // allow.write at config-set time and at launch.
-        // Nothing is saved at config-set time, so nothing to remove.
-        let err = state_ancestor_warning("allow.write", &cfg, &h).unwrap();
+        // allow.write at config-set time: the grant is saved and `set`
+        // appends, so the remedy unsets it in the layer it went to (OKb5).
+        let err = state_ancestor_warning("allow.write", &cfg, &h, GrantLayer::Global).unwrap();
         assert!(
-            err.contains("`cplt config set allow.write ~/.config/<tool>`"),
-            "{err}"
+            err.contains("`cplt config unset allow.write ~/.config`")
+                && err.contains("`cplt config set allow.write ~/.config/<tool>`"),
+            "global set must name unset-then-set: {err}"
         );
-        assert!(!err.contains("Remove"), "{err}");
-        let err = state_ancestor_warning("allow.write", &h, &h).unwrap();
+        let err = state_ancestor_warning("allow.write", &h, &h, GrantLayer::Local).unwrap();
         assert!(
-            err.contains("`cplt config set allow.write ~/<tool>`"),
-            "{err}"
+            err.contains("`cplt config unset --local allow.write ~`")
+                && err.contains("`cplt config set --local allow.write ~/<tool>`"),
+            "--local set must name the local layer: {err}"
         );
 
         // Each explicit layer names the command that removes the grant there.
@@ -7840,7 +7859,9 @@ mod tests {
         let real = crate::config::account_home().unwrap();
         let state = real.join(CPLT_STATE_DIR);
         assert_eq!(policy::passwd_state_dir(fake.path()), Some(state.clone()));
-        assert!(state_ancestor_warning("allow.write", &real, fake.path()).is_some());
+        assert!(
+            state_ancestor_warning("allow.write", &real, fake.path(), GrantLayer::Global).is_some()
+        );
         assert!(validate_grant_path("allow.write", &state.join("managed.d"), fake.path()).is_err());
         #[cfg(target_os = "macos")]
         {
