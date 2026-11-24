@@ -1552,6 +1552,40 @@ mod e2e_tests {
         );
     }
 
+    /// #1157: a link chain through the project (`out/l1 -> proj/l2 ->
+    /// elsewhere`) is refused: the agent could re-aim `proj/l2`, though both
+    /// ends lie outside every grant.
+    #[test]
+    fn e2e_session_summary_refuses_a_link_chain_through_the_project() {
+        require_sandbox!();
+        let fake = fake_agent("copilot", "exit 0\n");
+        let out = home_temp_dir("summary-out");
+        let elsewhere = home_temp_dir("summary-elsewhere");
+        let l2 = fake.path().join("l2");
+        std::os::unix::fs::symlink(elsewhere.path(), &l2).unwrap();
+        std::os::unix::fs::symlink(&l2, out.path().join("l1")).unwrap();
+        let path = out.path().join("l1/summary.json");
+        let new_path = format!(
+            "{}:{}",
+            fake.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--project-dir"])
+            .arg(project_dir())
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("CPLT_SESSION_SUMMARY", &path)
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not writing the session summary"),
+            "{stderr}"
+        );
+        assert!(!elsewhere.path().join("summary.json").exists());
+    }
+
     /// #1157: a launch that fails before the path check (no agent binary)
     /// writes no summary.
     #[test]

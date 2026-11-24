@@ -95,7 +95,7 @@ pub const UNCLASSIFIED: &str = "warn.unclassified";
 struct State {
     /// The launch path was entered; only then is a summary written.
     launched: bool,
-    path: Option<PathBuf>,
+    path: Option<Target>,
     agent: Option<String>,
     backend: Option<&'static str>,
     startup_ms: Option<u64>,
@@ -142,7 +142,7 @@ pub fn begin(agent: &str) {
 }
 
 /// Store the path [`path_refusal`] returned.
-pub fn set_path(path: PathBuf) {
+pub fn set_path(path: Target) {
     with(|s| s.path = Some(path));
 }
 
@@ -319,7 +319,7 @@ pub fn host_matches(host: &str, suffixes: &[String]) -> bool {
 pub fn path_refusal(
     path: &Path,
     on_path: impl Fn(&Path) -> Option<(PathBuf, PathBuf)>,
-) -> Result<PathBuf, String> {
+) -> Result<Target, String> {
     if !path.is_absolute() {
         return Err("it is not an absolute path".into());
     }
@@ -338,7 +338,43 @@ pub fn path_refusal(
             ));
         }
     }
-    Ok(canonical)
+    Target::open(&canonical).map_err(|e| format!("its directory cannot be opened ({e})"))
+}
+
+/// The summary's directory, opened once at check time and held until exit,
+/// so nothing that happens to the path in between can redirect the write.
+#[derive(Debug)]
+pub struct Target {
+    dir: std::os::fd::OwnedFd,
+    name: std::ffi::CString,
+}
+
+impl Target {
+    /// Open the parent of `path` (`O_DIRECTORY | O_NOFOLLOW`).
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        use std::ffi::CString;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        let refuse = |why: &str| std::io::Error::other(why.to_string());
+        let dir = path.parent().ok_or_else(|| refuse("no parent dir"))?;
+        let name = path.file_name().ok_or_else(|| refuse("no file name"))?;
+        let cstr = |b: &[u8]| CString::new(b).map_err(|_| refuse("NUL in path"));
+        let dir_c = cstr(dir.as_os_str().as_bytes())?;
+        // SAFETY: open on a NUL-terminated string; the fd is owned below.
+        let fd = unsafe {
+            libc::open(
+                dir_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            dir: unsafe { OwnedFd::from_raw_fd(fd) },
+            name: cstr(name.as_bytes())?,
+        })
+    }
 }
 
 /// Render the summary. `suffixes` filters `net_blocked_hosts`.
@@ -389,52 +425,31 @@ fn render(s: &State, suffixes: &[String]) -> serde_json::Value {
     Value::Object(m)
 }
 
-/// Write `contents` to `path` (parent already canonical, from
-/// [`path_refusal`]). The parent is resolved again and must not have moved,
-/// then opened `O_DIRECTORY | O_NOFOLLOW`; everything after is relative to
-/// that fd: a fresh 0600 temp file (`O_EXCL | O_NOFOLLOW`) renamed over the
-/// target. A symlink or anything but a regular file at `path` is refused.
-pub fn write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+/// Write `contents` into the directory `target` holds open: a fresh 0600
+/// temp file (`O_EXCL | O_NOFOLLOW`) renamed over the name, all relative to
+/// the fd. A symlink or anything but a regular file at the name is refused.
+pub fn write_file(target: &Target, contents: &[u8]) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
     let refuse = |why: &str| std::io::Error::other(why.to_string());
-    let dir = path.parent().ok_or_else(|| refuse("no parent dir"))?;
-    let name = path.file_name().ok_or_else(|| refuse("no file name"))?;
-    if std::fs::canonicalize(dir)? != dir {
-        return Err(refuse("its directory changed since launch"));
-    }
-    let cstr = |b: &[u8]| CString::new(b).map_err(|_| refuse("NUL in path"));
-    let dir_c = cstr(dir.as_os_str().as_bytes())?;
-    let name_c = cstr(name.as_bytes())?;
-    let tmp_c = cstr(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()).as_bytes())?;
-    // SAFETY: plain syscalls on NUL-terminated strings; fds are owned below.
-    let dfd = unsafe {
-        libc::open(
-            dir_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if dfd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let dfd = unsafe { OwnedFd::from_raw_fd(dfd) };
+    let dfd = target.dir.as_raw_fd();
+    let name_c = &target.name;
+    let tmp_c = CString::new(format!(
+        ".{}.{}.tmp",
+        name_c.to_string_lossy(),
+        std::process::id()
+    ))
+    .map_err(|_| refuse("NUL in path"))?;
+    // SAFETY: plain syscalls on NUL-terminated strings and a live fd.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe {
-        libc::fstatat(
-            dfd.as_raw_fd(),
-            name_c.as_ptr(),
-            &raw mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
+    let r = unsafe { libc::fstatat(dfd, name_c.as_ptr(), &raw mut st, libc::AT_SYMLINK_NOFOLLOW) };
     if r == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return Err(refuse("the path exists and is not a regular file"));
     }
     let fd = unsafe {
         libc::openat(
-            dfd.as_raw_fd(),
+            dfd,
             tmp_c.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600 as libc::c_uint,
@@ -448,14 +463,7 @@ pub fn write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .write_all(contents)
         .and_then(|()| f.sync_all())
         .and_then(|()| {
-            let r = unsafe {
-                libc::renameat(
-                    dfd.as_raw_fd(),
-                    tmp_c.as_ptr(),
-                    dfd.as_raw_fd(),
-                    name_c.as_ptr(),
-                )
-            };
+            let r = unsafe { libc::renameat(dfd, tmp_c.as_ptr(), dfd, name_c.as_ptr()) };
             if r == 0 {
                 Ok(())
             } else {
@@ -463,30 +471,29 @@ pub fn write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             }
         });
     if result.is_err() {
-        unsafe { libc::unlinkat(dfd.as_raw_fd(), tmp_c.as_ptr(), 0) };
+        unsafe { libc::unlinkat(dfd, tmp_c.as_ptr(), 0) };
     }
     result
 }
 
 /// Write the summary if the launch asked for one. Called once from `main`.
 pub fn write_if_requested() {
-    let (path, json) = {
-        let guard = STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(s) = guard.as_ref().filter(|s| s.launched) else {
-            return;
-        };
-        let Some(path) = s.path.clone() else {
-            return;
-        };
-        let raw = std::env::var(HOSTS_ENV).unwrap_or_default();
-        let (suffixes, _) = parse_suffixes(&raw);
-        (path, render(s, &suffixes))
+    let mut guard = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(s) = guard.as_mut().filter(|s| s.launched) else {
+        return;
     };
+    let Some(target) = s.path.take() else {
+        return;
+    };
+    let raw = std::env::var(HOSTS_ENV).unwrap_or_default();
+    let (suffixes, _) = parse_suffixes(&raw);
+    let json = render(s, &suffixes);
+    drop(guard);
     let mut bytes = json.to_string().into_bytes();
     bytes.push(b'\n');
-    if let Err(e) = write_file(&path, &bytes) {
+    if let Err(e) = write_file(&target, &bytes) {
         crate::ui::error(&format!("cannot write the session summary: {e}"));
     }
 }
@@ -659,7 +666,7 @@ mod tests {
         let (_d, dir) = canon_tmp();
         let p = dir.join("s.json");
         std::fs::write(&p, "old").unwrap();
-        write_file(&p, b"{}").unwrap();
+        write_file(&Target::open(&p).unwrap(), b"{}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}");
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
@@ -675,7 +682,7 @@ mod tests {
         std::fs::write(&target, "keep").unwrap();
         let link = dir.join("link.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(write_file(&link, b"{}").is_err());
+        assert!(write_file(&Target::open(&link).unwrap(), b"{}").is_err());
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()
@@ -686,11 +693,11 @@ mod tests {
         let fifo = dir.join("fifo.json");
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert!(write_file(&fifo, b"{}").is_err());
+        assert!(write_file(&Target::open(&fifo).unwrap(), b"{}").is_err());
     }
 
     /// A parent re-aimed after launch (a symlink swapped into the chain) is
-    /// refused at write time, not followed.
+    /// never followed: the write goes to the directory held since the check.
     #[test]
     fn write_refuses_a_parent_that_moved() {
         let (_d, dir) = canon_tmp();
@@ -698,10 +705,14 @@ mod tests {
         let victim = dir.join("victim");
         std::fs::create_dir(&real).unwrap();
         std::fs::create_dir(&victim).unwrap();
-        let checked = real.join("s.json");
-        std::fs::remove_dir(&real).unwrap();
+        let target = Target::open(&real.join("s.json")).unwrap();
+        std::fs::rename(&real, dir.join("moved")).unwrap();
         std::os::unix::fs::symlink(&victim, &real).unwrap();
-        assert!(write_file(&checked, b"{}").is_err());
+        write_file(&target, b"{}").unwrap();
+        assert!(
+            dir.join("moved/s.json").exists(),
+            "the held directory is used"
+        );
         assert!(!victim.join("s.json").exists());
     }
 
@@ -755,7 +766,7 @@ mod tests {
             ask(&out.join("l1/s.json")).is_err(),
             "two-hop link through a grant"
         );
-        assert_eq!(ask(&out.join("s.json")).unwrap(), out.join("s.json"));
+        assert!(ask(&out.join("s.json")).is_ok());
     }
 
     #[test]

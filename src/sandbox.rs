@@ -448,6 +448,20 @@ pub struct PreparedSandbox {
 }
 
 impl PreparedSandbox {
+    /// Every recursive write grant the macOS profile emits, read back from
+    /// its text: grants the Landlock policy model does not carry (a relocated
+    /// pnpm store, `/private/tmp`). Empty on Linux, where the policy is the
+    /// profile.
+    pub fn emitted_write_roots(&self) -> Vec<PathBuf> {
+        if cfg!(target_os = "macos") {
+            profile::emitted_write_subpaths(&self.profile_text)
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+impl PreparedSandbox {
     /// On Linux, when a write grant reaches cplt's state dir, the snapshot of
     /// `managed.d` to check once the session is over. macOS denies the dir.
     #[must_use]

@@ -6022,8 +6022,29 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if let Some(path) = cplt::session_summary::path_from_env()
         && cplt::session_summary::launched()
     {
+        // The profile's own write grants too: on macOS it grants trees the
+        // policy model does not carry (a relocated pnpm store).
+        let mut writable = policy.clone();
+        writable
+            .fs_rules
+            .extend(
+                prepared
+                    .emitted_write_roots()
+                    .into_iter()
+                    .map(|path| cplt::sandbox::FsRule {
+                        nofollow: false,
+                        path,
+                        access: cplt::sandbox::FsAccess {
+                            read: false,
+                            write: true,
+                            execute: false,
+                            ioctl: false,
+                            create_dirs: false,
+                        },
+                    }),
+            );
         match cplt::session_summary::path_refusal(&path, |p| {
-            cplt::check::writable_tree_on_path(&policy, &home_dir, p)
+            cplt::check::writable_tree_on_path(&writable, &home_dir, p)
         }) {
             Ok(checked) => cplt::session_summary::set_path(checked),
             Err(why) => ui::warn_id(
