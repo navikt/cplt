@@ -1511,7 +1511,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cplt-slow-opener-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let slow = dir.join("slow");
-        std::fs::write(&slow, "#!/bin/sh\nsleep 1\n").unwrap();
+        let (started, go) = (dir.join("started"), dir.join("go"));
+        // Blocks until the test releases it, so no scheduling can finish it early.
+        std::fs::write(
+            &slow,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+                started.display(),
+                go.display()
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
         let records = Mutex::new(Vec::new());
         let limiter = Limiter::default();
@@ -1524,10 +1534,13 @@ mod tests {
                     Some(slow.clone()),
                 );
             });
-            while limiter.inflight.load(Ordering::Acquire) == 0 {
-                std::thread::yield_now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !started.exists() {
+                assert!(std::time::Instant::now() < deadline, "opener never started");
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert!(records.lock().unwrap().is_empty(), "opener still running");
+            std::fs::write(&go, "").unwrap();
             limiter.drain(std::time::Duration::from_secs(10));
             assert_eq!(*records.lock().unwrap(), ["ALLOWED gw.example"]);
         });

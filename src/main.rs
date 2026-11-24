@@ -10405,21 +10405,6 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         Some(Err(line)) => findings.push(Finding::warning(line, None)),
         None => {}
     }
-    // The host opener's allow-list is `proxy.allow_private_domains` (#1091).
-    if cplt::mcp_broker::OPEN_URL_HOST_OPENER && resolved.mcp_broker && !resolved.allow_browser {
-        for d in &resolved.allow_private_domains {
-            let source = if resolved.repo_private_domains.contains(d) {
-                ".cplt.toml".to_string()
-            } else {
-                resolved
-                    .managed_tag(d, &[])
-                    .unwrap_or_else(|| "config".to_string())
-            };
-            ok.push(format!(
-                "browser opener may open: {d} and subdomains [{source}]"
-            ));
-        }
-    }
     // ── network: the policy `cplt check net` classifies against (#604) ──
     // Static: the same gate, no connection and no sandbox battery.
     if resolved.with_proxy {
@@ -10551,6 +10536,33 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         keychain_substitute.clone(),
     );
     let policy = sandbox::generate_policy(&sandbox_config);
+    // The host opener's allow-list is `proxy.allow_private_domains` (#1091).
+    // A launch turns the opener off when the sandbox can write the LaunchServices
+    // preferences, so report that instead of hosts nothing will open.
+    if cplt::mcp_broker::OPEN_URL_HOST_OPENER && resolved.mcp_broker && !resolved.allow_browser {
+        if let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, &home_dir) {
+            findings.push(Finding::warning(
+                format!(
+                    "browser opener off: the sandbox can write {}, so MCP login links will not open",
+                    doctor_tilde(&p.display().to_string(), &home_dir)
+                ),
+                None,
+            ));
+        } else {
+            for d in &resolved.allow_private_domains {
+                let source = if resolved.repo_private_domains.contains(d) {
+                    ".cplt.toml".to_string()
+                } else {
+                    resolved
+                        .managed_tag(d, &[])
+                        .unwrap_or_else(|| "config".to_string())
+                };
+                ok.push(format!(
+                    "browser opener may open: {d} and subdomains [{source}]"
+                ));
+            }
+        }
+    }
     // The cache-exec and Cypress checks the launch refuses on (#602), from the
     // same function, reusing this policy rather than generating it again.
     let launch_grants = match sandbox::launch_grants(&sandbox_config, &policy) {
