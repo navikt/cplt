@@ -413,7 +413,7 @@ pub struct PreparedSandbox {
     /// The MCP broker socket, for the `open_url` shims (#910). Set with
     /// [`Self::set_mcp_socket`].
     pub(crate) mcp_socket: Option<PathBuf>,
-    /// The launch's HTTPS push hint (#1144), repeated by a last-resort git
+    /// The fix from the launch's HTTPS push hint (#1144), repeated by a last-resort git
     /// credential helper when the push actually fails. Set with
     /// [`Self::set_push_hint`].
     pub(crate) push_hint: Option<String>,
@@ -485,8 +485,8 @@ impl PreparedSandbox {
     }
 
     /// Install the push-hint credential helper in the child (#1144).
-    pub fn set_push_hint(&mut self, hint: String) {
-        self.push_hint = Some(hint);
+    pub fn set_push_hint(&mut self, fix: String) {
+        self.push_hint = Some(fix);
     }
 
     /// The MCP broker socket the `open`/`xdg-open` shims forward to.

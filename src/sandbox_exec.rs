@@ -1332,16 +1332,30 @@ fn install_push_hint_helper(
     for (k, v) in github_credential_helper_config(
         current.as_deref(),
         crate::gh_proxy::gh_hosts(),
-        &path.to_string_lossy(),
+        &git_helper_value(&path),
     ) {
         cmd.env(k, v);
     }
 }
 
-/// The helper script: one stderr line for `get`, silence for `store`/`erase`.
-fn push_hint_helper_script(hint: &str) -> String {
-    let quoted = hint.replace('\'', "'\\''");
-    format!("#!/bin/sh\n[ \"$1\" = get ] && printf '%s\\n' 'cplt: {quoted}' >&2\nexit 0\n")
+/// A git `credential.helper` value for an absolute script path. Git runs a
+/// bare path through `sh`, so a space in `$HOME` would split it; `!` plus a
+/// single-quoted path is run as a shell command and survives it.
+fn git_helper_value(path: &Path) -> String {
+    format!("!'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// The helper script: on `get`, one stderr line naming the host git passes on
+/// stdin (the helper serves every gh host) and the fix; silence for
+/// `store`/`erase`. The host is agent-controlled, so only host characters
+/// are echoed.
+fn push_hint_helper_script(fix: &str) -> String {
+    let quoted = fix.replace('\'', "'\\''");
+    format!(
+        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nh=\nwhile IFS= read -r l; do case $l in host=*) h=${{l#host=}};; esac; done\n\
+         h=$(printf '%s' \"$h\" | tr -cd 'A-Za-z0-9.:_-')\n\
+         printf '%s\\n' \"cplt: git can't authenticate to https://$h inside the sandbox. \"'{quoted}' >&2\nexit 0\n"
+    )
 }
 
 /// `open`/`xdg-open` shims that hand an https URL to the MCP broker's
@@ -3433,12 +3447,14 @@ echo "failed to read keyring" >&2; exit 1"#,
         );
     }
 
-    /// #1144: the push-hint helper says the fix on stderr for `get`, prints
-    /// nothing on stdout, stays silent for `store`/`erase`, and survives a
-    /// quote in the hint.
+    /// #1144: the push-hint helper names the host from stdin and the fix on
+    /// stderr for `get`, prints nothing on stdout, stays silent for
+    /// `store`/`erase`, survives a quote in the fix and a hostile host.
     #[test]
     #[allow(clippy::disallowed_methods)] // /bin/sh by absolute path
     fn push_hint_helper_speaks_only_on_get_and_never_answers() {
+        use std::io::Write;
+        use std::process::Stdio;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("h");
         std::fs::write(
@@ -3446,26 +3462,52 @@ echo "failed to read keyring" >&2; exit 1"#,
             push_hint_helper_script("it's off; $(touch x) `id`"),
         )
         .unwrap();
-        let run = |op: &str| {
-            Command::new("/bin/sh")
+        let run = |op: &str, stdin: &str| {
+            let mut c = Command::new("/bin/sh")
                 .arg(&script)
                 .arg(op)
                 .current_dir(dir.path())
-                .output()
-                .unwrap()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            c.wait_with_output().unwrap()
         };
-        let get = run("get");
+        let get = run("get", "protocol=https\nhost=ghe.example.com\n\n");
         assert!(get.status.success());
         assert!(get.stdout.is_empty());
         assert_eq!(
             String::from_utf8_lossy(&get.stderr),
-            "cplt: it's off; $(touch x) `id`\n"
+            "cplt: git can't authenticate to https://ghe.example.com inside the sandbox. it's off; $(touch x) `id`\n"
         );
+        let evil = run("get", "host=a$(touch x)\u{1b}[31m.com\n");
+        assert!(String::from_utf8_lossy(&evil.stderr).contains("https://atouchx31m.com "));
         assert!(!dir.path().join("x").exists());
         for op in ["store", "erase"] {
-            let o = run(op);
+            let o = run(op, "host=github.com\n");
             assert!(o.status.success() && o.stdout.is_empty() && o.stderr.is_empty());
         }
+    }
+
+    /// The helper path survives a space in `$HOME` when git runs it through sh.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // /bin/sh by absolute path
+    fn git_helper_value_survives_spaces_and_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("my h'ome");
+        std::fs::create_dir(&d).unwrap();
+        let p = d.join("h");
+        std::fs::write(&p, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let v = git_helper_value(&p);
+        let o = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(v.strip_prefix('!').unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&o.stdout), "ok\n");
     }
 
     /// Every `gh_guard.hosts` host gets the helper, so a push to a GHE remote

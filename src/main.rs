@@ -5892,8 +5892,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         )
     {
         ui::warn(&hint);
-        // Said again when the push fails, not only at launch (#1144).
-        prepared.set_push_hint(hint);
+        // The fix is said again when git asks for credentials (#1144).
+        prepared.set_push_hint(cplt::doctor::gh_guard_fix(cli.no_gh_guard).to_string());
     }
 
     // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
@@ -11034,8 +11034,10 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     );
     let guard_fix = doctor::gh_guard_fix(cli.no_gh_guard);
     if let Some(hint) = doctor::push_hint(push.as_ref(), resolved.gh_guard.enabled, guard_fix) {
-        for label in &gh_write_allowed {
-            println!("guard:       {}", doctor::no_credentials_note(label));
+        if !gh_token {
+            for label in &gh_write_allowed {
+                println!("guard:       {}", doctor::no_credentials_note(label));
+            }
         }
         findings.push(Finding::warning(hint, Some(guard_fix.to_string())));
     }

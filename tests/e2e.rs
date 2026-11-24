@@ -675,7 +675,7 @@ mod e2e_tests {
     /// stderr and fills nothing. With the guard on, the helper is absent.
     #[test]
     fn e2e_push_hint_credential_helper_repeats_the_fix() {
-        const LINE: &str = "cplt: git push to https://github.com will fail";
+        const LINE: &str = "cplt: git can't authenticate to https://github.com inside the sandbox";
         let home = crate::common::make_config_home("push-hint-helper");
         let repo = crate::common::temp_repo("navikt/probe");
         let fill = "printf 'protocol=https\\nhost=github.com\\npath=navikt/probe.git\\n\\n' \
@@ -741,10 +741,12 @@ mod e2e_tests {
 
         let off = doctor(&["--no-gh-guard"]);
         assert!(off.contains("pr merge      ALLOWED"), "{off}");
-        assert!(
-            off.contains("allowed by policy; no GitHub credentials reachable in the sandbox"),
-            "{off}"
-        );
+        const NOTE: &str = "allowed by policy; no GitHub credentials reachable in the sandbox";
+        assert!(off.contains(NOTE), "{off}");
+        // A token that reaches gh contradicts the note.
+        let tok = doctor(&["--no-gh-guard", "--pass-env", "GH_TOKEN"]);
+        assert!(tok.contains("gh token for github.com found"), "{tok}");
+        assert!(!tok.contains(NOTE), "{tok}");
     }
 
     /// #1121: gh's own credential helper answers inside the sandbox once a
