@@ -1292,7 +1292,10 @@ on the host, outside the sandbox, and points your client's entry at
   The built-in endpoint serves it instead, still read-only with lockdown, but
   without the spec's `tools.allow`. cplt prints one warning at launch naming
   the spec, the reason and the fix, and `cplt mcp status` shows the spec as
-  `inactive` and a `github-mcp` row as `built-in`.
+  `inactive` with its reason and a `GitHub MCP: built-in endpoint` line
+  (`github_mcp.served_by` in `--json`). When nothing serves GitHub MCP (no
+  GitHub MCP entry, `deny.env` naming `GH_TOKEN`, the proxy off, no gh login),
+  the warning names only the unused spec.
 - Copilot CLI gets `--additional-mcp-config` with an entry named exactly the
   server id (`io.github.nais/nais-mcp`), so a "Registry only" MCP policy
   still allows it, and `--disable-mcp-server` for your own entries that run

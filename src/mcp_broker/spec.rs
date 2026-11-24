@@ -721,6 +721,8 @@ impl Detected {
     }
 }
 
+const UNREADABLE_DIR: &str = "cannot read the spec dir";
+
 /// The gh-token spec this launch's GitHub MCP serves (#909). `Ok(None)`: no
 /// spec. `Err(why)`: a spec exists but cannot serve; `why` is one short line
 /// (what, reason, fix) with no claim about who serves instead (#1115).
@@ -731,9 +733,8 @@ pub fn github_spec(
 ) -> Result<Option<Spec>, String> {
     let e = |s: &str| s.escape_debug().to_string();
     let unusable = |file: &str, reason: &str, fix: &str| {
-        // An unreadable spec dir is refused under its absolute path; spec
-        // files go by their bare name.
-        let what = if Path::new(file).is_absolute() {
+        // An unreadable spec dir is refused under the dir's path.
+        let what = if reason.starts_with(UNREADABLE_DIR) {
             format!("a gh-token spec in {}", e(file))
         } else {
             format!("the gh-token spec {}", e(file))
@@ -828,7 +829,7 @@ pub(crate) fn load_with_gate(
         Err(e) if oauth_gate && e.kind() != std::io::ErrorKind::NotFound => {
             let r = Rejected {
                 file: dir.display().to_string(),
-                reason: format!("cannot read the spec dir ({e})"),
+                reason: format!("{UNREADABLE_DIR} ({e})"),
                 fix: format!("make {} readable, or remove it", dir.display()),
             };
             out.remote_refused = Some(r.clone());
