@@ -95,7 +95,7 @@ rm ~/.cache/uv && mv /path/to/target ~/.cache/uv
 
 Pointing the tool's variable at the target (`UV_CACHE_DIR`, `MISE_DATA_DIR`)
 does not help: cplt does not grant those paths, so the tool fails inside the
-sandbox. `--allow-write` on the target has the same platform split as above.
+sandbox. `--allow-write` on the target restores writes but not execute.
 
 ## `sandbox.readonly_host_tool_paths` (off by default)
 
