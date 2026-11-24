@@ -283,34 +283,51 @@ pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<
     Ok(real)
 }
 
-/// Shown when gh predates `auth token --no-refresh`.
-pub(crate) const GH_TOO_OLD: &str = "gh is too old to read its token without refreshing it; upgrade gh to hand its login to the sandbox";
-
 /// `config_dir` pins gh to the dir that was checked, so the lookup reads it.
 #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
 fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> Option<String> {
-    let mut cmd = std::process::Command::new(gh);
-    // Without `--no-refresh` gh 2.103+ refreshes an expiring token and rewrites
-    // the keyring. Refresh tokens are single-use, so a lost race deletes the
-    // user's stored login (#1063, #1147). Never run it without the flag.
-    cmd.args(["auth", "token", "--hostname", "github.com", "--no-refresh"]);
-    if let Some(dir) = config_dir {
-        cmd.env("GH_CONFIG_DIR", dir);
-    }
-    for var in AUTH_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    // A timeout (None) or any failure hands over nothing. An older gh that
-    // rejects the flag gets a hint, never a retry with refresh back on.
-    let (ok, buf, stderr) = bounded_run(cmd, timeout, true)?;
-    if !ok {
-        if String::from_utf8_lossy(&stderr).contains("unknown flag: --no-refresh") {
-            crate::ui::warn(GH_TOO_OLD);
+    let probe = |no_refresh: bool| {
+        let mut cmd = std::process::Command::new(gh);
+        cmd.args(["auth", "token", "--hostname", "github.com"]);
+        // gh v2.103.0 added both token auto-refresh and `--no-refresh`. A
+        // refresh rewrites the keyring with a single-use refresh token, so a
+        // lost race deletes the stored login (#1063, #1147).
+        if no_refresh {
+            cmd.arg("--no-refresh");
         }
-        return None;
+        if let Some(dir) = config_dir {
+            cmd.env("GH_CONFIG_DIR", dir);
+        }
+        for var in AUTH_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        bounded_run(cmd, timeout, true)
+    };
+    // Retry without the flag only on gh's own unknown-flag error: that gh is
+    // older than v2.103.0 and cannot refresh. Any other failure (a denied
+    // Keychain read also exits 1) or a timeout hands over nothing.
+    let (ok, mut buf, stderr) = probe(true)?;
+    if !ok {
+        if !rejects_no_refresh_flag(&stderr) {
+            return None;
+        }
+        let (ok, retry, _) = probe(false)?;
+        if !ok {
+            return None;
+        }
+        buf = retry;
     }
     let token = String::from_utf8_lossy(&buf).trim().to_string();
     (!token.is_empty()).then_some(token)
+}
+
+/// gh (cobra) prints exactly this as the first stderr line, then usage.
+fn rejects_no_refresh_flag(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .next()
+        .map(str::trim_end)
+        == Some("unknown flag: --no-refresh")
 }
 
 /// Bound both the child and its stdout: a descendant can keep the pipe open
