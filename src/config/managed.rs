@@ -617,9 +617,30 @@ pub struct ManagedSnapshot {
     before: Option<Before>,
     /// Every dir from home down to `managed.d`, held so a session that makes
     /// one unsearchable (`chmod 000`) cannot hide its edit from the check.
-    held: Vec<std::fs::File>,
+    /// Each held dir with its mode before the session: only a mode the
+    /// session changed is put back, and only to this value.
+    held: Vec<(std::fs::File, u32)>,
     /// `lstat` of the path before: an unchanged stow-style link is no news.
     lstat: Option<(u64, u64)>,
+    /// `lstat` of every dir from below home down to `managed.d` before the
+    /// session, so an unopenable dir can be told apart from one it planted.
+    chain: BTreeMap<PathBuf, Key>,
+}
+
+/// (dev, ino, mode, mtime ns, ctime ns): a dir with the same key was not
+/// replaced, chmodded or written.
+type Key = (u64, u64, u32, i64, i64);
+
+fn key(path: &Path) -> Option<Key> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((
+        m.dev(),
+        m.ino(),
+        m.mode(),
+        m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+        m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+    ))
 }
 
 impl ManagedSnapshot {
@@ -627,9 +648,13 @@ impl ManagedSnapshot {
     #[must_use]
     pub fn take(home: &Path) -> Self {
         // Canonical, as the loader takes it: `open_dir` refuses any symlink hop.
-        let path = std::fs::canonicalize(home)
-            .unwrap_or_else(|_| home.to_path_buf())
-            .join(TRUSTED_DIR);
+        let canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        let path = canon.join(TRUSTED_DIR);
+        let chain = path
+            .ancestors()
+            .take_while(|p| *p != canon && p.starts_with(&canon))
+            .filter_map(|p| Some((p.to_path_buf(), key(p)?)))
+            .collect();
         let before = open_dir(&path).map(|(_, f, id)| (id, scan(&f)));
         let held = hold_chain(home, &path);
         let lstat = lstat_id(&path);
@@ -638,6 +663,7 @@ impl ManagedSnapshot {
             before,
             held,
             lstat,
+            chain,
         }
     }
 
@@ -656,13 +682,20 @@ impl ManagedSnapshot {
             // refuses that layout, so nothing loads from it. Say so, unless it
             // was already so before the session (a stow-linked state dir).
             (before, None) => {
-                // A plain dir the walk cannot open (a fresh `managed.d` at
-                // mode 000, never held): move it aside through its parent,
-                // reached with no symlink hop.
-                if let Some((_, p, _)) = self.path.parent().and_then(open_dir)
-                    && std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.is_dir())
+                // A dir on the chain the walk cannot open (a fresh `cplt` or
+                // `managed.d` at mode 000, never held): unless it is exactly
+                // as before the session, move the first such dir aside through
+                // its parent, reached with no symlink hop.
+                if let Err(Some((p, at, e))) = walk(&self.path)
+                    && !matches!(
+                        e.raw_os_error(),
+                        Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR)
+                    )
                 {
-                    return quarantine_dir(Some(&p), &self.path);
+                    let now = key(&at);
+                    return (now.is_none() || self.chain.get(&at) != now.as_ref())
+                        .then(|| quarantine_dir(Some(&p), &at))
+                        .flatten();
                 }
                 return (before.is_some() || lstat_id(&self.path) != self.lstat).then(|| {
                     format!(
@@ -731,7 +764,7 @@ fn lstat_id(path: &Path) -> Option<(u64, u64)> {
 
 /// Open each dir from the canonical `home` down to `path`, `O_NOFOLLOW`,
 /// stopping at the first that does not open.
-fn hold_chain(home: &Path, path: &Path) -> Vec<std::fs::File> {
+fn hold_chain(home: &Path, path: &Path) -> Vec<(std::fs::File, u32)> {
     use std::os::fd::AsRawFd as _;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY;
     let Ok(home) = std::fs::canonicalize(home) else {
@@ -748,22 +781,26 @@ fn hold_chain(home: &Path, path: &Path) -> Vec<std::fs::File> {
         out.push(std::mem::replace(&mut cur, std::fs::File::from(next)));
     }
     out.push(cur);
-    out
+    out.into_iter()
+        .filter_map(|f| {
+            use std::os::unix::fs::MetadataExt as _;
+            let mode = f.metadata().ok()?.mode() & 0o7777;
+            Some((f, mode))
+        })
+        .collect()
 }
 
-/// The path walk failed: give back owner search and write on every held dir
-/// that lost them (the session's `chmod 000`), through the descriptors, so
-/// the walk can run again. A dir moved or swapped still fails the walk.
-fn restore_search(held: &[std::fs::File]) {
+/// The path walk failed: put back the mode of every held dir the session
+/// changed (its `chmod 000`), through the descriptors, so the walk can run
+/// again. A dir the session left alone keeps its mode. A dir moved or swapped
+/// still fails the walk.
+fn restore_search(held: &[(std::fs::File, u32)]) {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::MetadataExt as _;
-    for f in held {
-        if let Ok(m) = f.metadata()
-            && m.mode() & 0o700 != 0o700
-        {
-            let mode = ((m.mode() | 0o700) & 0o7777) as libc::mode_t;
+    for (f, was) in held {
+        if f.metadata().is_ok_and(|m| m.mode() & 0o7777 != *was) {
             // SAFETY: `f` is an open directory; fchmod has no other preconditions.
-            unsafe { libc::fchmod(f.as_raw_fd(), mode) };
+            unsafe { libc::fchmod(f.as_raw_fd(), *was as libc::mode_t) };
         }
     }
 }
@@ -829,14 +866,20 @@ fn quarantine_at(dir: &std::fs::File, name: &OsStr) -> Option<String> {
     let rename = || unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0;
     // The session may have dropped write permission on the dir (`chmod 555`):
     // restore owner write through the held descriptor and try once more.
+    // The mode is put back afterwards: the rename needs write, nothing more.
     let ok = rename()
         || dir.metadata().is_ok_and(|m| {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = (m.permissions().mode() | 0o700) & 0o7777;
+            let was = m.permissions().mode() & 0o7777;
             // SAFETY: `fd` is an open directory; fchmod has no other preconditions.
-            let rc = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
-            rc == 0
-        }) && rename();
+            if unsafe { libc::fchmod(fd, (was | 0o700) as libc::mode_t) } != 0 {
+                return false;
+            }
+            let ok = rename();
+            // SAFETY: as above.
+            unsafe { libc::fchmod(fd, was as libc::mode_t) };
+            ok
+        });
     ok.then(|| name.to_string_lossy().into_owned())
 }
 
@@ -845,21 +888,37 @@ fn quarantine_at(dir: &std::fs::File, name: &OsStr) -> Option<String> {
 /// parent, the dir, and the dir's (dev, ino); every later step works on these
 /// descriptors, never on the path.
 fn open_dir(path: &Path) -> Option<(std::fs::File, std::fs::File, (u64, u64))> {
+    walk(path).ok()
+}
+
+/// A dir the walk reached, the prefix below it that would not open, and why.
+type Stuck = (std::fs::File, PathBuf, std::io::Error);
+
+/// [`open_dir`], but a failed open says where and why.
+fn walk(path: &Path) -> Result<(std::fs::File, std::fs::File, (u64, u64)), Option<Stuck>> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::MetadataExt as _;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY;
     let mut parent = None;
-    let mut cur = open_nofollow(libc::AT_FDCWD, OsStr::new("/"), flags).ok()?;
-    for c in path.strip_prefix("/").ok()?.components() {
+    let mut cur = open_nofollow(libc::AT_FDCWD, OsStr::new("/"), flags).map_err(|_| None)?;
+    let mut at = PathBuf::from("/");
+    for c in path.strip_prefix("/").map_err(|_| None)?.components() {
         let std::path::Component::Normal(name) = c else {
-            return None;
+            return Err(None);
         };
-        let next = open_nofollow(cur.as_raw_fd(), name, flags).ok()?;
+        at.push(name);
+        let next = match open_nofollow(cur.as_raw_fd(), name, flags) {
+            Ok(n) => n,
+            Err(e) => return Err(Some((std::fs::File::from(cur), at, e))),
+        };
         parent = Some(std::mem::replace(&mut cur, next));
     }
-    let (parent, dir) = (std::fs::File::from(parent?), std::fs::File::from(cur));
-    let m = dir.metadata().ok()?;
-    Some((parent, dir, (m.dev(), m.ino())))
+    let (parent, dir) = (
+        std::fs::File::from(parent.ok_or(None)?),
+        std::fs::File::from(cur),
+    );
+    let m = dir.metadata().map_err(|_| None)?;
+    Ok((parent, dir, (m.dev(), m.ino())))
 }
 
 /// Every entry below `dir`, `None` past [`MAX_ENTRIES`] or on a read error.
@@ -1638,14 +1697,75 @@ mod tests {
             } else {
                 d.clone()
             };
+            let was = std::fs::metadata(&locked).unwrap().permissions().mode() & 0o7777;
             mode(&locked, 0o000).unwrap();
             let line = snap.finish().expect("reported");
-            mode(&locked, 0o700).unwrap();
+            // The held descriptor put the mode back, so the edited file alone
+            // moved aside, not the whole dir.
+            assert_eq!(
+                std::fs::metadata(&locked).unwrap().permissions().mode() & 0o7777,
+                was,
+                "mode not restored (ancestor={ancestor}): {line}"
+            );
             assert!(
-                !f.exists(),
-                "edit left loadable (ancestor={ancestor}): {line}"
+                line.contains("changed nav-pilot.toml in") && d.is_dir() && !f.exists(),
+                "edit left loadable or whole dir moved (ancestor={ancestor}): {line}"
             );
         }
+    }
+
+    /// Fable on #1126: `~/.config/cplt` absent before the session, or swapped
+    /// for a fresh dir, then planted and made unopenable (`chmod 000`): the
+    /// first unopenable dir on the chain is moved aside.
+    #[test]
+    fn snapshot_quarantines_an_unopenable_created_or_swapped_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for swapped in [false, true] {
+            let h = Home::new();
+            let cplt = h.managed_d().parent().unwrap().to_path_buf();
+            if swapped {
+                write(&h.managed_d(), "nav-pilot.toml", GOOD);
+            } else {
+                std::fs::remove_dir_all(&cplt).unwrap();
+            }
+            let snap = ManagedSnapshot::take(h.path());
+            if swapped {
+                std::fs::rename(&cplt, h.path().join("old")).unwrap();
+            }
+            std::fs::create_dir_all(h.managed_d()).unwrap();
+            write(&h.managed_d(), "nav-pilot.toml", GOOD);
+            std::fs::set_permissions(&cplt, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let line = snap.finish();
+            assert!(
+                !cplt.exists(),
+                "planted cplt left loadable (swapped={swapped}): {line:?}"
+            );
+            assert!(line.is_some_and(|l| l.contains("changed cplt in")));
+        }
+    }
+
+    /// Fable on #1126: a dir the session never touched keeps its mode, and
+    /// a pre-existing unopenable `managed.d` is no news.
+    #[test]
+    fn snapshot_leaves_untouched_modes_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        let h = Home::new();
+        let config = h.path().join(".config");
+        std::fs::remove_dir(h.managed_d()).unwrap();
+        mode(&config, 0o555).unwrap();
+        assert!(ManagedSnapshot::take(h.path()).finish().is_none());
+        let now = std::fs::metadata(&config).unwrap().permissions().mode() & 0o7777;
+        mode(&config, 0o755).unwrap();
+        assert_eq!(now, 0o555, "an untouched dir was chmodded");
+
+        let h = Home::new();
+        let d = h.managed_d();
+        mode(&d, 0o000).unwrap();
+        let line = ManagedSnapshot::take(h.path()).finish();
+        mode(&d, 0o700).unwrap();
+        assert!(line.is_none(), "untouched 000 managed.d reported: {line:?}");
+        assert!(d.is_dir(), "untouched 000 managed.d moved aside");
     }
 
     /// Fable on #1126: an entry the session deleted is reported, and a
