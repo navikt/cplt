@@ -2001,6 +2001,56 @@ fn subcommand_short_value_flags(command: &str, subcommand: Option<&str>) -> &'st
     }
 }
 
+/// gh's built-in top-level command aliases (gh 2.105, `ALIASES:` in `--help`).
+const GH_COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("a11y", "accessibility"),
+    ("agent", "agent-task"),
+    ("agent-tasks", "agent-task"),
+    ("agents", "agent-task"),
+    ("at", "attestation"),
+    ("cs", "codespace"),
+    ("ext", "extension"),
+    ("extensions", "extension"),
+    ("rs", "ruleset"),
+    ("skills", "skill"),
+];
+
+/// gh's built-in subcommand aliases, as (canonical command, alias, canonical
+/// subcommand). `ls` for `list` is handled for every group.
+const GH_SUBCOMMAND_ALIASES: &[(&str, &str, &str)] = &[
+    ("extension", "uninstall", "remove"),
+    ("gist", "new", "create"),
+    ("issue", "new", "create"),
+    ("pr", "co", "checkout"),
+    ("pr", "new", "create"),
+    ("release", "new", "create"),
+    ("repo", "new", "create"),
+    ("secret", "remove", "delete"),
+    ("skill", "add", "install"),
+    ("skill", "show", "preview"),
+    ("variable", "remove", "delete"),
+];
+
+/// Map a built-in alias to the command gh runs, so policy sees the real
+/// command: unresolved, `gh pr new` was an unknown subcommand and passed under
+/// `unknown_command = allow` (#1099).
+fn canonical_command(word: &str) -> &str {
+    GH_COMMAND_ALIASES
+        .iter()
+        .find(|(a, _)| *a == word)
+        .map_or(word, |&(_, c)| c)
+}
+
+fn canonical_subcommand<'a>(command: &str, word: &'a str) -> &'a str {
+    if word == "ls" {
+        return "list";
+    }
+    GH_SUBCOMMAND_ALIASES
+        .iter()
+        .find(|(c, a, _)| *c == command && *a == word)
+        .map_or(word, |&(_, _, s)| s)
+}
+
 /// Parse a `gh` command line into its structured components.
 ///
 /// Expects `args` to be the arguments *after* the `gh` binary name,
@@ -2055,7 +2105,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         return None;
     }
 
-    let command = args[idx].to_string();
+    let command = canonical_command(args[idx]).to_string();
     idx += 1;
 
     // Special case: `gh api` has no subcommand — the next positional is the endpoint
@@ -2210,7 +2260,8 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
     // short-option arity for that (command, subcommand) pair so boolean flags
     // (`pr review -aRother/repo`) do not mask `-R` and value-taking flags
     // (`pr create -rRiley`) do not misread an uppercase `R` in the value.
-    let sub_hint = find_subcommand_hint(&command, &args[idx..]);
+    let sub_hint =
+        find_subcommand_hint(&command, &args[idx..]).map(|s| canonical_subcommand(&command, s));
     let mut subcommand = None;
     let mut repo_flag = None;
     let mut i = idx;
@@ -2261,7 +2312,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             }
             a => {
                 if subcommand.is_none() {
-                    subcommand = Some(a.to_string());
+                    subcommand = Some(canonical_subcommand(&command, a).to_string());
                 }
             }
         }
@@ -2290,6 +2341,21 @@ pub fn evaluate_with_policy(cmd: &ParsedCommand, allow_api_write: bool) -> Polic
     // Special handling for `gh api`
     if cmd.command == "api" {
         return evaluate_api(cmd, allow_api_write);
+    }
+
+    // A word that is not a gh built-in is a user alias or an extension. Aliases
+    // live in gh config the agent can write, so the guard cannot know what one
+    // runs, and an extension is `gh extension exec`, which is refused. `co` is
+    // gh's default alias for `pr checkout`, and redefinable like any other.
+    if cmd.command == "co"
+        || !(GH_COMMANDS.contains(&cmd.command.as_str())
+            || ["accessibility", "help", "version"].contains(&cmd.command.as_str()))
+    {
+        return PolicyResult {
+            decision: Decision::Block,
+            reason: "not a gh built-in command: a user alias or extension the guard cannot \
+                     resolve. Run the built-in command it stands for (`gh pr checkout`, not `gh co`)",
+        };
     }
 
     let sub = cmd.subcommand.as_deref().unwrap_or("");
@@ -7467,7 +7533,7 @@ mod tests {
     #[test]
     fn default_deny_unknown_commands() {
         let parsed = ParsedCommand {
-            command: "invented-future-cmd".to_string(),
+            command: "pr".to_string(),
             subcommand: Some("destroy".to_string()),
             repo_flag: None,
             method: None,
@@ -7672,6 +7738,50 @@ mod tests {
         for args in [&["pr", "", "merge"][..], &["", "pr", "merge"]] {
             assert_eq!(misplaced_flag(args), Some(""), "{args:?}");
             assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
+        }
+    }
+
+    /// #1099: built-in aliases get the canonical command's decision, and words
+    /// that are not built-ins (user aliases, extensions) are refused, under
+    /// `unknown_command = allow` too.
+    #[test]
+    fn gh_aliases_resolve_before_policy() {
+        let allow = GatePolicy {
+            unknown_command: UnknownCommandDecision::Allow,
+            ..GatePolicy::default()
+        };
+        for (alias, canonical) in [
+            (&["gist", "new", "-"][..], &["gist", "create", "-"][..]),
+            (&["pr", "new"], &["pr", "create"]),
+            (&["cs", "delete"], &["codespace", "delete"]),
+            (&["ext", "uninstall", "x"], &["extension", "remove", "x"]),
+            (&["secret", "remove", "X"], &["secret", "delete", "X"]),
+            (&["pr", "ls"], &["pr", "list"]),
+        ] {
+            let a = parse_command(alias).unwrap();
+            let c = parse_command(canonical).unwrap();
+            assert_eq!(
+                (&a.command, &a.subcommand),
+                (&c.command, &c.subcommand),
+                "{alias:?}"
+            );
+            assert_eq!(evaluate(&a).decision, evaluate(&c).decision, "{alias:?}");
+        }
+        for args in [
+            &["gist", "new", "-"][..],
+            &["cs", "delete"],
+            &["ext", "exec", "x"],
+        ] {
+            assert!(gate(args, Path::new("."), &allow).is_err(), "{args:?}");
+        }
+        for args in [&["co", "1"][..], &["my-alias"], &["some-extension", "run"]] {
+            let p = parse_command(args).unwrap();
+            assert_eq!(evaluate(&p).decision, Decision::Block, "{args:?}");
+            assert!(gate(args, Path::new("."), &allow).is_err(), "{args:?}");
+        }
+        for args in [&["help"][..], &["version"], &["a11y"]] {
+            let p = parse_command(args).unwrap();
+            assert_ne!(evaluate(&p).decision, Decision::Block, "{args:?}");
         }
     }
 

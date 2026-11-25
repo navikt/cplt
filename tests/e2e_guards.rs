@@ -315,6 +315,22 @@ fn gh_gate_blocks_repo_delete() {
     assert_refused(&stderr, ok, "deletes entire repository");
 }
 
+/// #1099: a built-in alias gets the canonical command's decision, and a word
+/// that is not a gh built-in (user alias, extension) is refused, also with
+/// `--unknown-command=allow`.
+#[test]
+fn gh_gate_resolves_aliases_under_unknown_allow() {
+    let allow = ["--unknown-command=allow"];
+    let (_, stderr, ok) = gh_gate_with_opts(&["cs", "delete"], &allow);
+    assert_refused(&stderr, ok, "out of scope");
+    let (_, stderr, ok) = gh_gate_with_opts(&["repo", "new", "x"], &allow);
+    assert!(!ok, "repo new must get repo create's decision: {stderr}");
+    let (_, stderr, ok) = gh_gate_with_opts(&["my-alias"], &allow);
+    assert_refused(&stderr, ok, "not a gh built-in command");
+    let (_, stderr, ok) = gh_gate_with_opts(&["pr", "ls"], &allow);
+    assert!(ok, "pr ls is pr list: {stderr}");
+}
+
 #[test]
 fn gh_gate_blocks_repo_edit() {
     let (_, stderr, ok) = gh_gate(&["repo", "edit", "--visibility", "private"]);
@@ -420,13 +436,14 @@ fn gh_gate_auth_token_allowed_when_disabled() {
 
 #[test]
 fn gh_gate_blocks_unknown_command() {
-    let (_, stderr, ok) = gh_gate(&["totally-new-command", "arg1"]);
+    let (_, stderr, ok) = gh_gate(&["pr", "totally-new-command", "arg1"]);
     assert_refused(&stderr, ok, "not recognized by the policy table");
 }
 
 #[test]
 fn gh_gate_allows_unknown_when_policy_allows() {
-    let (_, _, ok) = gh_gate_with_opts(&["totally-new-command"], &["--unknown-command=allow"]);
+    let (_, _, ok) =
+        gh_gate_with_opts(&["pr", "totally-new-command"], &["--unknown-command=allow"]);
     assert!(ok, "unknown commands should pass when policy is 'allow'");
 }
 
