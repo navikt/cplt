@@ -269,14 +269,12 @@ plumbing (`cat-file`, `rev-parse`, `ls-files`, `pack-objects`, `gc`, and so on).
 **`git worktree add` is refused unless it targets `$CPLT_WORKTREE_ROOT`**,
 whatever the push settings. Elsewhere in the sandbox it either stops halfway on
 a protected file (`.cplt.toml`, `.github/hooks`) or lands in the session scratch
-dir, which is deleted at exit. A path strictly inside the managed root (macOS, `sandbox.allow_git_worktrees`;
+dir, which is deleted at exit. A path strictly inside the managed root (`sandbox.allow_git_worktrees`;
 the root is baked into the wrapper at launch, not read from the agent's env) is
 allowed, resolved against the working
 directory and any `-C`, with symlinks followed; an unknown option or a `..`
 the guard can't resolve is refused. Otherwise use `cplt worktree add <name>
-<ref>` when `CPLT_WORKTREE_SOCKET` is set, or prepare worktrees outside cplt
-(on Linux, worktrees inside the sandbox are unsupported because the parent-side
-worktree broker and per-worktree protected-path enforcement are macOS-only).
+<ref>` when `CPLT_WORKTREE_SOCKET` is set, or prepare worktrees outside cplt.
 Other `git worktree` subcommands (`list`, `prune`, `remove`, ...) are allowed.
 Warn mode prints the refusal and runs the command.
 

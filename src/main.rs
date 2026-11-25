@@ -5733,7 +5733,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
-        worktree_broker,
+        mut worktree_broker,
         mcp_broker,
         mcp_refusal,
         ..
@@ -6193,14 +6193,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &mut prepared,
         probe.root_agents_md.as_deref(),
     );
-    #[cfg(target_os = "macos")]
-    if let Some(broker) = &worktree_broker {
-        broker
-            .set_sandbox(&mut prepared)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = &worktree_broker;
+    arm_worktree_broker(&mut worktree_broker, &mut prepared)?;
 
     // Compute hardening categories for environment sanitization
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -6401,6 +6394,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
+    // Before anything can start a thread: setns(CLONE_NEWUSER) needs one.
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(cplt::worktree_ns::HELPER_ARG.as_ref()) {
+        return cplt::worktree_ns::helper_main();
+    }
     cplt::session_summary::mark_process_start();
     let cli = Cli::parse();
     let result = run(cli);
@@ -8061,6 +8059,36 @@ struct AssembledSandbox {
     mcp_refusal: Option<String>,
 }
 
+/// Hand the broker the final session policy, after every amendment.
+///
+/// macOS refuses the launch on failure, as before. On Linux the one refusal is
+/// a session grant that reaches the broker's private staging (#965): the
+/// broker is then turned off for the session with a warning, and the managed
+/// root stays, exactly as when the broker cannot start.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_wraps))] // macOS can refuse
+fn arm_worktree_broker(
+    broker: &mut Option<cplt::worktree_broker::Broker>,
+    prepared: &mut sandbox::PreparedSandbox,
+) -> anyhow::Result<()> {
+    let Some(b) = broker.as_ref() else {
+        return Ok(());
+    };
+    #[cfg(target_os = "macos")]
+    b.set_sandbox(prepared)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    #[cfg(target_os = "linux")]
+    if let Err(error) = b.set_sandbox(prepared) {
+        ui::warn(&format!(
+            "managed-worktree broker unavailable: {error}. CPLT_WORKTREE_SOCKET is not set; the managed root remains available. Prepare worktrees outside cplt."
+        ));
+        prepared.set_worktree_socket(None);
+        *broker = None;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (b, prepared);
+    Ok(())
+}
+
 /// Start the managed-worktree broker for a launch (#531), or `None` when the
 /// root is off. Failure disables only the broker convenience, with a warning;
 /// the existing managed-root grant remains available under its usual denies.
@@ -8079,6 +8107,28 @@ fn start_worktree_broker(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     cplt::worktree_broker::Broker::start(ctx)
         .map_err(|e| anyhow::anyhow!("cannot start the worktree broker: {e}"))
+}
+
+/// Linux (#965): register the managed root for its namespace protections, or
+/// fail the launch. The root is only granted together with them, so a failure
+/// here must not leave a writable root without read-only binds.
+#[cfg(any(target_os = "linux", test))]
+fn register_worktree_root(project_dir: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+    let common = cplt::worktrees::repository_common_dir(project_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a git repository", project_dir.display()))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "sandbox.allow_git_worktrees is on, but the managed root cannot be protected: \
+                 {e}. Fix the cause, or turn the key off \
+                 (`cplt config set sandbox.allow_git_worktrees false`)."
+            )
+        })?;
+    #[cfg(target_os = "linux")]
+    cplt::worktree_ns::register(root, &common);
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
+    Ok(common)
 }
 
 /// Create the automatic macOS Playwright socket capability only for exact
@@ -8540,6 +8590,10 @@ fn assemble_sandbox(
     extra_exec.dedup();
     // Started before the profile is built, since the profile grants its socket.
     // Not for a dry check, which must not bind a socket or create the root (#553).
+    #[cfg(target_os = "linux")]
+    if let (Some(root), false) = (opts.repos.worktree_root, opts.inspect_only) {
+        register_worktree_root(&probe.project_dir, root)?;
+    }
     let worktree_broker = match (opts.repos.worktree_root, opts.inspect_only) {
         (Some(root), false) => match start_worktree_broker(probe, root) {
             Ok(broker) => Some(broker),
@@ -8717,6 +8771,10 @@ fn assemble_sandbox(
     #[cfg(target_os = "linux")]
     if resolved.netns {
         prepared.check_netns().map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    if opts.repos.worktree_root.is_some() && !opts.inspect_only && !prepared.uses_bubblewrap() {
+        anyhow::bail!("{}", sandbox::worktrees_need_bwrap());
     }
     prepared.set_worktree_root(opts.repos.worktree_root);
     // The shims only where `open_url` is served (#910).
@@ -9056,7 +9114,7 @@ fn run_exec_command(
         pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
-        worktree_broker,
+        mut worktree_broker,
         // Held until the child exits: it serves the host opener (#1091).
         mcp_broker,
         mcp_refusal: _,
@@ -9156,14 +9214,7 @@ fn run_exec_command(
 
     // Preflight: verify the sandbox mechanism works on this system.
     // Respects --no-validate (same as the main agent flow).
-    #[cfg(target_os = "macos")]
-    if let Some(broker) = &worktree_broker {
-        broker
-            .set_sandbox(&mut prepared)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = &worktree_broker;
+    arm_worktree_broker(&mut worktree_broker, &mut prepared)?;
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
             Ok(()) => {}
@@ -16313,10 +16364,24 @@ mod tests {
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
     }
 
-    /// #574 review: the launch path refuses the key off macOS, for a global
-    /// and a local key alike, before creating anything.
+    /// #965: a managed root that cannot be registered for its Linux
+    /// protections fails the launch instead of being granted unprotected.
     #[test]
-    fn managed_worktree_root_is_refused_on_linux() {
+    fn worktree_root_registration_fails_closed() {
+        let plain = tempfile::tempdir().expect("tempdir");
+        let err = super::register_worktree_root(plain.path(), plain.path())
+            .expect_err("a non-repository cannot be registered");
+        assert!(err.to_string().contains("cannot be protected"), "{err}");
+        assert!(
+            err.to_string().contains("allow_git_worktrees false"),
+            "{err}"
+        );
+    }
+
+    /// #574 review: the launch path refuses the key off macOS and Linux, for
+    /// a global and a local key alike, before creating anything.
+    #[test]
+    fn managed_worktree_root_is_refused_off_macos_and_linux() {
         let home = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("tempdir");
         let ok = std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
@@ -16337,11 +16402,11 @@ mod tests {
                 true,
                 home.path(),
                 repo.path(),
-                "linux",
+                "freebsd",
                 cplt::worktrees::DEFAULT_WALK_MAX_DIRS,
             )
-            .expect_err("refused on linux");
-            assert!(err.to_string().contains("macOS-only"), "{err}");
+            .expect_err("refused off macOS and Linux");
+            assert!(err.to_string().contains("macOS or Linux"), "{err}");
         }
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
     }

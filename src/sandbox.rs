@@ -108,6 +108,28 @@ mod exec;
 pub use exec::{GH_TOKEN_DIR_ENV, SCRATCH_DIR_ENV, opencode_handover_planned};
 #[path = "sandbox_landlock.rs"]
 pub(crate) mod landlock_mod;
+
+/// The project's bubblewrap protection lists for one more root, reused for
+/// managed worktrees created mid-session (#965). No copy of the tables.
+#[cfg(target_os = "linux")]
+pub(crate) mod bubblewrap_paths {
+    use std::path::{Path, PathBuf};
+    pub(crate) fn persistence(root: &Path) -> Vec<PathBuf> {
+        super::bubblewrap::git_persistence_paths(&[root], &[])
+    }
+    pub(crate) fn rename_pins(root: &Path) -> Vec<PathBuf> {
+        super::bubblewrap::rename_pin_paths(&[root], &[])
+    }
+    /// The protected subtrees (not files) under `root` that bwrap covers.
+    pub(crate) fn protected_trees(root: &Path) -> Vec<PathBuf> {
+        super::policy::PROTECTED_IN_ROOT
+            .iter()
+            .filter(|p| p.tree && p.linux == super::policy::LinuxCoverage::Bwrap)
+            .filter(|p| !p.rel.contains('*'))
+            .map(|p| root.join(p.rel))
+            .collect()
+    }
+}
 #[path = "sandbox_policy.rs"]
 mod policy;
 #[path = "sandbox_profile.rs"]
@@ -222,7 +244,8 @@ pub struct SandboxConfig<'a> {
     pub managed_worktree_root: Option<&'a Path>,
     /// The broker socket for `cplt worktree add` (#531), granted outbound as
     /// one exact path. `Some` only with the managed root on, and only from
-    /// `assemble_sandbox` after the broker has bound it.
+    /// `assemble_sandbox` after the broker has bound it. On Linux this is
+    /// `fd:<n>`, an inherited descriptor, and grants nothing (#965).
     pub worktree_socket: Option<&'a Path>,
     /// The MCP broker socket for `cplt mcp-stdio` (#824), granted outbound as
     /// one exact path, like `worktree_socket`. macOS only.
@@ -579,6 +602,30 @@ impl PreparedSandbox {
         self.open_url_hosts = hosts.to_vec();
     }
 
+    /// The agent's precomputed Landlock rules, for the worktree broker (#965).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn precomputed_rules(&self) -> &landlock_mod::PrecomputedSandbox {
+        &self.precomputed
+    }
+
+    /// Deny-path masks bubblewrap applies (#965: the broker refuses them).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bwrap_deny_masks(&self) -> usize {
+        self.bwrap_wrapper.as_ref().map_or(0, |w| w.deny_mask_count)
+    }
+
+    /// Whether this launch runs under bubblewrap (#965).
+    #[cfg(target_os = "linux")]
+    pub fn uses_bubblewrap(&self) -> bool {
+        self.bwrap_wrapper.is_some()
+    }
+
+    /// The final Landlock rules, for the worktree broker's git (#965).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn landlock_policy(&self) -> &landlock_mod::LandlockPolicy {
+        &self.policy
+    }
+
     /// Reapply after late agent-specific grants, before capturing the broker's
     /// read policy. Same-user staging privacy comes from Seatbelt, not mode 0700.
     #[cfg(target_os = "macos")]
@@ -759,6 +806,20 @@ impl PreparedSandbox {
             }
         }
     }
+}
+
+/// The refusal for `sandbox.allow_git_worktrees` without bubblewrap (#965).
+#[cfg(target_os = "linux")]
+pub fn worktrees_need_bwrap() -> String {
+    format!(
+        "sandbox.allow_git_worktrees needs Bubblewrap on Linux: only inside its namespace can \
+         cplt make each worktree's .git pointer, admin links and protected files read-only. \
+         Install it (e.g. `sudo apt install bubblewrap`) and do not pass --no-bubblewrap \
+         (`cplt config set sandbox.use_bubblewrap true` makes a failure loud), or turn the key \
+         off: `cplt config set sandbox.allow_git_worktrees false`. If it is installed but \
+         fails, {}.",
+        crate::doctor::USERNS_HINT
+    )
 }
 
 /// Why OpenCode v2 does not run on Linux without bubblewrap, and how to fix it.

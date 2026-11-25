@@ -1702,6 +1702,12 @@ fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
     if probe >= 3 {
         keep.push(probe);
     }
+    // Linux worktree broker (#965): the sandbox reaches the broker only
+    // through this inherited socketpair end. No filesystem path is granted.
+    let broker = crate::worktree_broker::INHERITED_FD.load(std::sync::atomic::Ordering::Acquire);
+    if broker >= 3 {
+        keep.push(broker);
+    }
 
     // SAFETY: the closure runs between fork and exec. `seal_fds` makes only
     // `fcntl` calls — no allocation, no locks, async-signal-safe.
@@ -2066,6 +2072,14 @@ pub fn exec(
                 ui::error(&super::opencode_v2_needs_bwrap());
                 return 1;
             }
+            BwrapOutcome::Fallback(reason) if crate::worktree_ns::required() => {
+                ui::error(&format!(
+                    "Bubblewrap could not start ({reason}). sandbox.allow_git_worktrees needs it \
+                     on Linux, version 0.8 or later for --disable-userns (#965), so this launch \
+                     stops instead of running without it."
+                ));
+                return 1;
+            }
             BwrapOutcome::Fallback(reason) => {
                 ui::warn(&format_bwrap_fallback_warning(sandbox.agent, &reason));
                 if wrapper.deny_mask_count > 0 {
@@ -2095,6 +2109,13 @@ pub fn exec(
                 // fall through to the direct path
             }
         }
+    }
+
+    // The managed worktree root needs bubblewrap on Linux (#965); main refuses
+    // earlier, this is the last line.
+    if crate::worktree_ns::required() {
+        ui::error(&super::worktrees_need_bwrap());
+        return 1;
     }
 
     // Direct Landlock + seccomp path (also the auto-detect fallback).
@@ -2343,6 +2364,26 @@ fn exec_bwrap(
     };
 
     let mut bwrap_argv = wrapper.bwrap_args.clone();
+    // #965: bwrap reports its child's host pid on --info-fd, so the parent can
+    // enter the namespace and protect managed worktrees before the agent runs.
+    let mut info_fds = [-1i32; 2];
+    if crate::worktree_ns::required() {
+        if unsafe { libc::pipe2(info_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            unsafe {
+                libc::close(policy_read_fd);
+                libc::close(policy_write_fd);
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return bwrap_setup_failed(wrapper, "cannot create info pipe");
+        }
+        bwrap_argv.push("--info-fd".to_string());
+        bwrap_argv.push(info_fds[1].to_string());
+        // A nested user and mount namespace would keep a copy of the mount
+        // table from before a broker bind, so the session may create none
+        // (bwrap 0.8+; an older bwrap refuses the flag and the launch stops).
+        bwrap_argv.push("--disable-userns".to_string());
+    }
     bwrap_argv.push("--".to_string());
     bwrap_argv.push(cplt_exe.to_string_lossy().into_owned());
 
@@ -2418,7 +2459,11 @@ fn exec_bwrap(
     // only two that are meant to: both are created CLOEXEC, the seal clears
     // the flag on these two in the child, and the re-entry helper reads them
     // by the fd numbers set above.
-    seal_inherited_fds(&mut cmd, vec![policy_read_fd, write_fd]);
+    let mut keep = vec![policy_read_fd, write_fd];
+    if info_fds[1] >= 0 {
+        keep.push(info_fds[1]);
+    }
+    seal_inherited_fds(&mut cmd, keep);
 
     ignore_terminal_stop_signals();
     let mut child = match cmd.spawn() {
@@ -2441,6 +2486,9 @@ fn exec_bwrap(
     unsafe {
         libc::close(policy_read_fd);
         libc::close(write_fd);
+        if info_fds[1] >= 0 {
+            libc::close(info_fds[1]);
+        }
     }
     let transfer = transfer_policy_bytes(
         policy_write_fd,
@@ -2469,7 +2517,23 @@ fn exec_bwrap(
         libc::close(policy_write_fd);
     }
 
-    let confirm = read_confirm_byte(read_fd);
+    let mut protect = || -> bool {
+        if info_fds[0] < 0 {
+            return true;
+        }
+        let result = read_info_pid(info_fds[0]).and_then(crate::worktree_ns::attach_and_protect);
+        unsafe {
+            libc::close(info_fds[0]);
+        }
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                ui::error(&format!("sandbox.allow_git_worktrees: {e}"));
+                false
+            }
+        }
+    };
+    let confirm = read_confirm_byte(read_fd, &mut protect);
     unsafe {
         libc::close(read_fd);
     }
@@ -2653,8 +2717,39 @@ enum ConfirmResult {
 }
 
 #[cfg(target_os = "linux")]
-fn read_confirm_byte(fd: i32) -> ConfirmResult {
-    read_confirm_byte_with_timeout(fd, 15_000)
+fn read_confirm_byte(fd: i32, before_ack: &mut dyn FnMut() -> bool) -> ConfirmResult {
+    read_confirm_byte_with_timeout(fd, 15_000, before_ack)
+}
+
+/// The `child-pid` from bwrap's `--info-fd` JSON (#965), bounded in time and size.
+#[cfg(target_os = "linux")]
+fn read_info_pid(fd: i32) -> Result<i32, String> {
+    let mut buf = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let r = unsafe { libc::poll(&raw mut pfd, 1, left.as_millis() as i32) };
+        if r <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 512];
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 || buf.len() > 4096 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf)
+            && let Some(pid) = v.get("child-pid").and_then(serde_json::Value::as_i64)
+        {
+            return i32::try_from(pid).map_err(|_| "bwrap reported a bad pid".to_string());
+        }
+    }
+    Err("bwrap did not report its child pid on --info-fd".into())
 }
 
 /// Wait (bounded) for the helper's confirm byte and send back the ack byte that
@@ -2666,7 +2761,11 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
 /// it remains blocked waiting for the ack byte until `close(fd)` unblocks it
 /// with EOF/`ECONNRESET`, preventing the agent from starting before `SIGKILL`.
 #[cfg(any(target_os = "linux", test))]
-fn read_confirm_byte_with_timeout(fd: i32, timeout_ms: i32) -> ConfirmResult {
+fn read_confirm_byte_with_timeout(
+    fd: i32,
+    timeout_ms: i32,
+    before_ack: &mut dyn FnMut() -> bool,
+) -> ConfirmResult {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -2695,6 +2794,10 @@ fn read_confirm_byte_with_timeout(fd: i32, timeout_ms: i32) -> ConfirmResult {
             return ConfirmResult::Eof;
         }
         if buf[0] == 0 {
+            return ConfirmResult::Refused;
+        }
+        // No ack, so the helper never starts the agent.
+        if !before_ack() {
             return ConfirmResult::Refused;
         }
         let ack = [1u8];
@@ -2774,7 +2877,7 @@ mod child_pid_tests {
         let (parent_fd, child_fd) = confirm_socketpair().unwrap();
         let helper = std::thread::spawn(move || confirm_and_wait_for_ack(child_fd));
         assert_eq!(
-            read_confirm_byte_with_timeout(parent_fd, 5_000),
+            read_confirm_byte_with_timeout(parent_fd, 5_000, &mut || true),
             ConfirmResult::Confirmed
         );
         unsafe {
@@ -2792,7 +2895,7 @@ mod child_pid_tests {
         //    return `false` so the agent is never executed before fallback.
         let (parent_fd, child_fd) = confirm_socketpair().unwrap();
         assert_eq!(
-            read_confirm_byte_with_timeout(parent_fd, 10),
+            read_confirm_byte_with_timeout(parent_fd, 10, &mut || true),
             ConfirmResult::Unknown
         );
         let helper = std::thread::spawn(move || confirm_and_wait_for_ack(child_fd));

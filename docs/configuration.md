@@ -608,10 +608,23 @@ policy, checks the private checkout, and publishes it atomically. It:
 at most 64 characters. Plain `git worktree add` inside the sandbox still works
 as before, but git runs it directly and none of the checks above apply.
 
-The command works only in a session cplt started, on macOS (on Linux, worktrees
-inside the sandbox are unsupported because the parent-side worktree broker is
-macOS-only). The worktrees it creates outlive the session, like any other in the
-root.
+The command works only in a session cplt started, on macOS or Linux. The
+worktrees it creates outlive the session, like any other in the root.
+
+On Linux the sandbox reaches the broker through an inherited descriptor, not a
+socket path, so a tool that closes inherited descriptors before running a
+command (Python's `subprocess` does by default) cannot run `cplt worktree add`
+from that command. If a grant such as `allow.write` covers `~/.cplt-worktrees`,
+the broker is off for the session and the launch says so. On Linux the key
+needs Bubblewrap: without it the launch stops and says how to fix it. With it,
+each worktree's `.git` pointer, admin links and protected files are read-only
+to the agent, `<common>/worktrees` is read-only (so plain `git worktree add`,
+`prune` and `remove` fail inside the session; use `cplt worktree add`), nothing
+else can be created directly in the root, and the worktrees cannot be renamed or
+removed from inside. It needs bubblewrap 0.8 or later: the session gets no
+nested user namespaces, so a browser sandbox (Chromium, through Playwright or
+Puppeteer) needs `--no-sandbox` with the key on. See
+[SECURITY.md](../SECURITY.md#managed-worktrees-on-linux).
 The broker requires a launch HEAD commit whose protected bytes and executable
 modes match the checkout. Symlinked protected paths or ancestors, filesystem
 aliases of protected names, and protected files larger than 1 MiB are refused.
@@ -650,7 +663,8 @@ What you get:
 - The launch prints the root in the startup summary, exports it as
   `CPLT_WORKTREE_ROOT`, and names it in the sandbox brief. With the key off the
   variable is removed, even if your shell has one.
-- The same persistence denies apply as in the project, at any depth: the shared
+- The same persistence denies apply as in the project (on Linux through the
+  bubblewrap binds above), at any depth: the shared
   `.git/hooks` and `.git/config`, each worktree's `config.worktree`, and
   `.github/hooks`, `.claude/settings.json`, `.cplt.toml` and the rest of the
   per-root list inside every worktree. See

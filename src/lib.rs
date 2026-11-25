@@ -38,6 +38,8 @@ pub mod untrusted;
 pub mod update;
 pub mod upstream;
 pub mod worktree_broker;
+#[cfg(target_os = "linux")]
+pub mod worktree_ns;
 pub mod worktrees;
 
 /// Safety check: reject overly broad project roots.

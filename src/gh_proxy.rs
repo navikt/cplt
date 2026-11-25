@@ -5489,13 +5489,10 @@ pub fn gate_git(
 }
 
 fn worktree_add_refusal_guidance(has_socket: bool, os: &str) -> String {
-    let hint = if os != "macos" {
-        let platform = if os == "linux" { "Linux" } else { os };
+    let hint = if os != "macos" && os != "linux" {
         format!(
-            "Worktrees inside the sandbox are unsupported on {platform}: the parent-side \
-             worktree broker (`cplt worktree add`) is currently macOS-only (the Seatbelt + \
-             socket flow and kernel protected-path enforcement inside worktrees are not wired on \
-             {platform} yet). Prepare worktrees outside cplt."
+            "Worktrees inside the sandbox are unsupported on {os}: the parent-side worktree \
+             broker (`cplt worktree add`) runs on macOS and Linux only. Prepare worktrees outside cplt."
         )
     } else if has_socket {
         "Use `cplt worktree add <name> <ref>`, or `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\"`."
@@ -9269,12 +9266,17 @@ mod tests {
     #[test]
     fn git_worktree_add_guidance_by_platform() {
         for has_socket in [false, true] {
-            let linux = worktree_add_refusal_guidance(has_socket, "linux");
-            assert!(linux.contains("unsupported on Linux"), "{linux}");
-            assert!(linux.contains("macOS-only"), "{linux}");
-            assert!(linux.contains("Seatbelt + socket"), "{linux}");
-            assert!(linux.contains("cplt worktree add"), "{linux}");
-            assert!(linux.contains("Prepare worktrees outside cplt"), "{linux}");
+            let other = worktree_add_refusal_guidance(has_socket, "freebsd");
+            assert!(other.contains("unsupported on freebsd"), "{other}");
+            assert!(other.contains("macOS and Linux only"), "{other}");
+            assert!(other.contains("Prepare worktrees outside cplt"), "{other}");
+        }
+        // #965: Linux gets the same guidance as macOS.
+        for has_socket in [false, true] {
+            assert_eq!(
+                worktree_add_refusal_guidance(has_socket, "linux"),
+                worktree_add_refusal_guidance(has_socket, "macos")
+            );
         }
 
         let mac_off = worktree_add_refusal_guidance(false, "macos");

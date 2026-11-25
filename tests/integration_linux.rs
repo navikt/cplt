@@ -5894,4 +5894,375 @@ finally:
     fn env_tool_dir_under_safe_root_but_protected_is_not_granted() {
         env_tool_dir_case("GOCACHE", ".gradle", &[], "gradle.properties", false);
     }
+
+    // ── Managed worktree broker (#965) ─────────────────────────────
+
+    /// A repository with a tracked file and a tracked protected file, and a
+    /// HOME outside `/tmp` (a `/tmp` grant would cover the broker's staging).
+    fn worktree_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let project = crate::common::temp_repo("navikt/worktree-broker-fixture");
+        fs::write(project.path().join("a.txt"), "tracked\n").unwrap();
+        fs::create_dir_all(project.path().join(".github/hooks")).unwrap();
+        fs::write(project.path().join(".github/hooks/h.json"), "{}\n").unwrap();
+        assert!(crate::common::git_ok(
+            project.path(),
+            &["add", "a.txt", ".github/hooks/h.json"]
+        ));
+        assert!(crate::common::git_ok(
+            project.path(),
+            &["commit", "-q", "-m", "fixture"]
+        ));
+        // With worktreeConfig, host git obeys each worktree's config.worktree.
+        for kv in [
+            ["core.repositoryformatversion", "1"],
+            ["extensions.worktreeConfig", "true"],
+        ] {
+            assert!(crate::common::git_ok(
+                project.path(),
+                &["config", kv[0], kv[1]]
+            ));
+        }
+        (project, crate::common::home_temp_dir("wt965"))
+    }
+
+    /// Run `script` in `--agent shell` with the key on. `bwrap` picks
+    /// `--use-bubblewrap` or `--no-bubblewrap`; `grant` adds a read grant over
+    /// `~/.cplt-worktrees`, which reaches the broker's staging.
+    fn worktree_run(
+        project: &Path,
+        home: &Path,
+        bwrap: bool,
+        grant: bool,
+        script: &str,
+    ) -> (i32, String, String) {
+        worktree_run_args(project, home, bwrap, grant, &[], script)
+    }
+
+    fn worktree_run_args(
+        project: &Path,
+        home: &Path,
+        bwrap: bool,
+        grant: bool,
+        extra: &[&str],
+        script: &str,
+    ) -> (i32, String, String) {
+        let h = fs::canonicalize(home).unwrap();
+        // Where cplt looks anyway, so the state dir stays ~/.config/cplt.
+        fs::create_dir_all(h.join(".config/cplt")).unwrap();
+        let cfg = h.join(".config/cplt/config.toml");
+        fs::write(&cfg, "[sandbox]\nallow_git_worktrees = true\n").unwrap();
+        let base = h.join(".cplt-worktrees");
+        fs::create_dir_all(&base).unwrap();
+        fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let dir = project.to_string_lossy().into_owned();
+        let grant_path = base.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["--yes", "--no-validate", "--project-dir", &dir];
+        args.push(if bwrap {
+            "--use-bubblewrap"
+        } else {
+            "--no-bubblewrap"
+        });
+        if grant {
+            args.extend_from_slice(&["--allow-read", &grant_path]);
+        }
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--agent", "shell", "--", "-c", script]);
+        let out = cplt_cmd()
+            .args(&args)
+            .env("HOME", &h)
+            .env("CPLT_CONFIG", &cfg)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("XDG_CACHE_HOME", h.join(".cache"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("run cplt");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The one managed root under `home`.
+    fn managed_root(home: &Path) -> PathBuf {
+        let base = fs::canonicalize(home).unwrap().join(".cplt-worktrees");
+        let roots: Vec<PathBuf> = fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with('.'))
+            .collect();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        roots[0].clone()
+    }
+
+    /// The writes an agent must not get into a managed worktree, each echoing
+    /// a marker when it wrongly succeeds, plus one ordinary write that must work.
+    fn protected_write_probes(cplt: &str, wt: &str) -> String {
+        format!(
+            r#"c='{cplt}'; r="$CPLT_WORKTREE_ROOT"; w="$r/{wt}"
+common=$(git -C "$w" rev-parse --git-common-dir)
+echo x >> "$w/.github/hooks/h.json" && echo "BAD_WRITE hooks"
+echo x > "$w/.github/hooks/new.json" && echo "BAD_WRITE new hook"
+echo x > "$w/.git" && echo "BAD_WRITE pointer"
+echo x > "$common/worktrees/{wt}/gitdir" && echo "BAD_WRITE gitdir"
+echo x > "$common/worktrees/{wt}/commondir" && echo "BAD_WRITE commondir"
+printf '[core]\n\thooksPath = /tmp\n' > "$common/worktrees/{wt}/config.worktree" && echo "BAD_WRITE config.worktree"
+echo x > "$w/.opencode/plugins/p.js" && echo "BAD_WRITE missing protected dir"
+mv "$w/.github" "$w/.gh2" && echo "BAD_WRITE rename .github"
+mv "$w" "$r/moved" && echo "BAD_WRITE rename worktree"
+git -C "$PWD" worktree add "$r/plain" HEAD >/dev/null 2>&1 && echo "BAD_WRITE plain add"
+mkdir "$r/handmade" 2>/dev/null && echo "BAD_WRITE mkdir in root"
+python3 - <<'PY'
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+# clone(CLONE_NEWUSER | SIGCHLD): a nested namespace would keep the mount
+# table from before a broker bind.
+r = libc.syscall(56, 0x10000000 | 17, 0, 0, 0, 0)
+if r == 0:
+    os._exit(0)
+if r > 0:
+    os.waitpid(r, 0)
+    print("BAD_WRITE nested userns")
+PY
+date +%s%N > "$w/a.txt" && g="git -C $w -c user.name=t -c user.email=t@t -c commit.gpgsign=false" \
+  && $g add a.txt && $g commit -q -m edit && echo ORDINARY_OK
+true"#
+        )
+    }
+
+    /// #965: under bubblewrap, `cplt worktree add` works from inside the
+    /// sandbox over an inherited descriptor; hostile names, refs and a planted
+    /// symlink are refused; the new worktree's .git pointer, admin links and
+    /// protected files are read-only to the agent, in this session and the next.
+    #[test]
+    fn worktree_add_under_bubblewrap_protects_the_new_worktree() {
+        require_bwrap!();
+        let cplt = env!("CARGO_BIN_EXE_cplt");
+        let (project, home) = worktree_fixture();
+        let script = format!(
+            r#"c='{cplt}'
+echo "SOCK=$CPLT_WORKTREE_SOCKET"
+"$c" worktree add good HEAD && echo GOOD_OK
+for n in '../escape' '--upload-pack=touch pwned' 'a/b' '.git' '..'; do
+  "$c" worktree add "$n" HEAD && echo "BAD_NAME_OK $n"
+done
+"$c" worktree add refx '--upload-pack=touch pwned' && echo BAD_REF_OK
+ln -s /etc "$CPLT_WORKTREE_ROOT/linked" 2>/dev/null && echo BAD_LINK_PLANTED
+{}"#,
+            protected_write_probes(cplt, "good")
+        );
+        let (code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), true, false, &script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(
+            stdout.contains("SOCK=fd:"),
+            "no inherited descriptor: {ctx}"
+        );
+        assert!(stdout.contains("GOOD_OK"), "{ctx}");
+        assert!(stdout.contains("ORDINARY_OK"), "{ctx}");
+        assert!(!stdout.contains("BAD_"), "{ctx}");
+        let root = managed_root(home.path());
+        assert_eq!(
+            fs::read_to_string(root.join("good/.github/hooks/h.json")).unwrap(),
+            "{}\n"
+        );
+        assert!(!root.join("good/.github/hooks/new.json").exists(), "{ctx}");
+        assert!(fs::symlink_metadata(root.join("linked")).is_err(), "{ctx}");
+        assert!(!project.path().join("pwned").exists(), "{ctx}");
+
+        // Next session: the existing worktree is protected before the agent starts.
+        let (code, stdout, stderr) = worktree_run(
+            project.path(),
+            home.path(),
+            true,
+            false,
+            &protected_write_probes(cplt, "good"),
+        );
+        let ctx = format!("second session\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("ORDINARY_OK"), "{ctx}");
+        assert!(!stdout.contains("BAD_"), "{ctx}");
+    }
+
+    /// #965: without bubblewrap the key is refused with a copy-paste fix,
+    /// before the agent runs.
+    #[test]
+    fn worktree_root_without_bubblewrap_is_refused() {
+        require_landlock!();
+        let (project, home) = worktree_fixture();
+        let (code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), false, false, "echo AGENT_RAN");
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_ne!(code, 0, "{ctx}");
+        assert!(!stdout.contains("AGENT_RAN"), "{ctx}");
+        assert!(stderr.contains("needs Bubblewrap on Linux"), "{ctx}");
+        assert!(
+            stderr.contains("cplt config set sandbox.allow_git_worktrees false"),
+            "{ctx}"
+        );
+    }
+
+    /// #965: the raw transport. A datagram with no descriptor, two
+    /// descriptors, or a non-stream socket gets nothing; a valid request after
+    /// them is still served.
+    #[test]
+    fn worktree_broker_transport_refuses_malformed_datagrams() {
+        require_bwrap!();
+        let has_python = Command::new("python3")
+            .args(["-c", "import socket; socket.send_fds"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(has_python, "python3 with socket.send_fds is required");
+        let script = r#"python3 - <<'PY'
+import os, socket
+n = int(os.environ['CPLT_WORKTREE_SOCKET'][3:])
+s = socket.socket(fileno=os.dup(n))
+s.send(b'x')
+a, b = socket.socketpair(); c, d = socket.socketpair()
+socket.send_fds(s, [b'x'], [b.fileno(), d.fileno()]); b.close(); d.close()
+a.settimeout(10); print('TWO_FDS_EOF', a.recv(16) == b'')
+e, f = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+socket.send_fds(s, [b'x'], [f.fileno()]); f.close()
+a, b = socket.socketpair()
+socket.send_fds(s, [b'x'], [b.fileno()]); b.close()
+a.sendall(b'{"op":"add","name":"py","ref":"HEAD","extra":1}\n'); a.settimeout(60)
+print('UNKNOWN_FIELD', a.recv(4096))
+a, b = socket.socketpair()
+socket.send_fds(s, [b'x'], [b.fileno()]); b.close()
+a.sendall(b'{"op":"add","name":"py","ref":"HEAD"}\n'); a.settimeout(60)
+print('VALID', a.recv(4096))
+PY"#;
+        let (project, home) = worktree_fixture();
+        let (code, stdout, stderr) = worktree_run(project.path(), home.path(), true, false, script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("TWO_FDS_EOF True"), "{ctx}");
+        assert!(stdout.contains("UNKNOWN_FIELD b'{\"ok\":false"), "{ctx}");
+        assert!(stdout.contains("VALID b'{\"ok\":true"), "{ctx}");
+        assert!(
+            managed_root(home.path()).join("py/a.txt").is_file(),
+            "{ctx}"
+        );
+    }
+
+    /// #965: a session grant that covers the broker's private staging turns the
+    /// broker off with a warning. It never runs with staging exposed, and the
+    /// managed root stays.
+    #[test]
+    fn worktree_broker_is_off_when_a_grant_covers_staging() {
+        require_bwrap!();
+        let cplt = env!("CARGO_BIN_EXE_cplt");
+        let script = format!(
+            r#"echo "SOCK=[$CPLT_WORKTREE_SOCKET] ROOT=[$CPLT_WORKTREE_ROOT]"; '{cplt}' worktree add x HEAD || echo REFUSED"#
+        );
+        let (project, home) = worktree_fixture();
+        let (_code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), true, true, &script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("SOCK=[]"), "{ctx}");
+        assert!(!stdout.contains("ROOT=[]"), "the root must stay: {ctx}");
+        assert!(stdout.contains("REFUSED"), "{ctx}");
+        assert!(
+            stderr.contains("managed-worktree broker unavailable"),
+            "{ctx}"
+        );
+    }
+
+    /// #965: no window. While `cplt worktree add` runs, a loop keeps trying to
+    /// open the new worktree's `.git` pointer and a protected file for writing.
+    /// It never succeeds, and the host files stay as the broker wrote them.
+    #[test]
+    fn worktree_add_leaves_no_window_for_writers() {
+        require_bwrap!();
+        let cplt = env!("CARGO_BIN_EXE_cplt");
+        let (project, home) = worktree_fixture();
+        let script = format!(
+            r#"r="$CPLT_WORKTREE_ROOT"
+race() {{ while :; do
+  if exec 3>>"$r/race/$1" 2>/dev/null; then echo pwn >&3; echo "RACE_OPENED $1"; exit 0; fi
+done; }}
+race .git & a=$!
+race .github/hooks/h.json & b=$!
+'{cplt}' worktree add race HEAD && echo ADDED
+sleep 1; kill $a $b 2>/dev/null; wait 2>/dev/null; true"#
+        );
+        let (code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), true, false, &script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("ADDED"), "{ctx}");
+        assert!(!stdout.contains("RACE_OPENED"), "{ctx}");
+        let root = managed_root(home.path());
+        assert!(
+            fs::read_to_string(root.join("race/.git"))
+                .unwrap()
+                .starts_with("gitdir: "),
+            "{ctx}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("race/.github/hooks/h.json")).unwrap(),
+            "{}\n",
+            "{ctx}"
+        );
+    }
+
+    /// #965 review: a client that keeps an alias of the passed stream and
+    /// clears its timeouts cannot hold the broker: reads and writes are
+    /// non-blocking and bounded, so the next request is still served.
+    #[test]
+    fn worktree_broker_survives_a_client_clearing_timeouts() {
+        require_bwrap!();
+        let script = r#"python3 - <<'PY'
+import os, socket, struct, time
+n = int(os.environ['CPLT_WORKTREE_SOCKET'][3:])
+s = socket.socket(fileno=os.dup(n))
+a, b = socket.socketpair()
+socket.send_fds(s, [b'x'], [b.fileno()])
+zero = struct.pack('ll', 0, 0)
+for _ in range(50):
+    b.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, zero)
+    b.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, zero)
+    b.setblocking(True)
+    time.sleep(0.01)
+c, d = socket.socketpair()
+socket.send_fds(s, [b'x'], [d.fileno()]); d.close()
+c.sendall(b'{"op":"add","name":"after","ref":"HEAD"}\n'); c.settimeout(90)
+print('AFTER', c.recv(4096))
+PY"#;
+        let (project, home) = worktree_fixture();
+        let (code, stdout, stderr) = worktree_run(project.path(), home.path(), true, false, script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("AFTER b'{\"ok\":true"), "{ctx}");
+    }
+
+    /// #965 review: the broker's git runs outside the namespace, where
+    /// bubblewrap's deny masks do not exist, so a session with any mask gets no
+    /// broker (it could read what the mask hides).
+    #[test]
+    fn worktree_broker_is_off_with_deny_masks() {
+        require_bwrap!();
+        let (project, home) = worktree_fixture();
+        // Outside /tmp, where bubblewrap can mask it.
+        let data = fs::canonicalize(home.path()).unwrap().join("data");
+        fs::create_dir_all(data.join("secret")).unwrap();
+        let grant = data.to_string_lossy().into_owned();
+        let deny = data.join("secret").to_string_lossy().into_owned();
+        let (_code, stdout, stderr) = worktree_run_args(
+            project.path(),
+            home.path(),
+            true,
+            false,
+            &["--allow-read", &grant, "--deny-path", &deny],
+            r#"echo "SOCK=[$CPLT_WORKTREE_SOCKET]""#,
+        );
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("SOCK=[]"), "{ctx}");
+        assert!(stderr.contains("deny path"), "{ctx}");
+    }
 }

@@ -22,24 +22,20 @@ pub const ENV: &str = "CPLT_WORKTREE_ROOT";
 /// Home-relative parent of every per-repository root. Never granted itself.
 pub const BASE: &str = ".cplt-worktrees";
 
-/// Refuse the key on any OS but macOS.
+/// Refuse the key on any OS but macOS and Linux.
 ///
 /// macOS denies the protected paths at any depth below a granted root with a
-/// regex. Linux has no equivalent: Landlock cannot subtract a path from a
-/// granted tree, and bubblewrap re-binds read-only only paths that exist at
-/// launch, at fixed depths (`<root>/<rel>`), never `<root>/<worktree>/<rel>`.
-/// So nothing inside the root would be kernel-enforced, and the key is
-/// macOS-only until that changes. `os` is `std::env::consts::OS`, passed in so
+/// regex. Linux (#965) needs bubblewrap for it: Landlock cannot subtract a
+/// path from a granted tree, so `worktree_ns` binds each worktree's protected
+/// paths read-only inside the session namespace, and a launch without
+/// bubblewrap is refused there. `os` is `std::env::consts::OS`, passed in so
 /// the refusal is testable on either host.
 pub fn refuse_unsupported_os(os: &str) -> Result<(), String> {
-    if os == "macos" {
+    if os == "macos" || os == "linux" {
         return Ok(());
     }
     Err(format!(
-        "sandbox.allow_git_worktrees is macOS-only for now. On {os}, nothing inside the \
-         worktree root would be kernel-enforced: Landlock cannot subtract paths from a granted \
-         tree, so .git pointers, hooks and agent config inside the worktrees would all be \
-         writable"
+        "sandbox.allow_git_worktrees needs macOS or Linux; {os} has no sandbox backend for it"
     ))
 }
 
@@ -1140,12 +1136,13 @@ mod tests {
         assert!(!h.path().join(BASE).exists());
     }
 
-    /// Item 3 of the #574 review: the key is macOS-only.
+    /// #574, #965: the key works on macOS and Linux only.
     #[test]
-    fn the_key_is_refused_off_macos() {
+    fn the_key_is_refused_off_macos_and_linux() {
         assert_eq!(refuse_unsupported_os("macos"), Ok(()));
-        let err = refuse_unsupported_os("linux").unwrap_err();
-        assert!(err.contains("macOS-only"), "{err}");
+        assert_eq!(refuse_unsupported_os("linux"), Ok(()));
+        let err = refuse_unsupported_os("freebsd").unwrap_err();
+        assert!(err.contains("macOS or Linux"), "{err}");
     }
 
     /// A repository with one managed worktree, as `git worktree add` leaves it.

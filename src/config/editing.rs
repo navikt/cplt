@@ -15,7 +15,7 @@ fn parse_value_for_key(
     value: &str,
 ) -> Result<toml_edit::Value, ConfigError> {
     // A value every launch on this OS would refuse is refused here instead,
-    // while the user is at the keyboard (#574: the key is macOS-only).
+    // while the user is at the keyboard (#574: the key needs macOS or Linux).
     if (key_info.section, key_info.key, value) == ("sandbox", "allow_git_worktrees", "true") {
         crate::worktrees::refuse_unsupported_os(std::env::consts::OS)
             .map_err(ConfigError::Validation)?;
@@ -703,19 +703,19 @@ mod tests {
         assert!(result.contains("quiet = true"));
     }
 
-    /// #574: `sandbox.allow_git_worktrees = true` is refused at `set` off
-    /// macOS, where every launch would refuse it. `false` is always fine.
+    /// #574/#965: `sandbox.allow_git_worktrees = true` is accepted on macOS and
+    /// Linux, and refused at `set` elsewhere. `false` is always fine.
     #[test]
-    fn allow_git_worktrees_is_refused_at_set_off_macos() {
+    fn allow_git_worktrees_is_refused_at_set_off_macos_and_linux() {
         let info = lookup_key("sandbox.allow_git_worktrees").unwrap();
         let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
         set_value_in_doc(&mut doc, info, "false").unwrap();
         let on = set_value_in_doc(&mut doc, info, "true");
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             on.unwrap();
         } else {
             let err = on.unwrap_err().to_string();
-            assert!(err.contains("macOS-only"), "{err}");
+            assert!(err.contains("macOS or Linux"), "{err}");
         }
     }
 

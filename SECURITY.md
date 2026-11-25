@@ -714,7 +714,8 @@ Denied credential paths and filtered environment variables reduce what can be ex
 
 #### Managed worktree root (`sandbox.allow_git_worktrees`)
 
-Off by default (#531). When on, the session gets one more project-grade tree:
+Off by default (#531; Linux since #965, see [the Linux part](#managed-worktrees-on-linux)
+below). When on, the session gets one more project-grade tree:
 `~/.cplt-worktrees/<id>`, read, write and execute, so sub-agents can run
 `git worktree add "$CPLT_WORKTREE_ROOT/<name>"`. What that grants and what it
 does not:
@@ -959,18 +960,84 @@ does not:
   the settle-probe notes in `src/audit.rs` on why a process group is not used.
   When the audit runs and the tree has not settled, the audit's own warning
   says processes were left running.
-- **macOS only.** On Linux the launch fails with the key on, and `config set`
-  refuses to turn it on. Landlock cannot subtract a path from the granted
-  root, and bubblewrap re-binds only paths that exist at launch, at fixed
-  depths, never `<root>/<worktree>/<rel>`. So nothing inside the root would
-  be kernel-enforced.
+- **macOS and Linux.** On Linux the key needs bubblewrap; see
+  [Managed worktrees on Linux](#managed-worktrees-on-linux).
 - **Residuals.** Everything written to the root outlives the session: cplt
   never deletes worktrees or branches. The agent can empty the root or plant
   files you later run outside cplt, the same as in the project directory. The
   end-of-session audit does not inspect the worktrees' contents; it prints a
   line saying so.
 
+##### Managed worktrees on Linux
 
+The key and `cplt worktree add` work on Linux since #965. The broker is the
+same code as on macOS: the same request format and limits, the same name and
+ref validation, the same private checkout in `~/.cplt-worktrees/.staging`, the
+same tree and protected-file checks. Three parts differ.
+
+- **Transport: an inherited descriptor, no socket path.** Below Landlock ABI
+  v9, nothing on Linux gates `connect(2)` to a pathname Unix socket, so a
+  socket file would be reachable by anything that can resolve its path. The
+  parent instead creates a `SOCK_SEQPACKET` socketpair and the sandbox inherits
+  one end (`CPLT_WORKTREE_SOCKET=fd:<n>`). It is the only descriptor
+  `seal_inherited_fds` keeps open besides the audit's settle probe, on the
+  Landlock-only path and through bubblewrap alike. A client creates a fresh
+  stream pair and passes one end over it with `SCM_RIGHTS`; the request and
+  reply then travel on that private stream. The parent accepts a datagram only
+  if it carries exactly one descriptor and that descriptor is an `AF_UNIX`
+  stream socket; anything else is closed unread. A tool that closes inherited
+  descriptors (Python's `subprocess` with its default `close_fds=True`, for
+  example) cannot reach the broker from its children. That fails closed.
+- **Git confinement: Landlock instead of `sandbox-exec`.** The broker's git
+  runs under the final session Landlock rules plus read and write (never
+  execute) on its private request directory, applied between fork and exec
+  with the same hook the agent spawn uses. If any session rule reaches
+  `~/.cplt-worktrees/.staging` (an `allow.write` over HOME, for example), the
+  broker is turned off for the session with a warning and
+  `CPLT_WORKTREE_SOCKET` is unset: Landlock cannot take staging back out of a
+  granted tree, and the broker never runs with staging exposed. The managed
+  root stays.
+- **Publish: `renameat2(RENAME_NOREPLACE)`**, called through `syscall(2)`, the
+  counterpart of `renameatx_np(RENAME_EXCL)`.
+
+**Bubblewrap is required.** Without it, a launch with the key on stops and
+says how to install bubblewrap or turn the key off; a bubblewrap that fails to
+start stops the launch instead of falling back to Landlock alone. The reason is
+the protections inside the root. macOS denies protected paths at any depth with
+a regex. Landlock cannot subtract a path from a granted tree, and bubblewrap
+binds only paths that exist when it starts. So cplt binds them itself: bwrap
+reports its child's pid on `--info-fd`, and before the agent is allowed to start
+the parent enters that user namespace (it owns it) and mount namespace in a
+single-threaded helper and attaches bind mounts with `open_tree`/`move_mount`,
+on descriptors opened without following a symlink in any component:
+
+- the managed root and `<common>/worktrees` read-only, so nothing can be
+  created in either from inside the session: no plain `git worktree add` (nor
+  `prune` or `remove`), no hand-made directory with a `.git` pointer. Each
+  existing admin directory is writable again on top;
+- for each worktree in the root, existing at launch or published by the broker
+  later: the project's own bubblewrap list (`git_persistence_paths` read-only,
+  `rename_pin_paths` pinned, the same tables as the project, not a copy), plus
+  the `.git` pointer, `commondir`, `gitdir` and `config.worktree` read-only,
+  then the pins, the admin directory and the worktree itself writable on top.
+
+**No window.** A published worktree first appears under the read-only root and
+`<common>/worktrees`, so the agent can read it but not write it, and a
+descriptor opened through a read-only mount stays read-only after later binds.
+The binds go read-only protected paths first, then each writable mount as a
+recursive clone that already carries them, so the first moment any part of the
+tree is writable, its protected paths are read-only. The broker's content
+checks run on the staged tree before publish, and nothing can change it after.
+
+**No nested namespaces.** A process in a nested user and mount namespace keeps
+a copy of the mount table from before a bind, and would see a new worktree
+without its protections. So the session runs with `bwrap --disable-userns`
+(bubblewrap 0.8 or later; an older one makes the launch stop). Without a user
+namespace, a process without capabilities cannot create a mount namespace.
+The seccomp filter does not cover this: `clone3` passes its flags behind a
+pointer, which BPF cannot read. Cost: anything that needs its own user
+namespace inside the session fails, Chromium's sandbox included (Playwright and
+Puppeteer need `--no-sandbox`). This applies only with the key on.
 #### Keychain access is all-or-nothing
 
 The macOS Keychain grant is two SBPL file rules on `~/Library/Keychains` plus the
