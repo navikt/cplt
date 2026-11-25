@@ -609,6 +609,41 @@ fn develop_repo_selectors<'a>(args: &[&'a str]) -> Vec<&'a str> {
     out
 }
 
+/// Whether every repository-naming operand of a non-`gh api` command names
+/// `member`. gh's PR and issue finders take the repository from a URL operand
+/// (`https://HOST/OWNER/REPO/pull/1`) or `[HOST/]OWNER/REPO#N` before `-R` and
+/// `GH_REPO`, so the gated repository is only the target when they agree. An
+/// operand that looks like one but does not parse fails closed.
+fn operands_name_only(args: &[&str], cmd: &ParsedCommand, member: &str) -> bool {
+    if cmd.command == "api" {
+        return true;
+    }
+    let same = |host: &str, owner: &str, repo: &str| {
+        !owner.is_empty()
+            && !repo.is_empty()
+            && member_name(host, &format!("{owner}/{repo}")).eq_ignore_ascii_case(member)
+    };
+    positional_operands(args).into_iter().all(|op| {
+        if let Some((_, rest)) = op.split_once("://") {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            let host = host.split(':').next().unwrap_or(host);
+            let mut seg = path.split('/');
+            same(host, seg.next().unwrap_or(""), seg.next().unwrap_or(""))
+        } else if let Some((path, _)) = op.split_once('#')
+            && path.contains('/')
+        {
+            match path.split('/').collect::<Vec<_>>()[..] {
+                [owner, repo] => same(DEFAULT_GH_HOST, owner, repo),
+                [host, owner, repo] => same(host, owner, repo),
+                _ => false,
+            }
+        } else {
+            true
+        }
+    })
+}
+
 /// `gh repo` subcommands whose positional operand is a repository, which gh
 /// reads with `FromFullName` and so accepts as `HOST/OWNER/REPO`.
 const REPO_OPERAND_SUBCOMMANDS: &[&str] = &[
@@ -3623,6 +3658,17 @@ fn gate_with_scope_resolver_for(
             };
 
             if let Some(member) = is_repo_in_scope(&cmd, &scope, invocation_repo.as_deref()) {
+                if !operands_name_only(args, &cmd, &member) {
+                    return Err(Refusal {
+                        headline: "'gh' was given a URL operand for another repository."
+                            .to_string(),
+                        guidance: format!(
+                            "gh takes the repository from a URL operand before -R. \
+                             Use a number, or a URL for {member}."
+                        ),
+                        agent_note: &[RESTRICTED, NOTE],
+                    });
+                }
                 // The matched member, never the launch repository: pinning the
                 // launch repo with a set in play is #213, N repositories wide.
                 Ok(GateApproval {
@@ -10402,6 +10448,76 @@ mod tests {
             "good/repo",
         ];
         assert!(!repo_selector_ambiguous(&a, Some("good/repo")));
+        // URL and `OWNER/REPO#N` operands must name the gated repository.
+        let scope = ["good/repo".to_string()];
+        for (a, ok) in [
+            (
+                &[
+                    "pr",
+                    "comment",
+                    "https://github.com/evil/repo/pull/1",
+                    "-R",
+                    "good/repo",
+                ][..],
+                false,
+            ),
+            (
+                &["pr", "close", "https://github.com/evil/repo/pull/1"],
+                false,
+            ),
+            (
+                &["pr", "merge", "https://github.com/evil/repo/pull/1"],
+                false,
+            ),
+            (
+                &["pr", "review", "https://github.com/evil/repo/pull/1"],
+                false,
+            ),
+            (
+                &["pr", "edit", "https://ghe.example/good/repo/pull/1"],
+                false,
+            ),
+            (
+                &["issue", "comment", "https://github.com/evil/repo/issues/1"],
+                false,
+            ),
+            (&["issue", "edit", "evil/repo#1"], false),
+            (&["issue", "close", "github.com/evil/repo#1"], false),
+            (
+                &["issue", "develop", "https://github.com/evil/repo/issues/1"],
+                false,
+            ),
+            (
+                &["pr", "comment", "https://github.com/good/repo/pull/1"],
+                true,
+            ),
+            (&["issue", "close", "Good/Repo#1"], true),
+            (&["pr", "comment", "12"], true),
+        ] {
+            let cmd = parse_command(a).unwrap();
+            assert_eq!(operands_name_only(a, &cmd, &scope[0]), ok, "{a:?}");
+        }
+        let gated = |a: &[&str]| gate_with_repo_scope(a, &policy, &scope, None);
+        let bad = [
+            "pr",
+            "comment",
+            "https://github.com/evil/repo/pull/1",
+            "-R",
+            "good/repo",
+            "--body",
+            "x",
+        ];
+        assert!(gated(&bad).is_err_and(|r| r.headline.contains("URL operand")));
+        let good = [
+            "pr",
+            "comment",
+            "https://github.com/good/repo/pull/1",
+            "-R",
+            "good/repo",
+            "--body",
+            "x",
+        ];
+        assert!(gated(&good).is_ok());
         // A single selector stays accepted.
         let a = ["pr", "comment", "1", "--body", "hi", "--repo=good/repo"];
         let cmd = parse_command(&a).unwrap();
