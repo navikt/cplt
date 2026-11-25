@@ -78,8 +78,11 @@ const STAGING_DIR: &str = ".staging";
 struct Request {
     op: String,
     name: String,
-    #[serde(rename = "ref")]
+    #[serde(rename = "ref", default)]
     reference: String,
+    /// `remove --force`: remove even with local changes (#1015).
+    #[serde(default)]
+    force: bool,
     /// `-b`: a new branch to create at `ref` (#966).
     #[serde(default)]
     branch: Option<String>,
@@ -545,6 +548,9 @@ fn handle(ctx: &Context, stream: UnixStream, stop: &AtomicBool) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let response = match read_request(&stream, stop).and_then(|r| {
+        if r.op == "remove" {
+            return remove_with_budget(ctx, &r.name, r.force, &Budget::new(stop));
+        }
         add_with_budget(
             ctx,
             &r.name,
@@ -668,7 +674,7 @@ fn read_request(stream: &UnixStream, stop: &AtomicBool) -> Result<Request, Strin
         .ok_or("request must be one line of at most 4096 bytes")?;
     let req: Request = serde_json::from_slice(body)
         .map_err(|_| "request is not a valid add request".to_string())?;
-    if req.op != "add" {
+    if req.op != "add" && req.op != "remove" {
         return Err(format!("unknown operation {:?}", truncate(&req.op, 32)));
     }
     Ok(req)
@@ -853,6 +859,154 @@ fn add_with_budget(
         .unwrap_or(&ctx.root)
         .display()
         .to_string())
+}
+
+/// Remove the managed worktree `name` (#1015). Never the main worktree, never
+/// anything outside the root, and never one with local changes or a lock
+/// unless `force` (git's single `--force`; a locked worktree is always refused).
+pub fn remove(ctx: &Context, name: &str, force: bool) -> Result<String, String> {
+    remove_with_budget(ctx, name, force, &Budget::new(&AtomicBool::new(false)))
+}
+
+/// Every input is agent-controlled: the name, the tree, any symlink planted in
+/// the root, the tree's `.git` pointer. So the target is one validated name
+/// under the root, its admin dir is found from git's own records (the admin
+/// `gitdir` files `git worktree list` reads, never the tree's pointer), and the
+/// tree is moved into private staging with one rename before anything is
+/// deleted. The rename moves whatever is at the path, never a symlink target,
+/// and the moved inode must be the one checked, so a swap after the check is
+/// put back and refused.
+fn remove_with_budget(
+    ctx: &Context,
+    name: &str,
+    force: bool,
+    budget: &Budget<'_>,
+) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
+    validate_name(name)?;
+    #[cfg(not(target_os = "linux"))]
+    ctx.read_policy
+        .get()
+        .ok_or("worktree broker session read policy is not installed")?;
+    #[cfg(target_os = "linux")]
+    ctx.landlock
+        .get()
+        .ok_or("worktree broker session Landlock policy is not installed")?;
+    let _lock = acquire_lock(&ctx.base, budget)?;
+    check_identity(&ctx.common, &ctx.common_fd)?;
+    let target = ctx.root.join(name);
+    let not_managed = || {
+        format!(
+            "{} is not a worktree of this repository under $CPLT_WORKTREE_ROOT",
+            target.display()
+        )
+    };
+    let meta = std::fs::symlink_metadata(&target).map_err(|_| not_managed())?;
+    if !meta.is_dir() {
+        return Err(not_managed());
+    }
+    let canonical_root = std::fs::canonicalize(&ctx.root).map_err(|_| not_managed())?;
+    let names = [target.clone(), canonical_root.join(name)];
+
+    // git's view: the path must be a linked worktree (never the first, main entry).
+    let list = run_bounded(
+        common_command(ctx, &["worktree", "list", "--porcelain", "-z"])?,
+        budget,
+    )?;
+    if !list.status.success() {
+        return Err("git worktree list failed".into());
+    }
+    let listed = list
+        .stdout
+        .split(|&b| b == 0)
+        .filter_map(|f| f.strip_prefix(b"worktree "))
+        .skip(1)
+        .any(|p| names.iter().any(|n| n.as_os_str().as_bytes() == p));
+    if !listed {
+        return Err(not_managed());
+    }
+    // The admin dir whose gitdir record names this tree: exactly one, a real dir.
+    let mut admins = Vec::new();
+    for entry in std::fs::read_dir(ctx.common.join("worktrees"))
+        .map_err(|_| not_managed())?
+        .flatten()
+    {
+        budget.check()?;
+        let admin = entry.path();
+        if !std::fs::symlink_metadata(&admin).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let Some(gitdir) = crate::untrusted::read_untrusted(&admin.join("gitdir"), 4096)
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let gitdir = Path::new(gitdir.trim_end_matches('\n'));
+        if names.iter().any(|n| n.join(".git") == gitdir) {
+            admins.push(admin);
+        }
+    }
+    let [admin] = admins.as_slice() else {
+        return Err(not_managed());
+    };
+    if std::fs::symlink_metadata(admin.join("locked")).is_ok() {
+        return Err(format!(
+            "worktree {name} is locked; unlock it outside cplt first"
+        ));
+    }
+    if !force {
+        refuse_filters(ctx, budget)?;
+        let git_dir = format!("--git-dir={}", admin.display());
+        let work_tree = format!("--work-tree={}", target.display());
+        let mut cmd = git::command(
+            &ctx.common,
+            &[
+                &git_dir,
+                &work_tree,
+                "status",
+                "--porcelain",
+                "-z",
+                "--ignore-submodules=none",
+            ],
+        )
+        .ok_or("no trusted git binary")?;
+        harden_data_query(ctx, &mut cmd);
+        let out = run_bounded(sandbox_git(ctx, cmd, None)?, budget)?;
+        if !out.status.success() {
+            return Err("cannot check the worktree for local changes".into());
+        }
+        if !out.stdout.is_empty() {
+            return Err(format!(
+                "worktree {name} has modified or untracked files; commit them, or pass --force to discard them"
+            ));
+        }
+    }
+    budget.check()?;
+    let staging = new_staging_dir(&ctx.base)?;
+    let moved = staging.join(name);
+    let result = (|| {
+        std::fs::rename(&target, &moved).map_err(|e| format!("cannot move {name}: {e}"))?;
+        let now = std::fs::symlink_metadata(&moved).map_err(|_| not_managed())?;
+        if !now.is_dir() || now.dev() != meta.dev() || now.ino() != meta.ino() {
+            // Swapped since the check: put back whatever was moved.
+            let _ = std::fs::rename(&moved, &target);
+            return Err(format!(
+                "{name} changed during removal; nothing was removed"
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir(&staging);
+        return Err(e);
+    }
+    // Both are now in places only cplt writes: staging, and the protected
+    // common dir. remove_dir_all never follows a symlink inside them.
+    let admin_result = std::fs::remove_dir_all(admin);
+    let _ = std::fs::remove_dir_all(&staging);
+    admin_result.map_err(|e| format!("removed the tree but not its git admin dir: {e}"))?;
+    Ok(target.display().to_string())
 }
 
 /// A branch this request created, deleted again unless the request publishes.
@@ -2192,6 +2346,36 @@ fn send_stream(fd: libc::c_int) -> std::io::Result<UnixStream> {
 /// filtering the environment, so a value inherited from the parent cannot point
 /// the client elsewhere.
 pub fn run_client(name: &str, reference: &str, branch: Option<&str>) -> ExitCode {
+    request(
+        serde_json::json!({"op": "add", "name": name, "ref": reference, "branch": branch}),
+        name,
+    )
+}
+
+/// The sandboxed side of `cplt worktree remove <path> [--force]` (#1015).
+/// `path` is a name, or a path whose parent is `$CPLT_WORKTREE_ROOT`; the
+/// broker checks the name again and trusts nothing else from here.
+pub fn run_remove_client(path: &str, force: bool) -> ExitCode {
+    let name = match path.trim_end_matches('/').rsplit_once('/') {
+        None => path,
+        Some((parent, name)) => {
+            let root = std::env::var("CPLT_WORKTREE_ROOT").unwrap_or_default();
+            if root.is_empty() || parent != root.trim_end_matches('/') {
+                eprintln!(
+                    "cplt worktree: only worktrees directly under $CPLT_WORKTREE_ROOT can be removed"
+                );
+                return ExitCode::FAILURE;
+            }
+            name
+        }
+    };
+    request(
+        serde_json::json!({"op": "remove", "name": name, "force": force}),
+        name,
+    )
+}
+
+fn request(body: serde_json::Value, name: &str) -> ExitCode {
     if let Some(msg) = client_os_error(std::env::consts::OS) {
         eprintln!("{msg}");
         return ExitCode::FAILURE;
@@ -2213,12 +2397,7 @@ pub fn run_client(name: &str, reference: &str, branch: Option<&str>) -> ExitCode
     let wait = GIT_TIMEOUT + IO_TIMEOUT;
     let _ = stream.set_read_timeout(Some(wait));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let Ok(mut line) = serde_json::to_string(&serde_json::json!({
-        "op": "add",
-        "name": name,
-        "ref": reference,
-        "branch": branch,
-    })) else {
+    let Ok(mut line) = serde_json::to_string(&body) else {
         eprintln!("cplt worktree: cannot encode the request");
         return ExitCode::FAILURE;
     };

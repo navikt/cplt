@@ -1369,6 +1369,17 @@ enum WorktreeAction {
         #[arg(short = 'b', value_name = "NEW_BRANCH")]
         branch: Option<String>,
     },
+    /// Remove a managed worktree. The branch is kept.
+    ///
+    /// Only linked worktrees directly under `$CPLT_WORKTREE_ROOT` that git
+    /// lists for this repository. Refused with local changes unless `--force`.
+    Remove {
+        /// Worktree name, or its path under `$CPLT_WORKTREE_ROOT`.
+        path: String,
+        /// Remove even with modified or untracked files (they are lost).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5345,22 +5356,26 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // and leave cli.command = None, silently breaking all other subcommands.
     // `cplt worktree` runs inside the sandbox, where `__CPLT_WRAPPED` is set, so
     // it is dispatched before any launch logic and its recursion guard.
-    #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Worktree { .. })) {
-        if let Some(Command::Worktree {
-            action:
-                WorktreeAction::Add {
-                    name,
-                    reference,
-                    branch,
-                },
-        }) = cli.command.take()
-        {
-            return Ok(cplt::worktree_broker::run_client(
-                &name,
-                &reference,
-                branch.as_deref(),
-            ));
+        match cli.command.take() {
+            Some(Command::Worktree {
+                action:
+                    WorktreeAction::Add {
+                        name,
+                        reference,
+                        branch,
+                    },
+            }) => {
+                return Ok(cplt::worktree_broker::run_client(
+                    &name,
+                    &reference,
+                    branch.as_deref(),
+                ));
+            }
+            Some(Command::Worktree {
+                action: WorktreeAction::Remove { path, force },
+            }) => return Ok(cplt::worktree_broker::run_remove_client(&path, force)),
+            _ => unreachable!(),
         }
     }
     // `mcp status` reads specs exactly as a launch from here would, so it

@@ -869,6 +869,23 @@ does not:
      Queue time is outside each request's operation budget. A 70 s client
      timeout does not cancel queued work; diagnostics tell the caller to check
      the destination before retrying.
+  - `cplt worktree remove <name> [--force]` (#1015) uses the same socket. Every
+    field is agent-controlled, so the name must pass the same one-component
+    check as `add` (no `/`, no `..`, no leading dot): only `<root>/<name>` can
+    be named. It must be a real directory, not a symlink, and git's own
+    `worktree list` for the pinned common directory must report it as a linked
+    worktree, never the main one. Its admin dir is the single
+    `<common>/worktrees/<id>` whose `gitdir` record names it; the tree's `.git`
+    pointer is never read, so a forged pointer cannot pick another admin dir or
+    repository. A locked worktree is refused. Without `--force`, `git status`
+    runs sandboxed under the session read policy (filters refused, hardened
+    overrides) and any modified or untracked file refuses the request. The tree
+    is then moved into private staging with one `rename`, which moves the entry
+    itself and never a symlink target; the moved inode must match the one
+    checked, or it is put back and the request refused. Only then are staging
+    and the admin dir deleted, without following symlinks. The branch is kept.
+    A change the agent makes between the status check and the move is lost:
+    the agent asked for the removal.
   - Plain `git worktree add` in the sandbox is unchanged: it runs git directly
     and gets none of the checks above. The launch-time and exit-time link
     checks still cover what it creates.
