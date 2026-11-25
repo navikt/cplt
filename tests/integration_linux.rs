@@ -6230,13 +6230,8 @@ true"#
         let list = String::from_utf8_lossy(&out.stdout);
         assert!(!list.contains("/dirty"), "{list}");
         let common = project.path().join(".git/worktrees");
-        let admins: Vec<String> = fs::read_dir(&common)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        // Only the re-added `clean` remains.
-        assert_eq!(admins, vec!["clean".to_string()], "{ctx}");
+        // Only the re-added `clean` keeps an admin dir (the broker names it).
+        assert_eq!(fs::read_dir(&common).unwrap().count(), 1, "{ctx}");
 
         // Remove the re-added tree in a fresh session, where it was bound at launch.
         let (code, stdout, stderr) = worktree_run(
