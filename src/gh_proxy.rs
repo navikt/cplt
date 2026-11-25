@@ -609,38 +609,58 @@ fn develop_repo_selectors<'a>(args: &[&'a str]) -> Vec<&'a str> {
     out
 }
 
-/// Whether every repository-naming operand of a non-`gh api` command names
-/// `member`. gh's PR and issue finders take the repository from a URL operand
-/// (`https://HOST/OWNER/REPO/pull/1`) or `[HOST/]OWNER/REPO#N` before `-R` and
-/// `GH_REPO`, so the gated repository is only the target when they agree. An
-/// operand that looks like one but does not parse fails closed.
+/// Flags whose value gh resolves as an issue number or URL, taking the
+/// repository from a URL (cli/cli b546819: `ResolveIssueRef`, and
+/// `ParseIssueFromArg` for `--duplicate-of`).
+const ISSUE_REF_FLAGS: &[&str] = &[
+    "--parent",
+    "--add-sub-issue",
+    "--remove-sub-issue",
+    "--blocked-by",
+    "--blocking",
+    "--add-blocked-by",
+    "--remove-blocked-by",
+    "--add-blocking",
+    "--remove-blocking",
+    "--duplicate-of",
+];
+
+/// Whether every URL a non-`gh api` command passes as an operand or as an
+/// issue-reference flag value names `member`. gh's PR and issue finders take
+/// the repository from an `http(s)` URL operand before `-R` and `GH_REPO`, so
+/// the pinned repository is only the target when they agree. A word that
+/// starts like a URL but does not parse to host, owner and repo fails closed.
 fn operands_name_only(args: &[&str], cmd: &ParsedCommand, member: &str) -> bool {
     if cmd.command == "api" {
         return true;
     }
-    let same = |host: &str, owner: &str, repo: &str| {
-        !owner.is_empty()
+    let mut words = positional_operands(args);
+    for (i, a) in args.iter().enumerate() {
+        if ISSUE_REF_FLAGS.contains(a) {
+            words.extend(args.get(i + 1).copied());
+        } else if let Some((flag, v)) = a.split_once('=')
+            && ISSUE_REF_FLAGS.contains(&flag)
+        {
+            words.push(v);
+        }
+    }
+    words.into_iter().all(|w| {
+        let lower = w.to_ascii_lowercase();
+        if !lower.starts_with("http:") && !lower.starts_with("https:") {
+            return true;
+        }
+        let Some((_, rest)) = w.split_once("://") else {
+            return false;
+        };
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host.split(':').next().unwrap_or(host);
+        let mut seg = path.split('/');
+        let (owner, repo) = (seg.next().unwrap_or(""), seg.next().unwrap_or(""));
+        !host.is_empty()
+            && !owner.is_empty()
             && !repo.is_empty()
             && member_name(host, &format!("{owner}/{repo}")).eq_ignore_ascii_case(member)
-    };
-    positional_operands(args).into_iter().all(|op| {
-        if let Some((_, rest)) = op.split_once("://") {
-            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-            let host = authority.rsplit('@').next().unwrap_or(authority);
-            let host = host.split(':').next().unwrap_or(host);
-            let mut seg = path.split('/');
-            same(host, seg.next().unwrap_or(""), seg.next().unwrap_or(""))
-        } else if let Some((path, _)) = op.split_once('#')
-            && path.contains('/')
-        {
-            match path.split('/').collect::<Vec<_>>()[..] {
-                [owner, repo] => same(DEFAULT_GH_HOST, owner, repo),
-                [host, owner, repo] => same(host, owner, repo),
-                _ => false,
-            }
-        } else {
-            true
-        }
     })
 }
 
@@ -3414,8 +3434,12 @@ fn gate_with_scope_resolver_for(
     real_git: Option<&Path>,
 ) -> Result<GateApproval, Refusal> {
     let approval = gate_decision(args, policy, hosts, resolve_scope, real_git)?;
+    // Writes only: a read by URL follows the same cross-repo read policy as
+    // the equivalent `-R` read, which the pin does not restrict either.
     if let Some(pin) = approval.repo_scope.as_deref()
         && let Some(cmd) = parse_command(args)
+        && (approval.check_merge_protection
+            || evaluate_with_policy(&cmd, policy.allow_api_write).decision == Decision::ScopeCheck)
     {
         let (host, repo) = split_member(pin);
         let member = member_name(host, repo);
@@ -3423,8 +3447,8 @@ fn gate_with_scope_resolver_for(
             return Err(Refusal {
                 headline: "'gh' was given a URL operand for another repository.".to_string(),
                 guidance: format!(
-                    "gh takes the repository from a URL operand before -R. \
-                     Use a number, or a URL for {member}."
+                    "gh takes the repository from a URL before -R. Pass a number, \
+                     or a URL in {member}, as the operand and in issue reference flags."
                 ),
                 agent_note: &[RESTRICTED, NOTE],
             });
@@ -10500,8 +10524,80 @@ mod tests {
                 &["issue", "comment", "https://github.com/evil/repo/issues/1"],
                 false,
             ),
-            (&["issue", "edit", "evil/repo#1"], false),
-            (&["issue", "close", "github.com/evil/repo#1"], false),
+            // gh's gated finders do not read `OWNER/REPO#N`; it is not a selector.
+            (&["issue", "edit", "evil/repo#1"], true),
+            (&["label", "create", "area/x#1"], true),
+            (&["pr", "comment", "https:/evil/repo/pull/1"], false),
+            (&["pr", "comment", "HTTPS:evil/repo"], false),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--parent",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue=https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-blocking",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--remove-blocked-by",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "create",
+                    "--parent",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "close",
+                    "1",
+                    "--duplicate-of",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--parent",
+                    "https://github.com/good/repo/issues/2",
+                ],
+                true,
+            ),
+            (&["issue", "edit", "1", "--parent", "7"], true),
             (
                 &["issue", "develop", "https://github.com/evil/repo/issues/1"],
                 false,
@@ -10510,7 +10606,10 @@ mod tests {
                 &["pr", "comment", "https://github.com/good/repo/pull/1"],
                 true,
             ),
-            (&["issue", "close", "Good/Repo#1"], true),
+            (
+                &["issue", "close", "https://github.com/Good/Repo/issues/1"],
+                true,
+            ),
             (&["pr", "comment", "12"], true),
         ] {
             let cmd = parse_command(a).unwrap();
@@ -10521,15 +10620,27 @@ mod tests {
         // issue transfer and lock are blocked outright.
         assert!(gated(&["issue", "transfer", foreign, "good/repo", "-R", "good/repo"]).is_err());
         assert!(gated(&["issue", "lock", foreign, "-R", "good/repo"]).is_err());
-        // A read in the allow tier is pinned too, so it gets the same check.
-        let view = [
-            "pr",
-            "view",
-            "https://github.com/evil/repo/pull/1",
-            "-R",
-            "good/repo",
-        ];
-        assert!(gated(&view).is_err_and(|r| r.headline.contains("URL operand")));
+        // A read by URL is treated like the same read with `-R`.
+        for (url, r) in [
+            (
+                ["pr", "view", "https://github.com/evil/repo/pull/1"],
+                ["pr", "view", "1", "-R", "evil/repo"],
+            ),
+            (
+                ["pr", "diff", "https://github.com/evil/repo/pull/1"],
+                ["pr", "diff", "1", "-R", "evil/repo"],
+            ),
+            (
+                ["issue", "view", "https://github.com/evil/repo/issues/1"],
+                ["issue", "view", "1", "-R", "evil/repo"],
+            ),
+        ] {
+            assert_eq!(gated(&url).is_ok(), gated(&r).is_ok(), "{url:?}");
+            assert!(gated(&url).is_ok(), "{url:?}");
+        }
+        // A write by URL with a foreign `--parent` is refused.
+        let a = ["issue", "edit", "1", "--parent", foreign, "-R", "good/repo"];
+        assert!(gated(&a).is_err_and(|r| r.headline.contains("URL operand")));
         // Merge goes through the allow_pr_merge branch, not the plain scope check.
         let merge = GatePolicy {
             allow_pr_merge: true,
