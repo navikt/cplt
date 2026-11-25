@@ -739,12 +739,21 @@ impl Endpoint {
             );
         }
         let mut cmd = self.command();
-        let Ok(mut child) = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        else {
+        // On macOS std makes pipes with pipe() and sets FD_CLOEXEC after, so a
+        // concurrent spawn can inherit this curl's stdin write end. curl reads
+        // `-K -` to EOF and then waits on the other curl: one spawn at a time.
+        // shortcut: covers only spawns here, not other threads; upgrade if those race too.
+        static SPAWN: Mutex<()> = Mutex::new(());
+        let spawned = {
+            let _one = SPAWN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        };
+        let Ok(mut child) = spawned else {
             reply(&mut client, "502 Bad Gateway");
             flush(&mut filter);
             return log.line(
