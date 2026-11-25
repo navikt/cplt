@@ -12743,3 +12743,75 @@ fn every_hinted_config_command_pastes_and_works() {
     );
     assert!(checked >= 20, "only {checked} hinted commands checked");
 }
+
+/// An `allow.read`/`allow.write` inside a credential directory, or of a
+/// registry file, is re-allowed after the deny rules unless a `deny.paths`
+/// entry covers it: then the deny wins, as on Linux (#1222).
+#[test]
+fn a_deny_path_beats_credential_dir_and_registry_file_grants() {
+    let read = vec![
+        PathBuf::from("/Users/test/.aws/config"),
+        PathBuf::from("/Users/test/.npmrc"),
+    ];
+    let write = vec![PathBuf::from("/Users/test/.kube/cache")];
+    let aws = r#"(allow file-read* (subpath "/Users/test/.aws/config"))"#;
+    let npmrc = r#"(allow file-read* (literal "/Users/test/.npmrc"))"#;
+    let kube = r#"(allow file-write* (subpath "/Users/test/.kube/cache"))"#;
+    let gen_with = |deny: &[PathBuf]| {
+        generate_profile(
+            &SandboxConfig {
+                extra_read: &read,
+                extra_write: &write,
+                extra_deny: deny,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    };
+
+    // `emit_user_allows` emits the plain grant before the denies too; the
+    // re-allow after them is the extra occurrence that must go.
+    let n = |p: &str, rule: &str| p.matches(rule).count();
+    let open = gen_with(&[]);
+    // Exact path, ancestor and an unrelated deny.
+    let deny = vec![
+        PathBuf::from("/Users/test/.aws/config"),
+        PathBuf::from("/Users/test/.kube"),
+        PathBuf::from("/Users/test/elsewhere"),
+    ];
+    let denied = gen_with(&deny);
+    for rule in [aws, kube] {
+        assert_eq!(n(&open, rule), 2, "{rule}\n{open}");
+        assert_eq!(n(&denied, rule), 1, "{rule} beats the deny\n{denied}");
+    }
+    assert_eq!(n(&open, npmrc), 1, "{open}");
+    assert_eq!(n(&denied, npmrc), 1, "an unrelated deny withholds nothing");
+    let denied = gen_with(&[PathBuf::from("/Users/test/.npmrc")]);
+    assert_eq!(n(&denied, npmrc), 0, "~/.npmrc beats the deny\n{denied}");
+}
+
+/// A `deny.paths` entry strictly inside a credential-dir grant keeps the grant
+/// and is repeated after its re-allow, so the child stays closed while the rest
+/// of the grant works, as bubblewrap's mask does on Linux (#1222).
+#[test]
+fn a_deny_path_inside_a_credential_dir_grant_keeps_the_grant_and_closes_the_child() {
+    let write = vec![PathBuf::from("/Users/test/.kube/cache")];
+    let deny = vec![PathBuf::from("/Users/test/.kube/cache/secret")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            extra_deny: &deny,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let allow = r#"(allow file-write* (subpath "/Users/test/.kube/cache"))"#;
+    let child = r#"(deny file-read* (subpath "/Users/test/.kube/cache/secret"))"#;
+    let last_allow = profile.rfind(allow).expect("re-allow kept");
+    let last_deny = profile.rfind(child).expect("child deny emitted");
+    assert_eq!(profile.matches(allow).count(), 2, "{profile}");
+    assert!(
+        last_deny > last_allow,
+        "child deny must follow the re-allow\n{profile}"
+    );
+}

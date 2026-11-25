@@ -2372,7 +2372,7 @@ fn warn_exec_tool_dir_shadowing(
         ui::warn(&w);
     }
     // Same launch points, after repo proposals and denies are merged.
-    for w in resolved.allow_deny_overlap_warnings(home_dir) {
+    for w in resolved.allow_deny_overlap_warnings() {
         ui::warn(&w);
     }
 }
@@ -12932,16 +12932,16 @@ fn run_config_set_via(
     }
     // Warn about an allow/deny overlap as soon as it is written, not only at
     // the next launch. Global layer only; the launch check covers the rest.
-    if !unset && !local && matches!(key, "allow.read" | "allow.write" | "deny.paths") {
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
-        if let Some(r) = config::Config::load_file()
+    if !unset
+        && !local
+        && matches!(key, "allow.read" | "allow.write" | "deny.paths")
+        && let Some(r) = config::Config::load_file()
             .ok()
             .flatten()
             .and_then(|c| c.config.merge(config::CliFlags::default()).ok())
-        {
-            for w in r.allow_deny_overlap_warnings(&home) {
-                ui::warn(&w);
-            }
+    {
+        for w in r.allow_deny_overlap_warnings() {
+            ui::warn(&w);
         }
     }
 

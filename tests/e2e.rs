@@ -502,9 +502,11 @@ mod e2e_tests {
         assert!(output.status.success(), "{stderr}");
         assert!(
             stderr.contains(&format!(
-                "allow.read {} overlaps deny.paths {}: the deny wins",
+                "allow.read {} overlaps deny.paths {}: {} is denied and the rest of {} stays granted",
                 outer.display(),
-                inner.display()
+                inner.display(),
+                inner.display(),
+                outer.display()
             )),
             "{stderr}"
         );
