@@ -305,6 +305,21 @@ impl Shared {
 }
 
 impl Broker {
+    /// The socket path an inspect-only run (`--print-profile`) plans with in
+    /// place of [`Self::start`], which binds, sweeps and creates dirs (#1220).
+    /// The name is a placeholder; a real session dir is random anyway.
+    #[must_use]
+    pub fn planned_socket() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        let dir = Path::new(crate::sandbox::PLAYWRIGHT_SOCKET_ROOT).join(format!(
+            "{}inspect-only",
+            crate::sandbox::PLAYWRIGHT_SOCKET_DIR_PREFIX
+        ));
+        #[cfg(not(target_os = "macos"))]
+        let dir = Path::new("/tmp").join("cplt-mcp-inspect-only");
+        dir.join("m")
+    }
+
     /// Bind the socket and serve `specs`. The child's egress goes through the
     /// proxy on `proxy_port`, whose allowlist already holds the specs' hosts.
     /// `open_domains`: the session's `proxy.allow_private_domains`, which

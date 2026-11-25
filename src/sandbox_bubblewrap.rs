@@ -417,6 +417,26 @@ pub(crate) fn test_functionality(
         return Err("bwrap test failed: forced by test".to_string());
     }
     let mut args = build_bwrap_args(fs_rules, overlays, deny_masks);
+    // Inspect names the placeholder without creating it (#1198). Probe the
+    // same plan with `/dev/null`, which always exists, as the file-mask source
+    // and without the placeholder's self-mask, so availability is judged as a
+    // launch judges it and the printed plan keeps the launch's shape.
+    if let Some(ph) = deny_masks
+        .placeholder
+        .as_deref()
+        .filter(|p| p.symlink_metadata().is_err())
+    {
+        let ph = ph.to_string_lossy();
+        if let Some(i) = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == ph && w[2] == ph)
+        {
+            args.drain(i..i + 3);
+        }
+        for a in args.iter_mut().filter(|a| **a == ph) {
+            *a = "/dev/null".to_string();
+        }
+    }
     #[cfg(test)]
     if FAIL_PROBE_ON.with_borrow(|on| on.as_ref().is_some_and(|a| args.contains(a))) {
         return Err("bwrap test failed: bwrap: forced by test".to_string());
@@ -1011,17 +1031,10 @@ impl DenyMasks {
 /// tree (`landlock_mod::credential_links`, #551), counted in neither total.
 /// One that cannot be masked is not put in `skipped`, which reports the
 /// user's deny paths; the caller asks [`DenyMasks::covers`] and warns itself.
-pub(crate) fn build_deny_masks(
-    extra_deny: &[PathBuf],
-    socket_masks: &[PathBuf],
-    credentials: &[CredentialLink],
-    scratch_dir: Option<&Path>,
-) -> DenyMasks {
-    plan_deny_masks(extra_deny, socket_masks, credentials, scratch_dir, false)
-}
-
-/// [`build_deny_masks`], but with `inspect_only` the placeholder is only
-/// named, never created: inspect writes nothing to the host (#1198).
+///
+/// With `inspect_only` the placeholder is only named, never created: inspect
+/// writes nothing to the host (#1198), and [`test_functionality`] probes
+/// without it.
 pub(crate) fn plan_deny_masks(
     extra_deny: &[PathBuf],
     socket_masks: &[PathBuf],
@@ -1183,6 +1196,17 @@ pub(crate) fn plan_deny_masks(
         credential_dirs,
         user_denied: user_canon,
     }
+}
+
+/// [`plan_deny_masks`] for a launch, as the tests call it.
+#[cfg(test)]
+pub(crate) fn build_deny_masks(
+    extra_deny: &[PathBuf],
+    socket_masks: &[PathBuf],
+    credentials: &[CredentialLink],
+    scratch_dir: Option<&Path>,
+) -> DenyMasks {
+    plan_deny_masks(extra_deny, socket_masks, credentials, scratch_dir, false)
 }
 
 const MASK_PLACEHOLDER: &str = "deny-mask";

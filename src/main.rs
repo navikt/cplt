@@ -8262,7 +8262,11 @@ fn assemble_sandbox(
     // Pre-create agent directories before entering sandbox.
     // Agents like OpenCode crash if their data/config dirs don't exist,
     // and the sandbox may block mkdir on parent paths.
-    for dir in agent_dirs.iter().filter(|_| !opts.inspect_only) {
+    // Never a file grant: `~/.claude.json` made as a directory breaks Claude.
+    for dir in agent_dirs
+        .iter()
+        .filter(|d| !opts.inspect_only && !d.is_file)
+    {
         if !dir.path.exists() {
             let _ = std::fs::create_dir_all(&dir.path);
         }
@@ -8578,6 +8582,9 @@ fn assemble_sandbox(
     let policy = sandbox::generate_policy(&sandbox_config);
     // The broker socket is added after this, so the policy it is judged by
     // is the session's own. Bound for `--print-profile` too.
+    // Inspect-only runs start no broker (#1220): it binds a socket, sweeps
+    // and creates host dirs. They plan with the socket path it would serve.
+    let broker_planned = std::cell::Cell::new(false);
     let mcp_broker = opts.mcp.and_then(|found| {
         let mut found = cplt::mcp_broker::Detected {
             specs: found.specs.clone(),
@@ -8609,6 +8616,10 @@ fn assemble_sandbox(
             // left OAuth links going nowhere with nothing on screen.
             if let Some(p) = cplt::mcp_broker::opener_config_writable(&policy, home_dir) {
                 ui::warn(&opener_writable_warning(&p));
+                return None;
+            }
+            if opts.inspect_only {
+                broker_planned.set(true);
                 return None;
             }
             return cplt::mcp_broker::Broker::start(
@@ -8646,6 +8657,10 @@ fn assemble_sandbox(
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+            return None;
+        }
+        if opts.inspect_only {
+            broker_planned.set(true);
             return None;
         }
         let broker = cplt::mcp_broker::Broker::start(
@@ -8701,7 +8716,13 @@ fn assemble_sandbox(
     sandbox_config.worktree_socket = worktree_broker
         .as_ref()
         .map(cplt::worktree_broker::Broker::socket);
-    sandbox_config.mcp_socket = mcp_broker.as_ref().map(cplt::mcp_broker::Broker::socket);
+    let planned_socket = broker_planned
+        .get()
+        .then(cplt::mcp_broker::Broker::planned_socket);
+    sandbox_config.mcp_socket = mcp_broker
+        .as_ref()
+        .map(cplt::mcp_broker::Broker::socket)
+        .or(planned_socket.as_deref());
     sandbox_config.restrict_oauth_bind = mcp_broker
         .as_ref()
         .is_some_and(cplt::mcp_broker::Broker::holds_oauth_port);

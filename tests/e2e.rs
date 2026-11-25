@@ -261,10 +261,12 @@ mod e2e_tests {
         out
     }
 
-    /// #1198, #1215: inspect commands write nothing to HOME or any XDG dir.
-    /// `cplt check` runs live probes, so it gets a real scratch dir (removed
-    /// on drop) and stages a probe binary in `~/.cache`; both bases exist on
-    /// any used machine and are made up front, so only new files count.
+    /// #1198, #1215, #1220: inspect commands write nothing to HOME or any
+    /// XDG dir. `--print-profile` runs on an empty HOME, so a scratch dir,
+    /// agent dir, MCP temp base or gh state it created would show. `cplt
+    /// check` runs live probes, so it gets a real scratch dir (removed on
+    /// drop) and stages a probe binary in `~/.cache`; both bases exist on any
+    /// used machine and are made before it runs, so only new files count.
     #[test]
     fn e2e_inspect_commands_leave_home_untouched() {
         let tmp = crate::common::home_temp_dir("inspect");
@@ -272,10 +274,12 @@ mod e2e_tests {
         let home = root.join("home");
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(home.join(".cache")).unwrap();
-        std::fs::create_dir_all(cplt::scratch::ScratchDir::base(&home)).unwrap();
-        let before = tree(&root);
-        for args in [&["--print-profile"][..], &["check"][..]] {
+        std::fs::create_dir_all(&home).unwrap();
+        // Its own repo: `home_temp_dir` sits in the developer's HOME, which
+        // may itself be a checkout the project would otherwise resolve to.
+        assert!(crate::common::git_ok(&project, &["init", "--quiet"]));
+        let run = |args: &[&str]| {
+            let before = tree(&root);
             let out = cplt_cmd()
                 .args(args)
                 .current_dir(&project)
@@ -291,12 +295,17 @@ mod e2e_tests {
                 .output()
                 .expect("binary should run");
             assert!(
-                out.status.code().is_some(),
-                "{args:?} was killed: {}",
+                out.status.success(),
+                "{args:?} failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
             assert_eq!(tree(&root), before, "{args:?} wrote to the host");
-        }
+        };
+        run(&["--print-profile"]);
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(cplt::scratch::ScratchDir::base(&home)).unwrap();
+        run(&["check"]);
     }
 
     #[test]

@@ -286,6 +286,10 @@ pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<
 /// `config_dir` pins gh to the dir that was checked, so the lookup reads it.
 #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
 fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> Option<String> {
+    // gh writes `$XDG_STATE_HOME/gh/device-id` on any run. A lookup is not a
+    // reason to write the host (`--print-profile` writes nothing, #1220), so
+    // gh gets a private state dir that is removed after the lookup.
+    let state = tempfile::tempdir().ok()?;
     let probe = |no_refresh: bool| {
         let mut cmd = std::process::Command::new(gh);
         cmd.args(["auth", "token", "--hostname", "github.com"]);
@@ -298,6 +302,7 @@ fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> 
         if let Some(dir) = config_dir {
             cmd.env("GH_CONFIG_DIR", dir);
         }
+        cmd.env("XDG_STATE_HOME", state.path());
         for var in AUTH_ENV_VARS {
             cmd.env_remove(var);
         }
