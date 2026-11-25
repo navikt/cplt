@@ -481,6 +481,35 @@ mod e2e_tests {
         );
     }
 
+    /// An `allow.read` over a `deny.paths` entry is warned about at launch,
+    /// naming both entries and which one wins.
+    #[test]
+    fn e2e_allow_read_over_deny_path_warns() {
+        let project = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let inner = outer.join("secret");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        let output = cplt_cmd()
+            .args(["--project-dir", &project.path().to_string_lossy()])
+            .args(["--allow-read", &outer.to_string_lossy()])
+            .args(["--deny-path", &inner.to_string_lossy()])
+            .arg("--print-profile")
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(&outer);
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "allow.read {} overlaps deny.paths {}: the deny wins",
+                outer.display(),
+                inner.display()
+            )),
+            "{stderr}"
+        );
+    }
+
     #[test]
     fn e2e_allow_read_appears_in_profile() {
         // Create a temp dir outside the project to allow-read

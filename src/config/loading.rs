@@ -1171,6 +1171,48 @@ impl Resolved {
             .collect()
     }
 
+    /// One warning per `allow.read`/`allow.write` entry that overlaps a
+    /// `deny.paths` entry (same path, ancestor or descendant), naming both and
+    /// which one wins on this platform. Both lines are honoured as far as the
+    /// backend allows; the warning exists so neither is believed in full.
+    #[must_use]
+    pub fn allow_deny_overlap_warnings(&self, home: &Path) -> Vec<String> {
+        let deny: Vec<String> = self
+            .deny_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let mut out = Vec::new();
+        for (key, list) in [
+            ("allow.read", &self.allow_read),
+            ("allow.write", &self.allow_write),
+        ] {
+            for (allow, denies) in grants_overlapping(list, &deny) {
+                for d in denies {
+                    let winner = if cfg!(target_os = "macos")
+                        && crate::sandbox::allow_outranks_user_deny(
+                            home,
+                            &allow,
+                            self.protect_pnpm_config,
+                        ) {
+                        "on macOS the allow wins where they overlap, while on Linux with \
+                         bubblewrap the deny wins"
+                    } else if cfg!(target_os = "linux") {
+                        "the deny wins where they overlap (deny.paths needs bubblewrap on Linux)"
+                    } else {
+                        "the deny wins where they overlap"
+                    };
+                    out.push(format!(
+                        "{key} {} overlaps deny.paths {d}: {winner}. \
+                         Remove one of the two entries to make the intent explicit.",
+                        allow.display()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Print comprehensive sandbox configuration summary to stderr.
     ///
     /// The full table shows every effective setting, defaults included, when
@@ -3108,6 +3150,59 @@ validate = false
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// An allow entry overlapping a deny entry in either direction is warned
+    /// about, naming both; a sibling sharing a string prefix is not.
+    #[test]
+    fn allow_deny_overlap_is_warned_in_every_direction() {
+        let home = PathBuf::from("/nonexistent-home-overlap");
+        let warn = |read: &[&str], write: &[&str], deny: &[&str]| {
+            let mut r = Config::default()
+                .merge(CliFlags::default())
+                .expect("default config merges");
+            r.allow_read = read.iter().map(PathBuf::from).collect();
+            r.allow_write = write.iter().map(PathBuf::from).collect();
+            r.deny_paths = deny.iter().map(PathBuf::from).collect();
+            r.allow_deny_overlap_warnings(&home)
+        };
+        // exact path
+        let w = warn(&["/w/a"], &[], &["/w/a"]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("allow.read /w/a overlaps deny.paths /w/a"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("the deny wins"), "{w:?}");
+        // parent allow over child deny
+        let w = warn(&[], &["/w"], &["/w/secret"]);
+        assert!(
+            w[0].contains("allow.write /w overlaps deny.paths /w/secret"),
+            "{w:?}"
+        );
+        // child allow under parent deny
+        let w = warn(&["/w/a/b"], &[], &["/w/a"]);
+        assert!(
+            w[0].contains("allow.read /w/a/b overlaps deny.paths /w/a"),
+            "{w:?}"
+        );
+        // no overlap: sibling with a shared string prefix
+        assert!(warn(&["/w/ab"], &["/x"], &["/w/a"]).is_empty());
+    }
+
+    /// On macOS a grant inside a credential directory is re-emitted after the
+    /// user denies and wins there; the warning must say so, not claim the deny.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn allow_deny_overlap_names_the_allow_as_winner_for_credential_dir_reallows() {
+        let home = PathBuf::from("/nonexistent-home-overlap");
+        let mut r = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges");
+        r.allow_read = vec![home.join(".aws/config")];
+        r.deny_paths = vec![home.join(".aws/config")];
+        let w = r.allow_deny_overlap_warnings(&home);
+        assert!(w[0].contains("on macOS the allow wins"), "{w:?}");
     }
 
     /// `sandbox.deny_copilot_dir_exec` (#324): an `allow.write` over `~/.copilot`
