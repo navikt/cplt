@@ -3508,6 +3508,16 @@ fn report_unix_socket_regime(
     let v9 = landlock_mod::check_availability().is_ok_and(|abi| abi >= ABI::V9);
     let blocked =
         |p: &Path| v9 || masks.is_some_and(|m| p.canonicalize().is_ok_and(|c| m.covers(&c)));
+    let bus = env_bus_endpoints();
+    if bus.other
+        || (bus.abstract_socket && !landlock_mod::check_availability().is_ok_and(|a| a >= ABI::V6))
+    {
+        crate::ui::warn(
+            "A D-Bus address in the environment names an endpoint that cannot be masked \
+             (abstract socket below Landlock ABI v6, a non-unix transport, or a malformed \
+             entry): the agent may reach that bus.",
+        );
+    }
     if let Some(line) = container_socket_line(
         config.home_dir,
         config.allow_docker,
@@ -3801,6 +3811,23 @@ fn mcp_bus_endpoints() -> BusEndpoints {
     bus
 }
 
+/// Every bus the environment names (`DBUS_SESSION_BUS_ADDRESS`,
+/// `DBUS_SYSTEM_BUS_ADDRESS`): a bus may listen anywhere, not only under the
+/// runtime dir, so each pathname endpoint gets its own mask.
+#[cfg(target_os = "linux")]
+fn env_bus_endpoints() -> BusEndpoints {
+    let mut out = BusEndpoints::default();
+    for var in ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"] {
+        if let Ok(a) = std::env::var(var) {
+            let mut b = parse_dbus_address(&a);
+            out.paths.append(&mut b.paths);
+            out.abstract_socket |= b.abstract_socket;
+            out.other |= b.other;
+        }
+    }
+    out
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// The endpoints in a D-Bus address list (`unix:path=/x;unix:abstract=y`).
 pub(crate) fn parse_dbus_address(addr: &str) -> BusEndpoints {
@@ -3810,13 +3837,24 @@ pub(crate) fn parse_dbus_address(addr: &str) -> BusEndpoints {
             out.other = true;
             continue;
         };
+        let mut known = false;
         for (k, v) in keys.split(',').filter_map(|kv| kv.split_once('=')) {
             match k {
-                "path" | "dir" => out.paths.push(PathBuf::from(dbus_unescape(v))),
-                "abstract" | "tmpdir" => out.abstract_socket = true,
+                "path" | "dir" if !v.is_empty() => {
+                    out.paths.push(PathBuf::from(dbus_unescape(v)));
+                    known = true;
+                }
+                "abstract" | "tmpdir" => {
+                    out.abstract_socket = true;
+                    known = true;
+                }
+                // `$XDG_RUNTIME_DIR/bus`, already masked with the runtime dirs.
+                "runtime" => known = true,
                 _ => {}
             }
         }
+        // Malformed: nothing to mask, so report it rather than drop it.
+        out.other |= !known;
     }
     out
 }
@@ -4344,6 +4382,11 @@ fn bwrap_plan(
         policy::DockerAccess::from_flags(config.allow_docker, config.allow_rootless_docker),
     )
     .into_iter()
+    // Sockets only: a `dir=` entry names a listen directory, not a socket.
+    .chain(env_bus_endpoints().paths.into_iter().filter(|p| {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket())
+    }))
     .chain(if config.mcp_socket.is_some() {
         mcp_bus_endpoints().paths
     } else {
@@ -5605,6 +5648,15 @@ mod tests {
         assert!(parse_dbus_address("unix:tmpdir=/tmp").abstract_socket);
         assert!(parse_dbus_address("tcp:host=localhost,port=1").other);
         assert_eq!(parse_dbus_address(""), BusEndpoints::default());
+        let rt = parse_dbus_address("unix:runtime=yes");
+        assert!(rt.paths.is_empty() && !rt.other && !rt.abstract_socket);
+        let list = parse_dbus_address("unix:abstract=/x;unix:path=/home/u/b%2cus");
+        assert_eq!(list.paths, [PathBuf::from("/home/u/b,us")]);
+        assert!(list.abstract_socket);
+        for bad in ["unix:path", "unix:path=", "unix:guid=1", "garbage"] {
+            let b = parse_dbus_address(bad);
+            assert!(b.paths.is_empty() && b.other, "{bad}");
+        }
     }
 
     #[test]
