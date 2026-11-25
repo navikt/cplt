@@ -6248,14 +6248,17 @@ PY"#;
     fn worktree_broker_is_off_with_deny_masks() {
         require_bwrap!();
         let (project, home) = worktree_fixture();
-        fs::create_dir_all(project.path().join("secret")).unwrap();
-        let deny = project.path().join("secret").to_string_lossy().into_owned();
+        // Outside /tmp, where bubblewrap can mask it.
+        let data = fs::canonicalize(home.path()).unwrap().join("data");
+        fs::create_dir_all(data.join("secret")).unwrap();
+        let grant = data.to_string_lossy().into_owned();
+        let deny = data.join("secret").to_string_lossy().into_owned();
         let (_code, stdout, stderr) = worktree_run_args(
             project.path(),
             home.path(),
             true,
             false,
-            &["--deny-path", &deny],
+            &["--allow-read", &grant, "--deny-path", &deny],
             r#"echo "SOCK=[$CPLT_WORKTREE_SOCKET]""#,
         );
         let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
