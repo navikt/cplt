@@ -720,6 +720,14 @@ fn add_with_budget(
         ),
     )
     .map_err(|e| format!("cannot write staged .git pointer: {e}"))?;
+    // Linux (#965): every protected path exists before publish, so each gets
+    // its read-only bind (config.worktree in the admin dir, empty protected
+    // subtrees in the tree).
+    #[cfg(target_os = "linux")]
+    crate::worktree_ns::ensure_placeholders(
+        &job.worktree,
+        &ctx.common.join("worktrees").join(&admin.name),
+    )?;
     admin.check_identity()?;
     same_directory(
         &open_at(

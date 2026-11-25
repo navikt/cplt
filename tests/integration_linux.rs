@@ -5912,6 +5912,16 @@ finally:
             project.path(),
             &["commit", "-q", "-m", "fixture"]
         ));
+        // With worktreeConfig, host git obeys each worktree's config.worktree.
+        for kv in [
+            ["core.repositoryformatversion", "1"],
+            ["extensions.worktreeConfig", "true"],
+        ] {
+            assert!(crate::common::git_ok(
+                project.path(),
+                &["config", kv[0], kv[1]]
+            ));
+        }
         (project, crate::common::home_temp_dir("wt965"))
     }
 
@@ -5988,6 +5998,8 @@ echo x > "$w/.github/hooks/new.json" && echo "BAD_WRITE new hook"
 echo x > "$w/.git" && echo "BAD_WRITE pointer"
 echo x > "$common/worktrees/{wt}/gitdir" && echo "BAD_WRITE gitdir"
 echo x > "$common/worktrees/{wt}/commondir" && echo "BAD_WRITE commondir"
+printf '[core]\n\thooksPath = /tmp\n' > "$common/worktrees/{wt}/config.worktree" && echo "BAD_WRITE config.worktree"
+echo x > "$w/.opencode/plugins/p.js" && echo "BAD_WRITE missing protected dir"
 mv "$w/.github" "$w/.gh2" && echo "BAD_WRITE rename .github"
 mv "$w" "$r/moved" && echo "BAD_WRITE rename worktree"
 git -C "$PWD" worktree add "$r/plain" HEAD >/dev/null 2>&1 && echo "BAD_WRITE plain add"

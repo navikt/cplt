@@ -102,6 +102,33 @@ fn exists(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
 }
 
+/// Make every path the bind list protects exist, so it is bound rather than
+/// skipped: an empty `config.worktree` in the admin dir (else, with
+/// `extensions.worktreeConfig`, the agent could create one that host git
+/// obeys) and an empty directory for each missing protected subtree (git does
+/// not track empty directories). Missing protected FILES other than
+/// `config.worktree` (`.cplt.toml`, `.claude/settings.json`, `opencode.json`)
+/// are not created, because a placeholder would show as untracked: the same
+/// gap the project has.
+pub fn ensure_placeholders(worktree: &Path, admin: &Path) -> Result<(), String> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(admin.join("config.worktree"))
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("cannot create config.worktree placeholder: {e}")),
+    }
+    for dir in crate::sandbox::bubblewrap_paths::protected_trees(worktree) {
+        if std::fs::symlink_metadata(&dir).is_err() {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn depth(p: &Path) -> usize {
     p.components().count()
 }
@@ -172,6 +199,7 @@ fn launch_set(root: &Path, common: &Path) -> Result<Vec<(PathBuf, Mode)>, String
             .and_then(|t| Path::new(t.trim()).parent().map(Path::to_path_buf));
         match wt {
             Some(wt) if wt.parent() == Some(root) && exists(&wt) => {
+                ensure_placeholders(&wt, admin)?;
                 set.extend(worktree_set(&wt, admin));
             }
             _ => set.push((admin.clone(), Mode::Rw)),

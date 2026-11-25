@@ -120,6 +120,15 @@ pub(crate) mod bubblewrap_paths {
     pub(crate) fn rename_pins(root: &Path) -> Vec<PathBuf> {
         super::bubblewrap::rename_pin_paths(&[root], &[])
     }
+    /// The protected subtrees (not files) under `root` that bwrap covers.
+    pub(crate) fn protected_trees(root: &Path) -> Vec<PathBuf> {
+        super::policy::PROTECTED_IN_ROOT
+            .iter()
+            .filter(|p| p.tree && p.linux == super::policy::LinuxCoverage::Bwrap)
+            .filter(|p| !p.rel.contains('*'))
+            .map(|p| root.join(p.rel))
+            .collect()
+    }
 }
 #[path = "sandbox_policy.rs"]
 mod policy;

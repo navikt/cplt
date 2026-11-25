@@ -8046,14 +8046,32 @@ fn start_worktree_broker(
                 "sandbox.allow_git_worktrees is on, but the project is not a git repository"
             )
         })?;
-    // Linux (#965): the root's namespace protections apply even if the broker
-    // itself fails to start below.
-    #[cfg(target_os = "linux")]
-    cplt::worktree_ns::register(root, &common);
     let ctx = cplt::worktree_broker::Context::new(&probe.project_dir, &common, root)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     cplt::worktree_broker::Broker::start(ctx)
         .map_err(|e| anyhow::anyhow!("cannot start the worktree broker: {e}"))
+}
+
+/// Linux (#965): register the managed root for its namespace protections, or
+/// fail the launch. The root is only granted together with them, so a failure
+/// here must not leave a writable root without read-only binds.
+#[cfg(any(target_os = "linux", test))]
+fn register_worktree_root(project_dir: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+    let common = cplt::worktrees::repository_common_dir(project_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a git repository", project_dir.display()))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "sandbox.allow_git_worktrees is on, but the managed root cannot be protected: \
+                 {e}. Fix the cause, or turn the key off \
+                 (`cplt config set sandbox.allow_git_worktrees false`)."
+            )
+        })?;
+    #[cfg(target_os = "linux")]
+    cplt::worktree_ns::register(root, &common);
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
+    Ok(common)
 }
 
 /// Create the automatic macOS Playwright socket capability only for exact
@@ -8515,6 +8533,10 @@ fn assemble_sandbox(
     extra_exec.dedup();
     // Started before the profile is built, since the profile grants its socket.
     // Not for a dry check, which must not bind a socket or create the root (#553).
+    #[cfg(target_os = "linux")]
+    if let (Some(root), false) = (opts.repos.worktree_root, opts.inspect_only) {
+        register_worktree_root(&probe.project_dir, root)?;
+    }
     let worktree_broker = match (opts.repos.worktree_root, opts.inspect_only) {
         (Some(root), false) => match start_worktree_broker(probe, root) {
             Ok(broker) => Some(broker),
@@ -16283,6 +16305,20 @@ mod tests {
         .expect("global key outside a repository is skipped");
         assert!(root.is_none());
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
+    }
+
+    /// #965: a managed root that cannot be registered for its Linux
+    /// protections fails the launch instead of being granted unprotected.
+    #[test]
+    fn worktree_root_registration_fails_closed() {
+        let plain = tempfile::tempdir().expect("tempdir");
+        let err = super::register_worktree_root(plain.path(), plain.path())
+            .expect_err("a non-repository cannot be registered");
+        assert!(err.to_string().contains("cannot be protected"), "{err}");
+        assert!(
+            err.to_string().contains("allow_git_worktrees false"),
+            "{err}"
+        );
     }
 
     /// #574 review: the launch path refuses the key off macOS and Linux, for
