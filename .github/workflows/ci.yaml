@@ -730,8 +730,13 @@ jobs:
         run: |
           set -o pipefail
           # The session-bus kernel tests (#1193) need a real bus; they panic
-          # under CPLT_TEST_REQUIRE_SANDBOX=1 without one.
-          sed "s|<listen>.*</listen>|<listen>unix:path=$HOME/cplt-ci-session-bus</listen>|" \
+          # under CPLT_TEST_REQUIRE_SANDBOX=1 without one. The socket sits at
+          # `bus` in a dedicated XDG_RUNTIME_DIR, like a login session's, so the
+          # tests exercise the ordinary runtime-dir mask. Under HOME it would
+          # be reachable below Landlock ABI v9.
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime"
+          mkdir -m 700 -p "$XDG_RUNTIME_DIR"
+          sed "s|<listen>.*</listen>|<listen>unix:path=$XDG_RUNTIME_DIR/bus</listen>|" \
             /usr/share/dbus-1/session.conf > "$RUNNER_TEMP/session.conf"
           dbus-run-session --config-file="$RUNNER_TEMP/session.conf" -- \
             cargo test --no-fail-fast --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
