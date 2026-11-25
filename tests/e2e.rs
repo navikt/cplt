@@ -10162,6 +10162,34 @@ paths = [
         );
     }
 
+    /// #1199: `exec` accepted `--show-denials` and dropped it. It now runs the
+    /// same audited session as an agent launch, denial stream included.
+    #[test]
+    fn e2e_exec_show_denials_streams_denials() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args([
+                "--show-denials",
+                "--no-validate",
+                "exec",
+                "--",
+                "/usr/bin/true",
+            ])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "cplt --show-denials exec should exit 0.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("Streaming sandbox denial logs"),
+            "exec should start the denial stream.\nstderr: {stderr}"
+        );
+    }
+
     /// #1128: `exec` and `doctor` force `quiet`, which used to hide the
     /// "Ignoring <VAR>" warning while the tool failed with a bare EPERM.
     #[test]
