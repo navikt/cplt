@@ -1030,51 +1030,60 @@ impl ScratchDir {
     /// Runs best-effort: errors are logged but don't prevent startup.
     pub fn gc_stale(home_dir: &Path) {
         let base = home_dir.join(SCRATCH_BASE);
-        // The agent can write the tree around its session dir, so the base
-        // may have been swapped for a link: sweep only the real one.
-        let (Ok(home), Ok(canonical)) = (
-            std::fs::canonicalize(home_dir),
-            std::fs::canonicalize(&base),
-        ) else {
+        let Some(base_file) = open_base_from_home(home_dir, &base) else {
             return;
         };
-        if canonical != home.join(SCRATCH_BASE) {
-            ui::warn(&format!(
-                "Skipping cleanup of old scratch dirs: {} resolves to {}, not a plain \
-                 directory under your home, so cplt will not delete anything there. \
-                 No action needed.",
-                base.display(),
-                canonical.display()
-            ));
-            return;
-        }
-        gc_stale_session_dirs(&canonical);
+        gc_stale_session_dirs(&base, &base_file);
     }
 }
 
+/// Open the scratch base by walking each component below the home dir with
+/// `openat(O_DIRECTORY | O_NOFOLLOW)`. The agent can write the tree around
+/// its session dir, so any component may have been swapped for a link; a
+/// path-based open would follow a swapped ancestor even with `O_NOFOLLOW`.
+fn open_base_from_home(home_dir: &Path, base: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut cur = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(home_dir)
+        .ok()?;
+    let parts: Vec<&str> = SCRATCH_BASE.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        let name = std::ffi::CString::new(*part).ok()?;
+        let next = if i + 1 == parts.len() {
+            openat_dir_nofollow(&cur, &name)
+        } else {
+            openat_nofollow(&cur, &name)
+        };
+        cur = match next {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => {
+                ui::warn(&format!(
+                    "Skipping cleanup of old scratch dirs: {} is not a plain directory \
+                     under your home (a link or unreadable), so cplt will not delete \
+                     anything there. No action needed.",
+                    base.display()
+                ));
+                return None;
+            }
+        };
+    }
+    (cur.metadata().ok()?.uid() == unsafe { libc::getuid() }).then_some(cur)
+}
+
 /// Every destructive step is relative to a descriptor opened without
-/// following links, from the base down, so a dir swapped for a symlink at any
-/// level cannot steer a delete or chmod outside the scratch tree.
-fn gc_stale_session_dirs(base: &Path) {
-    use std::os::unix::ffi::OsStrExt;
+/// following links, from the home dir down, so a dir swapped for a symlink at
+/// any level cannot steer a delete or chmod outside the scratch tree.
+fn gc_stale_session_dirs(base: &Path, base_file: &std::fs::File) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
     let uid = unsafe { libc::getuid() };
-    let Ok(base_file) = open_dir_nofollow(base) else {
-        return;
-    };
-    let (Ok(fd_meta), Ok(path_meta)) = (base_file.metadata(), base.symlink_metadata()) else {
-        return;
-    };
-    if fd_meta.uid() != uid || fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino()
-    {
-        return;
-    }
-
     let now = SystemTime::now();
 
-    for c_name in list_dir_at(&base_file) {
+    for c_name in list_dir_at(base_file) {
         let Ok(name) = c_name.to_str() else {
             continue;
         };
@@ -1083,37 +1092,47 @@ fn gc_stale_session_dirs(base: &Path) {
             continue;
         }
         let path = base.join(name);
-        let Ok(metadata) = path.symlink_metadata() else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
-            continue;
-        }
 
         // A session that crashed or was killed never ran `Drop`, so its gh
         // token cache would sit on disk until the 24h sweep. Remove it now
         // when the dir is marked and its lock is free. Unmarked dirs may be
         // live sessions of an older cplt: leave them alone.
         // The agent may have left its TMPDIR read-only (#1054).
-        let Ok(dir) = openat_dir_nofollow(&base_file, &c_name) else {
+        let Ok(dir) = openat_dir_nofollow(base_file, &c_name) else {
             continue;
         };
-        if !dir
-            .metadata()
-            .is_ok_and(|m| m.ino() == metadata.ino() && m.uid() == uid)
-        {
+        let Ok(metadata) = dir.metadata() else {
+            continue;
+        };
+        if metadata.uid() != uid {
             continue;
         }
         let held = session_lock_held_at(&dir);
         if held == Some(false) {
             let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
-            for file in gh_token_files(&path) {
-                let Some(Ok(c_file)) = file
-                    .file_name()
-                    .map(|n| std::ffi::CString::new(n.as_bytes()))
-                else {
+            for c_file in list_dir_at(&dir) {
+                let n = c_file.to_string_lossy();
+                if !(GH_TOKEN_FILES.contains(&n.as_ref())
+                    || n.starts_with(GH_TOKEN_CLAIMED_PREFIX)
+                    || GH_TOKEN_TMP_PREFIXES.iter().any(|p| n.starts_with(p)))
+                {
                     continue;
-                };
+                }
+                // Regular files only: a planted link is left alone.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dir.as_raw_fd(),
+                        c_file.as_ptr(),
+                        &raw mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                    || st.st_mode & libc::S_IFMT != libc::S_IFREG
+                {
+                    continue;
+                }
+                let file = path.join(n.as_ref());
                 if unsafe { libc::unlinkat(dir.as_raw_fd(), c_file.as_ptr(), 0) } != 0 {
                     let e = std::io::Error::last_os_error();
                     if e.kind() != std::io::ErrorKind::NotFound {
@@ -1139,7 +1158,7 @@ fn gc_stale_session_dirs(base: &Path) {
         if let Ok(age) = now.duration_since(modified)
             && age > STALE_AGE
             && held != Some(true)
-            && let Err(e) = remove_tree_at(&base_file, &c_name)
+            && let Err(e) = remove_tree_at(base_file, &c_name)
         {
             ui::warn(&format!(
                 "Warning: cannot remove stale scratch dir {}: {e}",
@@ -3429,6 +3448,26 @@ mod tests {
             "over-deep tree must fail"
         );
         assert!(deep.join("f").exists(), "nothing past the cap is removed");
+    }
+
+    /// A link at an ancestor of the scratch base is not followed either.
+    #[test]
+    fn gc_does_not_follow_a_symlinked_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, rest) = SCRATCH_BASE.split_once('/').unwrap();
+        let victim = tmp.path().join("victim");
+        let stale = victim.join(rest).join("0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("keep"), "x").unwrap();
+        age(&stale, std::time::Duration::from_secs(25 * 3600));
+        std::os::unix::fs::symlink(&victim, tmp.path().join(first)).unwrap();
+
+        ScratchDir::gc_stale(tmp.path());
+
+        assert!(
+            stale.join("keep").exists(),
+            "gc followed a symlinked ancestor"
+        );
     }
 
     #[test]

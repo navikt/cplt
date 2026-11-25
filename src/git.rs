@@ -706,6 +706,19 @@ fn subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
 /// may run a `.gitattributes`-selected filter or diff driver.
 fn reads_worktree_content(args: &[&str]) -> bool {
     match subcommand(args) {
+        // Plain `ls-files` lists the index and never refreshes it, so no
+        // filter runs. Options that stat or compare the worktree do not
+        // get the exemption.
+        Some("ls-files") => args.iter().any(|a| {
+            a.starts_with("-m")
+                || a.starts_with("-d")
+                || a.starts_with("-k")
+                || a.starts_with("--modified")
+                || a.starts_with("--deleted")
+                || a.starts_with("--killed")
+                || a.starts_with("--debug")
+                || a.starts_with("--eol")
+        }),
         Some(sub) => !CONTENT_FREE_SUBCOMMANDS.contains(&sub),
         // No subcommand at all (`git --version`): nothing to read. Still
         // treated as content-reading — fail closed, cost is one config read.

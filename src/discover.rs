@@ -1893,22 +1893,34 @@ fn worktree_common_dir(project_dir: &Path) -> Result<Option<PathBuf>, PathBuf> {
     if resolved != git_dir && !is_worktree_layout {
         return Ok(None);
     }
-    // A `.git` *file* in the project is a pointer the agent can write. Honour
-    // it only when the git dir it names is inside the project, or is a linked
-    // worktree's admin dir whose `gitdir` file (written by git, outside the
-    // project) points back at this project's `.git`. Anything else would let
-    // the next launch grant read+write on an unrelated repository. A project
-    // without its own `.git` (a subdirectory of a repo) is not affected.
-    let pointer = std::fs::symlink_metadata(&local).is_ok_and(|m| m.is_file());
-    let project = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
-    if pointer && !git_dir.starts_with(&project) {
+    // A `.git` file (or link) at the checkout root is a pointer the agent may
+    // have written, from this project dir or an earlier launch one level up.
+    // Honour it only when the git dir it names is inside that checkout, or is
+    // a linked worktree's admin dir whose `gitdir` file (written by git,
+    // outside the project) points back at the `.git` file. A link is never
+    // authenticated that way: its target can be another checkout's own
+    // pointer. Anything else would grant read+write on an unrelated repo.
+    let top = crate::git::output(project_dir, &["rev-parse", "--show-toplevel"])
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .unwrap_or_else(|| {
+            std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf())
+        });
+    let entry = top.join(".git");
+    let meta = std::fs::symlink_metadata(&entry);
+    let is_link = meta.as_ref().is_ok_and(|m| m.file_type().is_symlink());
+    let pointer = is_link || meta.as_ref().is_ok_and(std::fs::Metadata::is_file);
+    if pointer && !git_dir.starts_with(&top) {
+        if is_link {
+            return Err(git_dir);
+        }
         let back = crate::untrusted::read_untrusted(&git_dir.join("gitdir"), 4096)
             .ok()
             .flatten()
             .map(|s| PathBuf::from(s.trim()))
             .and_then(|p| std::fs::canonicalize(p).ok());
-        let local = std::fs::canonicalize(&local).ok();
-        if !(is_worktree_layout && back.is_some() && back == local) {
+        if !(is_worktree_layout && back.is_some() && back == std::fs::canonicalize(&entry).ok()) {
             return Err(git_dir);
         }
     }
@@ -2305,6 +2317,52 @@ mod tests {
             (None, None),
             "an explicit --allow-write is the recovery and silences the warning"
         );
+    }
+
+    /// The pointer check also covers a launch from a subdirectory, and a
+    /// `.git` that is a link to a pointer file.
+    #[test]
+    fn git_common_dir_refuses_a_foreign_pointer_from_a_subdir_or_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = &std::fs::canonicalize(tmp.path()).expect("canonicalize tmp");
+        let home = home.as_path();
+        let other = home.join("other");
+        std::fs::create_dir_all(&other).expect("mkdir other");
+        if !git_in(&other, &["init", "-q", "-b", "main"]) {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        let pointer = format!("gitdir: {}\n", other.join(".git").display());
+
+        let project = home.join("project");
+        std::fs::create_dir_all(project.join("sub")).expect("mkdir sub");
+        std::fs::write(project.join(".git"), &pointer).expect("write .git");
+        let (grant, problem) = git_common_dir(home, &project.join("sub"), &[]);
+        assert_eq!(
+            grant, None,
+            "subdir launch must not grant a foreign pointer"
+        );
+        assert!(problem.is_some(), "subdir refusal must be reported");
+
+        let linked = home.join("linked");
+        std::fs::create_dir_all(&linked).expect("mkdir linked");
+        // The link names another checkout's real worktree pointer, whose
+        // admin dir points back at that file, not at this project.
+        std::fs::write(other.join("f"), "x").expect("write");
+        assert!(git_in(&other, &["add", "-A"]), "git add");
+        assert!(git_in(&other, &["commit", "-qm", "init"]), "git commit");
+        let wt = home.join("other-wt");
+        assert!(
+            git_in(
+                &other,
+                &["worktree", "add", "-q", "-b", "feat", &wt.to_string_lossy()]
+            ),
+            "git worktree add"
+        );
+        std::os::unix::fs::symlink(wt.join(".git"), linked.join(".git")).expect("symlink");
+        let (grant, problem) = git_common_dir(home, &linked, &[]);
+        assert_eq!(grant, None, "a linked .git must not grant a foreign repo");
+        assert!(problem.is_some(), "link refusal must be reported");
     }
 
     /// The layout check must not break the case it exists to allow: a real
