@@ -7359,6 +7359,7 @@ mod tests {
             bubblewrap::Overlays::default(),
             &bubblewrap::DenyMasks::default(),
             false,
+            false,
         );
         let state = crate::doctor::bubblewrap_state(None, false, &config, &[]);
         let launch = prepare(&config).expect("prepare");

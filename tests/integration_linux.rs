@@ -1487,6 +1487,59 @@ else:
         assert_eq!(code, 0, "Normal read/write/fork/exec should work");
     }
 
+    /// #1191: nested user/mount namespaces are refused. `unshare -U` goes
+    /// through unshare(2); the python probe issues raw `clone` with
+    /// CLONE_NEWUSER / CLONE_NEWNS (EPERM) and `clone3` (ENOSYS, so libc falls
+    /// back), and checks a plain fork-style clone still works.
+    const NESTED_NS_PROBE: &str = r#"
+        unshare -U true 2>/dev/null && echo 'UNSHARE_ALLOWED' || echo 'UNSHARE_BLOCKED'
+        python3 -c "
+import ctypes, os, platform, signal
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+CLONE, CLONE3 = {'x86_64': (56, 435), 'aarch64': (220, 435)}[platform.machine()]
+CLONE_NEWNS, CLONE_NEWUSER = 0x20000, 0x10000000
+def clone(flags):
+    r = libc.syscall(CLONE, ctypes.c_ulong(flags | signal.SIGCHLD), 0, 0, 0, 0)
+    if r == 0:
+        os._exit(0)
+    if r > 0:
+        os.waitpid(r, 0)
+        return 'OK'
+    return os.strerror(ctypes.get_errno())
+print('NEWUSER', clone(CLONE_NEWUSER))
+print('NEWNS', clone(CLONE_NEWNS))
+print('PLAIN', clone(0))
+r = libc.syscall(CLONE3, 0, 0)
+print('CLONE3', os.strerror(ctypes.get_errno()) if r < 0 else 'OK')
+"
+    "#;
+
+    fn assert_nested_ns_blocked(stdout: &str) {
+        let (eperm, enosys) = ("Operation not permitted", "Function not implemented");
+        assert!(stdout.contains("UNSHARE_BLOCKED"), "{stdout}");
+        assert!(stdout.contains(&format!("NEWUSER {eperm}")), "{stdout}");
+        assert!(stdout.contains(&format!("NEWNS {eperm}")), "{stdout}");
+        assert!(stdout.contains("PLAIN OK"), "{stdout}");
+        assert!(stdout.contains(&format!("CLONE3 {enosys}")), "{stdout}");
+    }
+
+    #[test]
+    fn seccomp_blocks_nested_namespaces() {
+        require_landlock!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let (_, stdout, stderr) = run_sandboxed(project.path(), NESTED_NS_PROBE);
+        assert!(
+            stdout.contains("PLAIN"),
+            "probe did not run: {stdout} {stderr}"
+        );
+        assert_nested_ns_blocked(&stdout);
+    }
+
     // ── Terminal-injection ioctls (GHSA-q3p2-6x2x-8w8w, CVE-2017-5226) ──
     //
     // A sandboxed agent can `ioctl(fd0, TIOCSTI, &c)` on its inherited
@@ -3892,6 +3945,22 @@ except PermissionError:
                 || stdout.contains("not permitted"),
             "unshare must stay seccomp-blocked inside bwrap: {stdout}"
         );
+    }
+
+    #[test]
+    fn bwrap_blocks_nested_namespaces() {
+        require_bwrap!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let (_, stdout, stderr) = run_sandboxed_bwrap(project.path(), NESTED_NS_PROBE);
+        assert!(
+            stdout.contains("PLAIN"),
+            "probe did not run: {stdout} {stderr}"
+        );
+        assert_nested_ns_blocked(&stdout);
     }
 
     // ── Bubblewrap capability probes (issue #113) ─────────────────

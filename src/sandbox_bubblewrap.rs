@@ -411,6 +411,7 @@ pub(crate) fn test_functionality(
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
     netns: bool,
+    disable_userns: bool,
 ) -> Result<(), String> {
     #[cfg(test)]
     if FAIL_PROBE.get() {
@@ -423,6 +424,9 @@ pub(crate) fn test_functionality(
     }
     if netns {
         args.push("--unshare-net".to_string());
+    }
+    if disable_userns {
+        args.push("--disable-userns".to_string());
     }
     args.push("--".to_string());
     args.push("/bin/true".to_string());
@@ -1479,6 +1483,24 @@ pub(crate) fn resolve(
     }
 }
 
+/// Whether this bwrap accepts `--disable-userns` (bubblewrap 0.8+).
+///
+/// The flag caps nested user namespaces inside the sandbox at zero, a second
+/// layer behind the seccomp clone/unshare deny (#1191). Older bwrap rejects
+/// unknown options, so it is passed only when `--help` lists it; without it
+/// seccomp alone still refuses nested namespaces.
+#[allow(clippy::disallowed_methods)] // bwrap_path comes from git::trusted_binary("bwrap")
+fn supports_disable_userns(bwrap_path: &Path) -> bool {
+    Command::new(bwrap_path)
+        .arg("--help")
+        .output()
+        .is_ok_and(|o| help_lists_disable_userns(&String::from_utf8_lossy(&o.stdout)))
+}
+
+fn help_lists_disable_userns(help: &str) -> bool {
+    help.split_whitespace().any(|w| w == "--disable-userns")
+}
+
 pub(crate) fn build_wrapper(
     policy: &LandlockPolicy,
     overlays: Overlays<'_>,
@@ -1493,10 +1515,21 @@ pub(crate) fn build_wrapper(
         )
     })?;
     let bind_rules = mount_rules(policy);
-    test_functionality(&bwrap_path, &bind_rules, overlays, deny_masks, netns)?;
+    let disable_userns = supports_disable_userns(&bwrap_path);
+    test_functionality(
+        &bwrap_path,
+        &bind_rules,
+        overlays,
+        deny_masks,
+        netns,
+        disable_userns,
+    )?;
     let mut bwrap_args = build_bwrap_args(&bind_rules, overlays, deny_masks);
     if netns {
         bwrap_args.push("--unshare-net".to_string());
+    }
+    if disable_userns {
+        bwrap_args.push("--disable-userns".to_string());
     }
     Ok(BubblewrapWrapper {
         bwrap_path,
@@ -1923,6 +1956,18 @@ mod tests {
     }
 
     use super::*;
+
+    /// #1191: `--disable-userns` is passed only to a bwrap that lists it.
+    #[test]
+    fn disable_userns_detected_from_help() {
+        let new = "    --unshare-user               Create new user namespace\n    \
+                   --disable-userns             Disable further use of user namespaces inside sandbox\n";
+        assert!(help_lists_disable_userns(new));
+        let old = "    --unshare-user               Create new user namespace\n    \
+                   --unshare-user-try           Create new user namespace if possible\n";
+        assert!(!help_lists_disable_userns(old));
+        assert!(!help_lists_disable_userns("--disable-userns-x"));
+    }
 
     fn writable_rule(path: &str) -> FsRule {
         FsRule {
