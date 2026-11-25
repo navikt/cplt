@@ -5657,12 +5657,13 @@ fn push_recurses_submodules(
     let Some(git) = real_git else {
         return false;
     };
-    // A key that is set but empty (valueless `recurseSubmodules`) is not `no`:
-    // fail closed on it.
+    // Empty output means unset. A valueless `push.recurseSubmodules` also reads
+    // empty, and git itself refuses to push with it ("bad ... argument").
     let set = |args: &[&str]| {
         run_git(git, repo_args, args)
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|v| !v.is_empty())
     };
     if let Some(v) = set(&["config", "--get", "push.recurseSubmodules"]) {
         return !off(&v);
