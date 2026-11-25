@@ -1050,10 +1050,13 @@ pub(crate) fn build_deny_masks(
             Origin::Socket => socket_canon.push(canon.clone()),
             Origin::Credential => {}
         }
+        // A socket under /tmp is masked anyway: a grant can bind its host
+        // directory back over the private tmpfs, and the masks come last.
+        let tmp_socket = origin == Origin::Socket && !canon.is_dir();
         if canon.starts_with("/proc")
             || canon.starts_with("/dev")
             || canon.starts_with("/sys")
-            || canon.starts_with("/tmp")
+            || (canon.starts_with("/tmp") && !tmp_socket)
         {
             skip(canon);
             continue;
@@ -1132,10 +1135,7 @@ pub(crate) fn build_deny_masks(
         .iter()
         .filter(|p| {
             // bwrap gives these fresh mounts, which hide the host socket.
-            !["/tmp", "/proc", "/dev", "/sys"]
-                .iter()
-                .any(|m| p.starts_with(m))
-                && skipped.contains(p)
+            !["/proc", "/dev", "/sys"].iter().any(|m| p.starts_with(m)) && skipped.contains(p)
         })
         .count();
     // Counted by origin, not as "everything that is not a socket mask": a path
@@ -3314,6 +3314,21 @@ mod tests {
             3,
             "unmaskable deny paths must be recorded for the caller's warning"
         );
+    }
+
+    #[test]
+    fn socket_mask_under_tmp_is_still_applied() {
+        // A grant can bind a /tmp directory back over the private tmpfs, so a
+        // bus socket there needs its mask like any other.
+        let under_tmp = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
+        let bus = under_tmp.path().join("bus");
+        std::fs::write(&bus, "").expect("bus");
+        let base = non_tmp_tempdir();
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch");
+        let masks = build_deny_masks(&[], std::slice::from_ref(&bus), &[], Some(&scratch));
+        assert!(masks.covers(&bus.canonicalize().unwrap()));
+        assert_eq!(masks.socket_unmasked_count(), 0);
     }
 
     #[test]

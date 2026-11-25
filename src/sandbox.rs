@@ -3838,47 +3838,54 @@ pub(crate) fn parse_dbus_address(addr: &str) -> BusEndpoints {
             continue;
         };
         let mut known = false;
-        for (k, v) in keys.split(',').filter_map(|kv| kv.split_once('=')) {
+        for field in keys.split(',') {
+            let Some((k, v)) = field.split_once('=') else {
+                out.other = true;
+                continue;
+            };
             match k {
-                "path" | "dir" if !v.is_empty() => {
-                    out.paths.push(PathBuf::from(dbus_unescape(v)));
-                    known = true;
-                }
+                // Fail closed: a path in a malformed entry is still masked.
+                "path" | "dir" if !v.is_empty() => match dbus_unescape(v) {
+                    Some(p) => {
+                        out.paths.push(PathBuf::from(p));
+                        known = true;
+                    }
+                    // Bubblewrap takes UTF-8 arguments, so this one cannot be masked.
+                    None => out.other = true,
+                },
                 "abstract" | "tmpdir" => {
                     out.abstract_socket = true;
                     known = true;
                 }
                 // `$XDG_RUNTIME_DIR/bus`, already masked with the runtime dirs.
                 "runtime" => known = true,
-                _ => {}
+                "guid" => {}
+                _ => out.other = true,
             }
         }
-        // Malformed: nothing to mask, so report it rather than drop it.
+        // Nothing to mask, so report it rather than drop it.
         out.other |= !known;
     }
     out
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-/// D-Bus address values escape bytes as `%XX`.
-fn dbus_unescape(v: &str) -> String {
+/// D-Bus address values escape bytes as `%XX`. `None` for a bad escape or
+/// bytes that are not UTF-8: the path cannot be named exactly.
+fn dbus_unescape(v: &str) -> Option<String> {
     let b = v.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%'
-            && let Some(byte) = v
-                .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            out.push(byte);
+        if b[i] == b'%' {
+            out.push(u8::from_str_radix(v.get(i + 1..i + 3)?, 16).ok()?);
             i += 3;
         } else {
             out.push(b[i]);
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).ok()
 }
 
 /// The no-bubblewrap socket warning; `probe_failed` means bwrap is installed
@@ -5653,10 +5660,22 @@ mod tests {
         let list = parse_dbus_address("unix:abstract=/x;unix:path=/home/u/b%2cus");
         assert_eq!(list.paths, [PathBuf::from("/home/u/b,us")]);
         assert!(list.abstract_socket);
-        for bad in ["unix:path", "unix:path=", "unix:guid=1", "garbage"] {
+        for bad in [
+            "unix:path",
+            "unix:path=",
+            "unix:guid=1",
+            "garbage",
+            "unix:path=/x%FF",
+            "unix:path=/x%2",
+        ] {
             let b = parse_dbus_address(bad);
             assert!(b.paths.is_empty() && b.other, "{bad}");
         }
+        // A malformed field is reported, and the path it came with still masked.
+        let half = parse_dbus_address("unix:path=/home/u/bus,broken");
+        assert_eq!(half.paths, [PathBuf::from("/home/u/bus")]);
+        assert!(half.other);
+        assert!(parse_dbus_address("unix:path=/home/u/bus,foo=1").other);
     }
 
     #[test]
