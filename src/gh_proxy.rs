@@ -364,12 +364,117 @@ fn subcommand_long_value_flags(command: &str, subcommand: Option<&str>) -> &'sta
         ("repo", Some("view")) => &["--repo", "--branch", "--json", "--jq", "--template"],
         ("repo", Some("clone")) => &["--upstream-remote-name"],
         ("repo", Some("fork")) => &["--remote-name", "--org", "--fork-name"],
+        // Gated subcommands: every non-boolean flag in cli/cli b546819
+        // (pkg/cmd/{pr,issue,label}), plus `--repo`.
+        ("pr", Some("checkout")) => &["--repo", "--branch", "--worktree"],
+        ("pr", Some("create")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--base",
+            "--head",
+            "--reviewer",
+            "--assignee",
+            "--label",
+            "--project",
+            "--milestone",
+            "--recover",
+            "--template",
+        ],
+        ("pr" | "issue", Some("comment")) | ("pr", Some("review")) => {
+            &["--repo", "--body", "--body-file"]
+        }
+        ("pr", Some("edit")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--base",
+            "--add-reviewer",
+            "--remove-reviewer",
+            "--add-assignee",
+            "--remove-assignee",
+            "--add-label",
+            "--remove-label",
+            "--add-project",
+            "--remove-project",
+            "--milestone",
+        ],
+        ("pr", Some("ready" | "update-branch")) => &["--repo"],
+        ("pr" | "issue", Some("reopen")) | ("pr", Some("close")) => &["--repo", "--comment"],
+        ("pr", Some("merge")) => &[
+            "--repo",
+            "--body",
+            "--body-file",
+            "--subject",
+            "--match-head-commit",
+            "--author-email",
+        ],
+        ("issue", Some("create")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--assignee",
+            "--label",
+            "--project",
+            "--milestone",
+            "--recover",
+            "--template",
+            "--type",
+            "--parent",
+            "--blocked-by",
+            "--blocking",
+        ],
+        ("issue", Some("edit")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--add-assignee",
+            "--remove-assignee",
+            "--add-label",
+            "--remove-label",
+            "--add-project",
+            "--remove-project",
+            "--milestone",
+            "--type",
+            "--parent",
+            "--add-sub-issue",
+            "--remove-sub-issue",
+            "--add-blocked-by",
+            "--remove-blocked-by",
+            "--add-blocking",
+            "--remove-blocking",
+        ],
+        ("issue", Some("close")) => &["--repo", "--comment", "--duplicate-of", "--reason"],
+        ("issue", Some("develop")) => &[
+            "--repo",
+            "--branch-repo",
+            "--base",
+            "--name",
+            "--worktree",
+            "--issue-repo",
+        ],
+        ("label", Some("create")) => &["--repo", "--description", "--color"],
+        ("label", Some("edit")) => &["--repo", "--description", "--color", "--name"],
         _ => &[
             "--repo",
             "--title",
             "--body",
             "--notes",
             "--search",
+            "--body-file",
+            "--assignee",
+            "--label",
+            "--base",
+            "--head",
+            "--milestone",
+            "--reviewer",
+            "--project",
+            "--add-label",
+            "--remove-label",
             "--subject",
             "--description",
             "--json",
@@ -424,11 +529,164 @@ fn repo_flag_values<'a>(args: &[&'a str]) -> Vec<&'a str> {
     while let Some(a) = it.next() {
         if *a == "-R" || *a == "--repo" {
             out.extend(it.next().copied());
-        } else if let Some(v) = a.strip_prefix("--repo=").or_else(|| a.strip_prefix("-R")) {
+        } else if let Some(v) = a.strip_prefix("--repo=") {
             out.push(v);
+        } else if let Some(v) = a.strip_prefix("-R") {
+            out.push(v.strip_prefix('=').unwrap_or(v));
         }
     }
     out
+}
+
+/// Whether `-R`/`--repo` words, read without regard to flag arity, name more
+/// than one repository, or name one the parser did not take as the selector.
+/// Fails closed when a value-flag table is wrong or incomplete.
+fn repo_selector_ambiguous(args: &[&str], parsed: Option<&str>) -> bool {
+    if is_api(args) {
+        return false;
+    }
+    let mut seen: Vec<&str> = repo_flag_values(args);
+    // `R` anywhere in a short cluster (`-dR x`, `-dRx`), whatever the parser
+    // thought the word was: a missing value-flag entry must not pick the repo.
+    for (i, a) in args.iter().enumerate() {
+        let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) else {
+            continue;
+        };
+        let Some(pos) = cluster.find('R') else {
+            continue;
+        };
+        if pos == 0 || !cluster[..pos].bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue; // `-R…` is in repo_flag_values; `- Remove` is prose
+        }
+        let v = &cluster[pos + 1..];
+        let v = v.strip_prefix('=').unwrap_or(v);
+        seen.extend(if v.is_empty() {
+            args.get(i + 1).copied()
+        } else {
+            Some(v)
+        });
+    }
+    seen.extend(develop_repo_selectors(args));
+    if !seen.is_empty() && parsed.is_none() {
+        return true;
+    }
+    seen.extend(parsed);
+    seen.sort_unstable();
+    seen.dedup();
+    seen.len() > 1
+}
+
+/// Values of `gh issue develop --issue-repo/-i` and `--branch-repo`, which
+/// name repositories besides `-R` (cli/cli b546819, pkg/cmd/issue/develop).
+/// They go through the same agreement check, so each must equal the gated repo.
+/// No other gated subcommand takes a repository in a flag: `pr create --head
+/// owner:branch` names a head branch for a PR opened in the gated repo.
+fn develop_repo_selectors<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let Some(root) = root_command(args).0 else {
+        return Vec::new();
+    };
+    if args[root] != "issue" || find_subcommand_hint("issue", &args[root + 1..]) != Some("develop")
+    {
+        return Vec::new();
+    }
+    let short = subcommand_short_value_flags("issue", Some("develop"));
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let next = || args.get(i + 1).copied();
+        if matches!(*a, "--issue-repo" | "--branch-repo") {
+            out.extend(next());
+        } else if let Some(v) = a
+            .strip_prefix("--issue-repo=")
+            .or_else(|| a.strip_prefix("--branch-repo="))
+        {
+            out.push(v);
+        } else if let Some(c) = a.strip_prefix('-').filter(|c| !c.starts_with('-'))
+            && let Some(('i', attached)) = scan_short_cluster(c, short)
+        {
+            out.extend(attached.or_else(next));
+        }
+    }
+    out
+}
+
+/// Flags whose value gh resolves as an issue number or URL, taking the
+/// repository from a URL (cli/cli b546819: `ResolveIssueRef`, and
+/// `ParseIssueFromArg` for `--duplicate-of`).
+const ISSUE_REF_FLAGS: &[&str] = &[
+    "--parent",
+    "--add-sub-issue",
+    "--remove-sub-issue",
+    "--blocked-by",
+    "--blocking",
+    "--add-blocked-by",
+    "--remove-blocked-by",
+    "--add-blocking",
+    "--remove-blocking",
+    "--duplicate-of",
+];
+
+/// Whether every URL a non-`gh api` command passes as an operand or as an
+/// issue-reference flag value names `member`. gh's PR and issue finders take
+/// the repository from an `http(s)` URL operand before `-R` and `GH_REPO`, so
+/// the pinned repository is only the target when they agree. A word that
+/// starts like a URL but does not parse to host, owner and repo fails closed.
+fn operands_name_only(args: &[&str], cmd: &ParsedCommand, member: &str) -> bool {
+    if cmd.command == "api" {
+        return true;
+    }
+    let mut words = positional_operands(args);
+    let mut refs = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if ISSUE_REF_FLAGS.contains(a) {
+            refs.extend(args.get(i + 1).copied());
+        } else if let Some((flag, v)) = a.split_once('=')
+            && ISSUE_REF_FLAGS.contains(&flag)
+        {
+            refs.push(v);
+        }
+    }
+    // Most of these are pflag string slices, split as CSV. Dropping quotes and
+    // splitting on every comma yields each CSV field or a finer piece of it,
+    // so no URL hides inside a field; a URL that is not a whole piece fails.
+    let pieces: Vec<String> = refs
+        .iter()
+        .flat_map(|v| {
+            v.replace('"', "")
+                .split(',')
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for p in &pieces {
+        let lower = p.to_ascii_lowercase();
+        let at = lower
+            .find("http:")
+            .into_iter()
+            .chain(lower.find("https:"))
+            .min();
+        if at.is_some_and(|at| at != 0) {
+            return false;
+        }
+    }
+    words.extend(pieces.iter().map(String::as_str));
+    words.into_iter().all(|w| {
+        let lower = w.to_ascii_lowercase();
+        if !lower.starts_with("http:") && !lower.starts_with("https:") {
+            return true;
+        }
+        let Some((_, rest)) = w.split_once("://") else {
+            return false;
+        };
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host.split(':').next().unwrap_or(host);
+        let mut seg = path.split('/');
+        let (owner, repo) = (seg.next().unwrap_or(""), seg.next().unwrap_or(""));
+        !host.is_empty()
+            && !owner.is_empty()
+            && !repo.is_empty()
+            && member_name(host, &format!("{owner}/{repo}")).eq_ignore_ascii_case(member)
+    })
 }
 
 /// `gh repo` subcommands whose positional operand is a repository, which gh
@@ -1720,7 +1978,7 @@ fn subcommand_short_value_flags(command: &str, subcommand: Option<&str>) -> &'st
         ("issue", Some("edit")) => &['R', 'b', 'F', 'm', 't'],
         ("issue", Some("close")) => &['R', 'c', 'r'],
         ("issue", Some("reopen")) => &['R', 'c'],
-        ("issue", Some("develop")) => &['R', 'b', 'n'],
+        ("issue", Some("develop")) => &['R', 'b', 'n', 'i'],
         ("label", Some("list")) => &['R', 'q', 'L', 'S', 't'],
         ("label", Some("create")) => &['R', 'c', 'd'],
         ("label", Some("edit")) => &['R', 'c', 'd', 'n'],
@@ -1994,8 +2252,11 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 continue;
             }
             a if a.starts_with('-') => {
-                // Skip flags
-                i += 1;
+                // gh (pflag) gives a value flag the next word even when it
+                // starts with `-` (`--body --repo=x` sets the body to `--repo=x`).
+                let long =
+                    subcommand_long_value_flags(&command, subcommand.as_deref().or(sub_hint));
+                i += 1 + usize::from(flag_takes_next(a, value_flags, long));
                 continue;
             }
             a => {
@@ -3237,7 +3498,41 @@ fn gate_with_scope_resolver(
     gate_with_scope_resolver_for(args, policy, gh_hosts(), resolve_scope, real_git)
 }
 
+/// The one exit of the gate. Every approval that pins a repository (`GH_REPO`)
+/// passes [`operands_name_only`] here, whichever branch produced it: gh reads a
+/// URL operand before `GH_REPO`, so the pin alone does not bind the target.
 fn gate_with_scope_resolver_for(
+    args: &[&str],
+    policy: &GatePolicy,
+    hosts: &[String],
+    resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
+    real_git: Option<&Path>,
+) -> Result<GateApproval, Refusal> {
+    let approval = gate_decision(args, policy, hosts, resolve_scope, real_git)?;
+    // Writes only: a read by URL follows the same cross-repo read policy as
+    // the equivalent `-R` read, which the pin does not restrict either.
+    if let Some(pin) = approval.repo_scope.as_deref()
+        && let Some(cmd) = parse_command(args)
+        && (approval.check_merge_protection
+            || evaluate_with_policy(&cmd, policy.allow_api_write).decision == Decision::ScopeCheck)
+    {
+        let (host, repo) = split_member(pin);
+        let member = member_name(host, repo);
+        if !operands_name_only(args, &cmd, &member) {
+            return Err(Refusal {
+                headline: "'gh' was given a URL operand for another repository.".to_string(),
+                guidance: format!(
+                    "gh takes the repository from a URL before -R. Pass a number, \
+                     or a URL in {member}, as the operand and in issue reference flags."
+                ),
+                agent_note: &[RESTRICTED, NOTE],
+            });
+        }
+    }
+    Ok(approval)
+}
+
+fn gate_decision(
     args: &[&str],
     policy: &GatePolicy,
     hosts: &[String],
@@ -3329,6 +3624,19 @@ fn gate_with_scope_resolver_for(
         return Err(Refusal {
             headline: "'gh' was given --hostname more than once.".to_string(),
             guidance: "Pass a single --hostname.".to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
+    // Every word that could select a repository must agree with the one the
+    // parser picked; otherwise an arity mismatch could gate one repository
+    // while gh targets another. Nothing needs two, so refuse rather than pick.
+    if repo_selector_ambiguous(args, cmd.repo_flag.as_deref()) {
+        return Err(Refusal {
+            headline: "'gh' was given an ambiguous repository selector.".to_string(),
+            guidance: "Pass a single -R/--repo, and do not start a flag value with \
+                       '-R' or '--repo'."
+                .to_string(),
             agent_note: &[RESTRICTED, NOTE],
         });
     }
@@ -6788,17 +7096,17 @@ fn matches_allow_push_rule(
 }
 
 /// Simple glob matching for branch patterns.
-/// Supports `*` (any chars within segment) and `**` or trailing `*` for multi-segment.
+/// A trailing `*` matches any characters, `/` included; the literal prefix
+/// before it, `/` included, must match exactly (`agent/*` never matches `agent-main`).
 fn glob_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern == "**" {
         return true;
     }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        // e.g. "agent/*" matches "agent/fix-123"
-        value.starts_with(prefix) && value.len() > prefix.len() + 1
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        // e.g. "copilot-*" matches "copilot-fix-123"
-        value.starts_with(prefix)
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        // "agent/*" needs something after the slash, as before.
+        value
+            .strip_prefix(prefix)
+            .is_some_and(|r| !r.is_empty() || !prefix.ends_with('/'))
     } else {
         // Exact match
         pattern == value
@@ -10194,6 +10502,447 @@ mod tests {
         assert!(glob_match("feature", "feature"));
         assert!(!glob_match("agent/*", "other/fix"));
         assert!(!glob_match("feature", "feature2"));
+        assert!(!glob_match("agent/*", "agent-main"));
+        assert!(!glob_match("agent/*", "agent/"));
+        assert!(glob_match("agent/*", "agent/x/y"));
+        assert!(!glob_match("agent/*", "agent-main/x"));
+    }
+
+    #[test]
+    fn repo_selector_follows_gh_arity() {
+        let policy = GatePolicy::default();
+        for args in [
+            &[
+                "pr",
+                "comment",
+                "1",
+                "-R",
+                "evil/repo",
+                "--body",
+                "--repo=good/repo",
+            ][..],
+            &[
+                "issue",
+                "create",
+                "-R",
+                "evil/repo",
+                "--title",
+                "--repo=good/repo",
+                "--body",
+                "x",
+            ],
+            &[
+                "pr",
+                "comment",
+                "1",
+                "-R",
+                "evil/repo",
+                "-b",
+                "--repo=good/repo",
+            ],
+            &["pr", "comment", "1", "-R", "evil/repo", "-b", "-Rgood/repo"],
+            &[
+                "pr",
+                "comment",
+                "1",
+                "-R",
+                "evil/repo",
+                "--body",
+                "--repo",
+                "good/repo",
+            ],
+        ] {
+            let cmd = parse_command(args).unwrap();
+            assert_eq!(cmd.repo_flag.as_deref(), Some("evil/repo"), "{args:?}");
+            assert!(
+                repo_selector_ambiguous(args, cmd.repo_flag.as_deref()),
+                "{args:?}"
+            );
+            assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
+        }
+        // A boolean clustered before a value flag: `-eb` takes the next word.
+        let a = [
+            "pr",
+            "comment",
+            "1",
+            "-R",
+            "evil/repo",
+            "-eb",
+            "--repo=good/repo",
+        ];
+        assert_eq!(
+            parse_command(&a).unwrap().repo_flag.as_deref(),
+            Some("evil/repo")
+        );
+        // `--body=--repo=x` carries its own value and selects nothing.
+        let a = [
+            "pr",
+            "comment",
+            "1",
+            "-R",
+            "evil/repo",
+            "--body=--repo=good/repo",
+        ];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("evil/repo"));
+        assert!(!repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
+        // Clustered selectors after an unlisted-looking value flag.
+        let a = [
+            "pr",
+            "close",
+            "1",
+            "-dRevil/repo",
+            "--comment",
+            "-dRgood/repo",
+        ];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("evil/repo"));
+        assert!(repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
+        assert!(gate(&a, Path::new("."), &policy).is_err());
+        let a = [
+            "pr",
+            "close",
+            "1",
+            "-R",
+            "evil/repo",
+            "--comment",
+            "-dR",
+            "good/repo",
+        ];
+        assert!(repo_selector_ambiguous(&a, Some("evil/repo")));
+        // `-R=x` is one selector, not two.
+        let a = ["pr", "comment", "1", "-R=good/repo", "--body", "hi"];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("good/repo"));
+        assert!(!repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
+        let refused = gate(&a, Path::new("."), &policy)
+            .err()
+            .is_some_and(|r| r.headline.contains("ambiguous"));
+        assert!(!refused);
+        // `issue develop` repository flags must name the gated repo.
+        for a in [
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--issue-repo",
+                "evil/repo",
+            ][..],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--issue-repo=evil/repo",
+            ],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "-i",
+                "evil/repo",
+            ],
+            &["issue", "develop", "1", "-R", "good/repo", "-ievil/repo"],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--branch-repo",
+                "evil/repo",
+            ],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--branch-repo=evil/repo",
+            ],
+            &["issue", "develop", "1", "--branch-repo", "evil/repo"],
+        ] {
+            let cmd = parse_command(a).unwrap();
+            assert!(
+                repo_selector_ambiguous(a, cmd.repo_flag.as_deref()),
+                "{a:?}"
+            );
+            assert!(gate(a, Path::new("."), &policy).is_err(), "{a:?}");
+        }
+        let a = [
+            "issue",
+            "develop",
+            "1",
+            "-R",
+            "good/repo",
+            "--branch-repo",
+            "good/repo",
+        ];
+        assert!(!repo_selector_ambiguous(&a, Some("good/repo")));
+        // URL and `OWNER/REPO#N` operands must name the gated repository.
+        let scope = ["good/repo".to_string()];
+        for (a, ok) in [
+            (
+                &[
+                    "pr",
+                    "comment",
+                    "https://github.com/evil/repo/pull/1",
+                    "-R",
+                    "good/repo",
+                ][..],
+                false,
+            ),
+            (
+                &["pr", "close", "https://github.com/evil/repo/pull/1"],
+                false,
+            ),
+            (
+                &["pr", "merge", "https://github.com/evil/repo/pull/1"],
+                false,
+            ),
+            (
+                &["pr", "review", "https://github.com/evil/repo/pull/1"],
+                false,
+            ),
+            (
+                &["pr", "edit", "https://ghe.example/good/repo/pull/1"],
+                false,
+            ),
+            (
+                &["issue", "comment", "https://github.com/evil/repo/issues/1"],
+                false,
+            ),
+            // gh's gated finders do not read `OWNER/REPO#N`; it is not a selector.
+            (&["issue", "edit", "evil/repo#1"], true),
+            (&["label", "create", "area/x#1"], true),
+            (&["pr", "comment", "https:/evil/repo/pull/1"], false),
+            (&["pr", "comment", "HTTPS:evil/repo"], false),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--parent",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue=https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-blocking",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--remove-blocked-by",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "create",
+                    "--parent",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "close",
+                    "1",
+                    "--duplicate-of",
+                    "https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--parent",
+                    "https://github.com/good/repo/issues/2",
+                ],
+                true,
+            ),
+            (&["issue", "edit", "1", "--parent", "7"], true),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue",
+                    "5,https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue",
+                    "\"https://github.com/evil/repo/issues/2\"",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue",
+                    "\"5,https://github.com/evil/repo/issues/2\"",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--remove-blocking=5,https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-blocked-by",
+                    "5, https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "create",
+                    "--blocked-by=\"x,https://github.com/evil/repo/issues/2\"",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "create",
+                    "--blocking",
+                    "5,https://github.com/good/repo/issues/2",
+                ],
+                true,
+            ),
+            (&["issue", "edit", "1", "--add-sub-issue", "5,6"], true),
+            (
+                &["issue", "develop", "https://github.com/evil/repo/issues/1"],
+                false,
+            ),
+            (
+                &["pr", "comment", "https://github.com/good/repo/pull/1"],
+                true,
+            ),
+            (
+                &["issue", "close", "https://github.com/Good/Repo/issues/1"],
+                true,
+            ),
+            (&["pr", "comment", "12"], true),
+        ] {
+            let cmd = parse_command(a).unwrap();
+            assert_eq!(operands_name_only(a, &cmd, &scope[0]), ok, "{a:?}");
+        }
+        let gated = |a: &[&str]| gate_with_repo_scope(a, &policy, &scope, None);
+        let foreign = "https://github.com/evil/repo/issues/1";
+        // issue transfer and lock are blocked outright.
+        assert!(gated(&["issue", "transfer", foreign, "good/repo", "-R", "good/repo"]).is_err());
+        assert!(gated(&["issue", "lock", foreign, "-R", "good/repo"]).is_err());
+        // A read by URL is treated like the same read with `-R`.
+        for (url, r) in [
+            (
+                ["pr", "view", "https://github.com/evil/repo/pull/1"],
+                ["pr", "view", "1", "-R", "evil/repo"],
+            ),
+            (
+                ["pr", "diff", "https://github.com/evil/repo/pull/1"],
+                ["pr", "diff", "1", "-R", "evil/repo"],
+            ),
+            (
+                ["issue", "view", "https://github.com/evil/repo/issues/1"],
+                ["issue", "view", "1", "-R", "evil/repo"],
+            ),
+        ] {
+            assert_eq!(gated(&url).is_ok(), gated(&r).is_ok(), "{url:?}");
+            assert!(gated(&url).is_ok(), "{url:?}");
+        }
+        // A write by URL with a foreign `--parent` is refused.
+        let a = ["issue", "edit", "1", "--parent", foreign, "-R", "good/repo"];
+        assert!(gated(&a).is_err_and(|r| r.headline.contains("URL operand")));
+        // Merge goes through the allow_pr_merge branch, not the plain scope check.
+        let merge = GatePolicy {
+            allow_pr_merge: true,
+            ..GatePolicy::default()
+        };
+        let a = [
+            "pr",
+            "merge",
+            "https://github.com/evil/repo/pull/1",
+            "-R",
+            "good/repo",
+            "--squash",
+        ];
+        assert!(
+            gate_with_repo_scope(&a, &merge, &scope, None)
+                .is_err_and(|r| r.headline.contains("URL operand"))
+        );
+        let bad = [
+            "pr",
+            "comment",
+            "https://github.com/evil/repo/pull/1",
+            "-R",
+            "good/repo",
+            "--body",
+            "x",
+        ];
+        assert!(gated(&bad).is_err_and(|r| r.headline.contains("URL operand")));
+        let good = [
+            "pr",
+            "comment",
+            "https://github.com/good/repo/pull/1",
+            "-R",
+            "good/repo",
+            "--body",
+            "x",
+        ];
+        assert!(gated(&good).is_ok());
+        // A single selector stays accepted.
+        let a = ["pr", "comment", "1", "--body", "hi", "--repo=good/repo"];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("good/repo"));
+        assert!(!repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
     }
 
     #[test]

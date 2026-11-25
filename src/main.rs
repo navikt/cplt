@@ -18157,7 +18157,8 @@ mod tests {
             true,
             &mut elsewhere,
         );
-        assert_merge_refused(&effect, "is not in navikt/cplt");
+        // The gate refuses the foreign URL operand before the merge lookup runs.
+        assert_merge_refused(&effect, "URL operand for another repository");
     }
 
     #[test]
