@@ -4472,26 +4472,12 @@ mod tests {
         assert_eq!(shell_words("x ''"), ["x", ""]);
     }
 
-    /// Every `Agent` variant, for the tests that must cover all of them.
-    /// `all_agents_covers_every_variant` keeps this honest.
-    const ALL_AGENTS: [Agent; 8] = [
-        Agent::Copilot,
-        Agent::OpenCode,
-        Agent::Antigravity,
-        Agent::Pi,
-        Agent::Claude,
-        Agent::Goose,
-        Agent::Dsh,
-        Agent::Shell,
-    ];
-
     #[test]
     fn all_agents_covers_every_variant() {
         // The match is exhaustive, so adding a variant to `Agent` fails to
-        // compile until it is named here; the length check then forces it into
-        // ALL_AGENTS as well. Together they stop a new agent from quietly
-        // skipping every cross-agent contract test below.
-        for agent in ALL_AGENTS {
+        // compile until it is named here. Agent::ALL then has to list it, or
+        // the cross-agent contract tests below quietly skip the new agent.
+        for &agent in Agent::ALL {
             match agent {
                 Agent::Copilot
                 | Agent::OpenCode
@@ -4503,9 +4489,9 @@ mod tests {
                 | Agent::Shell => {}
             }
         }
-        let mut seen = ALL_AGENTS.to_vec();
+        let mut seen = Agent::ALL.to_vec();
         seen.dedup();
-        assert_eq!(seen.len(), ALL_AGENTS.len(), "ALL_AGENTS has a duplicate");
+        assert_eq!(seen.len(), Agent::ALL.len(), "Agent::ALL has a duplicate");
     }
 
     fn agent_dir(path: PathBuf) -> AgentDir {
@@ -4995,7 +4981,7 @@ mod tests {
             "vendor_conf.d",
             "vendor_functions.d",
         ];
-        for agent in ALL_AGENTS {
+        for &agent in Agent::ALL {
             for e in agent.host_persistence_denies() {
                 let file = HOST_PERSISTENCE_FILES.contains(e);
                 assert!(
@@ -5325,7 +5311,7 @@ mod tests {
                 Agent::Shell => false,      // not an AI agent, no auth
             }
         }
-        for agent in ALL_AGENTS {
+        for &agent in Agent::ALL {
             let (agent, expected) = (agent, expected_oauth_first(agent));
             assert_eq!(
                 agent.oauth_first(),
@@ -5380,7 +5366,7 @@ mod tests {
                 Agent::OpenCode | Agent::Pi | Agent::Dsh | Agent::Shell => &[],
             }
         }
-        for agent in ALL_AGENTS {
+        for &agent in Agent::ALL {
             assert_eq!(
                 agent.keychain_substitute_env_vars(),
                 expected_substitutes(agent),
@@ -5630,7 +5616,7 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             let home = tmp.path();
             let mut checked = 0;
-            for agent in ALL_AGENTS {
+            for &agent in Agent::ALL {
                 let dirs = agent.config_dirs(home);
                 let create_roots: Vec<&AgentDir> =
                     dirs.iter().filter(|d| !d.create_dirs.is_empty()).collect();
@@ -6857,7 +6843,7 @@ mod tests {
     fn every_agent_default_domains_nonempty_bare_and_registry_backed() {
         // Contract across ALL agents: non-empty, registry base present, and no
         // glob syntax (the proxy matcher does exact/subdomain matching only).
-        for agent in ALL_AGENTS {
+        for &agent in Agent::ALL {
             let domains = agent.default_allowed_domains();
             assert!(!domains.is_empty(), "{agent:?} list must not be empty");
             assert!(
