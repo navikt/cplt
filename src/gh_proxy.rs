@@ -635,15 +635,40 @@ fn operands_name_only(args: &[&str], cmd: &ParsedCommand, member: &str) -> bool 
         return true;
     }
     let mut words = positional_operands(args);
+    let mut refs = Vec::new();
     for (i, a) in args.iter().enumerate() {
         if ISSUE_REF_FLAGS.contains(a) {
-            words.extend(args.get(i + 1).copied());
+            refs.extend(args.get(i + 1).copied());
         } else if let Some((flag, v)) = a.split_once('=')
             && ISSUE_REF_FLAGS.contains(&flag)
         {
-            words.push(v);
+            refs.push(v);
         }
     }
+    // Most of these are pflag string slices, split as CSV. Dropping quotes and
+    // splitting on every comma yields each CSV field or a finer piece of it,
+    // so no URL hides inside a field; a URL that is not a whole piece fails.
+    let pieces: Vec<String> = refs
+        .iter()
+        .flat_map(|v| {
+            v.replace('"', "")
+                .split(',')
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for p in &pieces {
+        let lower = p.to_ascii_lowercase();
+        let at = lower
+            .find("http:")
+            .into_iter()
+            .chain(lower.find("https:"))
+            .min();
+        if at.is_some_and(|at| at != 0) {
+            return false;
+        }
+    }
+    words.extend(pieces.iter().map(String::as_str));
     words.into_iter().all(|w| {
         let lower = w.to_ascii_lowercase();
         if !lower.starts_with("http:") && !lower.starts_with("https:") {
@@ -10598,6 +10623,73 @@ mod tests {
                 true,
             ),
             (&["issue", "edit", "1", "--parent", "7"], true),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue",
+                    "5,https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue",
+                    "\"https://github.com/evil/repo/issues/2\"",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-sub-issue",
+                    "\"5,https://github.com/evil/repo/issues/2\"",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--remove-blocking=5,https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "1",
+                    "--add-blocked-by",
+                    "5, https://github.com/evil/repo/issues/2",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "create",
+                    "--blocked-by=\"x,https://github.com/evil/repo/issues/2\"",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "issue",
+                    "create",
+                    "--blocking",
+                    "5,https://github.com/good/repo/issues/2",
+                ],
+                true,
+            ),
+            (&["issue", "edit", "1", "--add-sub-issue", "5,6"], true),
             (
                 &["issue", "develop", "https://github.com/evil/repo/issues/1"],
                 false,
