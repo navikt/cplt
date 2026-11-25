@@ -566,6 +566,7 @@ fn repo_selector_ambiguous(args: &[&str], parsed: Option<&str>) -> bool {
             Some(v)
         });
     }
+    seen.extend(develop_repo_selectors(args));
     if !seen.is_empty() && parsed.is_none() {
         return true;
     }
@@ -573,6 +574,39 @@ fn repo_selector_ambiguous(args: &[&str], parsed: Option<&str>) -> bool {
     seen.sort_unstable();
     seen.dedup();
     seen.len() > 1
+}
+
+/// Values of `gh issue develop --issue-repo/-i` and `--branch-repo`, which
+/// name repositories besides `-R` (cli/cli b546819, pkg/cmd/issue/develop).
+/// They go through the same agreement check, so each must equal the gated repo.
+/// No other gated subcommand takes a repository in a flag: `pr create --head
+/// owner:branch` names a head branch for a PR opened in the gated repo.
+fn develop_repo_selectors<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let Some(root) = root_command(args).0 else {
+        return Vec::new();
+    };
+    if args[root] != "issue" || find_subcommand_hint("issue", &args[root + 1..]) != Some("develop")
+    {
+        return Vec::new();
+    }
+    let short = subcommand_short_value_flags("issue", Some("develop"));
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let next = || args.get(i + 1).copied();
+        if matches!(*a, "--issue-repo" | "--branch-repo") {
+            out.extend(next());
+        } else if let Some(v) = a
+            .strip_prefix("--issue-repo=")
+            .or_else(|| a.strip_prefix("--branch-repo="))
+        {
+            out.push(v);
+        } else if let Some(c) = a.strip_prefix('-').filter(|c| !c.starts_with('-'))
+            && let Some(('i', attached)) = scan_short_cluster(c, short)
+        {
+            out.extend(attached.or_else(next));
+        }
+    }
+    out
 }
 
 /// `gh repo` subcommands whose positional operand is a repository, which gh
@@ -10303,6 +10337,71 @@ mod tests {
             .err()
             .is_some_and(|r| r.headline.contains("ambiguous"));
         assert!(!refused);
+        // `issue develop` repository flags must name the gated repo.
+        for a in [
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--issue-repo",
+                "evil/repo",
+            ][..],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--issue-repo=evil/repo",
+            ],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "-i",
+                "evil/repo",
+            ],
+            &["issue", "develop", "1", "-R", "good/repo", "-ievil/repo"],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--branch-repo",
+                "evil/repo",
+            ],
+            &[
+                "issue",
+                "develop",
+                "1",
+                "-R",
+                "good/repo",
+                "--branch-repo=evil/repo",
+            ],
+            &["issue", "develop", "1", "--branch-repo", "evil/repo"],
+        ] {
+            let cmd = parse_command(a).unwrap();
+            assert!(
+                repo_selector_ambiguous(a, cmd.repo_flag.as_deref()),
+                "{a:?}"
+            );
+            assert!(gate(a, Path::new("."), &policy).is_err(), "{a:?}");
+        }
+        let a = [
+            "issue",
+            "develop",
+            "1",
+            "-R",
+            "good/repo",
+            "--branch-repo",
+            "good/repo",
+        ];
+        assert!(!repo_selector_ambiguous(&a, Some("good/repo")));
         // A single selector stays accepted.
         let a = ["pr", "comment", "1", "--body", "hi", "--repo=good/repo"];
         let cmd = parse_command(&a).unwrap();
