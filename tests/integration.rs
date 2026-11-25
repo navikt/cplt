@@ -5500,6 +5500,42 @@ int main(int argc, char **argv) {
         assert!(other, "the other files are still granted");
     }
 
+    /// A grant inside a credential directory, or of a registry file, that a
+    /// `deny.paths` entry also covers stays unreadable: the deny wins (#1222).
+    #[test]
+    fn real_profile_deny_path_beats_credential_dir_and_registry_grants() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = build_creds_home("cred-deny");
+        let aws = home.join(".aws/config");
+        fs::create_dir_all(aws.parent().unwrap()).unwrap();
+        fs::write(&aws, "SENTINEL_AWS_1222").unwrap();
+        let npmrc = home.join(".npmrc");
+        let grants = vec![aws.clone(), npmrc.clone()];
+
+        let mut opts = default_opts(&project, &home);
+        opts.extra_read = &grants;
+        let open = write_real_profile(&opts);
+        opts.extra_deny = &grants;
+        let denied = write_real_profile(&opts);
+
+        let read = |p: &PathBuf, f: &Path, s: &str| probe_build_cred(p, f, s).0;
+        let results = [
+            read(&open, &aws, "SENTINEL_AWS_1222"),
+            read(&open, &npmrc, "SENTINEL_NPM_TOKEN_463"),
+            read(&denied, &aws, "SENTINEL_AWS_1222"),
+            read(&denied, &npmrc, "SENTINEL_NPM_TOKEN_463"),
+        ];
+        fs::remove_dir_all(&home).ok();
+        fs::remove_file(&open).ok();
+        fs::remove_file(&denied).ok();
+        assert_eq!(
+            results,
+            [true, true, false, false],
+            "aws, npmrc: open then denied"
+        );
+    }
+
     #[test]
     fn real_profile_build_credentials_lose_to_a_user_deny() {
         require_sandbox!();

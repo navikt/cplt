@@ -174,7 +174,6 @@ pub use policy::{
 // so tests run cross-platform even though the output is macOS-specific.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use profile::MCP_CHILD_MACH_SERVICES;
-pub(crate) use profile::allow_outranks_user_deny;
 pub(crate) use profile::mcp_child_profile;
 pub use profile::{ReadDenies, generate_profile, generate_profile_with_playwright_socket_dir};
 

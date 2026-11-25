@@ -220,6 +220,7 @@ fn profile_locked(
         &mut sb,
         &home,
         config.extra_read,
+        config.extra_deny,
         config.protect_pnpm_config,
     );
     emit_denied_dotfile_overrides(
@@ -228,6 +229,7 @@ fn profile_locked(
         config.extra_read,
         config.extra_write,
         config.extra_exec,
+        config.extra_deny,
     );
     emit_gpg_signing_rules(&mut sb, &home, config.allow_gpg_signing, config.extra_deny);
     emit_docker_rules(&mut sb, &home, config.allow_docker, config.extra_deny);
@@ -2970,9 +2972,12 @@ fn overridable_credential_files(home: &Path, protect_pnpm_config: bool) -> Vec<S
 }
 
 /// Overridable credential files that `extra_read` explicitly re-allows.
+/// A file an overlapping `--deny-path` covers is left out, so the deny wins
+/// as it does on Linux (#1222).
 fn registry_config_overrides(
     home: &str,
     extra_read: &[PathBuf],
+    extra_deny: &[PathBuf],
     protect_pnpm_config: bool,
 ) -> Vec<String> {
     let home_path = Path::new(home);
@@ -2981,6 +2986,7 @@ fn registry_config_overrides(
         .filter(|file| {
             let full_path = resolved(home_path.join(file));
             extra_read.iter().any(|p| p == &full_path)
+                && overlapping_deny(extra_deny, &full_path).is_none()
         })
         .collect()
 }
@@ -3284,9 +3290,10 @@ fn emit_registry_config_overrides(
     sb: &mut String,
     home: &str,
     extra_read: &[PathBuf],
+    extra_deny: &[PathBuf],
     protect_pnpm_config: bool,
 ) {
-    let overrides = registry_config_overrides(home, extra_read, protect_pnpm_config);
+    let overrides = registry_config_overrides(home, extra_read, extra_deny, protect_pnpm_config);
     if !overrides.is_empty() {
         sbpl!(
             sb,
@@ -3333,23 +3340,6 @@ fn denied_dotfile_override_paths(home: &Path, path: &Path) -> Vec<String> {
         return forms;
     }
     Vec::new()
-}
-
-/// Whether a user grant on `allow` is re-emitted *after* the `--deny-path`
-/// rules, so it beats an overlapping user deny under SBPL last-match-wins:
-/// the credential-dir re-allows ([`emit_denied_dotfile_overrides`]) and the
-/// registry-file re-allows ([`registry_config_overrides`]). Every other user
-/// grant comes before the denies and loses to them. Used only to word the
-/// allow/deny overlap warning truthfully.
-pub(crate) fn allow_outranks_user_deny(
-    home: &Path,
-    allow: &Path,
-    protect_pnpm_config: bool,
-) -> bool {
-    !denied_dotfile_override_paths(home, allow).is_empty()
-        || overridable_credential_files(home, protect_pnpm_config)
-            .iter()
-            .any(|f| resolved(home.join(f)) == allow)
 }
 
 /// Keep a grant that names an SSH private key file itself working (#595).
@@ -3413,26 +3403,35 @@ fn emit_named_ssh_key_grants(
 /// macOS. `subpath` matches a plain file exactly as `literal` did, so the
 /// file case is unchanged and the directory case now means the same thing on
 /// both backends: the subtree the user named.
+///
+/// A grant an explicit `--deny-path` overlaps is not re-allowed, so the deny
+/// wins on macOS as it does on Linux, like [`emit_named_ssh_key_grants`]
+/// (#1222). Before, this re-allow came after the user denies and beat them.
 fn emit_denied_dotfile_overrides(
     sb: &mut String,
     home: &str,
     extra_read: &[PathBuf],
     extra_write: &[PathBuf],
     extra_exec: &[PathBuf],
+    extra_deny: &[PathBuf],
 ) {
     let home_path = Path::new(home);
+    let undenied = |p: &&PathBuf| overlapping_deny(extra_deny, p).is_none();
     // A path granted both ways is emitted once, from the write list.
     let read_only: Vec<String> = extra_read
         .iter()
         .filter(|p| !extra_write.contains(p) && !extra_exec.contains(p))
+        .filter(undenied)
         .flat_map(|p| denied_dotfile_override_paths(home_path, p))
         .collect();
     let writable: Vec<String> = extra_write
         .iter()
+        .filter(undenied)
         .flat_map(|p| denied_dotfile_override_paths(home_path, p))
         .collect();
     let executable: Vec<String> = extra_exec
         .iter()
+        .filter(undenied)
         .flat_map(|p| denied_dotfile_override_paths(home_path, p))
         .collect();
 
@@ -3711,8 +3710,12 @@ impl ReadDenies {
         }
 
         // 2. `emit_registry_config_overrides`
-        for file in registry_config_overrides(&home, config.extra_read, config.protect_pnpm_config)
-        {
+        for file in registry_config_overrides(
+            &home,
+            config.extra_read,
+            config.extra_deny,
+            config.protect_pnpm_config,
+        ) {
             for p in home_spellings(&home, &file) {
                 rules.push(ReadRule::AllowLiteral(PathBuf::from(p)));
             }
@@ -3724,6 +3727,7 @@ impl ReadDenies {
             .iter()
             .chain(config.extra_write)
             .chain(config.extra_exec)
+            .filter(|p| overlapping_deny(config.extra_deny, p).is_none())
         {
             for p in denied_dotfile_override_paths(config.home_dir, path) {
                 rules.push(ReadRule::AllowSubpath(PathBuf::from(p)));
