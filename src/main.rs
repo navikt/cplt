@@ -9877,17 +9877,10 @@ fn run_check_command(
 /// Silent on any git failure: this is an advisory check, and a repository
 /// without a commit yet, or no git at all, is not something to report as a
 /// finding.
-#[allow(clippy::disallowed_methods)] // `git` is a git::trusted_git() path, resolved immediately above
 fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> Vec<String> {
-    let Some(git) = cplt::git::trusted_git() else {
+    let Some(cmd) = cplt::git::command(project_dir, &["ls-files", "-z"]) else {
         return Vec::new();
     };
-    let mut cmd = std::process::Command::new(git);
-    cmd.arg("-C")
-        // The path itself, not a lossy string: a non-UTF-8 byte would be
-        // replaced and point git at a different directory, or none.
-        .arg(project_dir)
-        .args(["ls-files", "-z"]);
     let Ok(out) = cplt::git::output_bounded(cmd, cplt::git::GIT_TIMEOUT) else {
         return Vec::new();
     };
@@ -21151,6 +21144,87 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("tracked_sensitive_files hung on a planted FIFO");
         assert!(found.is_empty());
+    }
+
+    /// Diagnostics git must run hardened: a config in a pointed-to git dir
+    /// cannot make `cplt doctor`/`cplt check` run a program.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixture setup on a resolved trusted_git() path
+    fn tracked_sensitive_files_ignores_repo_fsmonitor() {
+        let (_g, dir) = canonical_tempdir();
+        let git = |args: &[&str]| {
+            std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        std::fs::write(dir.join(".env"), "x").unwrap();
+        assert!(git(&["init", "-q", "-b", "main"]));
+        assert!(git(&["add", ".env"]));
+        assert!(git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "i"
+        ]));
+        std::fs::rename(dir.join(".git"), dir.join("gd")).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: gd\n").unwrap();
+        let marker = dir.join("MARKER");
+        let mut cfg = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("gd/config"))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut cfg,
+            format!("[core]\n\tfsmonitor = touch {}\n", marker.display()).as_bytes(),
+        )
+        .unwrap();
+
+        let found = tracked_sensitive_files(&dir, true);
+        assert!(
+            found.iter().any(|f| f == ".env"),
+            "git still ran: {found:?}"
+        );
+        assert!(!marker.exists(), "repo fsmonitor ran on the host");
+    }
+
+    /// A repo-local content filter (as Git LFS sets) must not hide tracked
+    /// sensitive files from doctor/check: plain `ls-files` runs no filter.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixture setup on a resolved trusted_git() path
+    fn tracked_sensitive_files_works_with_a_local_content_filter() {
+        let (_g, dir) = canonical_tempdir();
+        let git = |args: &[&str]| {
+            std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        std::fs::write(dir.join(".env"), "x").unwrap();
+        assert!(git(&["init", "-q", "-b", "main"]));
+        assert!(git(&["add", ".env"]));
+        assert!(git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "i"
+        ]));
+        assert!(git(&["config", "filter.lfs.clean", "git-lfs clean -- %f"]));
+
+        let found = tracked_sensitive_files(&dir, true);
+        assert!(found.iter().any(|f| f == ".env"), "{found:?}");
     }
 
     /// #1012: launch only stats `../<name>/.git`, so when `sibling_checkout`

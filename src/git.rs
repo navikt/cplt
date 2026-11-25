@@ -706,6 +706,19 @@ fn subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
 /// may run a `.gitattributes`-selected filter or diff driver.
 fn reads_worktree_content(args: &[&str]) -> bool {
     match subcommand(args) {
+        // Plain `ls-files` lists the index and never refreshes it, so no
+        // filter runs. Options that stat or compare the worktree do not
+        // get the exemption.
+        Some("ls-files") => args.iter().any(|a| {
+            a.starts_with("-m")
+                || a.starts_with("-d")
+                || a.starts_with("-k")
+                || a.starts_with("--modified")
+                || a.starts_with("--deleted")
+                || a.starts_with("--killed")
+                || a.starts_with("--debug")
+                || a.starts_with("--eol")
+        }),
         Some(sub) => !CONTENT_FREE_SUBCOMMANDS.contains(&sub),
         // No subcommand at all (`git --version`): nothing to read. Still
         // treated as content-reading — fail closed, cost is one config read.
@@ -1038,6 +1051,49 @@ fn warn_refused_once() {
 
 #[cfg(test)]
 mod tests {
+    /// Parent-side git must go through [`command`], which applies the
+    /// config overrides and env clearing. A raw `Command::new` naming git
+    /// anywhere else in non-test code fails here unless listed: the listed
+    /// sites either run inside the sandbox or read no repository config.
+    #[test]
+    fn no_raw_git_command_outside_git_rs() {
+        const ALLOWED: &[(&str, usize)] = &[
+            ("audit.rs", 2),    // cwd `/`; env cleared with `--file -`
+            ("gh_proxy.rs", 2), // guard wrappers, inside the sandbox
+            ("upstream.rs", 1), // gate side, inside the sandbox
+        ];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src.clone()];
+        let mut found: Vec<String> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") || p.ends_with("src/git.rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p).unwrap();
+                let code = text.split("\nmod tests").next().unwrap_or("");
+                let rel = p.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+                let n = code
+                    .lines()
+                    .filter(|l| l.contains("Command::new(") && l.contains("git"))
+                    .count();
+                let allowed = ALLOWED.iter().find(|(f, _)| *f == rel).map_or(0, |a| a.1);
+                if n != allowed {
+                    found.push(format!("{rel}: {n} raw git Command(s), {allowed} allowed"));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "route git through git::command: {found:?}"
+        );
+    }
+
     use super::*;
 
     /// A FIFO as the repo config times the probe out (`None`), which

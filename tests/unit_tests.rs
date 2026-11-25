@@ -12635,6 +12635,7 @@ fn every_hinted_config_command_pastes_and_works() {
     const TEMPLATES: &[&str] = &[
         "cplt config set --local {key} {}",
         "cplt config set --local <KEY> <VALUE>",
+        "cplt config set --local allow.write {shown}",
         "cplt config set --local allow.write {t}/<tool>",
         "cplt config set --local sandbox.repo_dirs {first_path}",
         "cplt config set --local sandbox.repo_dirs <dir>",
