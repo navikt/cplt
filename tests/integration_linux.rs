@@ -6027,7 +6027,7 @@ for n in '../escape' '--upload-pack=touch pwned' 'a/b' '.git' '..'; do
   "$c" worktree add "$n" HEAD && echo "BAD_NAME_OK $n"
 done
 "$c" worktree add refx '--upload-pack=touch pwned' && echo BAD_REF_OK
-ln -s /etc "$CPLT_WORKTREE_ROOT/linked" && {{ "$c" worktree add linked HEAD && echo BAD_LINK_OK; }}
+ln -s /etc "$CPLT_WORKTREE_ROOT/linked" 2>/dev/null && echo BAD_LINK_PLANTED
 {}"#,
             protected_write_probes(cplt, "good")
         );
@@ -6048,17 +6048,9 @@ ln -s /etc "$CPLT_WORKTREE_ROOT/linked" && {{ "$c" worktree add linked HEAD && e
             "{}\n"
         );
         assert!(!root.join("good/.github/hooks/new.json").exists(), "{ctx}");
-        assert!(
-            fs::symlink_metadata(root.join("linked"))
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "{ctx}"
-        );
+        assert!(fs::symlink_metadata(root.join("linked")).is_err(), "{ctx}");
         assert!(!project.path().join("pwned").exists(), "{ctx}");
 
-        // The launch check refuses a non-worktree entry in the root; remove it.
-        fs::remove_file(root.join("linked")).unwrap();
         // Next session: the existing worktree is protected before the agent starts.
         let (code, stdout, stderr) = worktree_run(
             project.path(),
