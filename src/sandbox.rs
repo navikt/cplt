@@ -601,6 +601,18 @@ impl PreparedSandbox {
         self.open_url_hosts = hosts.to_vec();
     }
 
+    /// The agent's precomputed Landlock rules, for the worktree broker (#965).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn precomputed_rules(&self) -> &landlock_mod::PrecomputedSandbox {
+        &self.precomputed
+    }
+
+    /// Deny-path masks bubblewrap applies (#965: the broker refuses them).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bwrap_deny_masks(&self) -> usize {
+        self.bwrap_wrapper.as_ref().map_or(0, |w| w.deny_mask_count)
+    }
+
     /// Whether this launch runs under bubblewrap (#965).
     #[cfg(target_os = "linux")]
     pub fn uses_bubblewrap(&self) -> bool {

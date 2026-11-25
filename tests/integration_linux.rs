@@ -5935,6 +5935,17 @@ finally:
         grant: bool,
         script: &str,
     ) -> (i32, String, String) {
+        worktree_run_args(project, home, bwrap, grant, &[], script)
+    }
+
+    fn worktree_run_args(
+        project: &Path,
+        home: &Path,
+        bwrap: bool,
+        grant: bool,
+        extra: &[&str],
+        script: &str,
+    ) -> (i32, String, String) {
         let h = fs::canonicalize(home).unwrap();
         // Where cplt looks anyway, so the state dir stays ~/.config/cplt.
         fs::create_dir_all(h.join(".config/cplt")).unwrap();
@@ -5954,6 +5965,7 @@ finally:
         if grant {
             args.extend_from_slice(&["--allow-read", &grant_path]);
         }
+        args.extend_from_slice(extra);
         args.extend_from_slice(&["--agent", "shell", "--", "-c", script]);
         let out = cplt_cmd()
             .args(&args)
@@ -6197,5 +6209,57 @@ sleep 1; kill $a $b 2>/dev/null; wait 2>/dev/null; true"#
             "{}\n",
             "{ctx}"
         );
+    }
+
+    /// #965 review: a client that keeps an alias of the passed stream and
+    /// clears its timeouts cannot hold the broker: reads and writes are
+    /// non-blocking and bounded, so the next request is still served.
+    #[test]
+    fn worktree_broker_survives_a_client_clearing_timeouts() {
+        require_bwrap!();
+        let script = r#"python3 - <<'PY'
+import os, socket, struct, time
+n = int(os.environ['CPLT_WORKTREE_SOCKET'][3:])
+s = socket.socket(fileno=os.dup(n))
+a, b = socket.socketpair()
+socket.send_fds(s, [b'x'], [b.fileno()])
+zero = struct.pack('ll', 0, 0)
+for _ in range(50):
+    b.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, zero)
+    b.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, zero)
+    b.setblocking(True)
+    time.sleep(0.01)
+c, d = socket.socketpair()
+socket.send_fds(s, [b'x'], [d.fileno()]); d.close()
+c.sendall(b'{"op":"add","name":"after","ref":"HEAD"}\n'); c.settimeout(90)
+print('AFTER', c.recv(4096))
+PY"#;
+        let (project, home) = worktree_fixture();
+        let (code, stdout, stderr) = worktree_run(project.path(), home.path(), true, false, script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("AFTER b'{\"ok\":true"), "{ctx}");
+    }
+
+    /// #965 review: the broker's git runs outside the namespace, where
+    /// bubblewrap's deny masks do not exist, so a session with any mask gets no
+    /// broker (it could read what the mask hides).
+    #[test]
+    fn worktree_broker_is_off_with_deny_masks() {
+        require_bwrap!();
+        let (project, home) = worktree_fixture();
+        fs::create_dir_all(project.path().join("secret")).unwrap();
+        let deny = project.path().join("secret").to_string_lossy().into_owned();
+        let (_code, stdout, stderr) = worktree_run_args(
+            project.path(),
+            home.path(),
+            true,
+            false,
+            &["--deny-path", &deny],
+            r#"echo "SOCK=[$CPLT_WORKTREE_SOCKET]""#,
+        );
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("SOCK=[]"), "{ctx}");
+        assert!(stderr.contains("deny path"), "{ctx}");
     }
 }

@@ -95,6 +95,20 @@ struct Response {
     error: Option<String>,
 }
 
+/// Linux: the agent's own precomputed Landlock rules, opened before the agent
+/// ran, so no path is reopened per request (an agent-swapped symlink cannot
+/// widen them) and nothing leaks per request.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct LaunchRules(crate::sandbox::landlock_mod::PrecomputedSandbox);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for LaunchRules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchRules")
+    }
+}
+
 /// The paths one broker serves. All of them are fixed when the session starts.
 #[derive(Clone, Debug)]
 pub struct Context {
@@ -111,7 +125,7 @@ pub struct Context {
     read_policy: Arc<OnceLock<String>>,
     /// The final session Landlock rules, the Linux counterpart of `read_policy`.
     #[cfg(target_os = "linux")]
-    landlock: Arc<OnceLock<crate::sandbox::LandlockPolicy>>,
+    landlock: Arc<OnceLock<LaunchRules>>,
     protected: ProtectedTree,
     /// `<base>/<fingerprint>`, the directory worktrees are published into.
     root: PathBuf,
@@ -189,10 +203,22 @@ impl Context {
     /// take it back out of a granted tree, so the agent could read or swap a
     /// checkout in flight. The broker is then off, never running unconfined.
     #[cfg(target_os = "linux")]
-    pub fn set_landlock_policy(
+    pub(crate) fn set_landlock_policy(
         &self,
-        policy: crate::sandbox::LandlockPolicy,
+        policy: &crate::sandbox::LandlockPolicy,
+        rules: &crate::sandbox::landlock_mod::PrecomputedSandbox,
+        deny_masks: usize,
     ) -> Result<(), String> {
+        // The broker's git runs in the host mount namespace, where bubblewrap's
+        // deny masks do not exist; through alternates or symlinked object
+        // directories it could read what they hide and publish it into the
+        // root. So no broker while any mask is in force.
+        if deny_masks > 0 {
+            return Err(format!(
+                "the session masks {deny_masks} deny path(s) inside granted trees, and the \
+                 broker's git runs outside the namespace that hides them"
+            ));
+        }
         let staging = std::fs::canonicalize(&self.base)
             .unwrap_or_else(|_| self.base.clone())
             .join(STAGING_DIR);
@@ -209,7 +235,7 @@ impl Context {
             ));
         }
         self.landlock
-            .set(policy)
+            .set(LaunchRules(rules.clone()))
             .map_err(|_| "worktree broker Landlock policy was already installed".into())
     }
 }
@@ -354,8 +380,11 @@ impl Broker {
     /// Linux: capture the final session Landlock rules for the broker's git.
     #[cfg(target_os = "linux")]
     pub fn set_sandbox(&self, sandbox: &mut crate::sandbox::PreparedSandbox) -> Result<(), String> {
-        self.landlock
-            .set_landlock_policy(sandbox.landlock_policy().clone())
+        self.landlock.set_landlock_policy(
+            sandbox.landlock_policy(),
+            sandbox.precomputed_rules(),
+            sandbox.bwrap_deny_masks(),
+        )
     }
 }
 
@@ -537,7 +566,54 @@ fn handle(ctx: &Context, stream: UnixStream, stop: &AtomicBool) {
     };
     if let Ok(mut line) = serde_json::to_string(&response) {
         line.push('\n');
-        let _ = (&stream).write_all(line.as_bytes());
+        send_bounded(&stream, line.as_bytes(), stop);
+    }
+}
+
+/// Wait up to `ms` for `events` on `stream`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn poll_ready(stream: &UnixStream, events: libc::c_short, ms: libc::c_int) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: one live pollfd.
+    unsafe { libc::poll(&raw mut pfd, 1, ms) > 0 }
+}
+
+/// Write the reply with non-blocking sends, within [`IO_TIMEOUT`] and while
+/// the broker runs. Gives up silently: the client may be gone.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn send_bounded(stream: &UnixStream, mut bytes: &[u8], stop: &AtomicBool) {
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MSG_DONTWAIT;
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while !bytes.is_empty() && !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        if !poll_ready(stream, libc::POLLOUT, 100) {
+            continue;
+        }
+        // SAFETY: bytes is a live slice.
+        let n = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                flags,
+            )
+        };
+        if n > 0 {
+            bytes = &bytes[n as usize..];
+        } else if n < 0
+            && !matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            )
+        {
+            return;
+        }
     }
 }
 
@@ -549,11 +625,27 @@ fn read_request(stream: &UnixStream, stop: &AtomicBool) -> Result<Request, Strin
         if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err("request read deadline exceeded".into());
         }
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(|e| format!("cannot bound request read: {e}"))?;
+        // Per-call non-blocking I/O bounded by poll: a sender holding an alias
+        // of this socket can change its timeouts or O_NONBLOCK, but not these.
+        if !poll_ready(stream, libc::POLLIN, 100) {
+            continue;
+        }
         let mut byte = [0];
-        match (&*stream).read(&mut byte) {
+        // SAFETY: one byte into a live buffer.
+        let n = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        let res = if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        };
+        match res {
             Ok(0) => break,
             Ok(_) => {
                 line.push(byte[0]);
@@ -1444,32 +1536,43 @@ fn sandbox_git(ctx: &Context, cmd: Command, staging: Option<&Path>) -> Result<Co
 /// the broker's git between fork and exec.
 #[cfg(target_os = "linux")]
 fn sandbox_git(ctx: &Context, mut cmd: Command, staging: Option<&Path>) -> Result<Command, String> {
-    use crate::sandbox::{FsAccess, FsRule};
+    use crate::sandbox::FsAccess;
     use std::os::unix::process::CommandExt as _;
-    let mut policy = ctx
+    let mut pre = ctx
         .landlock
         .get()
         .ok_or("worktree broker session Landlock policy is not installed")?
+        .0
         .clone();
-    if let Some(staging) = staging {
-        policy.fs_rules.push(FsRule {
-            path: staging.to_path_buf(),
-            access: FsAccess {
-                read: true,
-                write: true,
-                execute: false,
-                ioctl: false,
-                create_dirs: true,
-            },
-            nofollow: false,
-        });
-    }
-    let pre = crate::sandbox::landlock_mod::precompute(policy)?;
+    // The one per-request rule: this request's private staging directory,
+    // opened without following a link and owned by the closure, so it closes
+    // with the Command whether or not it spawns.
+    let staging_fd = match staging {
+        Some(staging) => {
+            let fd = crate::sandbox::landlock_mod::open_no_symlinks_walk(staging)
+                .map_err(|e| format!("cannot open broker staging: {e}"))?;
+            pre.pre_opened_fds.push((
+                fd.as_raw_fd(),
+                FsAccess {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: true,
+                },
+            ));
+            Some(fd)
+        }
+        None => None,
+    };
     cmd.stdin(Stdio::null());
     // SAFETY: apply_precomputed is the same hook the agent spawn uses; it
     // makes raw syscalls on data prepared in the parent.
     unsafe {
-        cmd.pre_exec(move || crate::sandbox::landlock_mod::apply_precomputed(&pre));
+        cmd.pre_exec(move || {
+            let _keep = &staging_fd;
+            crate::sandbox::landlock_mod::apply_precomputed(&pre)
+        });
     }
     Ok(cmd)
 }
