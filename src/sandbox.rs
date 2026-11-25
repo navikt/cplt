@@ -64,7 +64,13 @@ pub(crate) mod bubblewrap_probe {
         grants: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> Result<(), String> {
         let git_dirs = super::launch_git_dirs(config)?;
-        let plan = super::bwrap_plan(config, &git_dirs, grants, &std::cell::OnceCell::new());
+        let plan = super::bwrap_plan(
+            config,
+            &git_dirs,
+            grants,
+            &std::cell::OnceCell::new(),
+            false,
+        );
         super::bubblewrap::build_wrapper(
             &plan.policy,
             super::bubblewrap::Overlays {
@@ -87,7 +93,13 @@ pub(crate) mod bubblewrap_probe {
         grants: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> Vec<std::path::PathBuf> {
         let git_dirs = super::launch_git_dirs(config).unwrap_or_default();
-        let plan = super::bwrap_plan(config, &git_dirs, grants, &std::cell::OnceCell::new());
+        let plan = super::bwrap_plan(
+            config,
+            &git_dirs,
+            grants,
+            &std::cell::OnceCell::new(),
+            false,
+        );
         config
             .extra_deny
             .iter()
@@ -191,7 +203,7 @@ pub(crate) use exec::which_binary;
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
     FsAccess, FsRule, LandlockPolicy, NetRule, blocked_syscall_names, describe_policy,
-    generate_policy,
+    ensure_podman_state_dirs, generate_policy,
 };
 // Kernel capability probe — used by integration tests (securityfs is
 // root-only on some hosts, so tests cannot read abi_version from there).
@@ -3639,11 +3651,11 @@ fn report_unix_socket_regime(
 /// launch's own wrapper builds and masks every bus endpoint that exists.
 /// Probed with the launch's rules, as `cplt doctor` does.
 #[cfg(target_os = "linux")]
-pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
+pub fn mcp_broker_refusal(config: &SandboxConfig, inspect_only: bool) -> Option<String> {
     if let Some(why) = mcp_flag_conflict(config.allow_gpg_signing, config.allow_rootless_docker) {
         return Some(why);
     }
-    let (wrapper, plan) = mcp_wrapper(config);
+    let (wrapper, plan) = mcp_wrapper(config, inspect_only);
     mcp_refusal_text(
         wrapper,
         &plan.deny_masks,
@@ -3658,7 +3670,7 @@ pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn mcp_wrapper_error(config: &SandboxConfig) -> Option<String> {
-    mcp_wrapper(config).0.err()
+    mcp_wrapper(config, false).0.err()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3668,7 +3680,7 @@ pub fn mcp_wrapper_error(_: &SandboxConfig) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
+fn mcp_wrapper(config: &SandboxConfig, inspect_only: bool) -> (Result<(), String>, BwrapPlan) {
     // Planned as the launch will be: with a broker socket, so with its masks.
     let probe_socket = Path::new("/tmp/cplt-mcp-probe/m");
     let config = &SandboxConfig {
@@ -3682,7 +3694,7 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
     )
     .unwrap_or_default();
     let git_dirs = launch_git_dirs(config).unwrap_or_default();
-    let plan = bwrap_plan(config, &git_dirs, &grants, &base);
+    let plan = bwrap_plan(config, &git_dirs, &grants, &base, inspect_only);
     let wrapper = if config.use_bubblewrap == Some(false) {
         Err("it is turned off".to_string())
     } else {
@@ -3703,7 +3715,7 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn mcp_broker_refusal(_: &SandboxConfig) -> Option<String> {
+pub fn mcp_broker_refusal(_: &SandboxConfig, _: bool) -> Option<String> {
     None
 }
 
@@ -4398,6 +4410,7 @@ fn bwrap_plan(
     extra_git_dirs: &[PathBuf],
     canonical_grants: &[(PathBuf, PathBuf)],
     base: &std::cell::OnceCell<LandlockPolicy>,
+    inspect_only: bool,
 ) -> BwrapPlan {
     let mut policy = base
         .get_or_init(|| landlock_mod::generate_policy(config))
@@ -4480,11 +4493,12 @@ fn bwrap_plan(
     })
     .filter(|p| p.exists())
     .collect();
-    let deny_masks = bubblewrap::build_deny_masks(
+    let deny_masks = bubblewrap::plan_deny_masks(
         config.extra_deny,
         &socket_masks,
         &credential_links,
         config.scratch_dir,
+        inspect_only,
     );
     BwrapPlan {
         policy,
@@ -4990,7 +5004,7 @@ fn prepare_impl(
         if !inspect_only {
             seed_claude_settings(config);
         }
-        bwrap_plan(config, extra_git_dirs, canonical_grants, base)
+        bwrap_plan(config, extra_git_dirs, canonical_grants, base, inspect_only)
     };
     // #790: the `/proc/self` rule binds to the first child's `/proc/<pid>`,
     // so every process it starts gets EACCES on its own `/proc/self/*`

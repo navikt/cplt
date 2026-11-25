@@ -586,6 +586,29 @@ pub fn pnpm_config_residuals(rules: &[FsRule], home: &Path) -> Vec<String> {
         .collect()
 }
 
+fn podman_state_dirs(config: &super::SandboxConfig) -> Vec<PathBuf> {
+    match policy::DockerAccess::from_flags(config.allow_docker, config.allow_rootless_docker) {
+        policy::DockerAccess::Off => Vec::new(),
+        _ => policy::linux_podman_state_dirs(
+            config.home_dir,
+            policy::current_uid(),
+            policy::xdg_runtime_dir_env().as_deref(),
+        ),
+    }
+}
+
+/// Create the Podman state dirs [`generate_policy`] grants. A rule on a
+/// missing path is skipped and bwrap drops its bind, so a first
+/// `podman --remote` could not create `libpod/` in the read-only runtime dir.
+/// Made the way Podman would (0700, never through a link, never the runtime
+/// dir itself). Launch only, before the policy: inspect writes nothing (#1198).
+pub fn ensure_podman_state_dirs(config: &super::SandboxConfig) {
+    for dir in podman_state_dirs(config) {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+    }
+}
+
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
@@ -1212,18 +1235,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
         policy::DockerAccess::Off => Vec::new(),
     };
-    let podman_state = match docker {
-        policy::DockerAccess::Off => Vec::new(),
-        _ => policy::linux_podman_state_dirs(home, uid, xdg.as_deref()),
-    };
-    // A rule on a missing path is skipped and bwrap drops its bind, so a
-    // first `podman --remote` could not create `libpod/` in the read-only
-    // runtime dir. Make it here, before the mount plan, the way Podman
-    // would (0700, never through a link, never the runtime dir itself).
-    for dir in &podman_state {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
-    }
+    let podman_state = podman_state_dirs(config);
     for path in docker_sockets.into_iter().chain(podman_state) {
         fs_rules.push(FsRule {
             // A rootless entry lives in a dir the user owns, so a link there

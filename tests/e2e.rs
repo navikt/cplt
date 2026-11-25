@@ -244,6 +244,72 @@ mod e2e_tests {
         }
     }
 
+    /// Every file and directory under `root`, relative to it.
+    fn tree(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(p.clone());
+                }
+                out.push(p.strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// #1198, #1215, #1220: inspect commands write nothing to HOME or any
+    /// XDG dir. `--print-profile` runs on an empty HOME, so a scratch dir,
+    /// agent dir, MCP temp base or gh state it created would show. `cplt
+    /// check` runs live probes, so it gets a real scratch dir (removed on
+    /// drop) and stages a probe binary in `~/.cache`; both bases exist on any
+    /// used machine and are made before it runs, so only new files count.
+    #[test]
+    fn e2e_inspect_commands_leave_home_untouched() {
+        let tmp = crate::common::home_temp_dir("inspect");
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        // Its own repo: `home_temp_dir` sits in the developer's HOME, which
+        // may itself be a checkout the project would otherwise resolve to.
+        assert!(crate::common::git_ok(&project, &["init", "--quiet"]));
+        let run = |args: &[&str]| {
+            let before = tree(&root);
+            let out = cplt_cmd()
+                .args(args)
+                .current_dir(&project)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("XDG_STATE_HOME", home.join(".local/state"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                // The probe shell must not pick up the developer's tool
+                // managers (mise writes its own state on start).
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .output()
+                .expect("binary should run");
+            assert!(
+                out.status.success(),
+                "{args:?} failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(tree(&root), before, "{args:?} wrote to the host");
+        };
+        run(&["--print-profile"]);
+        run(&["--agent", "claude", "--print-profile"]);
+        assert!(!home.join(".claude").exists() && !home.join(".claude.json").exists());
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(cplt::scratch::ScratchDir::base(&home)).unwrap();
+        run(&["check"]);
+    }
+
     #[test]
     fn e2e_print_profile_allows_project_dir() {
         let output = cplt_cmd()
@@ -14707,6 +14773,48 @@ mod agent_stubs {
             read_only: &[".claude/settings.json", ".claude/statusline.sh"],
             extra_args: "",
         });
+    }
+
+    /// #1219: the launch pre-creates agent dirs, never a file grant: a
+    /// `~/.claude.json` made as a directory breaks Claude.
+    #[test]
+    fn claude_launch_never_makes_claude_json_a_dir() {
+        if !sandbox_usable() {
+            return;
+        }
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-stub-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let bin = h.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("claude");
+        std::fs::write(&stub, STUB).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cmd = cplt_cmd();
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+        let o = cmd
+            .current_dir(&proj)
+            .env("HOME", &h)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .args(["--yes", "--agent", "claude", "--", "exit 0"])
+            .output()
+            .expect("cplt should run");
+        assert!(
+            o.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(h.join(".claude").is_dir(), "the dir grant is pre-created");
+        assert!(
+            !h.join(".claude.json").is_dir(),
+            "~/.claude.json made a dir"
+        );
     }
 
     /// #972: with the brief on, the fake `claude` gets

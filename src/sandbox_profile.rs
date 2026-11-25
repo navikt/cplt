@@ -339,7 +339,17 @@ fn profile_locked(
     }
     // Reads the grants back from the profile text so no grant can be missed.
     emit_user_deny_pins(&mut sb, config);
-    emit_grant_root_pins(&mut sb);
+    // A launch creates these before generating the profile; `--print-profile`
+    // does not (#1198), so it counts them as existing to print the same pins.
+    let created: Vec<&Path> = config
+        .agent_dirs
+        .iter()
+        // A file grant is never pinned while missing (#923 review).
+        .filter(|d| !d.is_file)
+        .map(|d| d.path.as_path())
+        .chain(config.scratch_dir)
+        .collect();
+    emit_grant_root_pins(&mut sb, &created);
 
     sb
 }
@@ -351,7 +361,7 @@ fn profile_locked(
 /// Pin every root whose parent is not itself writable: no unlink or rename,
 /// no create (for roots that exist). Both spellings, as Seatbelt matches the resolved path. Reads
 /// the grants back from the text, so a new grant anywhere is covered.
-fn emit_grant_root_pins(sb: &mut String) {
+fn emit_grant_root_pins(sb: &mut String, created: &[&Path]) {
     let roots = emitted_write_subpaths(sb);
     let mut pins: Vec<PathBuf> = roots
         .iter()
@@ -359,7 +369,7 @@ fn emit_grant_root_pins(sb: &mut String) {
         .filter(|r| !roots.iter().any(|o| o != *r && r.starts_with(o)))
         // A missing root stays creatable (tools make their caches on first
         // use); a symlink planted there is refused at the next launch.
-        .filter(|r| r.symlink_metadata().is_ok())
+        .filter(|r| r.symlink_metadata().is_ok() || created.iter().any(|c| c.starts_with(r)))
         .flat_map(|r| [r.clone(), crate::config::canonicalize_deepest(r)])
         .filter(|r| validate_sbpl_path(r).is_ok())
         .collect();
@@ -4408,6 +4418,22 @@ mod tests {
     }
 
     use super::*;
+
+    /// #1198: `--print-profile` creates nothing, so a root a launch would
+    /// create (an agent dir, the scratch base) still gets its pin.
+    #[test]
+    fn grant_root_pins_count_would_be_created_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("home/.copilot");
+        let grant = format!("(allow file-write* (subpath \"{}\"))\n", root.display());
+        let pin = format!("(deny file-write-create (literal \"{}\"))", root.display());
+        let mut sb = grant.clone();
+        emit_grant_root_pins(&mut sb, &[]);
+        assert!(!sb.contains(&pin), "a missing root stays creatable");
+        let mut sb = grant;
+        emit_grant_root_pins(&mut sb, &[&root.join("x")]);
+        assert!(sb.contains(&pin), "{sb}");
+    }
 
     #[test]
     fn key_root_over_a_system_ca_dir_is_flagged() {
