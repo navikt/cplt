@@ -2986,7 +2986,7 @@ fn registry_config_overrides(
         .filter(|file| {
             let full_path = resolved(home_path.join(file));
             extra_read.iter().any(|p| p == &full_path)
-                && overlapping_deny(extra_deny, &full_path).is_none()
+                && !extra_deny.iter().any(|d| full_path.starts_with(d))
         })
         .collect()
 }
@@ -3404,9 +3404,12 @@ fn emit_named_ssh_key_grants(
 /// file case is unchanged and the directory case now means the same thing on
 /// both backends: the subtree the user named.
 ///
-/// A grant an explicit `--deny-path` overlaps is not re-allowed, so the deny
-/// wins on macOS as it does on Linux, like [`emit_named_ssh_key_grants`]
-/// (#1222). Before, this re-allow came after the user denies and beat them.
+/// A grant an explicit `--deny-path` covers (same path or an ancestor) is not
+/// re-allowed. A deny strictly inside a grant keeps the grant and is repeated
+/// right after it, as [`reallow_below_user_denies`] does, so last-match-wins
+/// keeps the child closed. That matches Linux, where bubblewrap masks only the
+/// denied path and the parent grant stands (#1222). Before, this re-allow came
+/// after the user denies and beat them.
 fn emit_denied_dotfile_overrides(
     sb: &mut String,
     home: &str,
@@ -3416,7 +3419,7 @@ fn emit_denied_dotfile_overrides(
     extra_deny: &[PathBuf],
 ) {
     let home_path = Path::new(home);
-    let undenied = |p: &&PathBuf| overlapping_deny(extra_deny, p).is_none();
+    let undenied = |p: &&PathBuf| !extra_deny.iter().any(|d| p.starts_with(d));
     // A path granted both ways is emitted once, from the write list.
     let read_only: Vec<String> = extra_read
         .iter()
@@ -3453,7 +3456,36 @@ fn emit_denied_dotfile_overrides(
         sbpl!(sb, "(allow file-read* (subpath \"{path}\"))");
         sbpl!(sb, "(allow file-map-executable (subpath \"{path}\"))");
     }
+    for d in
+        denies_inside_dotfile_grants(home_path, extra_read, extra_write, extra_exec, extra_deny)
+    {
+        let d = d.to_string_lossy();
+        sbpl!(sb, "(deny file-read* (subpath \"{d}\"))");
+        sbpl!(sb, "(deny file-write* (subpath \"{d}\"))");
+    }
     sbpl!(sb);
+}
+
+/// `--deny-path` entries strictly inside a credential-dir grant that
+/// [`emit_denied_dotfile_overrides`] re-allows; they are repeated after it.
+fn denies_inside_dotfile_grants<'a>(
+    home: &Path,
+    extra_read: &[PathBuf],
+    extra_write: &[PathBuf],
+    extra_exec: &[PathBuf],
+    extra_deny: &'a [PathBuf],
+) -> Vec<&'a PathBuf> {
+    let granted: Vec<&PathBuf> = extra_read
+        .iter()
+        .chain(extra_write)
+        .chain(extra_exec)
+        .filter(|p| !extra_deny.iter().any(|d| p.starts_with(d)))
+        .filter(|p| !denied_dotfile_override_paths(home, p).is_empty())
+        .collect();
+    extra_deny
+        .iter()
+        .filter(|d| granted.iter().any(|g| d.starts_with(g)))
+        .collect()
 }
 
 /// The first explicit `--deny-path` that overlaps `root` in any direction:
@@ -3727,11 +3759,20 @@ impl ReadDenies {
             .iter()
             .chain(config.extra_write)
             .chain(config.extra_exec)
-            .filter(|p| overlapping_deny(config.extra_deny, p).is_none())
+            .filter(|p| !config.extra_deny.iter().any(|d| p.starts_with(d)))
         {
             for p in denied_dotfile_override_paths(config.home_dir, path) {
                 rules.push(ReadRule::AllowSubpath(PathBuf::from(p)));
             }
+        }
+        for d in denies_inside_dotfile_grants(
+            config.home_dir,
+            config.extra_read,
+            config.extra_write,
+            config.extra_exec,
+            config.extra_deny,
+        ) {
+            rules.push(ReadRule::DenySubpath(d.clone()));
         }
 
         // 4. `emit_gpg_signing_rules`

@@ -1173,7 +1173,7 @@ impl Resolved {
 
     /// One warning per `allow.read`/`allow.write` entry that overlaps a
     /// `deny.paths` entry (same path, ancestor or descendant), naming both and
-    /// which one wins (the deny, on every platform since #1222). Both lines are honoured as far as the
+    /// what wins, the same on every platform since #1222. Both lines are honoured as far as the
     /// backend allows; the warning exists so neither is believed in full.
     #[must_use]
     pub fn allow_deny_overlap_warnings(&self) -> Vec<String> {
@@ -1189,11 +1189,20 @@ impl Resolved {
         ] {
             for (allow, denies) in grants_overlapping(list, &deny) {
                 for d in denies {
-                    let winner = if cfg!(target_os = "linux") {
-                        "the deny wins where they overlap (deny.paths needs bubblewrap on Linux)"
+                    // A deny strictly inside the grant closes only itself; one
+                    // at or above it closes the whole grant (#1222).
+                    let mut winner = if Path::new(&d) != allow && Path::new(&d).starts_with(&allow)
+                    {
+                        format!(
+                            "{d} is denied and the rest of {} stays granted",
+                            allow.display()
+                        )
                     } else {
-                        "the deny wins where they overlap"
+                        format!("the deny wins and {} is not granted", allow.display())
                     };
+                    if cfg!(target_os = "linux") {
+                        winner.push_str(" (deny.paths needs bubblewrap on Linux)");
+                    }
                     out.push(format!(
                         "{key} {} overlaps deny.paths {d}: {winner}. \
                          Remove one of the two entries to make the intent explicit.",
@@ -3171,10 +3180,18 @@ validate = false
             w[0].contains("allow.write /w overlaps deny.paths /w/secret"),
             "{w:?}"
         );
+        assert!(
+            w[0].contains("/w/secret is denied and the rest of /w stays granted"),
+            "{w:?}"
+        );
         // child allow under parent deny
         let w = warn(&["/w/a/b"], &[], &["/w/a"]);
         assert!(
             w[0].contains("allow.read /w/a/b overlaps deny.paths /w/a"),
+            "{w:?}"
+        );
+        assert!(
+            w[0].contains("the deny wins and /w/a/b is not granted"),
             "{w:?}"
         );
         // no overlap: sibling with a shared string prefix
