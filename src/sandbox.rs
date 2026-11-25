@@ -3569,6 +3569,16 @@ fn report_unix_socket_regime(
     let v9 = landlock_mod::check_availability().is_ok_and(|abi| abi >= ABI::V9);
     let blocked =
         |p: &Path| v9 || masks.is_some_and(|m| p.canonicalize().is_ok_and(|c| m.covers(&c)));
+    let bus = env_bus_endpoints();
+    if bus.other
+        || (bus.abstract_socket && !landlock_mod::check_availability().is_ok_and(|a| a >= ABI::V6))
+    {
+        crate::ui::warn(
+            "A D-Bus address in the environment names an endpoint that cannot be masked \
+             (abstract socket below Landlock ABI v6, a non-unix transport, or a malformed \
+             entry): the agent may reach that bus.",
+        );
+    }
     if let Some(line) = container_socket_line(
         config.home_dir,
         config.allow_docker,
@@ -3845,6 +3855,21 @@ pub(crate) struct BusEndpoints {
     abstract_socket: bool,
     /// A non-unix transport (tcp, ...).
     other: bool,
+    /// A pathname the address names but bubblewrap cannot mask exactly
+    /// (bad escape, not UTF-8).
+    unmaskable_path: bool,
+}
+
+/// Under bubblewrap a bus socket that cannot be masked refuses the launch:
+/// a warning would leave the bus reachable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn bus_mask_refusal(bus: &BusEndpoints) -> Option<String> {
+    bus.unmaskable_path.then(|| {
+        "a D-Bus address in DBUS_SESSION_BUS_ADDRESS or DBUS_SYSTEM_BUS_ADDRESS names a \
+         socket path Bubblewrap cannot mask (bad %XX escape or not UTF-8). Fix the address \
+         or the socket path, or unset the variable."
+            .to_string()
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3862,6 +3887,24 @@ fn mcp_bus_endpoints() -> BusEndpoints {
     bus
 }
 
+/// Every bus the environment names (`DBUS_SESSION_BUS_ADDRESS`,
+/// `DBUS_SYSTEM_BUS_ADDRESS`): a bus may listen anywhere, not only under the
+/// runtime dir, so each pathname endpoint gets its own mask.
+#[cfg(target_os = "linux")]
+fn env_bus_endpoints() -> BusEndpoints {
+    let mut out = BusEndpoints::default();
+    for var in ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"] {
+        if let Ok(a) = std::env::var(var) {
+            let mut b = parse_dbus_address(&a);
+            out.paths.append(&mut b.paths);
+            out.abstract_socket |= b.abstract_socket;
+            out.other |= b.other;
+            out.unmaskable_path |= b.unmaskable_path;
+        }
+    }
+    out
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// The endpoints in a D-Bus address list (`unix:path=/x;unix:abstract=y`).
 pub(crate) fn parse_dbus_address(addr: &str) -> BusEndpoints {
@@ -3871,37 +3914,57 @@ pub(crate) fn parse_dbus_address(addr: &str) -> BusEndpoints {
             out.other = true;
             continue;
         };
-        for (k, v) in keys.split(',').filter_map(|kv| kv.split_once('=')) {
+        let mut known = false;
+        for field in keys.split(',') {
+            let Some((k, v)) = field.split_once('=') else {
+                out.other = true;
+                continue;
+            };
             match k {
-                "path" | "dir" => out.paths.push(PathBuf::from(dbus_unescape(v))),
-                "abstract" | "tmpdir" => out.abstract_socket = true,
-                _ => {}
+                // Fail closed: a path in a malformed entry is still masked.
+                "path" | "dir" if !v.is_empty() => {
+                    if let Some(p) = dbus_unescape(v) {
+                        out.paths.push(PathBuf::from(p));
+                        known = true;
+                    } else {
+                        // Bubblewrap takes UTF-8 arguments, so this one cannot be masked.
+                        out.other = true;
+                        out.unmaskable_path = true;
+                    }
+                }
+                "abstract" | "tmpdir" => {
+                    out.abstract_socket = true;
+                    known = true;
+                }
+                // `$XDG_RUNTIME_DIR/bus`, already masked with the runtime dirs.
+                "runtime" => known = true,
+                "guid" => {}
+                _ => out.other = true,
             }
         }
+        // Nothing to mask, so report it rather than drop it.
+        out.other |= !known;
     }
     out
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-/// D-Bus address values escape bytes as `%XX`.
-fn dbus_unescape(v: &str) -> String {
+/// D-Bus address values escape bytes as `%XX`. `None` for a bad escape or
+/// bytes that are not UTF-8: the path cannot be named exactly.
+fn dbus_unescape(v: &str) -> Option<String> {
     let b = v.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%'
-            && let Some(byte) = v
-                .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            out.push(byte);
+        if b[i] == b'%' {
+            out.push(u8::from_str_radix(v.get(i + 1..i + 3)?, 16).ok()?);
             i += 3;
         } else {
             out.push(b[i]);
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).ok()
 }
 
 /// The no-bubblewrap socket warning; `probe_failed` means bwrap is installed
@@ -4405,6 +4468,11 @@ fn bwrap_plan(
         policy::DockerAccess::from_flags(config.allow_docker, config.allow_rootless_docker),
     )
     .into_iter()
+    // Sockets only: a `dir=` entry names a listen directory, not a socket.
+    .chain(env_bus_endpoints().paths.into_iter().filter(|p| {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket())
+    }))
     .chain(if config.mcp_socket.is_some() {
         mcp_bus_endpoints().paths
     } else {
@@ -4984,6 +5052,12 @@ fn prepare_impl(
                 p.display()
             ));
         }
+    }
+
+    if bwrap_wrapper.is_some()
+        && let Some(e) = bus_mask_refusal(&env_bus_endpoints())
+    {
+        return Err(e);
     }
 
     // #834: the launch checked this before starting the broker
@@ -5666,6 +5740,40 @@ mod tests {
         assert!(parse_dbus_address("unix:tmpdir=/tmp").abstract_socket);
         assert!(parse_dbus_address("tcp:host=localhost,port=1").other);
         assert_eq!(parse_dbus_address(""), BusEndpoints::default());
+        let rt = parse_dbus_address("unix:runtime=yes");
+        assert!(rt.paths.is_empty() && !rt.other && !rt.abstract_socket);
+        let list = parse_dbus_address("unix:abstract=/x;unix:path=/home/u/b%2cus");
+        assert_eq!(list.paths, [PathBuf::from("/home/u/b,us")]);
+        assert!(list.abstract_socket);
+        for bad in [
+            "unix:path",
+            "unix:path=",
+            "unix:guid=1",
+            "garbage",
+            "unix:path=/x%FF",
+            "unix:path=/x%2",
+        ] {
+            let b = parse_dbus_address(bad);
+            assert!(b.paths.is_empty() && b.other, "{bad}");
+        }
+        for bad in ["unix:path=/x%FF", "unix:path=/x%2"] {
+            assert!(
+                super::bus_mask_refusal(&parse_dbus_address(bad)).is_some(),
+                "{bad}"
+            );
+        }
+        for warn_only in [
+            "unix:abstract=/x",
+            "tcp:host=h,port=1",
+            "unix:path=/b,broken",
+        ] {
+            assert!(super::bus_mask_refusal(&parse_dbus_address(warn_only)).is_none());
+        }
+        // A malformed field is reported, and the path it came with still masked.
+        let half = parse_dbus_address("unix:path=/home/u/bus,broken");
+        assert_eq!(half.paths, [PathBuf::from("/home/u/bus")]);
+        assert!(half.other);
+        assert!(parse_dbus_address("unix:path=/home/u/bus,foo=1").other);
     }
 
     #[test]
