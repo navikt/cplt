@@ -578,6 +578,36 @@ echo SCRATCH_CACHE_CONSUMED_ONCE
         assert!(stderr.contains("the proxy is off"), "{stderr}");
     }
 
+    /// #1197: `--print-profile` never starts the proxy, so the config key
+    /// `cplt config init` writes must not make it refuse.
+    #[test]
+    fn print_profile_works_with_inject_github_token_in_config() {
+        require_sandbox!();
+        let home = home_temp_dir("inject-print-profile");
+        let project = tempfile::tempdir().unwrap();
+        let config = home.path().join("cplt.toml");
+        std::fs::write(&config, "[proxy]\ninject_github_token = true\n").unwrap();
+        let mut cmd = cplt_cmd();
+        for var in cplt::token_inject::USER_CA_VARS {
+            cmd.env_remove(var);
+        }
+        let out = cmd
+            .env("CPLT_CONFIG", &config)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_DATA_HOME", home.path().join(".data"))
+            .env("XDG_STATE_HOME", home.path().join(".state"))
+            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .current_dir(project.path())
+            .args(["--yes", "--agent", "shell", "--print-profile"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("(deny default)"), "{stdout}");
+    }
+
     /// A CA variable denied on the command line refuses the launch too.
     #[test]
     fn inject_github_token_refuses_cli_denied_ca_var() {
