@@ -8389,7 +8389,14 @@ fn assemble_sandbox(
                  would get the real token: {fix}, or {off}."
             )
         };
-        if proxy_handle.is_none() {
+        // #1197: --print-profile never starts the proxy, so judge it from the
+        // config there; a real launch still needs the running proxy.
+        let proxy_off = if opts.inspect_only {
+            !resolved.with_proxy
+        } else {
+            proxy_handle.is_none()
+        };
+        if proxy_off {
             return Err(refuse(
                 "the proxy is off".into(),
                 "drop --no-proxy or set proxy.enabled = true",
