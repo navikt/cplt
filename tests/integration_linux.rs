@@ -3251,9 +3251,9 @@ print('BIND_OK')
     /// its `st_dev`, and probes TIOCSTI on the slave.
     const PTY_PROBE: &str = r#"python3 -c "
 import os, sys, fcntl, tty, subprocess
-m, s = os.openpty()
-name = os.ttyname(s)
 try:
+    m, s = os.openpty()
+    name = os.ttyname(s)
     fd = os.open(name, os.O_RDWR | os.O_NOCTTY)
     tty.setraw(fd)
     print('reopen=OK')
