@@ -426,6 +426,9 @@ pub struct PreparedSandbox {
     /// A write grant reaches cplt's state dir (warned, not refused). On Linux
     /// the launcher then quarantines what the session adds to `managed.d`.
     state_exposed: bool,
+    /// Why the OpenCode handover must not read `auth.json` this session
+    /// (#1057), judged against this session's policy.
+    pub(crate) opencode_auth_refused: Option<String>,
     agent: Agent,
     /// Specific localhost ports the user has explicitly opened.
     allow_localhost: Vec<u16>,
@@ -960,6 +963,13 @@ fn prepare_locked(
         &base,
     )?;
     prepared.state_exposed = exposed.is_some();
+    if config.agent == Agent::OpenCode && !inspect_only {
+        let policy = base.get_or_init(|| landlock_mod::generate_policy(config));
+        prepared.opencode_auth_refused =
+            crate::agent::opencode_auth_store_refusal(config.home_dir, |p| {
+                crate::check::writable_tree_on_path(policy, config.home_dir, p).map(|(_, t)| t)
+            });
+    }
     Ok(prepared)
 }
 
@@ -3523,6 +3533,7 @@ fn prepare_impl(
             .any(|e| e == "ms-playwright" || e == "ms-playwright/puppeteer"),
         proxy_port: config.proxy_port,
         state_exposed: false,
+        opencode_auth_refused: None,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
@@ -5403,6 +5414,7 @@ fn prepare_impl(
             .any(|e| e == "ms-playwright" || e == "ms-playwright/puppeteer"),
         proxy_port: config.proxy_port,
         state_exposed: false,
+        opencode_auth_refused: None,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,

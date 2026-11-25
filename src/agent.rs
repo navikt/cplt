@@ -503,8 +503,43 @@ fn opencode_auth_overlay(auth_json: Option<&str>, token: &str) -> Option<String>
     Some(serde_json::Value::Object(map).to_string())
 }
 
-/// [`opencode_auth_overlay`] for the store in `home`.
-pub fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
+/// Why the OpenCode credential store in `home` must not be read for the
+/// handover (#1057), or `None`. The store dir itself is agent-writable by
+/// design, which the leaf checks in [`read_opencode_auth_json`] cover. Its
+/// parent is not: an agent that can write the XDG data base, any entry on
+/// the way to it, or a symlink it passes through can swap `opencode/` for a
+/// link and choose what the next launch reads. `writable` is
+/// `check::writable_tree_on_path` against the session's policy.
+pub fn opencode_auth_store_refusal(
+    home: &Path,
+    writable: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<String> {
+    let store = opencode_auth_json(home)?.parent()?.to_path_buf();
+    let base = store.parent()?;
+    if let Some(tree) = writable(base) {
+        return Some(format!(
+            "{} is inside {}, which the sandbox makes writable",
+            base.display(),
+            tree.display()
+        ));
+    }
+    store
+        .symlink_metadata()
+        .is_ok_and(|m| m.is_symlink())
+        .then(|| format!("{} is a symlink", store.display()))
+}
+
+/// [`opencode_auth_overlay`] for the store in `home`. `refused` is
+/// [`opencode_auth_store_refusal`] for this session: the handover is skipped,
+/// loudly, and `auth.json` is not read.
+pub fn opencode_host_login(home: &Path, token: &str, refused: Option<&str>) -> Option<String> {
+    if let Some(why) = refused {
+        crate::ui::warn(&format!(
+            "{why}; skipping the Copilot login handover for OpenCode. Move XDG_DATA_HOME out of \
+             every write grant, or replace the symlink with a plain dir."
+        ));
+        return None;
+    }
     let path = opencode_auth_json(home)?;
     if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         crate::ui::warn(&format!(
@@ -6661,15 +6696,81 @@ mod tests {
         std::fs::write(&secret, r#"{"client_secret":"s3cret"}"#).unwrap();
         std::os::unix::fs::symlink(&secret, dir.join("auth.json")).unwrap();
         let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
-            opencode_host_login(tmp.path(), "tok")
+            opencode_host_login(tmp.path(), "tok", None)
         });
         assert!(got.is_none(), "handed over through a symlink: {got:?}");
         std::fs::remove_file(dir.join("auth.json")).unwrap();
         std::fs::hard_link(&secret, dir.join("auth.json")).unwrap();
         let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
-            opencode_host_login(tmp.path(), "tok")
+            opencode_host_login(tmp.path(), "tok", None)
         });
         assert!(got.is_none(), "handed over through a hard link: {got:?}");
+    }
+
+    /// #1057: the store's parent must not be agent-writable, and the store
+    /// dir must not be a link. Judged by the real policy predicate.
+    #[test]
+    fn opencode_auth_store_refuses_writable_parent_and_symlinked_store() {
+        use crate::sandbox::{FsAccess, FsRule, LandlockPolicy};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, proj) = (t.join("home"), t.join("proj"));
+        let data = proj.join("data");
+        std::fs::create_dir_all(data.join("opencode")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(data.join("opencode/auth.json"), "{}").unwrap();
+        let policy = |grant: &Path| LandlockPolicy {
+            fs_rules: vec![FsRule {
+                nofollow: false,
+                path: grant.to_path_buf(),
+                access: FsAccess {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            }],
+            net_rules: Vec::new(),
+            bind_rules: Vec::new(),
+            restrict_net_connect: true,
+            restrict_net_bind: false,
+            proxy_forced: false,
+            home_dir: home.clone(),
+            precreate_dirs: vec![],
+            plain_file: None,
+        };
+        let refusal = |grant: &Path, xdg: &Path| {
+            let p = policy(grant);
+            temp_env::with_var("XDG_DATA_HOME", Some(xdg), || {
+                opencode_auth_store_refusal(&home, |q| {
+                    crate::check::writable_tree_on_path(&p, &home, q).map(|(_, t)| t)
+                })
+            })
+        };
+        // Only the store dir writable (the default): fine.
+        assert_eq!(refusal(&data.join("opencode"), &data), None);
+        // The XDG base inside a writable project: refused, names the grant.
+        let why = refusal(&proj, &data).expect("writable parent refused");
+        assert!(why.contains(proj.to_str().unwrap()), "{why}");
+
+        // A symlinked store dir, nothing writable on the way.
+        let elsewhere = t.join("xdg");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(data.join("opencode"), elsewhere.join("opencode")).unwrap();
+        let why = refusal(&t.join("unrelated"), &elsewhere).expect("symlinked store refused");
+        assert!(why.contains("symlink"), "{why}");
+
+        // A symlinked parent planted under a writable grant: data_link -> data.
+        let link = proj.join("data_link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        assert!(
+            refusal(&proj, &link).is_some(),
+            "symlinked parent under a grant accepted"
+        );
+
+        // A refusal skips the read entirely.
+        assert!(opencode_host_login(&home, "tok", Some("x")).is_none());
     }
 
     #[test]

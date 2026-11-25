@@ -368,6 +368,45 @@ pub fn writable_tree_on_path(
         .find_map(|e| writable_tree_over(policy, home, &e).map(|tree| (e, tree)))
 }
 
+/// The write grant that lets the agent touch `path`: a writable tree over it
+/// or over any entry on the way to it ([`writable_tree_on_path`]), or a write
+/// rule *inside* it (#1112). A credential dir is only safe when neither holds:
+/// a file-level grant on `<login dir>/config` rewrites the login as surely as
+/// a grant over the whole dir.
+///
+/// "Inside" is decided by name and by identity. By name catches a rule under
+/// a dir that does not exist yet (case-insensitively on macOS, where the
+/// default volume is). By identity (device and inode of every existing
+/// ancestor of the rule) catches a case variant or a symlinked spelling of
+/// the dir. Unsure means inside: this only refuses a credential.
+#[must_use]
+pub fn writable_on_or_under(policy: &LandlockPolicy, home: &Path, path: &Path) -> Option<PathBuf> {
+    if let Some((_, tree)) = writable_tree_on_path(policy, home, path) {
+        return Some(tree);
+    }
+    policy
+        .fs_rules
+        .iter()
+        .find(|r| r.access.write && rule_inside(&r.path, path))
+        .map(|r| r.path.clone())
+}
+
+fn rule_inside(rule: &Path, dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let lexical = if cfg!(target_os = "macos") {
+        let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        within(&lower(rule), &lower(dir))
+    } else {
+        within(rule, dir)
+    };
+    lexical
+        || std::fs::metadata(dir).is_ok_and(|d| {
+            rule.ancestors().any(|a| {
+                std::fs::metadata(a).is_ok_and(|m| m.dev() == d.dev() && m.ino() == d.ino())
+            })
+        })
+}
+
 /// The resolved target of `path`, when the policy grants execute on `path` but
 /// not on what it actually resolves to (#390).
 ///
@@ -1594,6 +1633,57 @@ mod tests {
             Some(real.clone())
         );
         assert_eq!(writable_tree_over(&p, &home, &t.join("other/s.json")), None);
+    }
+
+    /// #1112: a write rule on a file or subdir inside a credential dir makes
+    /// the dir unsafe, matched by name, case variant and identity. A FIFO or a
+    /// symlink planted as the granted file still counts: the rule is the grant.
+    #[test]
+    fn writable_on_or_under_catches_grants_inside_the_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = t.join("home");
+        let login = home.join("Library/Application Support/nais");
+        std::fs::create_dir_all(login.join("sub")).unwrap();
+        let ask = |grant: &Path| {
+            let p = policy(vec![rule(grant.to_str().unwrap(), true, true, false)]);
+            writable_on_or_under(&p, &home, &login)
+        };
+        let file = login.join("config.yaml");
+        assert_eq!(ask(&file), Some(file.clone()), "file grant");
+        let sub = login.join("sub");
+        assert_eq!(ask(&sub), Some(sub.clone()), "subdir grant");
+        assert_eq!(ask(&home), Some(home.clone()), "grant over the dir");
+        assert_eq!(ask(&t.join("elsewhere")), None, "unrelated grant");
+        assert_eq!(
+            ask(&home.join("Library/nais-other")),
+            None,
+            "sibling prefix"
+        );
+        // A read-only rule inside is not a write grant.
+        let p = policy(vec![rule(file.to_str().unwrap(), true, false, false)]);
+        assert_eq!(writable_on_or_under(&p, &home, &login), None);
+
+        // Planted entries: a FIFO and a symlink as the granted file.
+        let fifo = login.join("fifo");
+        crate::untrusted::tests::mkfifo(&fifo);
+        assert_eq!(ask(&fifo), Some(fifo.clone()), "fifo grant");
+        let link = login.join("link");
+        std::os::unix::fs::symlink(t.join("elsewhere"), &link).unwrap();
+        assert_eq!(ask(&link), Some(link.clone()), "symlink grant");
+
+        // A symlinked spelling of the dir is caught by identity.
+        let alias = t.join("alias");
+        std::os::unix::fs::symlink(&login, &alias).unwrap();
+        let via = alias.join("config.yaml");
+        assert_eq!(ask(&via), Some(via.clone()), "symlinked spelling");
+
+        // A case variant: by name on macOS, by identity where the volume
+        // folds case.
+        let upper = home.join("Library/Application Support/NAIS/config.yaml");
+        if cfg!(target_os = "macos") || std::fs::metadata(upper.parent().unwrap()).is_ok() {
+            assert_eq!(ask(&upper), Some(upper.clone()), "case variant");
+        }
     }
 
     /// #385 F04: a list file outside every writable tree is still the agent's

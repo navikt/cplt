@@ -211,6 +211,8 @@ fn configure_command(
     opencode_v2: bool,
     // #1158: cplt cannot be exec'd in the sandbox; wrappers explain instead.
     cplt_exec_denied: Option<&Path>,
+    // #1057: the OpenCode store's parent is agent-writable; no handover.
+    opencode_auth_refused: Option<&str>,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -448,6 +450,7 @@ fn configure_command(
                 inherit_env,
                 opencode_v2,
                 which_real_gh().is_some(),
+                opencode_auth_refused,
             );
         }
         install_command_wrappers(
@@ -762,6 +765,7 @@ fn cache_gh_token_to_file(
     // only when the real gh is on PATH (#1054). Without it they would sit in
     // the agent's TMPDIR for nobody.
     gh_wrapper: bool,
+    opencode_auth_refused: Option<&str>,
 ) {
     // `inject_token` may have just set one in `cmd` (#1051).
     let serve = block_auth_token
@@ -816,7 +820,8 @@ fn cache_gh_token_to_file(
             deny_env,
             opencode_v2,
         ) && let Some(home) = std::env::var_os("HOME")
-            && let Some(auth) = crate::agent::opencode_host_login(Path::new(&home), &token)
+            && let Some(auth) =
+                crate::agent::opencode_host_login(Path::new(&home), &token, opencode_auth_refused)
         {
             cmd.env("OPENCODE_AUTH_CONTENT", auth);
         }
@@ -1980,6 +1985,7 @@ pub fn exec(
         sandbox.keychain_substitute.as_ref(),
         sandbox.opencode_v2,
         sandbox.cplt_exec_denied.as_deref(),
+        sandbox.opencode_auth_refused.as_deref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -2149,6 +2155,7 @@ pub fn exec(
         sandbox.keychain_substitute.as_ref(),
         sandbox.opencode_v2,
         sandbox.cplt_exec_denied.as_deref(),
+        sandbox.opencode_auth_refused.as_deref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -2417,6 +2424,7 @@ fn exec_bwrap(
         sandbox.keychain_substitute.as_ref(),
         sandbox.opencode_v2,
         sandbox.cplt_exec_denied.as_deref(),
+        sandbox.opencode_auth_refused.as_deref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
@@ -3475,6 +3483,7 @@ echo "failed to read keyring" >&2; exit 1"#,
                         false,
                         false,
                         true,
+                        None,
                     );
                     assert_eq!(
                         scratch.path().join(".gh-token").exists(),
@@ -3518,6 +3527,7 @@ echo "failed to read keyring" >&2; exit 1"#,
                         false,
                         false,
                         wrapper,
+                        None,
                     );
                     assert_eq!(
                         scratch.path().join(".gh-token").exists(),
