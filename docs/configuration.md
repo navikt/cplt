@@ -576,6 +576,7 @@ Inside the sandbox, create a worktree with the managed command:
 cplt worktree add <name> <branch>                 # on an existing local branch; prints the path
 cplt worktree add <name> <ref> -b <new-branch>    # on a new branch created at <ref>
 cplt worktree add <name> <tag-or-commit>          # detached at <ref>
+cplt worktree remove <name> [--force]             # remove it again; the branch is kept
 ```
 
 `cplt worktree add` checks out `<ref>` (a branch, tag or commit in the local
@@ -604,6 +605,12 @@ policy, checks the private checkout, and publishes it atomically. It:
   component, matching the launch/exit checks;
 - creates no branch, so a refused or failed request leaves no ref behind.
 
+`cplt worktree remove` takes a name or a path directly under
+`$CPLT_WORKTREE_ROOT`. It removes only a linked worktree of this repository that
+git lists there, never the main checkout and never a symlink. It refuses a
+worktree with modified or untracked files unless you pass `--force` (those files
+are lost), and always refuses a locked one.
+
 `<name>` is letters, digits, `.`, `_` and `-`, starting with a letter or digit,
 at most 64 characters. Plain `git worktree add` inside the sandbox still works
 as before, but git runs it directly and none of the checks above apply.
@@ -619,7 +626,7 @@ the broker is off for the session and the launch says so. On Linux the key
 needs Bubblewrap: without it the launch stops and says how to fix it. With it,
 each worktree's `.git` pointer, admin links and protected files are read-only
 to the agent, `<common>/worktrees` is read-only (so plain `git worktree add`,
-`prune` and `remove` fail inside the session; use `cplt worktree add`), nothing
+`prune` and `remove` fail inside the session; use `cplt worktree add` and `cplt worktree remove`), nothing
 else can be created directly in the root, and the worktrees cannot be renamed or
 removed from inside. It needs bubblewrap 0.8 or later: the session gets no
 nested user namespaces, so a browser sandbox (Chromium, through Playwright or

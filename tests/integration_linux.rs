@@ -6193,6 +6193,83 @@ ln -s /etc "$CPLT_WORKTREE_ROOT/linked" 2>/dev/null && echo BAD_LINK_PLANTED
         assert!(!stdout.contains("BAD_"), "{ctx}");
     }
 
+    /// #1015: under bubblewrap, `cplt worktree remove` from inside the session
+    /// refuses a dirty worktree and the main worktree, removes a clean one, and
+    /// `--force` removes a dirty one. Each removal takes the tree and its
+    /// `<common>/worktrees/<id>` admin dir off the host and out of
+    /// `git worktree list`.
+    #[test]
+    fn worktree_remove_under_bubblewrap_removes_tree_and_admin_dir() {
+        require_bwrap!();
+        let cplt = env!("CARGO_BIN_EXE_cplt");
+        let (project, home) = worktree_fixture();
+        let script = format!(
+            r#"c='{cplt}'; r="$CPLT_WORKTREE_ROOT"
+"$c" worktree add clean HEAD && echo ADD_CLEAN_OK
+"$c" worktree add dirty HEAD && echo ADD_DIRTY_OK
+echo x > "$r/dirty/untracked.txt" && echo DIRTIED
+"$c" worktree remove "$r/dirty" && echo BAD_DIRTY_REMOVED
+[ -f "$r/dirty/untracked.txt" ] && echo DIRTY_KEPT
+"$c" worktree remove "$PWD" && echo BAD_MAIN_REMOVED
+"$c" worktree remove .. && echo BAD_DOTDOT_REMOVED
+"$c" worktree remove "$r/clean" && echo REMOVE_CLEAN_OK
+[ -e "$r/clean" ] && echo BAD_CLEAN_VISIBLE
+"$c" worktree remove dirty --force && echo REMOVE_FORCE_OK
+[ -e "$r/dirty" ] && echo BAD_DIRTY_VISIBLE
+git worktree list --porcelain | grep -q "$r/" && echo BAD_STILL_LISTED
+"$c" worktree add clean HEAD && echo READD_OK
+true"#
+        );
+        let (code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), true, false, &script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        for m in [
+            "ADD_CLEAN_OK",
+            "ADD_DIRTY_OK",
+            "DIRTIED",
+            "DIRTY_KEPT",
+            "REMOVE_CLEAN_OK",
+            "REMOVE_FORCE_OK",
+            "READD_OK",
+        ] {
+            assert!(stdout.contains(m), "missing {m}: {ctx}");
+        }
+        assert!(!stdout.contains("BAD_"), "{ctx}");
+        assert!(project.path().join("a.txt").exists(), "{ctx}");
+
+        let root = managed_root(home.path());
+        assert!(fs::symlink_metadata(root.join("dirty")).is_err(), "{ctx}");
+        let out = crate::common::git_cmd(project.path())
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let list = String::from_utf8_lossy(&out.stdout);
+        assert!(!list.contains("/dirty"), "{list}");
+        let common = project.path().join(".git/worktrees");
+        // Only the re-added `clean` keeps an admin dir (the broker names it).
+        assert_eq!(fs::read_dir(&common).unwrap().count(), 1, "{ctx}");
+
+        // Remove the re-added tree in a fresh session, where it was bound at launch.
+        let (code, stdout, stderr) = worktree_run(
+            project.path(),
+            home.path(),
+            true,
+            false,
+            &format!(
+                r#"'{cplt}' worktree remove clean && echo REMOVE_OK
+[ -e "$CPLT_WORKTREE_ROOT/clean" ] && echo BAD_VISIBLE
+true"#
+            ),
+        );
+        let ctx = format!("second session\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("REMOVE_OK"), "{ctx}");
+        assert!(!stdout.contains("BAD_"), "{ctx}");
+        assert!(fs::symlink_metadata(root.join("clean")).is_err(), "{ctx}");
+        assert_eq!(fs::read_dir(&common).unwrap().count(), 0, "{ctx}");
+    }
+
     /// #965: without bubblewrap the key is refused with a copy-paste fix,
     /// before the agent runs.
     #[test]

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cplt::worktree_broker::{Broker, Context, add, validate_name, validate_reference};
+use cplt::worktree_broker::{Broker, Context, add, remove, validate_name, validate_reference};
 use cplt::worktrees::{self, DEFAULT_WALK_MAX_DIRS};
 
 /// `HOME` is process-wide, so the tests that set it run one at a time.
@@ -90,6 +90,10 @@ impl Fixture {
         with_home(self.home.path(), || {
             add(&self.ctx(), name, reference, Some(branch))
         })
+    }
+
+    fn remove(&self, name: &str, force: bool) -> Result<String, String> {
+        with_home(self.home.path(), || remove(&self.ctx(), name, force))
     }
 
     fn has_branch(&self, branch: &str) -> bool {
@@ -1045,10 +1049,9 @@ fn the_socket_serves_one_request_and_shuts_down() {
     );
     assert!(reply.contains("\"ok\":true"), "{reply}");
     assert!(reply.contains("wt2"), "{reply}");
-    let bad = send(
-        &socket,
-        b"{\"op\":\"remove\",\"name\":\"wt2\",\"ref\":\"HEAD\"}\n",
-    );
+    let removed = send(&socket, b"{\"op\":\"remove\",\"name\":\"wt2\"}\n");
+    assert!(removed.contains("\"ok\":true"), "{removed}");
+    let bad = send(&socket, b"{\"op\":\"move\",\"name\":\"wt2\"}\n");
     assert!(bad.contains("unknown operation"), "{bad}");
     let extra = send(
         &socket,
@@ -1270,4 +1273,104 @@ fn busy_branch_reader_ignores_fifos_and_symlinks() {
         assert!(elapsed < Duration::from_secs(5), "add took {elapsed:?}");
         assert_eq!(head_branch(&wt), "refs/heads/topic");
     }
+}
+
+// --- cplt worktree remove (#1015) ---
+
+#[test]
+fn remove_deletes_the_tree_and_admin_dir_and_keeps_the_branch() {
+    let fx = Fixture::new(&tracked_files());
+    let wt = PathBuf::from(fx.add_b("wt1", "HEAD", "topic").expect("add"));
+    assert_eq!(fx.admin_entries().len(), 1);
+    assert_eq!(
+        fx.remove("wt1", false).expect("remove"),
+        wt.display().to_string()
+    );
+    assert!(!wt.exists());
+    assert!(fx.admin_entries().is_empty());
+    assert!(fx.has_branch("topic"), "the branch is kept");
+    let list = common::git_cmd(fx.project.path())
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&list.stdout).contains("wt1"));
+    assert!(fx.remove("wt1", false).is_err(), "already gone");
+}
+
+#[test]
+fn remove_refuses_local_changes_unless_forced() {
+    let fx = Fixture::new(&tracked_files());
+    let wt = PathBuf::from(fx.add("wt1", "HEAD").expect("add"));
+    std::fs::write(wt.join("new.txt"), "work\n").unwrap();
+    let err = fx.remove("wt1", false).expect_err("untracked");
+    assert!(err.contains("untracked"), "{err}");
+    std::fs::remove_file(wt.join("new.txt")).unwrap();
+    std::fs::write(wt.join("src/a.txt"), "changed\n").unwrap();
+    assert!(fx.remove("wt1", false).is_err(), "modified");
+    assert!(wt.join("src/a.txt").exists());
+    fx.remove("wt1", true).expect("forced");
+    assert!(!wt.exists());
+    assert!(fx.admin_entries().is_empty());
+}
+
+#[test]
+fn remove_refuses_paths_outside_the_root_and_names_with_separators() {
+    let fx = Fixture::new(&tracked_files());
+    fx.add("wt1", "HEAD").expect("add");
+    for bad in ["..", "../wt1", "wt1/..", "/tmp", "a/b", ".git", ""] {
+        assert!(fx.remove(bad, true).is_err(), "{bad}");
+    }
+    assert!(fx.root.join("wt1").is_dir());
+}
+
+#[test]
+fn remove_never_touches_the_main_worktree_or_follows_a_symlink() {
+    let fx = Fixture::new(&tracked_files());
+    let wt = PathBuf::from(fx.add("wt1", "HEAD").expect("add"));
+    symlink(fx.project.path(), fx.root.join("main")).unwrap();
+    symlink(&wt, fx.root.join("alias")).unwrap();
+    for name in ["main", "alias"] {
+        let err = fx.remove(name, true).expect_err(name);
+        assert!(err.contains("not a worktree"), "{err}");
+    }
+    assert!(fx.project.path().join("src/a.txt").exists());
+    assert!(wt.join("src/a.txt").exists());
+    assert_eq!(fx.admin_entries().len(), 1);
+}
+
+#[test]
+fn remove_ignores_a_forged_git_pointer_and_unlisted_dirs() {
+    let fx = Fixture::new(&tracked_files());
+    let wt = PathBuf::from(fx.add("wt1", "HEAD").expect("add"));
+    let admin = fx.common.join("worktrees").join(&fx.admin_entries()[0]);
+    // A plain directory whose pointer claims wt1's admin dir.
+    let fake = fx.root.join("fake");
+    std::fs::create_dir(&fake).unwrap();
+    std::fs::write(fake.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    let err = fx.remove("fake", true).expect_err("forged");
+    assert!(err.contains("not a worktree"), "{err}");
+    assert!(fake.join(".git").exists());
+    // A pointer at another repository changes nothing either: git's records decide.
+    let other = common::temp_repo("navikt/other");
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", other.path().join(".git").display()),
+    )
+    .unwrap();
+    fx.remove("wt1", true).expect("removed by git's own record");
+    assert!(other.path().join(".git").is_dir());
+    assert!(!wt.exists());
+}
+
+#[test]
+fn remove_refuses_a_locked_worktree_even_when_forced() {
+    let fx = Fixture::new(&tracked_files());
+    let wt = PathBuf::from(fx.add("wt1", "HEAD").expect("add"));
+    assert!(common::git_ok(
+        fx.project.path(),
+        &["worktree", "lock", wt.to_str().unwrap()]
+    ));
+    let err = fx.remove("wt1", true).expect_err("locked");
+    assert!(err.contains("locked"), "{err}");
+    assert!(wt.is_dir());
 }
