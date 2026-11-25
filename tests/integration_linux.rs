@@ -6004,7 +6004,7 @@ if r > 0:
     os.waitpid(r, 0)
     print("BAD_WRITE nested userns")
 PY
-echo ok > "$w/a.txt" && g="git -C $w -c user.name=t -c user.email=t@t -c commit.gpgsign=false" \
+date +%s%N > "$w/a.txt" && g="git -C $w -c user.name=t -c user.email=t@t -c commit.gpgsign=false" \
   && $g add a.txt && $g commit -q -m edit && echo ORDINARY_OK
 true"#
         )
