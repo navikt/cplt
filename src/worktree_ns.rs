@@ -177,7 +177,10 @@ fn apply(set: &[(PathBuf, Mode)]) -> Result<(), String> {
         if text.contains(['\n', '\t']) {
             return Err("worktree paths must not contain tabs or newlines".into());
         }
-        input.push_str(&format!("{}\t{text}\n", mode.tag()));
+        input.push_str(mode.tag());
+        input.push('\t');
+        input.push_str(text);
+        input.push('\n');
     }
     let mut cmd = Command::new(exe);
     cmd.arg(HELPER_ARG)
@@ -226,11 +229,23 @@ pub fn helper_main() -> ExitCode {
 }
 
 fn helper() -> Result<(), String> {
-    // SAFETY: setns on descriptors the parent placed at 3 and 4.
+    // The user namespace that owns the mount namespace, not the pid's own:
+    // bwrap can nest a second, capability-less user namespace below it.
+    const NS_GET_USERNS: libc::c_ulong = 0xb701;
+    // SAFETY: ioctl and setns on descriptors the parent placed at 4 (and the
+    // one the ioctl returns).
     unsafe {
-        if libc::setns(3, libc::CLONE_NEWUSER) != 0 {
+        let owner = libc::ioctl(4, NS_GET_USERNS as _);
+        if owner < 0 {
+            return Err(format!(
+                "NS_GET_USERNS: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if libc::setns(owner, libc::CLONE_NEWUSER) != 0 {
             return Err(format!("setns(user): {}", std::io::Error::last_os_error()));
         }
+        libc::close(owner);
         if libc::setns(4, libc::CLONE_NEWNS) != 0 {
             return Err(format!("setns(mnt): {}", std::io::Error::last_os_error()));
         }
