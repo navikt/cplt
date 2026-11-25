@@ -364,6 +364,101 @@ fn subcommand_long_value_flags(command: &str, subcommand: Option<&str>) -> &'sta
         ("repo", Some("view")) => &["--repo", "--branch", "--json", "--jq", "--template"],
         ("repo", Some("clone")) => &["--upstream-remote-name"],
         ("repo", Some("fork")) => &["--remote-name", "--org", "--fork-name"],
+        // Gated subcommands: every non-boolean flag in cli/cli b546819
+        // (pkg/cmd/{pr,issue,label}), plus `--repo`.
+        ("pr", Some("checkout")) => &["--repo", "--branch", "--worktree"],
+        ("pr", Some("create")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--base",
+            "--head",
+            "--reviewer",
+            "--assignee",
+            "--label",
+            "--project",
+            "--milestone",
+            "--recover",
+            "--template",
+        ],
+        ("pr" | "issue", Some("comment")) | ("pr", Some("review")) => {
+            &["--repo", "--body", "--body-file"]
+        }
+        ("pr", Some("edit")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--base",
+            "--add-reviewer",
+            "--remove-reviewer",
+            "--add-assignee",
+            "--remove-assignee",
+            "--add-label",
+            "--remove-label",
+            "--add-project",
+            "--remove-project",
+            "--milestone",
+        ],
+        ("pr", Some("ready" | "update-branch")) => &["--repo"],
+        ("pr" | "issue", Some("reopen")) | ("pr", Some("close")) => &["--repo", "--comment"],
+        ("pr", Some("merge")) => &[
+            "--repo",
+            "--body",
+            "--body-file",
+            "--subject",
+            "--match-head-commit",
+            "--author-email",
+        ],
+        ("issue", Some("create")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--assignee",
+            "--label",
+            "--project",
+            "--milestone",
+            "--recover",
+            "--template",
+            "--type",
+            "--parent",
+            "--blocked-by",
+            "--blocking",
+        ],
+        ("issue", Some("edit")) => &[
+            "--repo",
+            "--title",
+            "--body",
+            "--body-file",
+            "--add-assignee",
+            "--remove-assignee",
+            "--add-label",
+            "--remove-label",
+            "--add-project",
+            "--remove-project",
+            "--milestone",
+            "--type",
+            "--parent",
+            "--add-sub-issue",
+            "--remove-sub-issue",
+            "--add-blocked-by",
+            "--remove-blocked-by",
+            "--add-blocking",
+            "--remove-blocking",
+        ],
+        ("issue", Some("close")) => &["--repo", "--comment", "--duplicate-of", "--reason"],
+        ("issue", Some("develop")) => &[
+            "--repo",
+            "--branch-repo",
+            "--base",
+            "--name",
+            "--worktree",
+            "--issue-repo",
+        ],
+        ("label", Some("create")) => &["--repo", "--description", "--color"],
+        ("label", Some("edit")) => &["--repo", "--description", "--color", "--name"],
         _ => &[
             "--repo",
             "--title",
@@ -434,8 +529,10 @@ fn repo_flag_values<'a>(args: &[&'a str]) -> Vec<&'a str> {
     while let Some(a) = it.next() {
         if *a == "-R" || *a == "--repo" {
             out.extend(it.next().copied());
-        } else if let Some(v) = a.strip_prefix("--repo=").or_else(|| a.strip_prefix("-R")) {
+        } else if let Some(v) = a.strip_prefix("--repo=") {
             out.push(v);
+        } else if let Some(v) = a.strip_prefix("-R") {
+            out.push(v.strip_prefix('=').unwrap_or(v));
         }
     }
     out
@@ -449,6 +546,26 @@ fn repo_selector_ambiguous(args: &[&str], parsed: Option<&str>) -> bool {
         return false;
     }
     let mut seen: Vec<&str> = repo_flag_values(args);
+    // `R` anywhere in a short cluster (`-dR x`, `-dRx`), whatever the parser
+    // thought the word was: a missing value-flag entry must not pick the repo.
+    for (i, a) in args.iter().enumerate() {
+        let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) else {
+            continue;
+        };
+        let Some(pos) = cluster.find('R') else {
+            continue;
+        };
+        if pos == 0 || !cluster[..pos].bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue; // `-R…` is in repo_flag_values; `- Remove` is prose
+        }
+        let v = &cluster[pos + 1..];
+        let v = v.strip_prefix('=').unwrap_or(v);
+        seen.extend(if v.is_empty() {
+            args.get(i + 1).copied()
+        } else {
+            Some(v)
+        });
+    }
     if !seen.is_empty() && parsed.is_none() {
         return true;
     }
@@ -1747,7 +1864,7 @@ fn subcommand_short_value_flags(command: &str, subcommand: Option<&str>) -> &'st
         ("issue", Some("edit")) => &['R', 'b', 'F', 'm', 't'],
         ("issue", Some("close")) => &['R', 'c', 'r'],
         ("issue", Some("reopen")) => &['R', 'c'],
-        ("issue", Some("develop")) => &['R', 'b', 'n'],
+        ("issue", Some("develop")) => &['R', 'b', 'n', 'i'],
         ("label", Some("list")) => &['R', 'q', 'L', 'S', 't'],
         ("label", Some("create")) => &['R', 'c', 'd'],
         ("label", Some("edit")) => &['R', 'c', 'd', 'n'],
@@ -10153,6 +10270,39 @@ mod tests {
         let cmd = parse_command(&a).unwrap();
         assert_eq!(cmd.repo_flag.as_deref(), Some("evil/repo"));
         assert!(!repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
+        // Clustered selectors after an unlisted-looking value flag.
+        let a = [
+            "pr",
+            "close",
+            "1",
+            "-dRevil/repo",
+            "--comment",
+            "-dRgood/repo",
+        ];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("evil/repo"));
+        assert!(repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
+        assert!(gate(&a, Path::new("."), &policy).is_err());
+        let a = [
+            "pr",
+            "close",
+            "1",
+            "-R",
+            "evil/repo",
+            "--comment",
+            "-dR",
+            "good/repo",
+        ];
+        assert!(repo_selector_ambiguous(&a, Some("evil/repo")));
+        // `-R=x` is one selector, not two.
+        let a = ["pr", "comment", "1", "-R=good/repo", "--body", "hi"];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("good/repo"));
+        assert!(!repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
+        let refused = gate(&a, Path::new("."), &policy)
+            .err()
+            .is_some_and(|r| r.headline.contains("ambiguous"));
+        assert!(!refused);
         // A single selector stays accepted.
         let a = ["pr", "comment", "1", "--body", "hi", "--repo=good/repo"];
         let cmd = parse_command(&a).unwrap();
