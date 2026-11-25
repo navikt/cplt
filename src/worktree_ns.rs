@@ -7,17 +7,23 @@
 //! user and mount namespaces (it owns the user namespace bwrap created, which
 //! gives it `CAP_SYS_ADMIN` there) and attaches bind mounts itself:
 //!
-//! - before the agent starts: `<common>/worktrees` read-only, so plain
-//!   `git worktree add` cannot create an admin directory, every existing admin
-//!   directory writable again on top, and the per-worktree set below for each
+//! - before the agent starts: the managed root and `<common>/worktrees`
+//!   read-only, so nothing can be created in either from inside the session;
+//!   then each existing admin directory writable, and [`worktree_set`] for each
 //!   existing worktree in the root;
-//! - after each broker publish: the per-worktree set for the new worktree.
+//! - after each broker publish: [`worktree_set`] for the new worktree.
+//!
+//! There is no window. A published worktree appears under the read-only root,
+//! so until its binds exist the agent can only read it, and a descriptor it
+//! opens through a read-only mount stays read-only. [`worktree_set`] orders the
+//! binds so the tree becomes writable only on top of its read-only protected
+//! paths. Nested namespaces, which would keep a copy of the mount table from
+//! before a bind, are refused by `bwrap --disable-userns`.
 //!
 //! The per-worktree set is the project's own bubblewrap list
-//! (`git_persistence_paths` read-only, `rename_pin_paths` self-bound), plus
-//! the `.git` pointer and the admin links (`commondir`, `gitdir`,
-//! `config.worktree`) read-only and the worktree and admin directories pinned
-//! against rename.
+//! (`git_persistence_paths` read-only, `rename_pin_paths` pinned), plus the
+//! `.git` pointer and the admin links (`commondir`, `gitdir`,
+//! `config.worktree`) read-only.
 //!
 //! Mounts are made with `open_tree`/`move_mount` on descriptors opened without
 //! following a symlink in any component, so a link the agent swaps in cannot
@@ -41,10 +47,7 @@ pub const HELPER_ARG: &str = "__cplt-worktree-ns";
 pub enum Mode {
     /// Read-only.
     Ro,
-    /// Same flags as now: only makes the path a mountpoint, so it cannot be
-    /// renamed or removed.
-    Pin,
-    /// Writable: an admin directory under the read-only `worktrees`.
+    /// Writable on top of a read-only parent mount.
     Rw,
 }
 
@@ -52,7 +55,6 @@ impl Mode {
     fn tag(self) -> &'static str {
         match self {
             Self::Ro => "ro",
-            Self::Pin => "pin",
             Self::Rw => "rw",
         }
     }
@@ -61,7 +63,7 @@ impl Mode {
 /// The managed root and the common git dir, registered by the broker.
 static SCOPE: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 /// The session's user and mount namespaces, opened before the agent starts.
-static NS: OnceLock<(OwnedFd, OwnedFd)> = OnceLock::new();
+static NS: OnceLock<OwnedFd> = OnceLock::new();
 
 /// The broker is running: the session must apply these protections.
 pub fn register(root: &Path, common: &Path) {
@@ -82,7 +84,7 @@ pub fn attach_and_protect(pid: i32) -> Result<(), String> {
             .map(OwnedFd::from)
             .map_err(|e| format!("cannot open the session's {kind} namespace: {e}"))
     };
-    let _ = NS.set((open("user")?, open("mnt")?));
+    let _ = NS.set(open("mnt")?);
     apply(&launch_set(root, common)?)
 }
 
@@ -100,21 +102,22 @@ fn exists(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
 }
 
-/// The protections for one worktree and its admin directory, in mount order:
-/// pins first, read-only binds on top.
+fn depth(p: &Path) -> usize {
+    p.components().count()
+}
+
+/// The binds for one worktree and its admin directory, in mount order.
+///
+/// Called while both are still under read-only mounts (the root and
+/// `<common>/worktrees`), so the agent can see them but write nothing. The
+/// order keeps it that way: read-only binds on the protected paths first, then
+/// writable pins from the deepest up, then the admin directory and the
+/// worktree itself writable on top. Each writable mount is a recursive clone,
+/// so it already carries the read-only binds below it: the first moment any
+/// part of the tree is writable, its protected paths are already read-only.
 pub fn worktree_set(worktree: &Path, admin: &Path) -> Vec<(PathBuf, Mode)> {
     use crate::sandbox::bubblewrap_paths as bw;
-    let mut set = vec![
-        (worktree.to_path_buf(), Mode::Pin),
-        (admin.to_path_buf(), Mode::Pin),
-    ];
-    let pins = bw::rename_pins(worktree);
-    set.extend(
-        pins.into_iter()
-            .filter(|p| exists(p))
-            .map(|p| (p, Mode::Pin)),
-    );
-    let ro = bw::persistence(worktree)
+    let mut ro: Vec<PathBuf> = bw::persistence(worktree)
         .into_iter()
         .chain([
             worktree.join(".git"),
@@ -122,14 +125,27 @@ pub fn worktree_set(worktree: &Path, admin: &Path) -> Vec<(PathBuf, Mode)> {
             admin.join("gitdir"),
             admin.join("config.worktree"),
         ])
-        .filter(|p| exists(p));
-    set.extend(ro.map(|p| (p, Mode::Ro)));
-    set.dedup();
+        .filter(|p| exists(p))
+        .collect();
+    ro.sort();
+    ro.dedup();
+    let mut pins: Vec<PathBuf> = bw::rename_pins(worktree)
+        .into_iter()
+        .filter(|p| exists(p) && !ro.contains(p) && p != worktree)
+        .collect();
+    pins.sort_by_key(|p| std::cmp::Reverse(depth(p)));
+    pins.dedup();
+    let mut set: Vec<(PathBuf, Mode)> = ro.into_iter().map(|p| (p, Mode::Ro)).collect();
+    set.extend(pins.into_iter().map(|p| (p, Mode::Rw)));
+    set.push((admin.to_path_buf(), Mode::Rw));
+    set.push((worktree.to_path_buf(), Mode::Rw));
     set
 }
 
-/// `<common>/worktrees` read-only, each admin directory writable on top, and
-/// the worktree set for every admin directory whose worktree is in the root.
+/// The root and `<common>/worktrees` read-only, so nothing can be created in
+/// either from inside the session (plain `git worktree add`, a hand-written
+/// `.git` pointer); then each admin directory writable, and the worktree set
+/// for every admin directory whose worktree is in the root.
 fn launch_set(root: &Path, common: &Path) -> Result<Vec<(PathBuf, Mode)>, String> {
     let worktrees = common.join("worktrees");
     match std::fs::symlink_metadata(&worktrees) {
@@ -138,7 +154,10 @@ fn launch_set(root: &Path, common: &Path) -> Result<Vec<(PathBuf, Mode)>, String
         Err(_) => std::fs::create_dir(&worktrees)
             .map_err(|e| format!("cannot create {}: {e}", worktrees.display()))?,
     }
-    let mut set = vec![(worktrees.clone(), Mode::Ro)];
+    let mut set = vec![
+        (root.to_path_buf(), Mode::Ro),
+        (worktrees.clone(), Mode::Ro),
+    ];
     let mut admins: Vec<PathBuf> = std::fs::read_dir(&worktrees)
         .map_err(|e| format!("cannot list {}: {e}", worktrees.display()))?
         .flatten()
@@ -147,29 +166,29 @@ fn launch_set(root: &Path, common: &Path) -> Result<Vec<(PathBuf, Mode)>, String
         .collect();
     admins.sort();
     for admin in &admins {
-        set.push((admin.clone(), Mode::Rw));
-    }
-    for admin in &admins {
-        let Ok(Some(text)) = crate::untrusted::read_untrusted(&admin.join("gitdir"), 4096) else {
-            continue;
-        };
-        let Some(wt) = Path::new(text.trim()).parent() else {
-            continue;
-        };
-        if wt.parent() == Some(root) && exists(wt) {
-            set.extend(worktree_set(wt, admin));
+        let wt = crate::untrusted::read_untrusted(&admin.join("gitdir"), 4096)
+            .ok()
+            .flatten()
+            .and_then(|t| Path::new(t.trim()).parent().map(Path::to_path_buf));
+        match wt {
+            Some(wt) if wt.parent() == Some(root) && exists(&wt) => {
+                set.extend(worktree_set(&wt, admin));
+            }
+            _ => set.push((admin.clone(), Mode::Rw)),
         }
     }
     Ok(set)
 }
 
-/// Run the helper with the namespace descriptors on fds 3 and 4 and the set
+/// Run the helper with the mount namespace descriptor on fd 3 and the set
 /// on stdin, one `<mode>\t<path>` per line.
 #[allow(clippy::disallowed_methods)] // current_exe: this binary, by absolute path
 fn apply(set: &[(PathBuf, Mode)]) -> Result<(), String> {
     use std::os::unix::process::CommandExt as _;
-    let (user, mnt) = NS.get().ok_or("the session namespace is not attached")?;
-    let (user, mnt) = (user.as_raw_fd(), mnt.as_raw_fd());
+    let mnt = NS
+        .get()
+        .ok_or("the session namespace is not attached")?
+        .as_raw_fd();
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate cplt: {e}"))?;
     let mut input = String::new();
     for (path, mode) in set {
@@ -188,10 +207,11 @@ fn apply(set: &[(PathBuf, Mode)]) -> Result<(), String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    // SAFETY: dup2 only, between fork and exec.
+    // SAFETY: dup2/fcntl only, between fork and exec. dup2 onto itself keeps
+    // FD_CLOEXEC, so the flag is cleared explicitly either way.
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(user, 3) < 0 || libc::dup2(mnt, 4) < 0 {
+            if libc::dup2(mnt, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -216,7 +236,7 @@ fn apply(set: &[(PathBuf, Mode)]) -> Result<(), String> {
     }
 }
 
-/// The helper: join the namespaces on fds 3 and 4, then bind every line of
+/// The helper: join the mount namespace on fd 3 (and the user namespace owning it), then bind every line of
 /// stdin onto itself. Exits non-zero at the first failure.
 pub fn helper_main() -> ExitCode {
     match helper() {
@@ -232,10 +252,10 @@ fn helper() -> Result<(), String> {
     // The user namespace that owns the mount namespace, not the pid's own:
     // bwrap can nest a second, capability-less user namespace below it.
     const NS_GET_USERNS: libc::c_ulong = 0xb701;
-    // SAFETY: ioctl and setns on descriptors the parent placed at 4 (and the
+    // SAFETY: ioctl and setns on descriptors the parent placed at 3 (and the
     // one the ioctl returns).
     unsafe {
-        let owner = libc::ioctl(4, NS_GET_USERNS as _);
+        let owner = libc::ioctl(3, NS_GET_USERNS as _);
         if owner < 0 {
             return Err(format!(
                 "NS_GET_USERNS: {}",
@@ -246,7 +266,7 @@ fn helper() -> Result<(), String> {
             return Err(format!("setns(user): {}", std::io::Error::last_os_error()));
         }
         libc::close(owner);
-        if libc::setns(4, libc::CLONE_NEWNS) != 0 {
+        if libc::setns(3, libc::CLONE_NEWNS) != 0 {
             return Err(format!("setns(mnt): {}", std::io::Error::last_os_error()));
         }
     }
@@ -255,7 +275,6 @@ fn helper() -> Result<(), String> {
         let (tag, path) = line.split_once('\t').ok_or("malformed line")?;
         let mode = match tag {
             "ro" => Mode::Ro,
-            "pin" => Mode::Pin,
             "rw" => Mode::Rw,
             _ => return Err(format!("unknown mode {tag:?}")),
         };
@@ -301,7 +320,6 @@ fn bind(path: &Path, mode: Mode) -> std::io::Result<()> {
         let (set, clr) = match mode {
             Mode::Ro => (MOUNT_ATTR_RDONLY, 0),
             Mode::Rw => (0, MOUNT_ATTR_RDONLY),
-            Mode::Pin => (0, 0),
         };
         if set != 0 || clr != 0 {
             let attr = MountAttr {

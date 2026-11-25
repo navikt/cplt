@@ -227,6 +227,9 @@ pub struct Broker {
     /// [`INHERITED_FD`]).
     #[cfg(target_os = "linux")]
     client_end: OwnedFd,
+    /// Linux: written on drop to wake the serve loop.
+    #[cfg(target_os = "linux")]
+    wake: OwnedFd,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     #[cfg(target_os = "macos")]
@@ -305,14 +308,23 @@ impl Broker {
         let worker_stop = Arc::clone(&stop);
         let policy_ctx = ctx.clone();
         crate::worktree_ns::register(&ctx.root, &ctx.common);
+        let mut pipe = [-1; 2];
+        // SAFETY: pipe2 writes two descriptors on success.
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err("cannot create the broker stop pipe".into());
+        }
+        // SAFETY: both were just created and are owned here only.
+        let (wake, wake_w) =
+            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
         let thread = std::thread::Builder::new()
             .name("cplt-worktree-broker".into())
-            .spawn(move || serve_fd(&server, &ctx, &worker_stop))
+            .spawn(move || serve_fd(&server, &wake, &ctx, &worker_stop))
             .map_err(|e| format!("cannot start the worktree broker thread: {e}"))?;
         INHERITED_FD.store(client.as_raw_fd(), Ordering::Release);
         Ok(Self {
             socket,
             client_end: client,
+            wake: wake_w,
             stop,
             thread: Some(thread),
             landlock: policy_ctx,
@@ -357,6 +369,11 @@ impl Drop for Broker {
             Ordering::Relaxed,
         );
         self.stop.store(true, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        // SAFETY: one byte to an owned pipe.
+        unsafe {
+            libc::write(self.wake.as_raw_fd(), [1u8].as_ptr().cast(), 1);
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -385,11 +402,33 @@ fn serve(listener: &UnixListener, ctx: &Context, stop: &AtomicBool) {
 /// exactly one descriptor, an `AF_UNIX` stream socket, which is then served
 /// exactly like an accepted macOS connection. Anything else is closed unread.
 #[cfg(target_os = "linux")]
-fn serve_fd(server: &OwnedFd, ctx: &Context, stop: &AtomicBool) {
+fn serve_fd(server: &OwnedFd, wake: &OwnedFd, ctx: &Context, stop: &AtomicBool) {
     while !stop.load(Ordering::Acquire) {
-        match recv_stream(server) {
-            Some(stream) => handle(ctx, stream, stop),
-            None => std::thread::sleep(Duration::from_millis(20)),
+        if let Some(stream) = recv_stream(server) {
+            handle(ctx, stream, stop);
+            continue;
+        }
+        // Block until a datagram or the stop pipe; no busy poll.
+        let mut fds = [
+            libc::pollfd {
+                fd: server.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two live pollfds.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+        if fds[0].revents & libc::POLLHUP != 0 && fds[0].revents & libc::POLLIN == 0 {
+            // Every sandbox copy is gone; nothing more can arrive.
+            return;
         }
     }
 }
@@ -692,22 +731,14 @@ fn add_with_budget(
     )?;
     budget.check()?;
     publish(&staging, name, &ctx.root)?;
-    // Linux (#965): the published tree gets the project's protections inside
-    // the session namespace, then is checked again, before it counts. On any
-    // failure it is removed with its admin dir and branch.
+    // Linux (#965): the tree appeared under the session's read-only root, so
+    // the agent cannot write it yet; bind its protections and make it writable.
+    // On failure it is removed with its admin dir and branch.
     #[cfg(target_os = "linux")]
     {
         let published = ctx.root.join(name);
         let admin_dir = ctx.common.join("worktrees").join(&admin.name);
-        let protected = crate::worktree_ns::protect_new(&published, &admin_dir).and_then(|()| {
-            verify_protected_names(&published, &ctx.protected, None, budget)?;
-            let pointer = std::fs::read_to_string(published.join(".git")).unwrap_or_default();
-            if pointer.trim() != format!("gitdir: {}", admin_dir.display()) {
-                return Err("the worktree's .git pointer changed before it was protected".into());
-            }
-            Ok(())
-        });
-        if let Err(e) = protected {
+        if let Err(e) = crate::worktree_ns::protect_new(&published, &admin_dir) {
             let _ = std::fs::remove_dir_all(&published);
             return Err(e);
         }

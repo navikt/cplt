@@ -5991,7 +5991,21 @@ echo x > "$common/worktrees/{wt}/commondir" && echo "BAD_WRITE commondir"
 mv "$w/.github" "$w/.gh2" && echo "BAD_WRITE rename .github"
 mv "$w" "$r/moved" && echo "BAD_WRITE rename worktree"
 git -C "$PWD" worktree add "$r/plain" HEAD >/dev/null 2>&1 && echo "BAD_WRITE plain add"
-echo ok > "$w/a.txt" && git -C "$w" status --short >/dev/null && echo ORDINARY_OK
+mkdir "$r/handmade" 2>/dev/null && echo "BAD_WRITE mkdir in root"
+python3 - <<'PY'
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+# clone(CLONE_NEWUSER | SIGCHLD): a nested namespace would keep the mount
+# table from before a broker bind.
+r = libc.syscall(56, 0x10000000 | 17, 0, 0, 0, 0)
+if r == 0:
+    os._exit(0)
+if r > 0:
+    os.waitpid(r, 0)
+    print("BAD_WRITE nested userns")
+PY
+echo ok > "$w/a.txt" && g="git -C $w -c user.name=t -c user.email=t@t -c commit.gpgsign=false" \
+  && $g add a.txt && $g commit -q -m edit && echo ORDINARY_OK
 true"#
         )
     }
@@ -6139,6 +6153,44 @@ PY"#;
         assert!(stdout.contains("REFUSED"), "{ctx}");
         assert!(
             stderr.contains("managed-worktree broker unavailable"),
+            "{ctx}"
+        );
+    }
+
+    /// #965: no window. While `cplt worktree add` runs, a loop keeps trying to
+    /// open the new worktree's `.git` pointer and a protected file for writing.
+    /// It never succeeds, and the host files stay as the broker wrote them.
+    #[test]
+    fn worktree_add_leaves_no_window_for_writers() {
+        require_bwrap!();
+        let cplt = env!("CARGO_BIN_EXE_cplt");
+        let (project, home) = worktree_fixture();
+        let script = format!(
+            r#"r="$CPLT_WORKTREE_ROOT"
+race() {{ while :; do
+  if exec 3>>"$r/race/$1" 2>/dev/null; then echo pwn >&3; echo "RACE_OPENED $1"; exit 0; fi
+done; }}
+race .git & a=$!
+race .github/hooks/h.json & b=$!
+'{cplt}' worktree add race HEAD && echo ADDED
+sleep 1; kill $a $b 2>/dev/null; wait 2>/dev/null; true"#
+        );
+        let (code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), true, false, &script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("ADDED"), "{ctx}");
+        assert!(!stdout.contains("RACE_OPENED"), "{ctx}");
+        let root = managed_root(home.path());
+        assert!(
+            fs::read_to_string(root.join("race/.git"))
+                .unwrap()
+                .starts_with("gitdir: "),
+            "{ctx}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("race/.github/hooks/h.json")).unwrap(),
+            "{}\n",
             "{ctx}"
         );
     }

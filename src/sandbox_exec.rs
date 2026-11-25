@@ -2075,7 +2075,8 @@ pub fn exec(
             BwrapOutcome::Fallback(reason) if crate::worktree_ns::required() => {
                 ui::error(&format!(
                     "Bubblewrap could not start ({reason}). sandbox.allow_git_worktrees needs it \
-                     on Linux (#965), so this launch stops instead of running without it."
+                     on Linux, version 0.8 or later for --disable-userns (#965), so this launch \
+                     stops instead of running without it."
                 ));
                 return 1;
             }
@@ -2378,6 +2379,10 @@ fn exec_bwrap(
         }
         bwrap_argv.push("--info-fd".to_string());
         bwrap_argv.push(info_fds[1].to_string());
+        // A nested user and mount namespace would keep a copy of the mount
+        // table from before a broker bind, so the session may create none
+        // (bwrap 0.8+; an older bwrap refuses the flag and the launch stops).
+        bwrap_argv.push("--disable-userns".to_string());
     }
     bwrap_argv.push("--".to_string());
     bwrap_argv.push(cplt_exe.to_string_lossy().into_owned());

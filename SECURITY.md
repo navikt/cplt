@@ -1011,24 +1011,33 @@ the parent enters that user namespace (it owns it) and mount namespace in a
 single-threaded helper and attaches bind mounts with `open_tree`/`move_mount`,
 on descriptors opened without following a symlink in any component:
 
-- `<common>/worktrees` read-only, so plain `git worktree add` cannot create an
-  admin directory (and `git worktree prune`/`remove` fail inside the sandbox),
-  with every existing admin directory writable again on top;
+- the managed root and `<common>/worktrees` read-only, so nothing can be
+  created in either from inside the session: no plain `git worktree add` (nor
+  `prune` or `remove`), no hand-made directory with a `.git` pointer. Each
+  existing admin directory is writable again on top;
 - for each worktree in the root, existing at launch or published by the broker
   later: the project's own bubblewrap list (`git_persistence_paths` read-only,
   `rename_pin_paths` pinned, the same tables as the project, not a copy), plus
-  the `.git` pointer, `commondir`, `gitdir` and `config.worktree` read-only, and
-  the worktree and its admin directory pinned so they cannot be renamed.
+  the `.git` pointer, `commondir`, `gitdir` and `config.worktree` read-only,
+  then the pins, the admin directory and the worktree itself writable on top.
 
-After a publish the broker binds, then checks the protected files and the
-`.git` pointer again; any failure removes the worktree, its admin directory and
-any new branch. **Residual:** a process that opens a protected directory inside
-a new worktree in the moment between publish and bind keeps a writable handle to
-it, because a bind does not change descriptors opened before it. Protected
-files are checked again after the bind, so a write in that moment refuses the
-request, but a later write through such a handle is not seen. Worktrees in the
-root that existing launches find are protected before the agent runs, so this
-applies only to worktrees made in the current session.
+**No window.** A published worktree first appears under the read-only root and
+`<common>/worktrees`, so the agent can read it but not write it, and a
+descriptor opened through a read-only mount stays read-only after later binds.
+The binds go read-only protected paths first, then each writable mount as a
+recursive clone that already carries them, so the first moment any part of the
+tree is writable, its protected paths are read-only. The broker's content
+checks run on the staged tree before publish, and nothing can change it after.
+
+**No nested namespaces.** A process in a nested user and mount namespace keeps
+a copy of the mount table from before a bind, and would see a new worktree
+without its protections. So the session runs with `bwrap --disable-userns`
+(bubblewrap 0.8 or later; an older one makes the launch stop). Without a user
+namespace, a process without capabilities cannot create a mount namespace.
+The seccomp filter does not cover this: `clone3` passes its flags behind a
+pointer, which BPF cannot read. Cost: anything that needs its own user
+namespace inside the session fails, Chromium's sandbox included (Playwright and
+Puppeteer need `--no-sandbox`). This applies only with the key on.
 #### Keychain access is all-or-nothing
 
 The macOS Keychain grant is two SBPL file rules on `~/Library/Keychains` plus the

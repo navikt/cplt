@@ -619,8 +619,11 @@ the broker is off for the session and the launch says so. On Linux the key
 needs Bubblewrap: without it the launch stops and says how to fix it. With it,
 each worktree's `.git` pointer, admin links and protected files are read-only
 to the agent, `<common>/worktrees` is read-only (so plain `git worktree add`,
-`prune` and `remove` fail inside the session; use `cplt worktree add`), and the
-worktrees cannot be renamed or removed from inside. See
+`prune` and `remove` fail inside the session; use `cplt worktree add`), nothing
+else can be created directly in the root, and the worktrees cannot be renamed or
+removed from inside. It needs bubblewrap 0.8 or later: the session gets no
+nested user namespaces, so a browser sandbox (Chromium, through Playwright or
+Puppeteer) needs `--no-sandbox` with the key on. See
 [SECURITY.md](../SECURITY.md#managed-worktrees-on-linux).
 The broker requires a launch HEAD commit whose protected bytes and executable
 modes match the checkout. Symlinked protected paths or ancestors, filesystem
