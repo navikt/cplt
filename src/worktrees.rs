@@ -25,13 +25,10 @@ pub const BASE: &str = ".cplt-worktrees";
 /// Refuse the key on any OS but macOS and Linux.
 ///
 /// macOS denies the protected paths at any depth below a granted root with a
-/// regex. Linux has no equivalent (#965, a stated gap): Landlock cannot
-/// subtract a path from a granted tree, and bubblewrap re-binds read-only only
-/// paths that exist at launch, at fixed depths, never `<root>/<worktree>/<rel>`.
-/// So inside the root, protected files and the `.git` pointers are writable on
-/// Linux, as they are in the project itself under Landlock alone. What Linux
-/// keeps: the broker's private checkout and tree checks, and the session-end
-/// and next-launch link checks. `os` is `std::env::consts::OS`, passed in so
+/// regex. Linux (#965) needs bubblewrap for it: Landlock cannot subtract a
+/// path from a granted tree, so `worktree_ns` binds each worktree's protected
+/// paths read-only inside the session namespace, and a launch without
+/// bubblewrap is refused there. `os` is `std::env::consts::OS`, passed in so
 /// the refusal is testable on either host.
 pub fn refuse_unsupported_os(os: &str) -> Result<(), String> {
     if os == "macos" || os == "linux" {

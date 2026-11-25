@@ -5897,53 +5897,52 @@ finally:
 
     // ── Managed worktree broker (#965) ─────────────────────────────
 
-    /// A repository with one tracked file, a HOME outside `/tmp` (a `/tmp`
-    /// grant would cover the broker's staging and turn it off), and a config
-    /// with the key on. Runs `script` in `--agent shell`.
-    fn worktree_session(
-        bwrap: bool,
-        grant_home: bool,
-        script: &str,
-    ) -> (
-        i32,
-        String,
-        String,
-        PathBuf,
-        tempfile::TempDir,
-        tempfile::TempDir,
-    ) {
+    /// A repository with a tracked file and a tracked protected file, and a
+    /// HOME outside `/tmp` (a `/tmp` grant would cover the broker's staging).
+    fn worktree_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
         let project = crate::common::temp_repo("navikt/worktree-broker-fixture");
         fs::write(project.path().join("a.txt"), "tracked\n").unwrap();
-        assert!(crate::common::git_ok(project.path(), &["add", "a.txt"]));
+        fs::create_dir_all(project.path().join(".github/hooks")).unwrap();
+        fs::write(project.path().join(".github/hooks/h.json"), "{}\n").unwrap();
+        assert!(crate::common::git_ok(
+            project.path(),
+            &["add", "a.txt", ".github/hooks/h.json"]
+        ));
         assert!(crate::common::git_ok(
             project.path(),
             &["commit", "-q", "-m", "fixture"]
         ));
-        let home = crate::common::home_temp_dir("wt965");
-        let h = fs::canonicalize(home.path()).unwrap();
-        // Where cplt looks for it anyway, so the state dir stays ~/.config/cplt
-        // and a grant on ~/.cplt-worktrees is not inside it.
+        (project, crate::common::home_temp_dir("wt965"))
+    }
+
+    /// Run `script` in `--agent shell` with the key on. `bwrap` picks
+    /// `--use-bubblewrap` or `--no-bubblewrap`; `grant` adds a read grant over
+    /// `~/.cplt-worktrees`, which reaches the broker's staging.
+    fn worktree_run(
+        project: &Path,
+        home: &Path,
+        bwrap: bool,
+        grant: bool,
+        script: &str,
+    ) -> (i32, String, String) {
+        let h = fs::canonicalize(home).unwrap();
+        // Where cplt looks anyway, so the state dir stays ~/.config/cplt.
         fs::create_dir_all(h.join(".config/cplt")).unwrap();
         let cfg = h.join(".config/cplt/config.toml");
-        fs::write(
-            &cfg,
-            format!("[sandbox]\nallow_git_worktrees = true\nuse_bubblewrap = {bwrap}\n"),
-        )
-        .unwrap();
-        let dir = project.path().to_string_lossy().into_owned();
-        // A read grant over the base reaches staging. Not HOME: that holds
-        // cplt's state dir and is refused outright.
-        let wt_base = h.join(".cplt-worktrees");
-        fs::create_dir_all(&wt_base).unwrap();
-        fs::set_permissions(
-            &wt_base,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
-        let grant = wt_base.to_string_lossy().into_owned();
+        fs::write(&cfg, "[sandbox]\nallow_git_worktrees = true\n").unwrap();
+        let base = h.join(".cplt-worktrees");
+        fs::create_dir_all(&base).unwrap();
+        fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let dir = project.to_string_lossy().into_owned();
+        let grant_path = base.to_string_lossy().into_owned();
         let mut args: Vec<&str> = vec!["--yes", "--no-validate", "--project-dir", &dir];
-        if grant_home {
-            args.extend_from_slice(&["--allow-read", &grant]);
+        args.push(if bwrap {
+            "--use-bubblewrap"
+        } else {
+            "--no-bubblewrap"
+        });
+        if grant {
+            args.extend_from_slice(&["--allow-read", &grant_path]);
         }
         args.extend_from_slice(&["--agent", "shell", "--", "-c", script]);
         let out = cplt_cmd()
@@ -5958,28 +5957,17 @@ finally:
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .expect("run cplt");
-        let base = h.join(".cplt-worktrees");
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
-            base,
-            project,
-            home,
         )
     }
 
-    fn worktree_backends() -> &'static [bool] {
-        if bwrap_available() {
-            &[false, true]
-        } else {
-            &[false]
-        }
-    }
-
-    /// The one managed root under `base`.
-    fn managed_root(base: &Path) -> PathBuf {
-        let roots: Vec<PathBuf> = fs::read_dir(base)
+    /// The one managed root under `home`.
+    fn managed_root(home: &Path) -> PathBuf {
+        let base = fs::canonicalize(home).unwrap().join(".cplt-worktrees");
+        let roots: Vec<PathBuf> = fs::read_dir(&base)
             .unwrap()
             .flatten()
             .map(|e| e.path())
@@ -5989,13 +5977,34 @@ finally:
         roots[0].clone()
     }
 
-    /// #965: `cplt worktree add` works from inside the sandbox, Landlock alone
-    /// and under bubblewrap, over an inherited descriptor rather than a socket
-    /// path; hostile names, refs and a planted symlink are refused.
+    /// The writes an agent must not get into a managed worktree, each echoing
+    /// a marker when it wrongly succeeds, plus one ordinary write that must work.
+    fn protected_write_probes(cplt: &str, wt: &str) -> String {
+        format!(
+            r#"c='{cplt}'; r="$CPLT_WORKTREE_ROOT"; w="$r/{wt}"
+common=$(git -C "$w" rev-parse --git-common-dir)
+echo x >> "$w/.github/hooks/h.json" && echo "BAD_WRITE hooks"
+echo x > "$w/.github/hooks/new.json" && echo "BAD_WRITE new hook"
+echo x > "$w/.git" && echo "BAD_WRITE pointer"
+echo x > "$common/worktrees/{wt}/gitdir" && echo "BAD_WRITE gitdir"
+echo x > "$common/worktrees/{wt}/commondir" && echo "BAD_WRITE commondir"
+mv "$w/.github" "$w/.gh2" && echo "BAD_WRITE rename .github"
+mv "$w" "$r/moved" && echo "BAD_WRITE rename worktree"
+git -C "$PWD" worktree add "$r/plain" HEAD >/dev/null 2>&1 && echo "BAD_WRITE plain add"
+echo ok > "$w/a.txt" && git -C "$w" status --short >/dev/null && echo ORDINARY_OK
+true"#
+        )
+    }
+
+    /// #965: under bubblewrap, `cplt worktree add` works from inside the
+    /// sandbox over an inherited descriptor; hostile names, refs and a planted
+    /// symlink are refused; the new worktree's .git pointer, admin links and
+    /// protected files are read-only to the agent, in this session and the next.
     #[test]
-    fn worktree_add_from_inside_the_sandbox() {
-        require_landlock!();
+    fn worktree_add_under_bubblewrap_protects_the_new_worktree() {
+        require_bwrap!();
         let cplt = env!("CARGO_BIN_EXE_cplt");
+        let (project, home) = worktree_fixture();
         let script = format!(
             r#"c='{cplt}'
 echo "SOCK=$CPLT_WORKTREE_SOCKET"
@@ -6005,44 +6014,65 @@ for n in '../escape' '--upload-pack=touch pwned' 'a/b' '.git' '..'; do
 done
 "$c" worktree add refx '--upload-pack=touch pwned' && echo BAD_REF_OK
 ln -s /etc "$CPLT_WORKTREE_ROOT/linked" && {{ "$c" worktree add linked HEAD && echo BAD_LINK_OK; }}
-true"#
+{}"#,
+            protected_write_probes(cplt, "good")
         );
-        for &bwrap in worktree_backends() {
-            let (code, stdout, stderr, base, project, _home) =
-                worktree_session(bwrap, false, &script);
-            let ctx = format!("bwrap={bwrap}\nstdout: {stdout}\nstderr: {stderr}");
-            assert_eq!(code, 0, "{ctx}");
-            assert!(
-                stdout.contains("SOCK=fd:"),
-                "no inherited descriptor: {ctx}"
-            );
-            assert!(stdout.contains("GOOD_OK"), "{ctx}");
-            assert!(
-                !stdout.contains("BAD_"),
-                "a hostile request succeeded: {ctx}"
-            );
-            let root = managed_root(&base);
-            assert_eq!(
-                fs::read_to_string(root.join("good/a.txt")).unwrap(),
-                "tracked\n",
-                "{ctx}"
-            );
-            assert!(
-                fs::symlink_metadata(root.join("linked"))
-                    .unwrap()
-                    .file_type()
-                    .is_symlink(),
-                "the planted link must not be replaced: {ctx}"
-            );
-            assert!(!base.join("escape").exists(), "{ctx}");
-            assert!(!project.path().join("pwned").exists(), "{ctx}");
-            assert!(!root.join("pwned").exists(), "{ctx}");
-            // The broker publishes nothing outside the root, and no staging is left.
-            let staging: Vec<_> = fs::read_dir(base.join(".staging"))
-                .map(|r| r.flatten().collect())
-                .unwrap_or_default();
-            assert!(staging.is_empty(), "staging left behind: {ctx}");
-        }
+        let (code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), true, false, &script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(
+            stdout.contains("SOCK=fd:"),
+            "no inherited descriptor: {ctx}"
+        );
+        assert!(stdout.contains("GOOD_OK"), "{ctx}");
+        assert!(stdout.contains("ORDINARY_OK"), "{ctx}");
+        assert!(!stdout.contains("BAD_"), "{ctx}");
+        let root = managed_root(home.path());
+        assert_eq!(
+            fs::read_to_string(root.join("good/.github/hooks/h.json")).unwrap(),
+            "{}\n"
+        );
+        assert!(!root.join("good/.github/hooks/new.json").exists(), "{ctx}");
+        assert!(
+            fs::symlink_metadata(root.join("linked"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{ctx}"
+        );
+        assert!(!project.path().join("pwned").exists(), "{ctx}");
+
+        // Next session: the existing worktree is protected before the agent starts.
+        let (code, stdout, stderr) = worktree_run(
+            project.path(),
+            home.path(),
+            true,
+            false,
+            &protected_write_probes(cplt, "good"),
+        );
+        let ctx = format!("second session\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("ORDINARY_OK"), "{ctx}");
+        assert!(!stdout.contains("BAD_"), "{ctx}");
+    }
+
+    /// #965: without bubblewrap the key is refused with a copy-paste fix,
+    /// before the agent runs.
+    #[test]
+    fn worktree_root_without_bubblewrap_is_refused() {
+        require_landlock!();
+        let (project, home) = worktree_fixture();
+        let (code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), false, false, "echo AGENT_RAN");
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_ne!(code, 0, "{ctx}");
+        assert!(!stdout.contains("AGENT_RAN"), "{ctx}");
+        assert!(stderr.contains("needs Bubblewrap on Linux"), "{ctx}");
+        assert!(
+            stderr.contains("cplt config set sandbox.allow_git_worktrees false"),
+            "{ctx}"
+        );
     }
 
     /// #965: the raw transport. A datagram with no descriptor, two
@@ -6050,15 +6080,12 @@ true"#
     /// them is still served.
     #[test]
     fn worktree_broker_transport_refuses_malformed_datagrams() {
-        require_landlock!();
+        require_bwrap!();
         let has_python = Command::new("python3")
             .args(["-c", "import socket; socket.send_fds"])
             .output()
             .is_ok_and(|o| o.status.success());
-        if !has_python {
-            eprintln!("SKIPPED: python3 with socket.send_fds unavailable");
-            return;
-        }
+        assert!(has_python, "python3 with socket.send_fds is required");
         let script = r#"python3 - <<'PY'
 import os, socket
 n = int(os.environ['CPLT_WORKTREE_SOCKET'][3:])
@@ -6078,39 +6105,39 @@ socket.send_fds(s, [b'x'], [b.fileno()]); b.close()
 a.sendall(b'{"op":"add","name":"py","ref":"HEAD"}\n'); a.settimeout(60)
 print('VALID', a.recv(4096))
 PY"#;
-        for &bwrap in worktree_backends() {
-            let (code, stdout, stderr, base, _project, _home) =
-                worktree_session(bwrap, false, script);
-            let ctx = format!("bwrap={bwrap}\nstdout: {stdout}\nstderr: {stderr}");
-            assert_eq!(code, 0, "{ctx}");
-            assert!(stdout.contains("TWO_FDS_EOF True"), "{ctx}");
-            assert!(stdout.contains("UNKNOWN_FIELD b'{\"ok\":false"), "{ctx}");
-            assert!(stdout.contains("VALID b'{\"ok\":true"), "{ctx}");
-            assert!(managed_root(&base).join("py/a.txt").is_file(), "{ctx}");
-        }
+        let (project, home) = worktree_fixture();
+        let (code, stdout, stderr) = worktree_run(project.path(), home.path(), true, false, script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 0, "{ctx}");
+        assert!(stdout.contains("TWO_FDS_EOF True"), "{ctx}");
+        assert!(stdout.contains("UNKNOWN_FIELD b'{\"ok\":false"), "{ctx}");
+        assert!(stdout.contains("VALID b'{\"ok\":true"), "{ctx}");
+        assert!(
+            managed_root(home.path()).join("py/a.txt").is_file(),
+            "{ctx}"
+        );
     }
 
     /// #965: a session grant that covers the broker's private staging turns the
-    /// broker off with a warning. It is never run with staging exposed, and
-    /// the managed root stays.
+    /// broker off with a warning. It never runs with staging exposed, and the
+    /// managed root stays.
     #[test]
     fn worktree_broker_is_off_when_a_grant_covers_staging() {
-        require_landlock!();
+        require_bwrap!();
         let cplt = env!("CARGO_BIN_EXE_cplt");
         let script = format!(
             r#"echo "SOCK=[$CPLT_WORKTREE_SOCKET] ROOT=[$CPLT_WORKTREE_ROOT]"; '{cplt}' worktree add x HEAD || echo REFUSED"#
         );
-        for &bwrap in worktree_backends() {
-            let (_code, stdout, stderr, _base, _project, _home) =
-                worktree_session(bwrap, true, &script);
-            let ctx = format!("bwrap={bwrap}\nstdout: {stdout}\nstderr: {stderr}");
-            assert!(stdout.contains("SOCK=[]"), "{ctx}");
-            assert!(!stdout.contains("ROOT=[]"), "the root must stay: {ctx}");
-            assert!(stdout.contains("REFUSED"), "{ctx}");
-            assert!(
-                stderr.contains("managed-worktree broker unavailable"),
-                "{ctx}"
-            );
-        }
+        let (project, home) = worktree_fixture();
+        let (_code, stdout, stderr) =
+            worktree_run(project.path(), home.path(), true, true, &script);
+        let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("SOCK=[]"), "{ctx}");
+        assert!(!stdout.contains("ROOT=[]"), "the root must stay: {ctx}");
+        assert!(stdout.contains("REFUSED"), "{ctx}");
+        assert!(
+            stderr.contains("managed-worktree broker unavailable"),
+            "{ctx}"
+        );
     }
 }

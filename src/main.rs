@@ -6377,6 +6377,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
+    // Before anything can start a thread: setns(CLONE_NEWUSER) needs one.
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(cplt::worktree_ns::HELPER_ARG.as_ref()) {
+        return cplt::worktree_ns::helper_main();
+    }
     cplt::session_summary::mark_process_start();
     let cli = Cli::parse();
     let result = run(cli);
@@ -8041,6 +8046,10 @@ fn start_worktree_broker(
                 "sandbox.allow_git_worktrees is on, but the project is not a git repository"
             )
         })?;
+    // Linux (#965): the root's namespace protections apply even if the broker
+    // itself fails to start below.
+    #[cfg(target_os = "linux")]
+    cplt::worktree_ns::register(root, &common);
     let ctx = cplt::worktree_broker::Context::new(&probe.project_dir, &common, root)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     cplt::worktree_broker::Broker::start(ctx)
@@ -8683,6 +8692,10 @@ fn assemble_sandbox(
     #[cfg(target_os = "linux")]
     if resolved.netns {
         prepared.check_netns().map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    if opts.repos.worktree_root.is_some() && !opts.inspect_only && !prepared.uses_bubblewrap() {
+        anyhow::bail!("{}", sandbox::worktrees_need_bwrap());
     }
     prepared.set_worktree_root(opts.repos.worktree_root);
     // The shims only where `open_url` is served (#910).

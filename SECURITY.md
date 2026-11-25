@@ -960,8 +960,8 @@ does not:
   the settle-probe notes in `src/audit.rs` on why a process group is not used.
   When the audit runs and the tree has not settled, the audit's own warning
   says processes were left running.
-- **macOS and Linux.** On Linux nothing inside the root is kernel-enforced;
-  see [Managed worktrees on Linux](#managed-worktrees-on-linux).
+- **macOS and Linux.** On Linux the key needs bubblewrap; see
+  [Managed worktrees on Linux](#managed-worktrees-on-linux).
 - **Residuals.** Everything written to the root outlives the session: cplt
   never deletes worktrees or branches. The agent can empty the root or plant
   files you later run outside cplt, the same as in the project directory. The
@@ -1000,18 +1000,35 @@ same tree and protected-file checks. Three parts differ.
 - **Publish: `renameat2(RENAME_NOREPLACE)`**, called through `syscall(2)`, the
   counterpart of `renameatx_np(RENAME_EXCL)`.
 
-**Stated gap: no denies inside the root.** macOS denies the protected paths at
-any depth below the root with a regex, and pins `commondir` and every `.git`
-below it. Linux cannot. Landlock cannot subtract a path from a granted tree,
-and bubblewrap re-binds read-only only paths that exist at launch, at fixed
-depths. So inside the managed root, on both Linux backends, an agent can write
-a worktree's `.git` pointer, its admin links under `<common>/worktrees/<id>`,
-and protected files such as `.github/hooks` or `.cplt.toml` after the broker
-created them. Plain `git worktree add` into the root also works directly. That
-matches the project itself on a Landlock-only host. What remains on Linux: the
-broker's checks at creation time, the end-of-session link check, and the
-next-launch refusal while a tampered link is present. Do not run git or cplt in
-a managed worktree that the end-of-session check flagged.
+**Bubblewrap is required.** Without it, a launch with the key on stops and
+says how to install bubblewrap or turn the key off; a bubblewrap that fails to
+start stops the launch instead of falling back to Landlock alone. The reason is
+the protections inside the root. macOS denies protected paths at any depth with
+a regex. Landlock cannot subtract a path from a granted tree, and bubblewrap
+binds only paths that exist when it starts. So cplt binds them itself: bwrap
+reports its child's pid on `--info-fd`, and before the agent is allowed to start
+the parent enters that user namespace (it owns it) and mount namespace in a
+single-threaded helper and attaches bind mounts with `open_tree`/`move_mount`,
+on descriptors opened without following a symlink in any component:
+
+- `<common>/worktrees` read-only, so plain `git worktree add` cannot create an
+  admin directory (and `git worktree prune`/`remove` fail inside the sandbox),
+  with every existing admin directory writable again on top;
+- for each worktree in the root, existing at launch or published by the broker
+  later: the project's own bubblewrap list (`git_persistence_paths` read-only,
+  `rename_pin_paths` pinned, the same tables as the project, not a copy), plus
+  the `.git` pointer, `commondir`, `gitdir` and `config.worktree` read-only, and
+  the worktree and its admin directory pinned so they cannot be renamed.
+
+After a publish the broker binds, then checks the protected files and the
+`.git` pointer again; any failure removes the worktree, its admin directory and
+any new branch. **Residual:** a process that opens a protected directory inside
+a new worktree in the moment between publish and bind keeps a writable handle to
+it, because a bind does not change descriptors opened before it. Protected
+files are checked again after the bind, so a write in that moment refuses the
+request, but a later write through such a handle is not seen. Worktrees in the
+root that existing launches find are protected before the agent runs, so this
+applies only to worktrees made in the current session.
 #### Keychain access is all-or-nothing
 
 The macOS Keychain grant is two SBPL file rules on `~/Library/Keychains` plus the

@@ -615,8 +615,12 @@ On Linux the sandbox reaches the broker through an inherited descriptor, not a
 socket path, so a tool that closes inherited descriptors before running a
 command (Python's `subprocess` does by default) cannot run `cplt worktree add`
 from that command. If a grant such as `allow.write` covers `~/.cplt-worktrees`,
-the broker is off for the session and the launch says so. On Linux the
-persistence denies listed below do not apply inside the managed root: see
+the broker is off for the session and the launch says so. On Linux the key
+needs Bubblewrap: without it the launch stops and says how to fix it. With it,
+each worktree's `.git` pointer, admin links and protected files are read-only
+to the agent, `<common>/worktrees` is read-only (so plain `git worktree add`,
+`prune` and `remove` fail inside the session; use `cplt worktree add`), and the
+worktrees cannot be renamed or removed from inside. See
 [SECURITY.md](../SECURITY.md#managed-worktrees-on-linux).
 The broker requires a launch HEAD commit whose protected bytes and executable
 modes match the checkout. Symlinked protected paths or ancestors, filesystem
@@ -656,7 +660,8 @@ What you get:
 - The launch prints the root in the startup summary, exports it as
   `CPLT_WORKTREE_ROOT`, and names it in the sandbox brief. With the key off the
   variable is removed, even if your shell has one.
-- On macOS, the same persistence denies apply as in the project, at any depth: the shared
+- The same persistence denies apply as in the project (on Linux through the
+  bubblewrap binds above), at any depth: the shared
   `.git/hooks` and `.git/config`, each worktree's `config.worktree`, and
   `.github/hooks`, `.claude/settings.json`, `.cplt.toml` and the rest of the
   per-root list inside every worktree. See

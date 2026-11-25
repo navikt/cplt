@@ -304,6 +304,7 @@ impl Broker {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let policy_ctx = ctx.clone();
+        crate::worktree_ns::register(&ctx.root, &ctx.common);
         let thread = std::thread::Builder::new()
             .name("cplt-worktree-broker".into())
             .spawn(move || serve_fd(&server, &ctx, &worker_stop))
@@ -691,6 +692,26 @@ fn add_with_budget(
     )?;
     budget.check()?;
     publish(&staging, name, &ctx.root)?;
+    // Linux (#965): the published tree gets the project's protections inside
+    // the session namespace, then is checked again, before it counts. On any
+    // failure it is removed with its admin dir and branch.
+    #[cfg(target_os = "linux")]
+    {
+        let published = ctx.root.join(name);
+        let admin_dir = ctx.common.join("worktrees").join(&admin.name);
+        let protected = crate::worktree_ns::protect_new(&published, &admin_dir).and_then(|()| {
+            verify_protected_names(&published, &ctx.protected, None, budget)?;
+            let pointer = std::fs::read_to_string(published.join(".git")).unwrap_or_default();
+            if pointer.trim() != format!("gitdir: {}", admin_dir.display()) {
+                return Err("the worktree's .git pointer changed before it was protected".into());
+            }
+            Ok(())
+        });
+        if let Err(e) = protected {
+            let _ = std::fs::remove_dir_all(&published);
+            return Err(e);
+        }
+    }
     job.published = true;
     if let Some(created) = &created {
         created.keep.set(true);

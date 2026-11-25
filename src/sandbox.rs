@@ -108,6 +108,19 @@ mod exec;
 pub use exec::{GH_TOKEN_DIR_ENV, SCRATCH_DIR_ENV, opencode_handover_planned};
 #[path = "sandbox_landlock.rs"]
 pub(crate) mod landlock_mod;
+
+/// The project's bubblewrap protection lists for one more root, reused for
+/// managed worktrees created mid-session (#965). No copy of the tables.
+#[cfg(target_os = "linux")]
+pub(crate) mod bubblewrap_paths {
+    use std::path::{Path, PathBuf};
+    pub(crate) fn persistence(root: &Path) -> Vec<PathBuf> {
+        super::bubblewrap::git_persistence_paths(&[root], &[])
+    }
+    pub(crate) fn rename_pins(root: &Path) -> Vec<PathBuf> {
+        super::bubblewrap::rename_pin_paths(&[root], &[])
+    }
+}
 #[path = "sandbox_policy.rs"]
 mod policy;
 #[path = "sandbox_profile.rs"]
@@ -579,6 +592,12 @@ impl PreparedSandbox {
         self.open_url_hosts = hosts.to_vec();
     }
 
+    /// Whether this launch runs under bubblewrap (#965).
+    #[cfg(target_os = "linux")]
+    pub fn uses_bubblewrap(&self) -> bool {
+        self.bwrap_wrapper.is_some()
+    }
+
     /// The final Landlock rules, for the worktree broker's git (#965).
     #[cfg(target_os = "linux")]
     pub(crate) fn landlock_policy(&self) -> &landlock_mod::LandlockPolicy {
@@ -763,6 +782,20 @@ impl PreparedSandbox {
             }
         }
     }
+}
+
+/// The refusal for `sandbox.allow_git_worktrees` without bubblewrap (#965).
+#[cfg(target_os = "linux")]
+pub fn worktrees_need_bwrap() -> String {
+    format!(
+        "sandbox.allow_git_worktrees needs Bubblewrap on Linux: only inside its namespace can \
+         cplt make each worktree's .git pointer, admin links and protected files read-only. \
+         Install it (e.g. `sudo apt install bubblewrap`) and do not pass --no-bubblewrap \
+         (`cplt config set sandbox.use_bubblewrap true` makes a failure loud), or turn the key \
+         off: `cplt config set sandbox.allow_git_worktrees false`. If it is installed but \
+         fails, {}.",
+        crate::doctor::USERNS_HINT
+    )
 }
 
 /// Why OpenCode v2 does not run on Linux without bubblewrap, and how to fix it.
