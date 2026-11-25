@@ -1983,3 +1983,29 @@ one of these caches under `$HOME`: `.bun/install/cache`,
 | `bun install` (default clonefile backend) | Works with the cache in a listed location. A cache moved elsewhere with `BUN_INSTALL_CACHE_DIR` or `XDG_CACHE_HOME` fails with "failed copying files from cache to destination"; use `bun install --backend copyfile` or `backend = "copyfile"` in `bunfig.toml` |
 | `cp -c -R`, `ditto --clone`, `uv` | Work: they fall back to cloning file by file |
 | Single-file clones | Unaffected |
+
+## A `.git` file that points outside the project
+
+When a project's `.git` is a file (as with `git init --separate-git-dir`), cplt
+grants the git directory it names only when that directory is inside the
+project, or is the admin directory of a linked worktree created with
+`git worktree add`. Any other target is not granted, and the launch warns:
+
+```text
+Not granting the git directory <gitdir> named by this project's .git file: ...
+```
+
+| Setup | Impact |
+| --- | --- |
+| `git worktree add` checkouts | Unaffected |
+| A project inside a repository (no `.git` of its own) | Unaffected |
+| A separate git directory outside the project | git fails inside the sandbox until you grant it once: `cplt --allow-write <gitdir>`, or keep it with `cplt config set --local allow.write <gitdir>` |
+
+## Scratch cleanup skipped when the cache path is a link
+
+At launch cplt deletes scratch directories older than 24 hours from
+`~/Library/Caches/cplt/tmp` (macOS) or `~/.cache/cplt/tmp` (Linux). If any
+part of that path below your home resolves somewhere else, for example a
+symlinked `~/Library/Caches`, cplt skips the cleanup and says so, rather than
+delete anything in the link's target. No action is needed; remove old
+directories there by hand if they take up space.

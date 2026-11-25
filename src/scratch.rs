@@ -1040,8 +1040,11 @@ impl ScratchDir {
         };
         if canonical != home.join(SCRATCH_BASE) {
             ui::warn(&format!(
-                "Warning: not cleaning scratch dirs: {} is not a plain directory",
-                base.display()
+                "Skipping cleanup of old scratch dirs: {} resolves to {}, not a plain \
+                 directory under your home, so cplt will not delete anything there. \
+                 No action needed.",
+                base.display(),
+                canonical.display()
             ));
             return;
         }
@@ -1091,12 +1094,18 @@ fn gc_stale_session_dirs(base: &Path) {
         // token cache would sit on disk until the 24h sweep. Remove it now
         // when the dir is marked and its lock is free. Unmarked dirs may be
         // live sessions of an older cplt: leave them alone.
-        let held = session_lock_held(&path);
-        if held == Some(false)
-            // The agent may have left its TMPDIR read-only (#1054).
-            && let Ok(dir) = openat_dir_nofollow(&base_file, &c_name)
-            && dir.metadata().is_ok_and(|m| m.ino() == metadata.ino() && m.uid() == uid)
+        // The agent may have left its TMPDIR read-only (#1054).
+        let Ok(dir) = openat_dir_nofollow(&base_file, &c_name) else {
+            continue;
+        };
+        if !dir
+            .metadata()
+            .is_ok_and(|m| m.ino() == metadata.ino() && m.uid() == uid)
         {
+            continue;
+        }
+        let held = session_lock_held_at(&dir);
+        if held == Some(false) {
             let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
             for file in gh_token_files(&path) {
                 let Some(Ok(c_file)) = file
@@ -1117,11 +1126,7 @@ fn gc_stale_session_dirs(base: &Path) {
         // Kept at exit for a dirty worktree (#963): the user removes it.
         // Honoured only while a linked worktree is still there, so a planted
         // or outlived marker does not keep the dir forever.
-        if path
-            .join(KEPT_MARKER)
-            .symlink_metadata()
-            .is_ok_and(|m| m.is_file())
-            && !linked_worktrees(&path).is_empty()
+        if read_untrusted_file_at(&dir, KEPT_MARKER) && !linked_worktrees_in(&dir, &path).is_empty()
         {
             continue;
         }
@@ -1150,41 +1155,65 @@ fn openat_dir_nofollow(
     parent: &std::fs::File,
     name: &std::ffi::CStr,
 ) -> std::io::Result<std::fs::File> {
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-    let open = || {
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is a fresh descriptor this File now owns.
-        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-    };
-    match open() {
+    match openat_nofollow(parent, name) {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            chmod_700_nofollow_at(parent.as_raw_fd(), name)?;
-            open()
+            chmod_700_nofollow_at(std::os::unix::io::AsRawFd::as_raw_fd(parent), name)?;
+            openat_nofollow(parent, name)
         }
         other => other,
     }
 }
 
+/// Open directory `name` under `parent`; a link or non-dir fails.
+fn openat_nofollow(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor this File now owns.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Deepest tree [`remove_tree_at`] descends: each level holds a descriptor,
+/// and an agent-built tree must not exhaust them or the stack.
+const REMOVE_TREE_MAX_DEPTH: usize = 64;
+
 /// Remove `name` under `parent` and everything below it with `unlinkat`,
 /// never following a link: a link is unlinked, not descended into.
 fn remove_tree_at(parent: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
+    remove_tree_at_depth(parent, name, 0)
+}
+
+/// Past [`REMOVE_TREE_MAX_DEPTH`] it fails closed: nothing at that level or
+/// below is removed, and the error reaches the caller's warning.
+fn remove_tree_at_depth(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    depth: usize,
+) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
+    if depth >= REMOVE_TREE_MAX_DEPTH {
+        return Err(std::io::Error::other(format!(
+            "directory tree deeper than {REMOVE_TREE_MAX_DEPTH} levels, left in place"
+        )));
+    }
     let dir = openat_dir_nofollow(parent, name)?;
     let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
     for child in list_dir_at(&dir) {
         // Fails for a directory; the recursion opens it O_NOFOLLOW.
         if unsafe { libc::unlinkat(dir.as_raw_fd(), child.as_ptr(), 0) } != 0 {
-            remove_tree_at(&dir, &child)?;
+            remove_tree_at_depth(&dir, &child, depth + 1)?;
         }
     }
     if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
@@ -1197,21 +1226,25 @@ fn remove_tree_at(parent: &std::fs::File, name: &std::ffi::CStr) -> std::io::Res
 /// older than `max_age`. Same rules as [`gc_stale_session_dirs`]: no symlinks,
 /// real directories only, owned by us. Best-effort, one `readdir`.
 pub(crate) fn sweep_old_dirs(base: &Path, name_ok: impl Fn(&str) -> bool, max_age: Duration) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(entries) = std::fs::read_dir(base) else {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::getuid() };
+    let Ok(base_file) = open_dir_nofollow(base) else {
         return;
     };
     let now = SystemTime::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = path.symlink_metadata() else {
+    for c_name in list_dir_at(&base_file) {
+        if !c_name.to_str().is_ok_and(&name_ok) {
+            continue;
+        }
+        // A link fails O_NOFOLLOW here, so it is never entered or removed through.
+        let Ok(dir) = openat_nofollow(&base_file, &c_name) else {
             continue;
         };
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::getuid() }
-            || !entry.file_name().to_str().is_some_and(&name_ok)
-        {
+        let Ok(metadata) = dir.metadata() else {
+            continue;
+        };
+        // A live session keeps its dir however old it is.
+        if metadata.uid() != uid || session_lock_held_at(&dir) == Some(true) {
             continue;
         }
         let old = metadata
@@ -1219,11 +1252,11 @@ pub(crate) fn sweep_old_dirs(base: &Path, name_ok: impl Fn(&str) -> bool, max_ag
             .ok()
             .and_then(|m| now.duration_since(m).ok())
             .is_some_and(|age| age > max_age);
-        if old {
-            if let Ok(dir) = open_dir_nofollow(&path) {
-                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
-            }
-            let _ = remove_tree(&path);
+        if old && let Err(e) = remove_tree_at(&base_file, &c_name) {
+            ui::warn(&format!(
+                "Warning: cannot remove stale dir {}: {e}",
+                base.join(c_name.to_string_lossy().as_ref()).display()
+            ));
         }
     }
 }
@@ -1235,10 +1268,9 @@ const SOCKET_STALE_AGE: Duration = Duration::from_hours(24 * 7);
 /// Our socket-dir name, and no running session holds its lock: a live
 /// session keeps its dir however old it is.
 #[cfg(target_os = "macos")]
-fn socket_dir_sweepable(root: &Path, name: &str) -> bool {
+fn socket_dir_sweepable(name: &str) -> bool {
     name.strip_prefix(PLAYWRIGHT_SOCKET_DIR_PREFIX)
         .is_some_and(is_session_id)
-        && session_lock_held(&root.join(name)) != Some(true)
 }
 
 /// Create [`SESSION_MARKER`] in `dir` and hold a shared lock on it. On
@@ -1265,21 +1297,39 @@ fn lock_session_with(dir: &Path, flock: impl Fn(&std::fs::File) -> bool) -> Opti
 
 /// `None`: the dir has no session marker. `Some(true)`: a running cplt holds
 /// it. `Some(false)`: marked and unlocked, so its session is gone.
+#[cfg(test)]
 fn session_lock_held(dir: &Path) -> Option<bool> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
+    session_lock_held_at(&open_dir_nofollow(dir).ok()?)
+}
+
+/// [`session_lock_held`] on an open dir: the marker is opened relative to it.
+fn session_lock_held_at(dir: &std::fs::File) -> Option<bool> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new(SESSION_MARKER).ok()?;
     // The agent can write the scratch dir: never follow a symlink, and never
     // block on a FIFO it left in place of the marker.
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join(SESSION_MARKER))
-        .ok()?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh descriptor this File now owns.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
     if !f.metadata().ok()?.is_file() {
         return None;
     }
     // SAFETY: `f` owns a valid descriptor; the lock is released when it drops.
     Some(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0)
+}
+
+/// `name` under `dir` is a plain file (not a link, FIFO or dir).
+fn read_untrusted_file_at(dir: &std::fs::File, name: &str) -> bool {
+    crate::untrusted::read_untrusted_at(dir, name, 0).is_ok_and(|r| r.is_some())
 }
 
 /// A short, random, per-session macOS directory for Playwright control sockets.
@@ -1312,7 +1362,7 @@ impl SessionSocketDir {
         {
             return Err("Playwright socket root is not the expected real directory".to_string());
         }
-        sweep_old_dirs(root, |n| socket_dir_sweepable(root, n), SOCKET_STALE_AGE);
+        sweep_old_dirs(root, socket_dir_sweepable, SOCKET_STALE_AGE);
 
         let session_id = generate_session_id()?;
         Self::create_for_session_id(&session_id)
@@ -1440,38 +1490,46 @@ fn dirty_worktrees(scratch: &Path) -> Vec<PathBuf> {
 
 /// Every linked worktree under `scratch`, within the walk bounds.
 fn linked_worktrees(scratch: &Path) -> Vec<PathBuf> {
+    match open_dir_nofollow(scratch) {
+        Ok(root) => linked_worktrees_in(&root, scratch),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The walk behind [`linked_worktrees`], from an open `root` at `scratch`.
+/// Every step is `openat(O_NOFOLLOW)` from the parent's descriptor, so a dir
+/// swapped for a link mid-walk is skipped, not followed.
+fn linked_worktrees_in(root: &std::fs::File, scratch: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut budget = WORKTREE_SCAN_ENTRIES;
-    let mut stack = vec![(scratch.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+    let Ok(first) = root.try_clone() else {
+        return found;
+    };
+    let mut stack = vec![(first, scratch.to_path_buf(), 0usize)];
+    while let Some((dir, dir_path, depth)) = stack.pop() {
+        for name in list_dir_at(&dir) {
             if budget == 0 {
                 return found;
             }
             budget -= 1;
-            // `DirEntry::file_type` does not follow symlinks.
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() || ft.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if is_linked_worktree(&path, scratch) {
+            let Ok(child) = openat_nofollow(&dir, &name) else {
+                continue; // not a dir, a link, or unreadable
+            };
+            let path = dir_path.join(name.to_string_lossy().as_ref());
+            if is_linked_worktree(&child, &path, scratch) {
                 found.push(path.clone());
             }
             // Clean worktrees are walked too: a dirty one can sit below.
-            if depth + 1 < WORKTREE_SCAN_DEPTH && entry.file_name() != ".git" {
-                stack.push((path, depth + 1));
+            if depth + 1 < WORKTREE_SCAN_DEPTH && name.as_bytes() != b".git" {
+                stack.push((child, path, depth + 1));
             }
         }
     }
     found
 }
 
-fn is_linked_worktree(dir: &Path, scratch: &Path) -> bool {
-    let Ok(Some(text)) = crate::untrusted::read_untrusted(&dir.join(".git"), 4096) else {
+fn is_linked_worktree(dir_file: &std::fs::File, dir: &Path, scratch: &Path) -> bool {
+    let Ok(Some(text)) = crate::untrusted::read_untrusted_at(dir_file, ".git", 4096) else {
         return false;
     };
     let Some(gitdir) = text.trim_end().strip_prefix("gitdir: ") else {
@@ -2013,7 +2071,7 @@ mod tests {
             &id('a'),
             &id('c'),
             Some(&id('d')),
-            socket_dir_sweepable,
+            |_, n| socket_dir_sweepable(n),
             SOCKET_STALE_AGE,
         );
     }
@@ -3331,6 +3389,46 @@ mod tests {
         ScratchDir::gc_stale(tmp.path());
 
         assert!(stale.join("keep").exists(), "gc followed a symlinked base");
+    }
+
+    /// The worktree walk does not enter a link, even one whose target holds
+    /// a linked worktree.
+    #[test]
+    fn linked_worktrees_does_not_follow_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("scratch");
+        let outside = tmp.path().join("outside");
+        let admin = tmp.path().join("repo/.git/worktrees/x");
+        std::fs::create_dir_all(&admin).unwrap();
+        for d in [&scratch.join("real"), &outside] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, scratch.join("link")).unwrap();
+
+        let found = linked_worktrees(&scratch);
+        assert_eq!(found, vec![scratch.join("real")], "{found:?}");
+    }
+
+    /// A tree deeper than the cap is left in place, with nothing removed
+    /// beyond it, rather than exhausting descriptors.
+    #[test]
+    fn remove_tree_at_stops_at_the_depth_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut deep = tmp.path().join("top");
+        for _ in 0..REMOVE_TREE_MAX_DEPTH + 2 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f"), "x").unwrap();
+        let base = std::fs::File::open(tmp.path()).unwrap();
+        let name = std::ffi::CString::new("top").unwrap();
+
+        assert!(
+            remove_tree_at(&base, &name).is_err(),
+            "over-deep tree must fail"
+        );
+        assert!(deep.join("f").exists(), "nothing past the cap is removed");
     }
 
     #[test]

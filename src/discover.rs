@@ -1768,16 +1768,26 @@ pub fn git_common_dir(
     let resolved = match worktree_common_dir(project_dir) {
         Ok(Some(resolved)) => resolved,
         Ok(None) => return (None, None),
-        Err(()) => {
+        Err(target) => {
+            // The user granting it explicitly is the one-step recovery for a
+            // separate gitdir kept outside the project on purpose.
+            if allow_write.iter().any(|w| target.starts_with(w)) {
+                return (None, None);
+            }
+            // Escaped: the path comes from a file the agent can write.
+            let shown = target.to_string_lossy().escape_debug().to_string();
             return (
                 None,
                 Some(CommonDirProblem {
-                    message: "Not granting the git directory named by this project's .git file: \
-                              it lies outside the project and is not a linked worktree of it, \
-                              so git will fail inside the sandbox."
-                        .into(),
-                    fix: "If this project should be a worktree, recreate it with git worktree add"
-                        .into(),
+                    message: format!(
+                        "Not granting the git directory {shown} named by this project's .git \
+                         file: it lies outside the project and is not a linked worktree of it, \
+                         so git will fail inside the sandbox."
+                    ),
+                    fix: format!(
+                        "If that git directory is yours, grant it with --allow-write {shown}, \
+                         or keep the grant with cplt config set --local allow.write {shown}"
+                    ),
                 }),
             );
         }
@@ -1844,7 +1854,7 @@ pub fn git_common_dir(
 /// already covers. `Err` when the project's `.git` file points outside the
 /// project at something that is not a linked worktree of it. No unsafe-root or
 /// `$HOME` filtering: [`git_common_dir`] applies that.
-fn worktree_common_dir(project_dir: &Path) -> Result<Option<PathBuf>, ()> {
+fn worktree_common_dir(project_dir: &Path) -> Result<Option<PathBuf>, PathBuf> {
     let Some(resolved) = git_dir_of(project_dir) else {
         return Ok(None);
     };
@@ -1899,7 +1909,7 @@ fn worktree_common_dir(project_dir: &Path) -> Result<Option<PathBuf>, ()> {
             .and_then(|p| std::fs::canonicalize(p).ok());
         let local = std::fs::canonicalize(&local).ok();
         if !(is_worktree_layout && back.is_some() && back == local) {
-            return Err(());
+            return Err(git_dir);
         }
     }
     Ok(Some(resolved))
@@ -2284,7 +2294,17 @@ mod tests {
 
         let (grant, problem) = git_common_dir(home, &project, &[]);
         assert_eq!(grant, None, "a foreign .git pointer must not be granted");
-        assert!(problem.is_some(), "the refusal must be reported");
+        let target = std::fs::canonicalize(other.join(".git")).unwrap();
+        let problem = problem.expect("the refusal must be reported").warning();
+        assert!(
+            problem.contains(&format!("--allow-write {}", target.display())),
+            "{problem}"
+        );
+        assert_eq!(
+            git_common_dir(home, &project, std::slice::from_ref(&target)),
+            (None, None),
+            "an explicit --allow-write is the recovery and silences the warning"
+        );
     }
 
     /// The layout check must not break the case it exists to allow: a real
