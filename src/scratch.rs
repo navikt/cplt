@@ -1030,36 +1030,60 @@ impl ScratchDir {
     /// Runs best-effort: errors are logged but don't prevent startup.
     pub fn gc_stale(home_dir: &Path) {
         let base = home_dir.join(SCRATCH_BASE);
-        gc_stale_session_dirs(&base);
+        // The agent can write the tree around its session dir, so the base
+        // may have been swapped for a link: sweep only the real one.
+        let (Ok(home), Ok(canonical)) = (
+            std::fs::canonicalize(home_dir),
+            std::fs::canonicalize(&base),
+        ) else {
+            return;
+        };
+        if canonical != home.join(SCRATCH_BASE) {
+            ui::warn(&format!(
+                "Warning: not cleaning scratch dirs: {} is not a plain directory",
+                base.display()
+            ));
+            return;
+        }
+        gc_stale_session_dirs(&canonical);
     }
 }
 
+/// Every destructive step is relative to a descriptor opened without
+/// following links, from the base down, so a dir swapped for a symlink at any
+/// level cannot steer a delete or chmod outside the scratch tree.
 fn gc_stale_session_dirs(base: &Path) {
-    if !base.exists() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let uid = unsafe { libc::getuid() };
+    let Ok(base_file) = open_dir_nofollow(base) else {
+        return;
+    };
+    let (Ok(fd_meta), Ok(path_meta)) = (base_file.metadata(), base.symlink_metadata()) else {
+        return;
+    };
+    if fd_meta.uid() != uid || fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino()
+    {
         return;
     }
 
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return;
-    };
-
     let now = SystemTime::now();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-
+    for c_name in list_dir_at(&base_file) {
+        let Ok(name) = c_name.to_str() else {
+            continue;
+        };
+        // Only delete entries that look like our session IDs (hex UUID)
+        if !is_session_id(name) {
+            continue;
+        }
+        let path = base.join(name);
         let Ok(metadata) = path.symlink_metadata() else {
             continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            continue;
-        }
-
-        // Only delete entries that look like our session IDs (hex UUID)
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        if !is_session_id(&name) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
             continue;
         }
 
@@ -1068,21 +1092,24 @@ fn gc_stale_session_dirs(base: &Path) {
         // when the dir is marked and its lock is free. Unmarked dirs may be
         // live sessions of an older cplt: leave them alone.
         let held = session_lock_held(&path);
-        if held == Some(false) {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            // The agent may have left its TMPDIR read-only (#1054). Only our
-            // own dirs, opened without following a symlink.
-            if metadata.uid() == unsafe { libc::getuid() }
-                && let Ok(dir) = open_dir_nofollow(&path)
-            {
-                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
-            }
+        if held == Some(false)
+            // The agent may have left its TMPDIR read-only (#1054).
+            && let Ok(dir) = openat_dir_nofollow(&base_file, &c_name)
+            && dir.metadata().is_ok_and(|m| m.ino() == metadata.ino() && m.uid() == uid)
+        {
+            let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
             for file in gh_token_files(&path) {
-                match std::fs::remove_file(&file) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                let Some(Ok(c_file)) = file
+                    .file_name()
+                    .map(|n| std::ffi::CString::new(n.as_bytes()))
+                else {
+                    continue;
+                };
+                if unsafe { libc::unlinkat(dir.as_raw_fd(), c_file.as_ptr(), 0) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != std::io::ErrorKind::NotFound {
                         ui::warn(&orphan_token_warning(&file, &e));
                     }
-                    _ => {}
                 }
             }
         }
@@ -1107,22 +1134,63 @@ fn gc_stale_session_dirs(base: &Path) {
         if let Ok(age) = now.duration_since(modified)
             && age > STALE_AGE
             && held != Some(true)
+            && let Err(e) = remove_tree_at(&base_file, &c_name)
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if metadata.uid() != unsafe { libc::getuid() } {
-                continue;
-            }
-            if let Ok(dir) = open_dir_nofollow(&path) {
-                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
-            }
-            if let Err(e) = remove_tree(&path) {
-                ui::warn(&format!(
-                    "Warning: cannot remove stale scratch dir {}: {e}",
-                    path.display()
-                ));
-            }
+            ui::warn(&format!(
+                "Warning: cannot remove stale scratch dir {}: {e}",
+                path.display()
+            ));
         }
     }
+}
+
+/// Open directory `name` under `parent` without following a link, making it
+/// readable (0700, on the entry itself) when the agent left it unreadable.
+fn openat_dir_nofollow(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let open = || {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor this File now owns.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    };
+    match open() {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            chmod_700_nofollow_at(parent.as_raw_fd(), name)?;
+            open()
+        }
+        other => other,
+    }
+}
+
+/// Remove `name` under `parent` and everything below it with `unlinkat`,
+/// never following a link: a link is unlinked, not descended into.
+fn remove_tree_at(parent: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+    let dir = openat_dir_nofollow(parent, name)?;
+    let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+    for child in list_dir_at(&dir) {
+        // Fails for a directory; the recursion opens it O_NOFOLLOW.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), child.as_ptr(), 0) } != 0 {
+            remove_tree_at(&dir, &child)?;
+        }
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Remove directories in `base` whose name passes `name_ok` and whose mtime is
@@ -1613,19 +1681,17 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// `chmod 0700` on `path` itself, never on what a link there points to.
 fn chmod_700_nofollow(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    chmod_700_nofollow_at(libc::AT_FDCWD, &c_path)
+}
+
+/// `chmod 0700` on `name` under `dirfd` itself, never on a link's target.
+fn chmod_700_nofollow_at(dirfd: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-        let rc = unsafe {
-            libc::fchmodat(
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-                0o700,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
+        let rc = unsafe { libc::fchmodat(dirfd, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -1636,14 +1702,25 @@ fn chmod_700_nofollow(path: &Path) -> std::io::Result<()> {
     // Portable where fchmodat's AT_SYMLINK_NOFOLLOW is not (glibc < 2.32).
     #[cfg(not(target_os = "macos"))]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        use std::os::unix::io::AsRawFd;
-        let fd = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::FromRawFd;
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor this File now owns.
+        let fd = unsafe { std::fs::File::from_raw_fd(fd) };
         std::fs::set_permissions(
-            format!("/proc/self/fd/{}", fd.as_raw_fd()),
+            format!(
+                "/proc/self/fd/{}",
+                std::os::unix::io::AsRawFd::as_raw_fd(&fd)
+            ),
             std::fs::Permissions::from_mode(0o700),
         )
     }
@@ -3235,6 +3312,25 @@ mod tests {
             "symlink target outside scratch must not be chmodded"
         );
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A scratch base replaced by a link to another directory is not swept,
+    /// and nothing at the link's target is removed.
+    #[test]
+    fn gc_does_not_follow_a_symlinked_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        let stale = victim.join("0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("keep"), "x").unwrap();
+        age(&stale, std::time::Duration::from_secs(25 * 3600));
+        let base = tmp.path().join(SCRATCH_BASE);
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &base).unwrap();
+
+        ScratchDir::gc_stale(tmp.path());
+
+        assert!(stale.join("keep").exists(), "gc followed a symlinked base");
     }
 
     #[test]

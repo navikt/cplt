@@ -1765,8 +1765,22 @@ pub fn git_common_dir(
     project_dir: &Path,
     allow_write: &[PathBuf],
 ) -> (Option<PathBuf>, Option<CommonDirProblem>) {
-    let Some(resolved) = worktree_common_dir(project_dir) else {
-        return (None, None);
+    let resolved = match worktree_common_dir(project_dir) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return (None, None),
+        Err(()) => {
+            return (
+                None,
+                Some(CommonDirProblem {
+                    message: "Not granting the git directory named by this project's .git file: \
+                              it lies outside the project and is not a linked worktree of it, \
+                              so git will fail inside the sandbox."
+                        .into(),
+                    fix: "If this project should be a worktree, recreate it with git worktree add"
+                        .into(),
+                }),
+            );
+        }
     };
     // Safety: reject unsafe roots
     if crate::is_unsafe_root(&resolved, home_dir) {
@@ -1827,17 +1841,21 @@ pub fn git_common_dir(
 
 /// The shared git dir of a linked worktree or separate gitdir, with a steered
 /// `commondir` rejected. `None` for a plain repo, whose `.git` the project grant
-/// already covers. No unsafe-root or `$HOME` filtering: [`git_common_dir`] applies that.
-fn worktree_common_dir(project_dir: &Path) -> Option<PathBuf> {
+/// already covers. `Err` when the project's `.git` file points outside the
+/// project at something that is not a linked worktree of it. No unsafe-root or
+/// `$HOME` filtering: [`git_common_dir`] applies that.
+fn worktree_common_dir(project_dir: &Path) -> Result<Option<PathBuf>, ()> {
+    let Some(resolved) = git_dir_of(project_dir) else {
+        return Ok(None);
+    };
     // `git_dir_of` runs the hardened invoker and canonicalizes; it also
     // subsumes the old `raw == ".git"` spelling check, because the comparison
     // below is against the *resolved* local `.git` rather than git's output.
-    let resolved = git_dir_of(project_dir)?;
     // Not a worktree — the common dir is the project's own `.git` directory,
     // which the project grant already covers.
     let local = project_dir.join(".git");
-    if resolved == std::fs::canonicalize(&local).unwrap_or(local) {
-        return None;
+    if resolved == std::fs::canonicalize(&local).unwrap_or_else(|_| local.clone()) {
+        return Ok(None);
     }
     // `--git-common-dir` is not trustworthy on its own: git derives it from a
     // `commondir` file inside the gitdir, which sits in the project tree the
@@ -1854,15 +1872,37 @@ fn worktree_common_dir(project_dir: &Path) -> Option<PathBuf> {
     //   - worktree: the common dir is `<gitdir>/../..`, because git writes
     //     literally `../..` into `<main>/.git/worktrees/<name>/commondir`
     // A steered commondir satisfies neither, and is never named in a warning.
-    let git_dir = crate::git::output(project_dir, &["rev-parse", "--absolute-git-dir"])
+    let Some(git_dir) = crate::git::output(project_dir, &["rev-parse", "--absolute-git-dir"])
         .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))?;
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+    else {
+        return Ok(None);
+    };
     let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
     let is_worktree_layout = git_dir.parent().and_then(Path::parent) == Some(resolved.as_path());
     if resolved != git_dir && !is_worktree_layout {
-        return None;
+        return Ok(None);
     }
-    Some(resolved)
+    // A `.git` *file* in the project is a pointer the agent can write. Honour
+    // it only when the git dir it names is inside the project, or is a linked
+    // worktree's admin dir whose `gitdir` file (written by git, outside the
+    // project) points back at this project's `.git`. Anything else would let
+    // the next launch grant read+write on an unrelated repository. A project
+    // without its own `.git` (a subdirectory of a repo) is not affected.
+    let pointer = std::fs::symlink_metadata(&local).is_ok_and(|m| m.is_file());
+    let project = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    if pointer && !git_dir.starts_with(&project) {
+        let back = crate::untrusted::read_untrusted(&git_dir.join("gitdir"), 4096)
+            .ok()
+            .flatten()
+            .map(|s| PathBuf::from(s.trim()))
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        let local = std::fs::canonicalize(&local).ok();
+        if !(is_worktree_layout && back.is_some() && back == local) {
+            return Err(());
+        }
+    }
+    Ok(Some(resolved))
 }
 
 /// Find the Electron `.app/Contents` that a Copilot CLI shim runs under.
@@ -2219,6 +2259,32 @@ mod tests {
             (None, None),
             "a planted commondir must not grant access to another repository"
         );
+    }
+
+    /// A `.git` file in the project naming another repository's git dir is
+    /// not honoured: no grant, and a problem to warn about.
+    #[test]
+    fn git_common_dir_refuses_a_git_file_pointing_at_another_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = &std::fs::canonicalize(tmp.path()).expect("canonicalize tmp");
+        let home = home.as_path();
+        let project = home.join("project");
+        let other = home.join("other");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        std::fs::create_dir_all(&other).expect("mkdir other");
+        if !git_in(&other, &["init", "-q", "-b", "main"]) {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", other.join(".git").display()),
+        )
+        .expect("write .git file");
+
+        let (grant, problem) = git_common_dir(home, &project, &[]);
+        assert_eq!(grant, None, "a foreign .git pointer must not be granted");
+        assert!(problem.is_some(), "the refusal must be reported");
     }
 
     /// The layout check must not break the case it exists to allow: a real
