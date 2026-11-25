@@ -2240,13 +2240,18 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
 }
 
 /// `repos/{o}/{r}/pulls/{n}/merge` or `repos/{o}/{r}/merges`, in any spelling
-/// GitHub would route the same way (full URL, extra slashes, query, case).
+/// GitHub would route the same way (full URL, query, case, percent-escapes).
 fn is_merge_endpoint(endpoint: &str) -> bool {
     let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
     let path = path
         .split_once("://")
         .and_then(|(_, rest)| rest.split_once('/'))
         .map_or(path, |(_, p)| p);
+    // GitHub routes on the decoded path; one that does not decode counts as a
+    // merge, so it fails closed.
+    let Some(path) = decode_api_path(path) else {
+        return true;
+    };
     let segments: Vec<String> = path
         .split('/')
         .filter(|s| !s.is_empty())
@@ -2707,8 +2712,9 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
 /// `path` with its percent-escapes decoded once, as GitHub reads it.
 ///
 /// `None` for a spelling the guard does not reason about: a malformed escape,
-/// a `%` left after decoding (double encoding), a `.` or `..` segment, a
-/// backslash, a control character, or bytes that are not UTF-8.
+/// a `%` left after decoding (double encoding), a `.` or `..` segment, an
+/// empty inner segment (`//`), a `;`, a backslash, a control character, or
+/// bytes that are not UTF-8.
 fn decode_api_path(path: &str) -> Option<String> {
     let mut bytes = Vec::with_capacity(path.len());
     let mut rest = path.as_bytes();
@@ -2725,7 +2731,8 @@ fn decode_api_path(path: &str) -> Option<String> {
         }
     }
     let decoded = String::from_utf8(bytes).ok()?;
-    let refused = decoded.contains(['%', '\\'])
+    let refused = decoded.contains(['%', '\\', ';'])
+        || decoded.trim_matches('/').contains("//")
         || decoded.chars().any(char::is_control)
         || decoded.split('/').any(|s| s == "." || s == "..");
     (!refused).then_some(decoded)
@@ -4484,6 +4491,7 @@ const SENSITIVE_CONFIG_PREFIXES: &[&str] = &[
     "branch.",
     "include.",
     "includeif.",
+    "submodule.",
 ];
 
 /// The first `-c` / `--config-env` key an agent supplied that matches a
@@ -5090,6 +5098,20 @@ pub fn gate_git(
         });
     }
 
+    // Recursive submodule pushes run through git's own child git, not this
+    // wrapper, so no remote or branch rule applies to them. Refuse them.
+    if prevent_push && sub == "push" && push_recurses_submodules(sub_args, real_git, &repo_args) {
+        return Err(Refusal {
+            headline: "'git push' with submodule recursion is not allowed while push prevention is active."
+                .to_string(),
+            guidance: "Submodule pushes would not get the push rules applied.\n\
+                       Push each submodule separately from its own directory, then push this repository\n\
+                       with `--recurse-submodules=no` (or `=check`)."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
+    }
+
     // A destination that is not a configured remote — `--repo=<url>`, or the
     // positional repository argument `git push <url|path> [refspec…]` — overrides
     // where the push lands, so any remote/URL authorization the guard performs
@@ -5594,6 +5616,43 @@ fn is_unconstrainable_push_flag(arg: &str) -> bool {
         arg,
         "--all" | "--mirror" | "--branches" | "--tags" | "--follow-tags" | "--prune"
     )
+}
+
+/// Whether a `git push` would also push submodules. The last
+/// `--[no-]recurse-submodules` wins; without one, `push.recurseSubmodules` and
+/// then `submodule.recurse` decide, as in git. Only `no` and `check` push
+/// nothing; any other value, including the bare flag (whose value git takes
+/// from the next token), counts as recursion.
+fn push_recurses_submodules(
+    push_args: &[&str],
+    real_git: Option<&Path>,
+    repo_args: &[&str],
+) -> bool {
+    let off = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "no" | "check" | "false");
+    let mut flag = None;
+    for arg in push_args {
+        if *arg == "--" {
+            break;
+        }
+        if *arg == "--no-recurse-submodules" {
+            flag = Some(false);
+        } else if *arg == "--recurse-submodules" {
+            flag = Some(true);
+        } else if let Some(v) = arg.strip_prefix("--recurse-submodules=") {
+            flag = Some(!off(v));
+        }
+    }
+    if let Some(f) = flag {
+        return f;
+    }
+    let Some(git) = real_git else {
+        return false;
+    };
+    if let Some(v) = git_config_value(git, repo_args, "push.recurseSubmodules") {
+        return !off(&v);
+    }
+    git_config_value(git, repo_args, "submodule.recurse")
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"))
 }
 
 /// What a `git push` writes to, as far as a branch filter can be enforced.
@@ -8837,6 +8896,12 @@ mod tests {
             "/repos/o/r/pulls/1/merge/",
             "https://api.github.com/repos/o/r//pulls/1/MERGE?x=1",
             "repos/o/r/merges",
+            "repos/o/r/pulls/1/%6derge",
+            "repos/o/r/pulls/1/%4D%45RGE",
+            "repos/o/r/%6derges",
+            "repos/o/r/pulls/1/%256derge",
+            "repos/o/r/pulls/1/merge;x",
+            "repos/o/r/pulls/1/../1/merge",
         ] {
             for method in ["PUT", "POST"] {
                 let cmd = parse_command(&["api", "-X", method, endpoint]).unwrap();
@@ -8848,6 +8913,19 @@ mod tests {
             }
             let cmd = parse_command(&["api", endpoint, "-f", "merge_method=squash"]).unwrap();
             assert_eq!(evaluate_with_policy(&cmd, true).decision, Decision::Block);
+        }
+        // Paths that do not canonicalize cleanly are refused for reads too.
+        for endpoint in [
+            "repos/o/r//pulls",
+            "repos/o/r/pulls;x",
+            "repos/o/r/%2e%2e/x",
+        ] {
+            let cmd = parse_command(&["api", endpoint]).unwrap();
+            assert_eq!(
+                evaluate_with_policy(&cmd, false).decision,
+                Decision::Block,
+                "{endpoint}"
+            );
         }
         // Reading whether a PR is merged is not a merge.
         let cmd = parse_command(&["api", "repos/o/r/pulls/1/merge"]).unwrap();
@@ -10714,6 +10792,71 @@ mod tests {
                 )
                 .is_err(),
                 "whole-repo push mode {mode} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn push_with_submodule_recursion_is_refused() {
+        let Some(git) = git_or_skip() else { return };
+        let rules = vec![origin_agent_rule()];
+        let push = |dir: &str, extra: &[&str]| {
+            let mut args = vec!["-C", dir, "push"];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["origin", "agent/x"]);
+            gate_git_t(&args, true, true, false, &rules, Some(&git))
+        };
+        let (_t, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        for flags in [
+            &["--recurse-submodules"][..],
+            &["--recurse-submodules=on-demand"],
+            &["--recurse-submodules=only"],
+            &["--no-recurse-submodules", "--recurse-submodules=on-demand"],
+        ] {
+            assert!(push(&dir, flags).is_err(), "{flags:?} must be refused");
+        }
+        for flags in [
+            &[][..],
+            &["--recurse-submodules=no"],
+            &["--recurse-submodules=check"],
+            &["--recurse-submodules=on-demand", "--no-recurse-submodules"],
+        ] {
+            assert!(push(&dir, flags).is_ok(), "{flags:?} must pass");
+        }
+        assert!(
+            gate_git_t(
+                &[
+                    "-C",
+                    &dir,
+                    "-c",
+                    "submodule.recurse=true",
+                    "push",
+                    "origin",
+                    "agent/x"
+                ],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "-c submodule.recurse must be refused"
+        );
+        for (key, value) in [
+            ("push.recurseSubmodules", "on-demand"),
+            ("submodule.recurse", "true"),
+        ] {
+            let (_c, r) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+                .expect("git present: scratch repo must build");
+            git_setup(&git, &r, &["config", key, value]);
+            let d = r.to_string_lossy().into_owned();
+            assert!(push(&d, &[]).is_err(), "{key}={value} must be refused");
+            assert!(
+                push(&d, &["--recurse-submodules=no"]).is_ok(),
+                "the flag overrides {key}"
             );
         }
     }
