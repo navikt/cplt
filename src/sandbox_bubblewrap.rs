@@ -1017,6 +1017,18 @@ pub(crate) fn build_deny_masks(
     credentials: &[CredentialLink],
     scratch_dir: Option<&Path>,
 ) -> DenyMasks {
+    plan_deny_masks(extra_deny, socket_masks, credentials, scratch_dir, false)
+}
+
+/// [`build_deny_masks`], but with `inspect_only` the placeholder is only
+/// named, never created: inspect writes nothing to the host (#1198).
+pub(crate) fn plan_deny_masks(
+    extra_deny: &[PathBuf],
+    socket_masks: &[PathBuf],
+    credentials: &[CredentialLink],
+    scratch_dir: Option<&Path>,
+    inspect_only: bool,
+) -> DenyMasks {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<PathBuf> = Vec::new();
@@ -1099,7 +1111,13 @@ pub(crate) fn build_deny_masks(
     let placeholder = if files.is_empty() {
         None
     } else {
-        match scratch_dir.map(create_mask_placeholder) {
+        match scratch_dir.map(|s| {
+            if inspect_only {
+                Ok(s.join(MASK_PLACEHOLDER))
+            } else {
+                create_mask_placeholder(s)
+            }
+        }) {
             Some(Ok(path)) => Some(path),
             Some(Err(e)) => {
                 placeholder_error = Some(format!("cannot create deny-mask placeholder: {e}"));
@@ -1167,10 +1185,12 @@ pub(crate) fn build_deny_masks(
     }
 }
 
+const MASK_PLACEHOLDER: &str = "deny-mask";
+
 /// Create the mode-000 empty file used as the bind source for file masks.
 fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::OpenOptionsExt;
-    let path = scratch.join("deny-mask");
+    let path = scratch.join(MASK_PLACEHOLDER);
     // Planned more than once per launch (the MCP broker check, #834, then
     // `prepare`): the earlier copy is mode 000, so write would fail. The
     // agent has not started yet, so the file is still cplt's own.

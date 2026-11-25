@@ -244,6 +244,61 @@ mod e2e_tests {
         }
     }
 
+    /// Every file and directory under `root`, relative to it.
+    fn tree(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(p.clone());
+                }
+                out.push(p.strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// #1198, #1215: inspect commands write nothing to HOME or any XDG dir.
+    /// `cplt check` runs live probes, so it gets a real scratch dir (removed
+    /// on drop) and stages a probe binary in `~/.cache`; both bases exist on
+    /// any used machine and are made up front, so only new files count.
+    #[test]
+    fn e2e_inspect_commands_leave_home_untouched() {
+        let tmp = crate::common::home_temp_dir("inspect");
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(cplt::scratch::ScratchDir::base(&home)).unwrap();
+        let before = tree(&root);
+        for args in [&["--print-profile"][..], &["check"][..]] {
+            let out = cplt_cmd()
+                .args(args)
+                .current_dir(&project)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("XDG_STATE_HOME", home.join(".local/state"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                // The probe shell must not pick up the developer's tool
+                // managers (mise writes its own state on start).
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .output()
+                .expect("binary should run");
+            assert!(
+                out.status.code().is_some(),
+                "{args:?} was killed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(tree(&root), before, "{args:?} wrote to the host");
+        }
+    }
+
     #[test]
     fn e2e_print_profile_allows_project_dir() {
         let output = cplt_cmd()

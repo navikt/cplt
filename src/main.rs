@@ -5774,6 +5774,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             pnpm_candidate: None,
             launch_dir: Some(&launch_dir),
             inspect_only: cli.print_profile || mcp_status.is_some(),
+            live_probes: false,
             opencode_v2,
             mcp: mcp_status.is_none().then_some(&mcp_found),
             mcp_probe: mcp_status.is_some(),
@@ -7958,6 +7959,9 @@ struct AssemblyOptions<'a> {
     /// (`--print-profile`, `cplt check`), so preparing it must not write to
     /// the host (#553).
     inspect_only: bool,
+    /// `cplt check`: inspect-only, but its probes run in the sandbox, so it
+    /// still gets a real scratch dir (removed on drop) to run them in.
+    live_probes: bool,
     /// An OpenCode v2 session: the host state dir is not granted (#796).
     opencode_v2: bool,
     /// Brokered MCP servers to serve (#824); `None` off the launch path.
@@ -8133,7 +8137,7 @@ fn assemble_sandbox(
     }
 
     // Create per-session scratch directory if enabled
-    let scratch_guard = if resolved.scratch_dir {
+    let scratch_guard = if resolved.scratch_dir && (!opts.inspect_only || opts.live_probes) {
         // GC stale scratch dirs from previous sessions (best-effort)
         scratch::ScratchDir::gc_stale(home_dir);
 
@@ -8144,7 +8148,14 @@ fn assemble_sandbox(
     } else {
         None
     };
-    let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
+    // Inspect-only runs create nothing (#1198): they plan with the path a
+    // session dir would get, so the printed policy matches a launch's.
+    let would_be_scratch = (resolved.scratch_dir && opts.inspect_only)
+        .then(|| scratch::ScratchDir::would_be(home_dir));
+    let scratch_path = scratch_guard
+        .as_ref()
+        .map(cplt::scratch::ScratchDir::path)
+        .or(would_be_scratch.as_deref());
     let pnpm = opts
         .pnpm_candidate
         .map(Path::to_path_buf)
@@ -8251,7 +8262,7 @@ fn assemble_sandbox(
     // Pre-create agent directories before entering sandbox.
     // Agents like OpenCode crash if their data/config dirs don't exist,
     // and the sandbox may block mkdir on parent paths.
-    for dir in &agent_dirs {
+    for dir in agent_dirs.iter().filter(|_| !opts.inspect_only) {
         if !dir.path.exists() {
             let _ = std::fs::create_dir_all(&dir.path);
         }
@@ -8304,15 +8315,17 @@ fn assemble_sandbox(
     }) {
         warn_managed_once(&line);
     }
-    write_session_sandbox_brief(
-        resolved,
-        active_agent,
-        scratch_path,
-        home_dir,
-        opts.repos.rows,
-        opts.repos.worktree_root,
-        cli.observe_domains,
-    );
+    if !opts.inspect_only {
+        write_session_sandbox_brief(
+            resolved,
+            active_agent,
+            scratch_path,
+            home_dir,
+            opts.repos.rows,
+            opts.repos.worktree_root,
+            cli.observe_domains,
+        );
+    }
 
     if let Some(line) = sandbox::gradle_loopback_hint(
         &probe.project_dir,
@@ -8426,7 +8439,10 @@ fn assemble_sandbox(
                 ));
             }
         }
-        if let Err(e) = cplt::token_inject::setup(scratch) {
+        // Inspect writes no CA into scratch (#1215); the checks above still run.
+        if !opts.inspect_only
+            && let Err(e) = cplt::token_inject::setup(scratch)
+        {
             let fix = if e.starts_with("no system CA bundle") {
                 "install the system CA bundle (ca-certificates)"
             } else if e.starts_with("cannot load the CA file in") {
@@ -8556,6 +8572,9 @@ fn assemble_sandbox(
         keychain_substitute,
     );
 
+    if !opts.inspect_only {
+        sandbox::ensure_podman_state_dirs(&sandbox_config);
+    }
     let policy = sandbox::generate_policy(&sandbox_config);
     // The broker socket is added after this, so the policy it is judged by
     // is the session's own. Bound for `--print-profile` too.
@@ -8605,7 +8624,7 @@ fn assemble_sandbox(
             })
             .ok();
         }
-        let mut refused = sandbox::mcp_broker_refusal(&sandbox_config);
+        let mut refused = sandbox::mcp_broker_refusal(&sandbox_config, opts.inspect_only);
         // A launch, not `--print-profile`: offer the host fix, then judge again.
         if refused.is_some()
             && !opts.inspect_only
@@ -8614,7 +8633,7 @@ fn assemble_sandbox(
             ui::warn(refused.as_deref().unwrap_or_default());
             let fixed = || sandbox::mcp_wrapper_error(&sandbox_config).is_none();
             if cplt::host_fix::offer(p, resolved.yes, false, Some(home_dir), &fixed) {
-                refused = sandbox::mcp_broker_refusal(&sandbox_config);
+                refused = sandbox::mcp_broker_refusal(&sandbox_config, opts.inspect_only);
             }
         }
         if let Some(why) = refused {
@@ -8663,7 +8682,7 @@ fn assemble_sandbox(
     }
     let mcp_refusal = opts
         .mcp_probe
-        .then(|| sandbox::mcp_broker_refusal(&sandbox_config))
+        .then(|| sandbox::mcp_broker_refusal(&sandbox_config, opts.inspect_only))
         .flatten();
     let read_denies = sandbox::ReadDenies::from_config_for_current_os(&sandbox_config);
     // Here, not at each caller: the launch, `exec` and `check` all build their
@@ -8872,9 +8891,6 @@ fn prepare_shell_sandbox(
     project_dir: &Path,
     repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
-    if !cli.print_profile {
-        cplt::sandbox::ensure_split_tool_dirs(home_dir, resolved.readonly_host_tool_paths);
-    }
     let mut probe = HostProbe::probe(resolved, home_dir, project_dir, repos.dirs);
     // Like `exec`, `check` never writes the managed block, so it probes
     // without the root AGENTS.md read (#252).
@@ -8894,6 +8910,7 @@ fn prepare_shell_sandbox(
             launch_dir: None,
             // `cplt check` only reports on the policy.
             inspect_only: true,
+            live_probes: true,
             opencode_v2: false,
             mcp: None,
             mcp_probe: false,
@@ -9216,6 +9233,7 @@ fn run_exec_command(
                 pnpm_candidate,
                 launch_dir: Some(&launch_dir),
                 inspect_only: cli.print_profile,
+                live_probes: false,
                 opencode_v2: false,
                 // No MCP discovery for `exec`; an empty set still starts the
                 // host opener on macOS (#1091).

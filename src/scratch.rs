@@ -1024,6 +1024,17 @@ impl ScratchDir {
         &self.path
     }
 
+    /// Where [`Self::create`] would put a session dir, without creating
+    /// anything: for inspect-only runs (`--print-profile`, `cplt check`,
+    /// #1198). The name is a placeholder; a real one is random anyway.
+    #[must_use]
+    pub fn would_be(home_dir: &Path) -> PathBuf {
+        std::fs::canonicalize(home_dir)
+            .unwrap_or_else(|_| home_dir.to_path_buf())
+            .join(SCRATCH_BASE)
+            .join("inspect-only")
+    }
+
     /// Garbage-collect stale scratch directories older than 24 hours.
     ///
     /// Only deletes entries that look like our UUID-named session dirs.
