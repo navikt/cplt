@@ -696,6 +696,20 @@ The exposure is the same on both platforms and is not about peer terminals at
 all: `/dev/tty` and the inherited descriptors 0/1/2 name the agent's own
 controlling terminal, and that terminal is the user's shell.
 
+**PTYs under Bubblewrap use a private devpts (#1016).** Without a `/dev/pts`
+grant nothing in the sandbox can allocate a working PTY (`script`, `node-pty`,
+Claude Code background sessions). Under Bubblewrap, `--dev /dev` mounts a fresh
+devpts instance, so every `/dev/pts/N` there is a PTY the sandbox made itself;
+the host's terminals do not exist in it. The re-entry helper, running inside
+the namespaces, adds read + write + `IoctlDev` on `/dev/pts` only when
+`statfs` reports devpts there and its device id differs from the host
+`/dev/pts` the parent recorded. The parent policy never carries the rule, so
+the Landlock-only path, including auto mode's fallback when bwrap fails, never
+grants the host devpts. `TIOCSTI`/`TIOCLINUX` stay denied by seccomp on these
+PTYs too. **Gap:** without Bubblewrap there is no private instance, and
+granting the host devpts would expose the user's other terminals, so PTY
+allocation stays blocked there. Install bubblewrap to get it.
+
 **Reconnaissance leaks basic host info.** Hostname, IP address, OS version, and the sanitized subset of env vars are readable by any code inside the sandbox. This is unavoidable, because Copilot itself needs the information.
 
 *Possible mitigation:* a future hardening category could mask the hostname and inject synthetic env values, at the risk of breaking tools that depend on accurate system info. Low priority, since recon without credential access has little value.

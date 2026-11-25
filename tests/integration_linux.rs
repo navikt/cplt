@@ -3244,6 +3244,93 @@ print('BIND_OK')
         run_sandboxed_with_flags(project_dir, &["--use-bubblewrap"], script)
     }
 
+    // ── Private devpts under bubblewrap (#1016) ───────────────────
+
+    /// Opens a PTY pair, reopens the slave by path (the Landlock rule), sets
+    /// raw mode on it (IoctlDev), runs `tty` on it, lists `/dev/pts`, prints
+    /// its `st_dev`, and probes TIOCSTI on the slave.
+    const PTY_PROBE: &str = r#"python3 -c "
+import os, sys, fcntl, tty, subprocess
+m, s = os.openpty()
+name = os.ttyname(s)
+try:
+    fd = os.open(name, os.O_RDWR | os.O_NOCTTY)
+    tty.setraw(fd)
+    print('reopen=OK')
+except OSError as e:
+    print('reopen=' + type(e).__name__); sys.exit(0)
+out = subprocess.run(['tty'], stdin=fd, capture_output=True, text=True).stdout.strip()
+print('tty=' + out + ' name=' + name)
+print('ls=' + ','.join(sorted(os.listdir('/dev/pts'))))
+print('dev=' + str(os.stat('/dev/pts').st_dev))
+try:
+    fcntl.ioctl(fd, 0x5412, b'x'); print('sti=OK')
+except PermissionError:
+    print('sti=EPERM')
+""#;
+
+    #[test]
+    fn bwrap_grants_only_its_private_devpts() {
+        require_bwrap!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let (code, out, err) = run_sandboxed_bwrap(project.path(), PTY_PROBE);
+        assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
+        assert!(
+            out.contains("reopen=OK"),
+            "PTY slave must open under bwrap: {out}\n{err}"
+        );
+        let name = out
+            .lines()
+            .find_map(|l| l.split(" name=").nth(1))
+            .expect("name line");
+        assert!(
+            out.contains(&format!("tty={name}")),
+            "program must run on the PTY: {out}"
+        );
+        // Only the private instance's ptmx and the PTY just made.
+        let n = name.trim_start_matches("/dev/pts/");
+        let ls = out.lines().find_map(|l| l.strip_prefix("ls=")).unwrap();
+        for e in ls.split(',') {
+            assert!(
+                e == "ptmx" || e == n,
+                "host PTY visible in sandbox: {e} ({ls})"
+            );
+        }
+        // A different devpts superblock from the host's.
+        if let Ok(host) = std::fs::metadata("/dev/pts") {
+            use std::os::unix::fs::MetadataExt;
+            let dev = out.lines().find_map(|l| l.strip_prefix("dev=")).unwrap();
+            assert_ne!(
+                dev,
+                host.dev().to_string(),
+                "sandbox /dev/pts is the host's"
+            );
+        }
+        assert!(out.contains("sti=EPERM"), "TIOCSTI must stay denied: {out}");
+    }
+
+    /// Without bwrap `/dev/pts` is the host's: no rule, so reopening a slave
+    /// by path stays denied (GHSA-q3p2-6x2x-8w8w).
+    #[test]
+    fn landlock_only_keeps_host_devpts_denied() {
+        require_landlock!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let (_, out, err) =
+            run_sandboxed_with_flags(project.path(), &["--no-bubblewrap"], PTY_PROBE);
+        assert!(
+            out.contains("reopen=PermissionError"),
+            "host devpts must stay denied without bwrap: {out}\n{err}"
+        );
+    }
+
     // ── proxy.netns (#114) ─────────────────────────────────────────
 
     /// A `cplt` running `script` with `proxy.netns = true` under bubblewrap.
