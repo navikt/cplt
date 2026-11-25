@@ -6195,17 +6195,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     );
     arm_worktree_broker(&mut worktree_broker, &mut prepared)?;
 
-    // Compute hardening categories for environment sanitization
-    let disabled_categories = resolved.disabled_hardening_categories();
-
     // proxy_handle is set up before sandbox::prepare() (see above)
-
-    // --show-denials: stream sandbox denial logs in the background.
-    #[allow(unused_mut)] // mut needed on macOS where denial_proc is assigned
-    let mut denial_proc: Option<std::process::Child> = None;
-    if cli.show_denials {
-        denial_proc = start_denial_stream();
-    }
 
     // Printed by the exec path once the wrappers are installed, so their
     // notices (gh scope, git guard) land above the separator, not under it
@@ -6252,22 +6242,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         (agent_bin.clone(), copilot_args.clone())
     };
 
-    // Run agent inside sandbox, wrapped in the post-session audit lifecycle.
-    // The audit is on by default and suppressed by --no-audit or --quiet. The
-    // baseline is captured just before exec and the report printed just after,
-    // both in the parent (outside the sandbox) — see audit::run.
-    let audit_enabled = resolved.audit && !resolved.quiet;
-    let routing = network_routing_fact(&resolved);
-    let needs_snapshot = audit_enabled || cli.observe_domains;
-    let mut observe_domains_output = if cli.observe_domains {
-        cli.observe_domains_out
-            .as_deref()
-            .map(PinnedObserveDomainsOutput::open)
-    } else {
-        None
-    };
-    let mut proxy_handle = proxy_handle;
-    let managed_guard = prepared.guard_managed();
+    // Run agent inside sandbox, wrapped in the post-session audit lifecycle
+    // shared with `cplt exec` (#1199).
     // OpenCode's snapshot stores sit in its writable data dir, outside every
     // root the `.git` check walks; unsandboxed OpenCode runs git in them.
     let opencode_stores = (active_agent == agent::Agent::OpenCode).then(|| {
@@ -6281,113 +6257,51 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let trusted_before = (active_agent == agent::Agent::Copilot
         && !resolved.allow_copilot_host_persistence)
         .then(|| agent::copilot_trusted_folders(&home_dir));
-    let audit_mode = audit::AuditMode::for_run(audit_enabled, cli.observe_domains);
-    let (exit_code, snapshot, settled) = audit::run(
-        &project_dir,
-        &resolved.allow_write,
-        &resolved.allow_write_state,
-        &repo_paths,
-        audit_mode,
-        &routing,
-        || {
-            sandbox::exec_sandboxed(
-                &prepared,
-                &exec_bin,
-                &exec_args,
-                &launch_dir,
-                &repo_paths,
-                &resolved.pass_env,
-                resolved.inherit_env,
-                &disabled_categories,
-                &resolved.deny_env,
-                &resolved.gh_guard,
-                &resolved.git_guard,
-                resolved.quiet,
-                &print_banner,
-            )
+    let exit_code = run_audited_session(
+        &AuditedSession {
+            cli: &cli,
+            resolved: &resolved,
+            prepared: &prepared,
+            project_dir: &project_dir,
+            home_dir: &home_dir,
+            repo_paths: &repo_paths,
+            launch_dir: &launch_dir,
+            worktree_root: worktree_root.as_deref(),
+            scratch_guard: scratch_guard.as_ref(),
+            mcp_broker: mcp_broker.as_ref(),
+            exec_bin: &exec_bin,
+            exec_args: &exec_args,
         },
-        || {
-            proxy_handle.take().and_then(|handle| {
-                if needs_snapshot {
-                    Some(handle.finalize_snapshot(audit::SNAPSHOT_DRAIN_BUDGET))
-                } else {
-                    handle.shutdown();
-                    None
-                }
-            })
-        },
-    );
-    if let Some(guard) = managed_guard {
-        if let Some(line) = guard.finish() {
-            ui::warn_id("warn.managed-guard", &line);
-        }
-        // Only a probe that ran can say the tree is still alive (#1126).
-        if needs_snapshot && !settled {
-            ui::warn_id("warn.managed-unsettled", config::UNSETTLED_MANAGED_WARNING);
-        }
-    }
-    if let Some((own, before)) = &v2_model {
-        cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
-    }
-    if let Some(before) = trusted_before {
-        for added in agent::copilot_trusted_folders(&home_dir)
-            .iter()
-            .filter(|f| !before.contains(f))
-        {
-            let added = sanitize_terminal_text(added);
-            ui::warn_id(
-                "warn.copilot-trusted-folder",
-                &format!(
-                    "Copilot now trusts {added}: this session added it to \
+        proxy_handle,
+        &print_banner,
+        |audit_mode, settled| {
+            if let Some((own, before)) = &v2_model {
+                cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
+            }
+            if let Some(before) = trusted_before {
+                for added in agent::copilot_trusted_folders(&home_dir)
+                    .iter()
+                    .filter(|f| !before.contains(f))
+                {
+                    let added = sanitize_terminal_text(added);
+                    ui::warn_id(
+                        "warn.copilot-trusted-folder",
+                        &format!(
+                            "Copilot now trusts {added}: this session added it to \
                  ~/.copilot/config.json trustedFolders, so host sessions there skip the \
                  trust prompt. Remove it from that file if you did not choose \
                  \"remember this folder\"."
-                ),
-            );
-        }
-    }
-    cplt::opencode_v2::save_tui(&v2_tui);
-    if let Some(stores) = opencode_stores {
-        // Same rule as the nested repo check: only a probe that ran can say so.
-        stores.report(audit_mode != audit::AuditMode::Disabled && !settled);
-    }
-    if resolved.git_guard.enabled
-        && !resolved.quiet
-        && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)
-    {
-        cplt::upstream::apply(
-            scratch,
-            &project_dir,
-            &repo_paths,
-            &resolved.git_guard,
-            settled,
-        );
-    }
-    if let Some(broker) = &mcp_broker {
-        // #1091: every host-opener decision, whatever the log level.
-        let opens = broker.open_url_records();
-        if !opens.is_empty() {
-            ui::info(&format!("host opener: {}", opens.join("; ")));
-        }
-    }
-    warn_worktrees_not_audited(
-        audit_enabled,
-        worktree_root.as_deref(),
-        &home_dir,
-        &project_dir,
-        resolved.worktree_walk_max_dirs,
+                        ),
+                    );
+                }
+            }
+            cplt::opencode_v2::save_tui(&v2_tui);
+            if let Some(stores) = opencode_stores {
+                // Same rule as the nested repo check: only a probe that ran can say so.
+                stores.report(audit_mode != audit::AuditMode::Disabled && !settled);
+            }
+        },
     );
-
-    // Cleanup
-    if cli.observe_domains
-        && let Some(snapshot) = snapshot.as_ref()
-    {
-        emit_observed_domains(snapshot, observe_domains_output.as_mut());
-    }
-    if let Some(mut child) = denial_proc {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 
     cplt::session_summary::finish(exit_code);
     Ok(ExitCode::from(exit_code))
@@ -8968,6 +8882,145 @@ fn prepare_shell_sandbox(
     )
 }
 
+/// What the audited session needs from either launch path.
+struct AuditedSession<'a> {
+    cli: &'a Cli,
+    resolved: &'a config::Resolved,
+    prepared: &'a sandbox::PreparedSandbox,
+    project_dir: &'a Path,
+    home_dir: &'a Path,
+    repo_paths: &'a [PathBuf],
+    launch_dir: &'a Path,
+    worktree_root: Option<&'a Path>,
+    scratch_guard: Option<&'a scratch::ScratchDir>,
+    mcp_broker: Option<&'a cplt::mcp_broker::Broker>,
+    exec_bin: &'a Path,
+    exec_args: &'a [String],
+}
+
+/// Run the sandboxed command inside the post-session audit lifecycle: denial
+/// stream, audit baseline and report, and the post-session warnings.
+///
+/// One helper for `run()` and `cplt exec` (#1199): the copies drifted, and
+/// exec accepted `--show-denials` and did nothing with it. `agent_post` runs
+/// the agent-specific steps at their place in the warning order; it gets the
+/// audit mode and whether the post-session probe settled.
+fn run_audited_session(
+    s: &AuditedSession<'_>,
+    proxy_handle: Option<proxy::ProxyHandle>,
+    print_banner: &dyn Fn(),
+    agent_post: impl FnOnce(audit::AuditMode, bool),
+) -> u8 {
+    let (cli, resolved) = (s.cli, s.resolved);
+    let disabled_categories = resolved.disabled_hardening_categories();
+
+    // --show-denials: stream sandbox denial logs in the background.
+    let denial_proc = if cli.show_denials {
+        start_denial_stream()
+    } else {
+        None
+    };
+
+    // The audit is on by default and suppressed by --no-audit or --quiet. The
+    // baseline is captured just before exec and the report printed just after,
+    // both in the parent (outside the sandbox) — see audit::run.
+    let audit_enabled = resolved.audit && !resolved.quiet;
+    let routing = network_routing_fact(resolved);
+    let needs_snapshot = audit_enabled || cli.observe_domains;
+    let mut observe_domains_output = if cli.observe_domains {
+        cli.observe_domains_out
+            .as_deref()
+            .map(PinnedObserveDomainsOutput::open)
+    } else {
+        None
+    };
+    let mut proxy_handle = proxy_handle;
+    let managed_guard = s.prepared.guard_managed();
+    let audit_mode = audit::AuditMode::for_run(audit_enabled, cli.observe_domains);
+    let (exit_code, snapshot, settled) = audit::run(
+        s.project_dir,
+        &resolved.allow_write,
+        &resolved.allow_write_state,
+        s.repo_paths,
+        audit_mode,
+        &routing,
+        || {
+            sandbox::exec_sandboxed(
+                s.prepared,
+                s.exec_bin,
+                s.exec_args,
+                s.launch_dir,
+                s.repo_paths,
+                &resolved.pass_env,
+                resolved.inherit_env,
+                &disabled_categories,
+                &resolved.deny_env,
+                &resolved.gh_guard,
+                &resolved.git_guard,
+                resolved.quiet,
+                print_banner,
+            )
+        },
+        || {
+            proxy_handle.take().and_then(|handle| {
+                if needs_snapshot {
+                    Some(handle.finalize_snapshot(audit::SNAPSHOT_DRAIN_BUDGET))
+                } else {
+                    handle.shutdown();
+                    None
+                }
+            })
+        },
+    );
+    if let Some(guard) = managed_guard {
+        if let Some(line) = guard.finish() {
+            ui::warn_id("warn.managed-guard", &line);
+        }
+        // Only a probe that ran can say the tree is still alive (#1126).
+        if needs_snapshot && !settled {
+            ui::warn_id("warn.managed-unsettled", config::UNSETTLED_MANAGED_WARNING);
+        }
+    }
+    agent_post(audit_mode, settled);
+    if resolved.git_guard.enabled
+        && !resolved.quiet
+        && let Some(scratch) = s.scratch_guard.map(cplt::scratch::ScratchDir::path)
+    {
+        cplt::upstream::apply(
+            scratch,
+            s.project_dir,
+            s.repo_paths,
+            &resolved.git_guard,
+            settled,
+        );
+    }
+    if let Some(broker) = s.mcp_broker {
+        // #1091: every host-opener decision, whatever the log level.
+        let opens = broker.open_url_records();
+        if !opens.is_empty() {
+            ui::info(&format!("host opener: {}", opens.join("; ")));
+        }
+    }
+    warn_worktrees_not_audited(
+        audit_enabled,
+        s.worktree_root,
+        s.home_dir,
+        s.project_dir,
+        resolved.worktree_walk_max_dirs,
+    );
+
+    if cli.observe_domains
+        && let Some(snapshot) = snapshot.as_ref()
+    {
+        emit_observed_domains(snapshot, observe_domains_output.as_mut());
+    }
+    if let Some(mut child) = denial_proc {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    exit_code
+}
+
 /// Run an arbitrary command inside the sandbox (`cplt exec -- <cmd> [args]`).
 ///
 /// Reuses the Agent::Shell sandbox policy. Defaults to quiet+yes so it is
@@ -9247,99 +9300,28 @@ fn run_exec_command(
         active_agent,
     )?;
 
-    let disabled_categories = resolved.disabled_hardening_categories();
-
-    // Same audit lifecycle as the main agent flow (shared audit::run helper).
-    // In exec mode quiet defaults on (scripting UX), so the audit is off unless
-    // the user passes --no-quiet.
-    let audit_enabled = resolved.audit && !resolved.quiet;
-    let routing = network_routing_fact(&resolved);
-    let needs_snapshot = audit_enabled || cli.observe_domains;
-    let mut observe_domains_output = if cli.observe_domains {
-        cli.observe_domains_out
-            .as_deref()
-            .map(PinnedObserveDomainsOutput::open)
-    } else {
-        None
-    };
-    let mut proxy_handle = proxy_handle;
-    let managed_guard = prepared.guard_managed();
-    let (exit_code, snapshot, settled) = audit::run(
-        &project_dir,
-        &resolved.allow_write,
-        &resolved.allow_write_state,
-        &repo_paths,
-        audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
-        &routing,
-        || {
-            sandbox::exec_sandboxed(
-                &prepared,
-                &exec_bin,
-                &exec_args,
-                &launch_dir,
-                &repo_paths,
-                &resolved.pass_env,
-                resolved.inherit_env,
-                &disabled_categories,
-                &resolved.deny_env,
-                &resolved.gh_guard,
-                &resolved.git_guard,
-                resolved.quiet,
-                &|| {},
-            )
+    // Same audited session as the agent launch (#1199). In exec mode quiet
+    // defaults on (scripting UX), so the audit is off unless the user passes
+    // --no-quiet.
+    let exit_code = run_audited_session(
+        &AuditedSession {
+            cli,
+            resolved: &resolved,
+            prepared: &prepared,
+            project_dir: &project_dir,
+            home_dir: &home_dir,
+            repo_paths: &repo_paths,
+            launch_dir: &launch_dir,
+            worktree_root: worktree_root.as_deref(),
+            scratch_guard: scratch_guard.as_ref(),
+            mcp_broker: mcp_broker.as_ref(),
+            exec_bin: &exec_bin,
+            exec_args: &exec_args,
         },
-        || {
-            proxy_handle.take().and_then(|handle| {
-                if needs_snapshot {
-                    Some(handle.finalize_snapshot(audit::SNAPSHOT_DRAIN_BUDGET))
-                } else {
-                    handle.shutdown();
-                    None
-                }
-            })
-        },
+        proxy_handle,
+        &|| {},
+        |_, _| {},
     );
-    if let Some(guard) = managed_guard {
-        if let Some(line) = guard.finish() {
-            ui::warn(&line);
-        }
-        // Only a probe that ran can say the tree is still alive (#1126).
-        if needs_snapshot && !settled {
-            ui::warn(config::UNSETTLED_MANAGED_WARNING);
-        }
-    }
-    if resolved.git_guard.enabled
-        && !resolved.quiet
-        && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)
-    {
-        cplt::upstream::apply(
-            scratch,
-            &project_dir,
-            &repo_paths,
-            &resolved.git_guard,
-            settled,
-        );
-    }
-    if let Some(broker) = &mcp_broker {
-        // #1091: same opener record as an agent launch.
-        let opens = broker.open_url_records();
-        if !opens.is_empty() {
-            ui::info(&format!("host opener: {}", opens.join("; ")));
-        }
-    }
-    warn_worktrees_not_audited(
-        audit_enabled,
-        worktree_root.as_deref(),
-        &home_dir,
-        &project_dir,
-        resolved.worktree_walk_max_dirs,
-    );
-
-    if cli.observe_domains
-        && let Some(snapshot) = snapshot.as_ref()
-    {
-        emit_observed_domains(snapshot, observe_domains_output.as_mut());
-    }
 
     Ok(ExitCode::from(exit_code))
 }
