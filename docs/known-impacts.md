@@ -1921,7 +1921,7 @@ For the `oh-my-openagent` OpenCode plugin specifically, `OMO_DISABLE_POSTHOG=1` 
 
 ## Terminal devices and allocating a PTY
 
-The sandbox allows writing to a short list of device nodes: `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, and the `/dev/fd` subtree (which covers `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`). Reading under `/dev` stays open, with one exception: the numbered terminal devices, `/dev/ttysNNN` on macOS. On Linux the same rule removes every right on `/dev/pts`.
+The sandbox allows writing to a short list of device nodes: `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, and the `/dev/fd` subtree (which covers `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`). Reading under `/dev` stays open, with one exception: the numbered terminal devices, `/dev/ttysNNN` on macOS. On Linux the same rule removes every right on `/dev/pts`, except under Bubblewrap (below).
 
 Those numbered nodes each name one specific terminal, and on a normal desktop most of them belong to the user's *other* windows:
 
@@ -1942,6 +1942,8 @@ Two things do change:
 | `pty.spawn()`, `pexpect`, `node-pty` | ❌ Blocked          | same call, same device                                     |
 | `tmux`, `screen`                     | ❌ Blocked          | one PTY per pane (`tmux` was already blocked by its socket in `$TMPDIR`) |
 | `stty -f "$(tty)"`, or anything that opens its own terminal by name | ❌ Blocked | the name is a numbered device; use the plain form, which works on fd 0 |
+
+**Linux with Bubblewrap: PTYs work.** Bubblewrap gives the sandbox its own devpts instance, which holds only PTYs the sandbox created, so cplt grants `/dev/pts` there. `script`, `pexpect`, `node-pty`, `tmux` panes and Claude Code background sessions (`--bg`) can allocate a terminal. The host's terminals are not visible, and `TIOCSTI` stays blocked ([#1016](https://github.com/navikt/cplt/issues/1016)). Without Bubblewrap (Landlock only) the table above applies, because `/dev/pts` is then the host's: install `bubblewrap` and check with `cplt doctor`.
 
 ### `expect` fails without failing
 

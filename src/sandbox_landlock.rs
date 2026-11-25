@@ -336,6 +336,9 @@ const DEVICE_FILES: &[&str] = &[
 //   `dev.tty.legacy_tiocsti` sysctl toggles it at runtime. So a real set of
 //   supported configurations still exposes it — do not assume ≥6.2 is safe.
 //
+// The one exception is bwrap's private devpts, granted by the in-namespace
+// helper only (`private_devpts_rule` in sandbox_bubblewrap.rs, #1016).
+//
 // There is no `/dev/pts` rule at all now. Nothing in a normal session opens a
 // `/dev/pts/N` by path: the agent's terminal arrives as inherited fds 0/1/2,
 // Landlock binds rights at `open()` rather than on each read or write, and

@@ -1631,6 +1631,10 @@ struct InnerPolicy {
     /// string round trip to be matched.
     #[serde(default)]
     plain_file: Option<usize>,
+    /// `st_dev` of the host's `/dev/pts`, so the helper can refuse to grant a
+    /// devpts that is the host's (see [`private_devpts_rule`]).
+    #[serde(default)]
+    host_pts_dev: Option<u64>,
     /// `[agent_binary, args...]` — `execve`-ed verbatim by the helper.
     agent_argv: Vec<String>,
 }
@@ -1659,6 +1663,9 @@ pub(crate) fn serialize_policy(
         restrict_net_bind: wrapper.restrict_net_bind,
         proxy_forced: wrapper.proxy_forced,
         plain_file: wrapper.plain_file,
+        host_pts_dev: std::fs::metadata("/dev/pts")
+            .ok()
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m)),
         agent_argv,
     };
     serde_json::to_vec(&policy).map_err(std::io::Error::other)
@@ -1715,11 +1722,17 @@ fn run_inner() {
         return;
     }
 
-    let fs_rules: Vec<(FsRule, Option<FileId>)> = policy
+    let mut fs_rules: Vec<(FsRule, Option<FileId>)> = policy
         .fs_rules
         .iter()
         .map(|r| (r.to_fs_rule(), r.id))
         .collect();
+    // Only this helper, running inside bwrap's namespaces, may add the PTY
+    // rule: the parent policy never carries it, so a Landlock-only fallback
+    // can never grant the host devpts (#1016).
+    if let Some(rule) = private_devpts_rule(policy.host_pts_dev) {
+        fs_rules.push((rule, None));
+    }
     let net_rules: Vec<NetRule> = policy
         .net_ports
         .iter()
@@ -1785,6 +1798,43 @@ fn run_inner() {
 
     exec_agent(&policy.agent_argv);
     // `exec_agent` only returns if `execve` failed.
+}
+
+/// The `/dev/pts` grant for PTY users (Claude Code `--bg`, `script`, tmux),
+/// or `None` unless `/dev/pts` is provably a private devpts instance (#1016).
+///
+/// Security-critical. On the host, `/dev/pts/N` are other terminals' slaves
+/// (GHSA-q3p2-6x2x-8w8w), so the grant is safe only on bwrap's `--dev /dev`
+/// devpts, a `newinstance` mount holding just the sandbox's own PTYs. Fail
+/// closed on every doubt:
+/// * `/dev/pts` must be devpts (`statfs`), not a tmpfs or bind of anything else;
+/// * its `st_dev` must differ from the host `/dev/pts` the parent saw, so a
+///   bind of the host devpts (the same superblock, the same device id) is
+///   refused even though it is devpts too.
+///
+/// `TIOCSTI`/`TIOCLINUX` stay denied by seccomp on every fd, so an ioctl
+/// grant here cannot inject keystrokes even into the sandbox's own PTYs.
+fn private_devpts_rule(host_pts_dev: Option<u64>) -> Option<FsRule> {
+    use std::os::unix::fs::MetadataExt;
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // 0x1cd1 is DEVPTS_SUPER_MAGIC, a bare literal because f_type's width varies by libc.
+    if unsafe { libc::statfs(c"/dev/pts".as_ptr(), &raw mut fs) } != 0 || fs.f_type != 0x1cd1 {
+        return None;
+    }
+    let dev = std::fs::symlink_metadata("/dev/pts").ok()?.dev();
+    if host_pts_dev == Some(dev) {
+        return None;
+    }
+    Some(FsRule {
+        nofollow: false,
+        path: PathBuf::from("/dev/pts"),
+        access: FsAccess {
+            read: true,
+            write: true,
+            ioctl: true,
+            ..Default::default()
+        },
+    })
 }
 
 /// Read the whole policy pipe until EOF, then close the fd.
