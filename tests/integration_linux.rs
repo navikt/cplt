@@ -6043,6 +6043,8 @@ ln -s /etc "$CPLT_WORKTREE_ROOT/linked" && {{ "$c" worktree add linked HEAD && e
         );
         assert!(!project.path().join("pwned").exists(), "{ctx}");
 
+        // The launch check refuses a non-worktree entry in the root; remove it.
+        fs::remove_file(root.join("linked")).unwrap();
         // Next session: the existing worktree is protected before the agent starts.
         let (code, stdout, stderr) = worktree_run(
             project.path(),
