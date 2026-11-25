@@ -10840,6 +10840,11 @@ mod tests {
                 "--push-option",
                 "--no-recurse-submodules",
             ],
+            &[
+                "--recurse-submodules=on-demand",
+                "-o--no-recurse-submodules",
+            ],
+            &["--recurse-submodules=on-demand", "-ox"],
         ] {
             assert!(push(&dir, flags).is_err(), "{flags:?} must be refused");
         }
