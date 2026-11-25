@@ -2897,6 +2897,43 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
 /// gets no pin, so a staged directory renamed into its place would bring the
 /// read-only children with it.
 pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
+    split_tool_dirs(home, readonly_host_tool_paths, &mut |p| {
+        let _ = std::fs::create_dir(p);
+        p.is_dir()
+    });
+}
+
+/// The dirs [`ensure_split_tool_dirs`] would create, without creating any.
+/// `cplt check` reports them: it must not write the host, and a launch
+/// grants them only once they exist (#1227).
+pub fn missing_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    split_tool_dirs(home, readonly_host_tool_paths, &mut |p| {
+        if p.is_dir() {
+            return true;
+        }
+        // Something that is not a dir blocks the real create too.
+        if p.symlink_metadata().is_ok() {
+            return false;
+        }
+        // `create_dir` makes one level: the parent must exist, or be planned.
+        let parent_ok = p
+            .parent()
+            .is_some_and(|d| d.is_dir() || missing.iter().any(|m| m == d));
+        if !parent_ok {
+            return false;
+        }
+        if !missing.iter().any(|m| m == p) {
+            missing.push(p.to_path_buf());
+        }
+        true
+    });
+    missing
+}
+
+/// Walks the dirs to create; `mk` creates one (or plans it) and says whether
+/// it is a dir afterwards.
+fn split_tool_dirs(home: &Path, readonly_host_tool_paths: bool, mk: &mut dyn FnMut(&Path) -> bool) {
     let overlays = HOST_TOOL_RO_OVERLAYS
         .iter()
         .filter(|_| readonly_host_tool_paths);
@@ -2914,11 +2951,13 @@ pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
         };
         // A read-only root is created too: the sandbox can no longer create
         // it, and a first `npm install` on a fresh machine would fail.
-        if !root.write || overlay {
-            let _ = std::fs::create_dir(home.join(parent));
-        }
-        if home.join(parent).is_dir() {
-            let _ = std::fs::create_dir(home.join(child));
+        let parent_ok = if !root.write || overlay {
+            mk(&home.join(parent))
+        } else {
+            home.join(parent).is_dir()
+        };
+        if parent_ok {
+            mk(&home.join(child));
         }
     }
     // Bubblewrap skips a missing path, so every keyed overlay must exist.
@@ -2931,7 +2970,7 @@ pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
                     .parent()
                     .is_some_and(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
                 {
-                    let _ = std::fs::create_dir(&path);
+                    mk(&path);
                 }
                 continue;
             };
@@ -2940,7 +2979,7 @@ pub fn ensure_split_tool_dirs(home: &Path, readonly_host_tool_paths: bool) {
                 cur.push(c);
                 let ok = match cur.symlink_metadata() {
                     Ok(m) => m.is_dir(),
-                    Err(_) => std::fs::create_dir(&cur).is_ok(),
+                    Err(_) => mk(&cur),
                 };
                 if !ok {
                     break;
@@ -6613,6 +6652,26 @@ mod tests {
         );
         assert_eq!(writable(".m2"), [".m2/repository", ".m2/wrapper"]);
         assert_eq!(writable(".yarn"), [".yarn/berry"]);
+    }
+
+    /// `cplt check` lists what a launch would create, writing nothing (#1227).
+    #[test]
+    fn missing_split_tool_dirs_lists_what_ensure_creates_without_creating() {
+        crate::with_env_lock_no_xdg(|| {
+            for ro in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let h = tmp.path();
+                std::fs::create_dir(h.join(".gradle")).unwrap();
+                let missing = missing_split_tool_dirs(h, ro);
+                assert!(missing.iter().any(|p| p == &h.join(".m2/repository")));
+                assert!(missing.iter().all(|p| !p.exists()), "dry run created a dir");
+                ensure_split_tool_dirs(h, ro);
+                for p in &missing {
+                    assert!(p.is_dir(), "listed but not created: {}", p.display());
+                }
+                assert!(missing_split_tool_dirs(h, ro).is_empty());
+            }
+        });
     }
 
     #[test]

@@ -609,6 +609,15 @@ pub fn ensure_podman_state_dirs(config: &super::SandboxConfig) {
     }
 }
 
+/// The Podman state dirs [`ensure_podman_state_dirs`] would create. For
+/// `cplt check`, which must not write the host (#1227).
+pub fn missing_podman_state_dirs(config: &super::SandboxConfig) -> Vec<PathBuf> {
+    podman_state_dirs(config)
+        .into_iter()
+        .filter(|d| d.symlink_metadata().is_err())
+        .collect()
+}
+
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
