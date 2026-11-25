@@ -5630,17 +5630,26 @@ fn push_recurses_submodules(
 ) -> bool {
     let off = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "no" | "check" | "false");
     let mut flag = None;
-    for arg in push_args {
-        if *arg == "--" {
+    let mut i = 0;
+    while i < push_args.len() {
+        let arg = push_args[i];
+        if arg == "--" {
             break;
         }
-        if *arg == "--no-recurse-submodules" {
+        // A value-taking flag consumes the next token, as in `push_positionals`:
+        // `-o --no-recurse-submodules` is a push option, not a flag.
+        if PUSH_FLAGS_WITH_VALUE.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if arg == "--no-recurse-submodules" {
             flag = Some(false);
-        } else if *arg == "--recurse-submodules" {
+        } else if arg == "--recurse-submodules" {
             flag = Some(true);
         } else if let Some(v) = arg.strip_prefix("--recurse-submodules=") {
             flag = Some(!off(v));
         }
+        i += 1;
     }
     if let Some(f) = flag {
         return f;
@@ -5648,11 +5657,18 @@ fn push_recurses_submodules(
     let Some(git) = real_git else {
         return false;
     };
-    if let Some(v) = git_config_value(git, repo_args, "push.recurseSubmodules") {
+    // A key that is set but empty (valueless `recurseSubmodules`) is not `no`:
+    // fail closed on it.
+    let set = |args: &[&str]| {
+        run_git(git, repo_args, args)
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    if let Some(v) = set(&["config", "--get", "push.recurseSubmodules"]) {
         return !off(&v);
     }
-    git_config_value(git, repo_args, "submodule.recurse")
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"))
+    // `--bool` lets git normalize the valueless form and yes/on/1.
+    set(&["config", "--bool", "--get", "submodule.recurse"]).is_some_and(|v| v == "true")
 }
 
 /// What a `git push` writes to, as far as a branch filter can be enforced.
@@ -10814,6 +10830,16 @@ mod tests {
             &["--recurse-submodules=on-demand"],
             &["--recurse-submodules=only"],
             &["--no-recurse-submodules", "--recurse-submodules=on-demand"],
+            &[
+                "--recurse-submodules=on-demand",
+                "-o",
+                "--no-recurse-submodules",
+            ],
+            &[
+                "--recurse-submodules=on-demand",
+                "--push-option",
+                "--no-recurse-submodules",
+            ],
         ] {
             assert!(push(&dir, flags).is_err(), "{flags:?} must be refused");
         }
@@ -10859,6 +10885,31 @@ mod tests {
                 "the flag overrides {key}"
             );
         }
+    }
+
+    #[test]
+    fn push_with_valueless_submodule_recurse_is_refused() {
+        let Some(git) = git_or_skip() else { return };
+        let rules = vec![origin_agent_rule()];
+        let (_t, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let cfg = repo.join(".git/config");
+        let mut text = std::fs::read_to_string(&cfg).unwrap();
+        text.push_str("[submodule]\n\trecurse\n");
+        std::fs::write(&cfg, text).unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        assert!(
+            gate_git_t(
+                &["-C", &dir, "push", "origin", "agent/x"],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "valueless submodule.recurse means true"
+        );
     }
 
     #[test]
