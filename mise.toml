@@ -61,7 +61,7 @@ run = "sh hack/quiet-test.sh --lib"
 
 [tasks."test:unit"]
 description = "Run unit tests — cross-platform, sandbox-safe"
-run = "sh hack/quiet-test.sh --test unit_tests --test github_mcp_spec"
+run = "sh hack/quiet-test.sh --test unit_tests --test github_mcp_spec --test config_corpus --test state_pin --test state_root"
 
 [tasks."test:probe"]
 description = "Run offline probe regression checks (requires Python 3 and Node.js)"
@@ -99,13 +99,21 @@ run = "sh hack/quiet-test.sh --test e2e_guards"
 description = "Run parent-side git invocation hardening E2E tests — macOS only, sandbox-safe"
 run = "sh hack/quiet-test.sh --test e2e_git_hardening"
 
+[tasks."test:e2e-golden"]
+description = "Run operator-view golden-path E2E tests — macOS only, sandbox-safe"
+run = "sh hack/quiet-test.sh --test e2e_golden"
+
+[tasks."test:mcp-broker"]
+description = "Run MCP host broker tests — macOS or Linux, NOT sandbox-safe"
+run = "sh hack/quiet-test.sh --test mcp_broker"
+
 [tasks."test:e2e-live"]
 description = "Run live smoke tests — macOS only, requires Copilot auth + network, NOT sandbox-safe"
 run = "sh hack/quiet-test.sh --test e2e -- --ignored"
 
 [tasks."test:all"]
 description = "Run all test suites except live smoke tests — macOS only, sandbox-safe"
-depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects", "test:e2e-guards", "test:e2e-git-hardening", "test:network-audit", "test:worktree-broker"]
+depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects", "test:e2e-guards", "test:e2e-git-hardening", "test:e2e-golden", "test:network-audit", "test:worktree-broker", "test:mcp-broker"]
 
 [tasks."test:everything"]
 description = "Run ALL tests including live smoke tests — macOS only, NOT sandbox-safe"

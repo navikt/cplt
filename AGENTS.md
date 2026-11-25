@@ -25,14 +25,18 @@ Always run `mise run check` at the end of a coding session.
 | Task | Suite | In sandbox | Linux CI | macOS CI | Requirements |
 |-------------------------|----------------|:----------:|:--------:|:--------:|-------------------------------|
 | `mise run check` | fmt + clippy + unit + lib + offline probe | ✅ | ✅ | ✅ | Python 3 + Node.js (safe everywhere) |
-| `mise run test:unit` | unit_tests | ✅ | ✅ | ✅ | None |
+| `mise run test:unit` | unit_tests, github_mcp_spec, config_corpus, state_pin, state_root | ✅ | ✅ | ✅ | None |
 | `mise run test:lib` | lib (modules) | ✅ | ✅ | ✅ | None |
 | `mise run test:probe` | offline probe checks | ✅ | ✅ | ✅ | Python 3 + Node.js; PTY case macOS-only |
 | `mise run test:integration` | integration | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
 | `mise run test:integration-linux` | integration_linux | ❌ | ✅ | ❌ | Linux with Landlock (5.13+) |
 | `mise run test:network-audit` | network_audit | ✅ | ❌ | ✅ | macOS or Linux; binds localhost TCP |
-| `mise run test:e2e` | e2e | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
+| `mise run test:e2e` | e2e, message_commands | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
+| `mise run test:e2e-guards` | e2e_guards | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
+| `mise run test:e2e-git-hardening` | e2e_git_hardening | ✅ | ❌ | ✅ | macOS `sandbox-exec`, real git |
+| `mise run test:e2e-golden` | e2e_golden | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
+| `mise run test:mcp-broker` | mcp_broker | ❌ | ✅ | ✅ | macOS keychain or Linux bubblewrap + session bus |
 | `mise run test:worktree-broker` | worktree_broker | ❌ | ❌ | ✅ | macOS; real git, binds a Unix socket |
 | `mise run test:e2e-live` | e2e (ignored), 6 smoke tests | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
 | `mise run test:all` | the suites above except live, including guard and broker suites | ✅ | ❌ | ✅ | macOS + `copilot` in PATH |
