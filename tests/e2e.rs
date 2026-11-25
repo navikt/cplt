@@ -303,6 +303,8 @@ mod e2e_tests {
             assert_eq!(tree(&root), before, "{args:?} wrote to the host");
         };
         run(&["--print-profile"]);
+        run(&["--agent", "claude", "--print-profile"]);
+        assert!(!home.join(".claude").exists() && !home.join(".claude.json").exists());
         std::fs::create_dir_all(home.join(".cache")).unwrap();
         std::fs::create_dir_all(cplt::scratch::ScratchDir::base(&home)).unwrap();
         run(&["check"]);
@@ -14769,6 +14771,48 @@ mod agent_stubs {
             read_only: &[".claude/settings.json", ".claude/statusline.sh"],
             extra_args: "",
         });
+    }
+
+    /// #1219: the launch pre-creates agent dirs, never a file grant: a
+    /// `~/.claude.json` made as a directory breaks Claude.
+    #[test]
+    fn claude_launch_never_makes_claude_json_a_dir() {
+        if !sandbox_usable() {
+            return;
+        }
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-stub-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let bin = h.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("claude");
+        std::fs::write(&stub, STUB).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cmd = cplt_cmd();
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+        let o = cmd
+            .current_dir(&proj)
+            .env("HOME", &h)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .args(["--yes", "--agent", "claude", "--", "exit 0"])
+            .output()
+            .expect("cplt should run");
+        assert!(
+            o.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(h.join(".claude").is_dir(), "the dir grant is pre-created");
+        assert!(
+            !h.join(".claude.json").is_dir(),
+            "~/.claude.json made a dir"
+        );
     }
 
     /// #972: with the brief on, the fake `claude` gets

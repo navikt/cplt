@@ -1125,7 +1125,10 @@ pub(crate) fn plan_deny_masks(
         None
     } else {
         match scratch_dir.map(|s| {
-            if inspect_only {
+            // `cplt check` inspects with a real scratch dir and runs probes under
+            // bwrap, which binds the placeholder: create it there. A planned
+            // (not yet existing) scratch dir stays untouched (#1198).
+            if inspect_only && !s.is_dir() {
                 Ok(s.join(MASK_PLACEHOLDER))
             } else {
                 create_mask_placeholder(s)

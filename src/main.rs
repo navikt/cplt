@@ -8444,7 +8444,8 @@ fn assemble_sandbox(
             }
         }
         // Inspect writes no CA into scratch (#1215); the checks above still run.
-        if !opts.inspect_only
+        // `cplt check` has a real scratch dir, removed on exit: set up as a launch.
+        if (!opts.inspect_only || opts.live_probes)
             && let Err(e) = cplt::token_inject::setup(scratch)
         {
             let fix = if e.starts_with("no system CA bundle") {

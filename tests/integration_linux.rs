@@ -3261,6 +3261,50 @@ print('BIND_OK')
         run_sandboxed_with_flags(project_dir, &["--use-bubblewrap"], script)
     }
 
+    /// #1219: `cplt check` runs its probes under bubblewrap, which binds
+    /// `<scratch>/deny-mask` over every file mask. Inspect-only once skipped
+    /// creating it, so every probe failed. A `--deny-path` file inside the
+    /// project is open to Landlock, so BLOCKED proves the bwrap mask applied.
+    #[test]
+    fn check_probes_run_under_bwrap_with_a_file_mask() {
+        require_bwrap!();
+        let project = create_test_project();
+        let secret = project.path().join("secret.txt");
+        fs::write(&secret, "s").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let check = |args: &[&str]| {
+            let mut cmd = cplt_cmd();
+            crate::common::with_scratch_home(&mut cmd);
+            let out = cmd
+                .env("HOME", h)
+                .env("XDG_CONFIG_HOME", h.join(".config"))
+                .env("XDG_DATA_HOME", h.join(".local/share"))
+                .env("XDG_STATE_HOME", h.join(".local/state"))
+                .env("XDG_CACHE_HOME", h.join(".cache"))
+                .args(["--agent", "shell", "--use-bubblewrap", "--project-dir"])
+                .arg(project.path())
+                .arg("--deny-path")
+                .arg(&secret)
+                .arg("check")
+                .args(args)
+                .output()
+                .expect("cplt check should run");
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        let (code, out, err) = check(&[]);
+        assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+        let (_, out, err) = check(&["path", secret.to_str().unwrap()]);
+        assert!(
+            out.contains("(read): BLOCKED"),
+            "stdout: {out}\nstderr: {err}"
+        );
+    }
+
     // ── Private devpts under bubblewrap (#1016) ───────────────────
 
     /// Opens a PTY pair, reopens the slave by path (the Landlock rule), sets
