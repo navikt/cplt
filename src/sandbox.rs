@@ -64,13 +64,7 @@ pub(crate) mod bubblewrap_probe {
         grants: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> Result<(), String> {
         let git_dirs = super::launch_git_dirs(config)?;
-        let plan = super::bwrap_plan(
-            config,
-            &git_dirs,
-            grants,
-            &std::cell::OnceCell::new(),
-            false,
-        );
+        let plan = super::bwrap_plan(config, &git_dirs, grants, &std::cell::OnceCell::new(), true);
         super::bubblewrap::build_wrapper(
             &plan.policy,
             super::bubblewrap::Overlays {
@@ -93,13 +87,7 @@ pub(crate) mod bubblewrap_probe {
         grants: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> Vec<std::path::PathBuf> {
         let git_dirs = super::launch_git_dirs(config).unwrap_or_default();
-        let plan = super::bwrap_plan(
-            config,
-            &git_dirs,
-            grants,
-            &std::cell::OnceCell::new(),
-            false,
-        );
+        let plan = super::bwrap_plan(config, &git_dirs, grants, &std::cell::OnceCell::new(), true);
         config
             .extra_deny
             .iter()
@@ -856,7 +844,7 @@ pub(crate) fn opencode_v2_needs_bwrap() -> String {
 /// - A Playwright socket directory is supplied on a non-macOS platform
 /// - The platform does not support sandboxing
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
-    prepare_with_pnpm_shadow(config, None, false)
+    prepare_with_pnpm_shadow(config, None, false, true)
 }
 
 /// Validate and compile a sandbox with a cplt-owned pnpm shadow.
@@ -864,12 +852,25 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 /// `inspect_only` is for callers that print or check the policy and never
 /// launch it (`--print-profile`, `cplt check`): it keeps prepare from writing
 /// to the host, and the profile lists what a launch would create instead.
+///
+/// `create_mask_placeholder` says whether `config.scratch_dir` is a real
+/// session dir the deny-mask placeholder may be created in. Inspect-only runs
+/// pass a would-be path under the agent-writable cache, so only a launch or
+/// `cplt check`'s live probes set it.
 pub fn prepare_with_pnpm_shadow(
     config: &SandboxConfig,
     pnpm_shadow_dir: Option<&Path>,
     inspect_only: bool,
+    create_mask_placeholder: bool,
 ) -> Result<PreparedSandbox, String> {
-    crate::env_read_lock(|| prepare_locked(config, pnpm_shadow_dir, inspect_only))
+    crate::env_read_lock(|| {
+        prepare_locked(
+            config,
+            pnpm_shadow_dir,
+            inspect_only,
+            create_mask_placeholder,
+        )
+    })
 }
 
 /// Prints, once per launch, where the OAuth callback port guard (#1017) cannot
@@ -901,6 +902,7 @@ fn prepare_locked(
     config: &SandboxConfig,
     pnpm_shadow_dir: Option<&Path>,
     inspect_only: bool,
+    create_mask_placeholder: bool,
 ) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
@@ -951,6 +953,7 @@ fn prepare_locked(
         &git_dirs,
         pnpm_shadow_dir,
         inspect_only,
+        create_mask_placeholder,
         &canonical_grants,
         &base,
     )?;
@@ -3469,6 +3472,7 @@ fn prepare_impl(
     extra_git_dirs: &[PathBuf],
     pnpm_shadow_dir: Option<&Path>,
     _inspect_only: bool,
+    _create_mask_placeholder: bool,
     _canonical_grants: &[(PathBuf, PathBuf)],
     _base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<PreparedSandbox, String> {
@@ -3651,11 +3655,11 @@ fn report_unix_socket_regime(
 /// launch's own wrapper builds and masks every bus endpoint that exists.
 /// Probed with the launch's rules, as `cplt doctor` does.
 #[cfg(target_os = "linux")]
-pub fn mcp_broker_refusal(config: &SandboxConfig, inspect_only: bool) -> Option<String> {
+pub fn mcp_broker_refusal(config: &SandboxConfig, create_mask_placeholder: bool) -> Option<String> {
     if let Some(why) = mcp_flag_conflict(config.allow_gpg_signing, config.allow_rootless_docker) {
         return Some(why);
     }
-    let (wrapper, plan) = mcp_wrapper(config, inspect_only);
+    let (wrapper, plan) = mcp_wrapper(config, create_mask_placeholder);
     mcp_refusal_text(
         wrapper,
         &plan.deny_masks,
@@ -3670,7 +3674,7 @@ pub fn mcp_broker_refusal(config: &SandboxConfig, inspect_only: bool) -> Option<
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn mcp_wrapper_error(config: &SandboxConfig) -> Option<String> {
-    mcp_wrapper(config, false).0.err()
+    mcp_wrapper(config, true).0.err()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3680,7 +3684,10 @@ pub fn mcp_wrapper_error(_: &SandboxConfig) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn mcp_wrapper(config: &SandboxConfig, inspect_only: bool) -> (Result<(), String>, BwrapPlan) {
+fn mcp_wrapper(
+    config: &SandboxConfig,
+    create_mask_placeholder: bool,
+) -> (Result<(), String>, BwrapPlan) {
     // Planned as the launch will be: with a broker socket, so with its masks.
     let probe_socket = Path::new("/tmp/cplt-mcp-probe/m");
     let config = &SandboxConfig {
@@ -3694,7 +3701,7 @@ fn mcp_wrapper(config: &SandboxConfig, inspect_only: bool) -> (Result<(), String
     )
     .unwrap_or_default();
     let git_dirs = launch_git_dirs(config).unwrap_or_default();
-    let plan = bwrap_plan(config, &git_dirs, &grants, &base, inspect_only);
+    let plan = bwrap_plan(config, &git_dirs, &grants, &base, create_mask_placeholder);
     let wrapper = if config.use_bubblewrap == Some(false) {
         Err("it is turned off".to_string())
     } else {
@@ -4410,7 +4417,7 @@ fn bwrap_plan(
     extra_git_dirs: &[PathBuf],
     canonical_grants: &[(PathBuf, PathBuf)],
     base: &std::cell::OnceCell<LandlockPolicy>,
-    inspect_only: bool,
+    create_mask_placeholder: bool,
 ) -> BwrapPlan {
     let mut policy = base
         .get_or_init(|| landlock_mod::generate_policy(config))
@@ -4498,7 +4505,7 @@ fn bwrap_plan(
         &socket_masks,
         &credential_links,
         config.scratch_dir,
-        inspect_only,
+        create_mask_placeholder,
     );
     BwrapPlan {
         policy,
@@ -4904,6 +4911,7 @@ fn prepare_impl(
     extra_git_dirs: &[PathBuf],
     pnpm_shadow_dir: Option<&Path>,
     inspect_only: bool,
+    create_mask_placeholder: bool,
     canonical_grants: &[(PathBuf, PathBuf)],
     base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<PreparedSandbox, String> {
@@ -5004,7 +5012,13 @@ fn prepare_impl(
         if !inspect_only {
             seed_claude_settings(config);
         }
-        bwrap_plan(config, extra_git_dirs, canonical_grants, base, inspect_only)
+        bwrap_plan(
+            config,
+            extra_git_dirs,
+            canonical_grants,
+            base,
+            create_mask_placeholder,
+        )
     };
     // #790: the `/proc/self` rule binds to the first child's `/proc/<pid>`,
     // so every process it starts gets EACCES on its own `/proc/self/*`
@@ -6796,7 +6810,7 @@ mod tests {
         );
         assert!(error.contains("sandbox.refuse_unenforced false"), "{error}");
         // `cplt check` / `--print-profile` refuse exactly when a launch does.
-        let Err(inspected) = prepare_with_pnpm_shadow(&config, None, true) else {
+        let Err(inspected) = prepare_with_pnpm_shadow(&config, None, true, false) else {
             panic!("inspect must refuse like the launch");
         };
         assert_eq!(inspected, error);
@@ -6986,7 +7000,7 @@ mod tests {
         config.use_bubblewrap = Some(false);
         let app_data = policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env);
 
-        prepare_with_pnpm_shadow(&config, None, true).expect("inspection must validate");
+        prepare_with_pnpm_shadow(&config, None, true, false).expect("inspection must validate");
         assert!(!app_data.exists(), "inspection must not create app state");
 
         prepare(&config).expect("launch must prepare app state");
@@ -8601,7 +8615,7 @@ mod tests {
             config.copilot_cache_env = &env;
             config.use_bubblewrap = Some(false);
 
-            prepare_with_pnpm_shadow(&config, None, true).unwrap();
+            prepare_with_pnpm_shadow(&config, None, true, false).unwrap();
             assert!(!pkg.parent().unwrap().exists(), "{var}: inspect wrote");
 
             prepare(&config).unwrap_or_else(|e| panic!("{var}: {e}"));
