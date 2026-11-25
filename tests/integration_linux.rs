@@ -3268,11 +3268,14 @@ print('BIND_OK')
     #[test]
     fn check_probes_run_under_bwrap_with_a_file_mask() {
         require_bwrap!();
-        let project = create_test_project();
-        let secret = project.path().join("secret.txt");
+        // Not under /tmp: the launch grants /tmp, and bwrap hides it
+        // behind a private tmpfs where a mask cannot land.
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = &home.path().canonicalize().unwrap();
+        let project = h.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let secret = project.join("secret.txt");
         fs::write(&secret, "s").unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let h = home.path();
         let check = |args: &[&str]| {
             let mut cmd = cplt_cmd();
             crate::common::with_scratch_home(&mut cmd);
@@ -3283,7 +3286,7 @@ print('BIND_OK')
                 .env("XDG_STATE_HOME", h.join(".local/state"))
                 .env("XDG_CACHE_HOME", h.join(".cache"))
                 .args(["--agent", "shell", "--use-bubblewrap", "--project-dir"])
-                .arg(project.path())
+                .arg(&project)
                 .arg("--deny-path")
                 .arg(&secret)
                 .arg("check")
