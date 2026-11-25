@@ -2360,6 +2360,10 @@ fn warn_exec_tool_dir_shadowing(
     for w in resolved.exec_tool_dir_warnings(home_dir, agent) {
         ui::warn(&w);
     }
+    // Same launch points, after repo proposals and denies are merged.
+    for w in resolved.allow_deny_overlap_warnings(home_dir) {
+        ui::warn(&w);
+    }
 }
 
 /// Report `.cplt.toml` keys this cplt does not understand.
@@ -12921,6 +12925,20 @@ fn run_config_set_via(
     if let Err(e) = op.write_document(&doc) {
         ui::error(&e.to_string());
         return ExitCode::FAILURE;
+    }
+    // Warn about an allow/deny overlap as soon as it is written, not only at
+    // the next launch. Global layer only; the launch check covers the rest.
+    if !unset && !local && matches!(key, "allow.read" | "allow.write" | "deny.paths") {
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        if let Some(r) = config::Config::load_file()
+            .ok()
+            .flatten()
+            .and_then(|c| c.config.merge(config::CliFlags::default()).ok())
+        {
+            for w in r.allow_deny_overlap_warnings(&home) {
+                ui::warn(&w);
+            }
+        }
     }
 
     if unset {

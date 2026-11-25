@@ -3335,6 +3335,23 @@ fn denied_dotfile_override_paths(home: &Path, path: &Path) -> Vec<String> {
     Vec::new()
 }
 
+/// Whether a user grant on `allow` is re-emitted *after* the `--deny-path`
+/// rules, so it beats an overlapping user deny under SBPL last-match-wins:
+/// the credential-dir re-allows ([`emit_denied_dotfile_overrides`]) and the
+/// registry-file re-allows ([`registry_config_overrides`]). Every other user
+/// grant comes before the denies and loses to them. Used only to word the
+/// allow/deny overlap warning truthfully.
+pub(crate) fn allow_outranks_user_deny(
+    home: &Path,
+    allow: &Path,
+    protect_pnpm_config: bool,
+) -> bool {
+    !denied_dotfile_override_paths(home, allow).is_empty()
+        || overridable_credential_files(home, protect_pnpm_config)
+            .iter()
+            .any(|f| resolved(home.join(f)) == allow)
+}
+
 /// Keep a grant that names an SSH private key file itself working (#595).
 ///
 /// The default `id_rsa`/`id_ed25519`/... deny comes after every user allow, so
