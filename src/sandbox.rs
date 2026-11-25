@@ -3794,6 +3794,21 @@ pub(crate) struct BusEndpoints {
     abstract_socket: bool,
     /// A non-unix transport (tcp, ...).
     other: bool,
+    /// A pathname the address names but bubblewrap cannot mask exactly
+    /// (bad escape, not UTF-8).
+    unmaskable_path: bool,
+}
+
+/// Under bubblewrap a bus socket that cannot be masked refuses the launch:
+/// a warning would leave the bus reachable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn bus_mask_refusal(bus: &BusEndpoints) -> Option<String> {
+    bus.unmaskable_path.then(|| {
+        "a D-Bus address in DBUS_SESSION_BUS_ADDRESS or DBUS_SYSTEM_BUS_ADDRESS names a \
+         socket path Bubblewrap cannot mask (bad %XX escape or not UTF-8). Fix the address \
+         or the socket path, or unset the variable."
+            .to_string()
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3823,6 +3838,7 @@ fn env_bus_endpoints() -> BusEndpoints {
             out.paths.append(&mut b.paths);
             out.abstract_socket |= b.abstract_socket;
             out.other |= b.other;
+            out.unmaskable_path |= b.unmaskable_path;
         }
     }
     out
@@ -3845,14 +3861,16 @@ pub(crate) fn parse_dbus_address(addr: &str) -> BusEndpoints {
             };
             match k {
                 // Fail closed: a path in a malformed entry is still masked.
-                "path" | "dir" if !v.is_empty() => match dbus_unescape(v) {
-                    Some(p) => {
+                "path" | "dir" if !v.is_empty() => {
+                    if let Some(p) = dbus_unescape(v) {
                         out.paths.push(PathBuf::from(p));
                         known = true;
+                    } else {
+                        // Bubblewrap takes UTF-8 arguments, so this one cannot be masked.
+                        out.other = true;
+                        out.unmaskable_path = true;
                     }
-                    // Bubblewrap takes UTF-8 arguments, so this one cannot be masked.
-                    None => out.other = true,
-                },
+                }
                 "abstract" | "tmpdir" => {
                     out.abstract_socket = true;
                     known = true;
@@ -4975,6 +4993,12 @@ fn prepare_impl(
         }
     }
 
+    if bwrap_wrapper.is_some()
+        && let Some(e) = bus_mask_refusal(&env_bus_endpoints())
+    {
+        return Err(e);
+    }
+
     // #834: the launch checked this before starting the broker
     // (`mcp_broker_refusal`); this is the backstop. Strict, so a spawn-time
     // bwrap failure stops the run instead of falling back to plain Landlock
@@ -5670,6 +5694,19 @@ mod tests {
         ] {
             let b = parse_dbus_address(bad);
             assert!(b.paths.is_empty() && b.other, "{bad}");
+        }
+        for bad in ["unix:path=/x%FF", "unix:path=/x%2"] {
+            assert!(
+                super::bus_mask_refusal(&parse_dbus_address(bad)).is_some(),
+                "{bad}"
+            );
+        }
+        for warn_only in [
+            "unix:abstract=/x",
+            "tcp:host=h,port=1",
+            "unix:path=/b,broken",
+        ] {
+            assert!(super::bus_mask_refusal(&parse_dbus_address(warn_only)).is_none());
         }
         // A malformed field is reported, and the path it came with still masked.
         let half = parse_dbus_address("unix:path=/home/u/bus,broken");
