@@ -379,10 +379,12 @@ pub struct SandboxConfig<'a> {
     /// `open` binary (#251).
     pub allow_browser: bool,
     /// The credential this agent can use *instead of* the login Keychain, if
-    /// any (#242). `Some` drops the Keychain grant from the profile and, for an
-    /// env-var substitute, forwards that variable into the sandbox — those two
-    /// derive from this one field so they cannot disagree. `None` keeps the
-    /// grant and forwards nothing extra. Inert on Linux.
+    /// any (#242). On macOS, `Some` drops the Keychain grant from the profile
+    /// and, for an env-var substitute, forwards that variable into the sandbox;
+    /// those two derive from this one field so they cannot disagree, and `None`
+    /// keeps the grant and forwards nothing extra. On Linux, for Copilot, `Some`
+    /// carries the token read from Secret Service with `secret-tool` and sets
+    /// `COPILOT_GITHUB_TOKEN`; inert for other agents on Linux.
     pub keychain_substitute: Option<crate::agent::KeychainSubstitute>,
     /// Use Bubblewrap for namespace isolation (Linux only).
     /// - `Some(true)`: Always use bwrap (fail if unavailable)

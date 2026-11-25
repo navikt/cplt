@@ -275,7 +275,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
-        description: "Run the local MCP servers that have a broker spec in ~/.config/cplt/mcp/ (written by nav-pilot) on the host, behind cplt's tool policy, instead of inside the sandbox. macOS only. Turn one off for a run with --no-mcp-broker <id>.",
+        description: "Run the local MCP servers that have a broker spec in ~/.config/cplt/mcp/ (written by nav-pilot) on the host, behind cplt's tool policy, instead of inside the sandbox. macOS, and Linux under Bubblewrap. Turn one off for a run with --no-mcp-broker <id>.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -571,7 +571,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true for Copilot and Claude, false for other agents",
-        description: "Drop the macOS Keychain grant when the agent has a credential it can reach without it. Copilot uses `gh auth token`, Claude uses CLAUDE_CODE_OAUTH_TOKEN; both keep the grant without one.",
+        description: "Drop the macOS Keychain grant when the agent has a credential it can reach without it (Copilot uses `gh auth token`, Claude uses CLAUDE_CODE_OAUTH_TOKEN; both keep the grant without one). On Linux, for Copilot, reads Copilot's Secret Service login with `secret-tool` and passes it as COPILOT_GITHUB_TOKEN.",
     },
     ConfigKeyInfo {
         section: "sandbox",
