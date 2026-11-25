@@ -1816,11 +1816,9 @@ fn run_inner() {
 /// grant here cannot inject keystrokes even into the sandbox's own PTYs.
 fn private_devpts_rule(host_pts_dev: Option<u64>) -> Option<FsRule> {
     use std::os::unix::fs::MetadataExt;
-    const DEVPTS_SUPER_MAGIC: i64 = 0x1cd1;
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c"/dev/pts".as_ptr(), &mut fs) } != 0
-        || fs.f_type as i64 != DEVPTS_SUPER_MAGIC
-    {
+    // 0x1cd1 is DEVPTS_SUPER_MAGIC, a bare literal because f_type's width varies by libc.
+    if unsafe { libc::statfs(c"/dev/pts".as_ptr(), &raw mut fs) } != 0 || fs.f_type != 0x1cd1 {
         return None;
     }
     let dev = std::fs::symlink_metadata("/dev/pts").ok()?.dev();
