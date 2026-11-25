@@ -6710,27 +6710,17 @@ fn matches_allow_push_rule(
 }
 
 /// Simple glob matching for branch patterns.
-/// `prefix/*` matches one `/` segment under `prefix`; `prefix/**` matches one
-/// or more. Another trailing `*` (`copilot-*`) is a plain prefix match.
+/// A trailing `*` matches any characters, `/` included; the literal prefix
+/// before it, `/` included, must match exactly (`agent/*` never matches `agent-main`).
 fn glob_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern == "**" {
         return true;
     }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        // "agent/**" matches "agent/x" and "agent/x/y"
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        // "agent/*" needs something after the slash, as before.
         value
             .strip_prefix(prefix)
-            .and_then(|r| r.strip_prefix('/'))
-            .is_some_and(|r| !r.is_empty())
-    } else if let Some(prefix) = pattern.strip_suffix("/*") {
-        // "agent/*" matches "agent/fix-123", not "agent-main" or "agent/x/y"
-        value
-            .strip_prefix(prefix)
-            .and_then(|r| r.strip_prefix('/'))
-            .is_some_and(|r| !r.is_empty() && !r.contains('/'))
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        // e.g. "copilot-*" matches "copilot-fix-123"
-        value.starts_with(prefix)
+            .is_some_and(|r| !r.is_empty() || !prefix.ends_with('/'))
     } else {
         // Exact match
         pattern == value
@@ -10081,9 +10071,8 @@ mod tests {
         assert!(!glob_match("feature", "feature2"));
         assert!(!glob_match("agent/*", "agent-main"));
         assert!(!glob_match("agent/*", "agent/"));
-        assert!(!glob_match("agent/*", "agent/x/y"));
-        assert!(glob_match("agent/**", "agent/x/y"));
-        assert!(!glob_match("agent/**", "agent-main/x"));
+        assert!(glob_match("agent/*", "agent/x/y"));
+        assert!(!glob_match("agent/*", "agent-main/x"));
     }
 
     #[test]
