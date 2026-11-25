@@ -3403,7 +3403,37 @@ fn gate_with_scope_resolver(
     gate_with_scope_resolver_for(args, policy, gh_hosts(), resolve_scope, real_git)
 }
 
+/// The one exit of the gate. Every approval that pins a repository (`GH_REPO`)
+/// passes [`operands_name_only`] here, whichever branch produced it: gh reads a
+/// URL operand before `GH_REPO`, so the pin alone does not bind the target.
 fn gate_with_scope_resolver_for(
+    args: &[&str],
+    policy: &GatePolicy,
+    hosts: &[String],
+    resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
+    real_git: Option<&Path>,
+) -> Result<GateApproval, Refusal> {
+    let approval = gate_decision(args, policy, hosts, resolve_scope, real_git)?;
+    if let Some(pin) = approval.repo_scope.as_deref()
+        && let Some(cmd) = parse_command(args)
+    {
+        let (host, repo) = split_member(pin);
+        let member = member_name(host, repo);
+        if !operands_name_only(args, &cmd, &member) {
+            return Err(Refusal {
+                headline: "'gh' was given a URL operand for another repository.".to_string(),
+                guidance: format!(
+                    "gh takes the repository from a URL operand before -R. \
+                     Use a number, or a URL for {member}."
+                ),
+                agent_note: &[RESTRICTED, NOTE],
+            });
+        }
+    }
+    Ok(approval)
+}
+
+fn gate_decision(
     args: &[&str],
     policy: &GatePolicy,
     hosts: &[String],
@@ -3658,17 +3688,6 @@ fn gate_with_scope_resolver_for(
             };
 
             if let Some(member) = is_repo_in_scope(&cmd, &scope, invocation_repo.as_deref()) {
-                if !operands_name_only(args, &cmd, &member) {
-                    return Err(Refusal {
-                        headline: "'gh' was given a URL operand for another repository."
-                            .to_string(),
-                        guidance: format!(
-                            "gh takes the repository from a URL operand before -R. \
-                             Use a number, or a URL for {member}."
-                        ),
-                        agent_note: &[RESTRICTED, NOTE],
-                    });
-                }
                 // The matched member, never the launch repository: pinning the
                 // launch repo with a set in play is #213, N repositories wide.
                 Ok(GateApproval {
@@ -10498,6 +10517,36 @@ mod tests {
             assert_eq!(operands_name_only(a, &cmd, &scope[0]), ok, "{a:?}");
         }
         let gated = |a: &[&str]| gate_with_repo_scope(a, &policy, &scope, None);
+        let foreign = "https://github.com/evil/repo/issues/1";
+        // issue transfer and lock are blocked outright.
+        assert!(gated(&["issue", "transfer", foreign, "good/repo", "-R", "good/repo"]).is_err());
+        assert!(gated(&["issue", "lock", foreign, "-R", "good/repo"]).is_err());
+        // A read in the allow tier is pinned too, so it gets the same check.
+        let view = [
+            "pr",
+            "view",
+            "https://github.com/evil/repo/pull/1",
+            "-R",
+            "good/repo",
+        ];
+        assert!(gated(&view).is_err_and(|r| r.headline.contains("URL operand")));
+        // Merge goes through the allow_pr_merge branch, not the plain scope check.
+        let merge = GatePolicy {
+            allow_pr_merge: true,
+            ..GatePolicy::default()
+        };
+        let a = [
+            "pr",
+            "merge",
+            "https://github.com/evil/repo/pull/1",
+            "-R",
+            "good/repo",
+            "--squash",
+        ];
+        assert!(
+            gate_with_repo_scope(&a, &merge, &scope, None)
+                .is_err_and(|r| r.headline.contains("URL operand"))
+        );
         let bad = [
             "pr",
             "comment",
