@@ -281,9 +281,11 @@ jobs:
           # locations that auto-delete on drop. Any leftover here means a test
           # wrote into the checkout and failed to clean up — fail the job so the
           # invariant is enforced (issue #112).
-          if [ -n "$(git status --porcelain)" ]; then
+          # --ignored=matching also lists gitignored fixtures (.cplt-*, .cplt-e2e-*),
+          # the most likely leak (#1192). target/ is the build dir, not a leak.
+          if [ -n "$(git status --porcelain --ignored=matching -- . ':!target')" ]; then
             echo "::error::Working tree is dirty after tests — a test leaked artifacts into the repo:"
-            git status --porcelain
+            git status --porcelain --ignored=matching -- . ':!target'
             exit 1
           fi
           echo "Working tree clean — no test artifacts leaked"
@@ -631,7 +633,7 @@ jobs:
       - name: Install bubblewrap
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap dbus
 
       - name: Enable unprivileged user namespaces
         run: |
@@ -725,7 +727,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --no-fail-fast --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          # The session-bus kernel tests (#1193) need a real bus; they panic
+          # under CPLT_TEST_REQUIRE_SANDBOX=1 without one.
+          sed "s|<listen>.*</listen>|<listen>unix:path=$HOME/cplt-ci-session-bus</listen>|" \
+            /usr/share/dbus-1/session.conf > "$RUNNER_TEMP/session.conf"
+          dbus-run-session --config-file="$RUNNER_TEMP/session.conf" -- \
+            cargo test --no-fail-fast --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       - name: Annotate failing tests
         if: failure()
@@ -757,9 +764,11 @@ jobs:
           # locations that auto-delete on drop. Any leftover here means a test
           # wrote into the checkout and failed to clean up — fail the job so the
           # invariant is enforced (issue #112).
-          if [ -n "$(git status --porcelain)" ]; then
+          # --ignored=matching also lists gitignored fixtures (.cplt-*, .cplt-e2e-*),
+          # the most likely leak (#1192). target/ is the build dir, not a leak.
+          if [ -n "$(git status --porcelain --ignored=matching -- . ':!target')" ]; then
             echo "::error::Working tree is dirty after tests — a test leaked artifacts into the repo:"
-            git status --porcelain
+            git status --porcelain --ignored=matching -- . ':!target'
             exit 1
           fi
           echo "Working tree clean — no test artifacts leaked"

@@ -1716,8 +1716,22 @@ except OSError as e:
     /// inherits neither the Landlock domain nor the seccomp filter nor the
     /// namespaces.
     fn session_bus_path() -> Option<String> {
-        let path = format!("/run/user/{}/bus", unsafe { libc::getuid() });
-        Path::new(&path).exists().then_some(path)
+        // `dbus-run-session` (CI) listens on its own path, not /run/user/UID/bus.
+        let from_env = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+            .ok()
+            .and_then(|a| {
+                a.strip_prefix("unix:path=")
+                    .map(|p| p.split(',').next().unwrap_or(p).to_owned())
+            });
+        let path =
+            from_env.unwrap_or_else(|| format!("/run/user/{}/bus", unsafe { libc::getuid() }));
+        let found = Path::new(&path).exists().then_some(path);
+        // A bus-less CI host must not turn these three tests into silent passes.
+        assert!(
+            found.is_some() || !require_sandbox_enforced(),
+            "session bus required by CPLT_TEST_REQUIRE_SANDBOX but none found"
+        );
+        found
     }
 
     #[test]
