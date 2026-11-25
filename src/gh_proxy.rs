@@ -1807,6 +1807,23 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         let mut has_input_file = false;
         let mut repo_flag = None;
         let mut api_endpoint = None;
+        // A method-override header makes GitHub treat the request as that
+        // method, so it overrides `-X`. Unknown or read values count as POST.
+        let mut override_method: Option<String> = None;
+        let mut note_header = |h: &str| {
+            let (name, value) = h.split_once(':').unwrap_or((h, ""));
+            if matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "x-http-method-override" | "x-http-method" | "x-method-override"
+            ) {
+                let v = value.trim().to_uppercase();
+                override_method = Some(if matches!(v.as_str(), "" | "GET" | "HEAD") {
+                    "POST".to_string()
+                } else {
+                    v
+                });
+            }
+        };
 
         // Long flags that consume the next argument as a value
         const API_LONG_FLAGS_WITH_VALUE: &[&str] = &[
@@ -1840,6 +1857,8 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             } else if arg.starts_with("--input=") {
                 has_input_flags = true;
                 has_input_file = true;
+            } else if let Some(val) = arg.strip_prefix("--header=") {
+                note_header(val);
             } else if !arg.starts_with("--")
                 && arg.starts_with('-')
                 && arg.len() >= 2
@@ -1866,6 +1885,11 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                     'f' | 'F' => {
                         has_input_flags = true;
                     }
+                    'H' => {
+                        if let Some(v) = val {
+                            note_header(v);
+                        }
+                    }
                     _ => {}
                 }
             } else if arg.starts_with('-') {
@@ -1891,6 +1915,12 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                             i += 1;
                         }
                     }
+                    "--header" => {
+                        if let Some(v) = args.get(i + 1) {
+                            note_header(v);
+                        }
+                        i += 1;
+                    }
                     f if API_LONG_FLAGS_WITH_VALUE.contains(&f) => {
                         i += 1; // skip value
                     }
@@ -1901,6 +1931,9 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 api_endpoint = Some(arg.to_string());
             }
             i += 1;
+        }
+        if override_method.is_some() {
+            method = override_method;
         }
 
         return Some(ParsedCommand {
@@ -2252,16 +2285,26 @@ fn is_merge_endpoint(endpoint: &str) -> bool {
     let Some(path) = decode_api_path(path) else {
         return true;
     };
+    // gh expands placeholders client-side (a branch named `merge`), so a
+    // templated path could become a merge path.
+    if path.contains(['{', '}'])
+        || [":owner", ":repo", ":branch"]
+            .iter()
+            .any(|p| path.contains(p))
+    {
+        return true;
+    }
     let segments: Vec<String> = path
         .split('/')
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
         .collect();
     let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
-    matches!(
-        segments.as_slice(),
-        ["repos", _, _, "pulls", _, "merge"] | ["repos", _, _, "merges"]
-    )
+    match segments.as_slice() {
+        ["repos", _, _, "merges", ..] => true,
+        ["repos", _, _, "pulls", _, rest @ ..] => rest.iter().any(|s| s.starts_with("merge")),
+        _ => false,
+    }
 }
 
 /// Destination host for a `gh api` command that passed [`github_api_endpoint_path`].
@@ -5619,16 +5662,22 @@ fn is_unconstrainable_push_flag(arg: &str) -> bool {
 }
 
 /// Whether a `git push` would also push submodules. The last
-/// `--[no-]recurse-submodules` wins; without one, `push.recurseSubmodules` and
-/// then `submodule.recurse` decide, as in git. Only `no` and `check` push
-/// nothing; any other value, including the bare flag (whose value git takes
+/// `--[no-]recurse-submodules` wins; without one, either `push.recurseSubmodules`
+/// or `submodule.recurse` being on counts (git lets the later one win, so the
+/// guard does not try to order them). Only `no`/`off`/`false`/`0` and `check`
+/// push nothing; any other value, including the bare flag (whose value git takes
 /// from the next token), counts as recursion.
 fn push_recurses_submodules(
     push_args: &[&str],
     real_git: Option<&Path>,
     repo_args: &[&str],
 ) -> bool {
-    let off = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "no" | "check" | "false");
+    let off = |v: &str| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "no" | "check" | "false" | "off" | "0"
+        )
+    };
     let mut flag = None;
     let mut i = 0;
     while i < push_args.len() {
@@ -5665,11 +5714,10 @@ fn push_recurses_submodules(
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    if let Some(v) = set(&["config", "--get", "push.recurseSubmodules"]) {
-        return !off(&v);
-    }
-    // `--bool` lets git normalize the valueless form and yes/on/1.
-    set(&["config", "--bool", "--get", "submodule.recurse"]).is_some_and(|v| v == "true")
+    // git lets whichever key appears later win; refuse if either is on.
+    set(&["config", "--get", "push.recurseSubmodules"]).is_some_and(|v| !off(&v))
+        // `--bool` lets git normalize the valueless form and yes/on/1.
+        || set(&["config", "--bool", "--get", "submodule.recurse"]).is_some_and(|v| v == "true")
 }
 
 /// What a `git push` writes to, as far as a branch filter can be enforced.
@@ -8919,6 +8967,13 @@ mod tests {
             "repos/o/r/pulls/1/%256derge",
             "repos/o/r/pulls/1/merge;x",
             "repos/o/r/pulls/1/../1/merge",
+            "repos/o/r/pulls/1/merge.json",
+            "repos/o/r/pulls/1/merge%20",
+            "repos/o/r/pulls/1/merges",
+            "repos/o/r/merges/x",
+            "repos/{owner}/{repo}/pulls/1/{branch}",
+            "repos/:owner/:repo/pulls/1/:branch",
+            "repos/o/r/pulls/1/{branch}",
         ] {
             for method in ["PUT", "POST"] {
                 let cmd = parse_command(&["api", "-X", method, endpoint]).unwrap();
@@ -8930,6 +8985,22 @@ mod tests {
             }
             let cmd = parse_command(&["api", endpoint, "-f", "merge_method=squash"]).unwrap();
             assert_eq!(evaluate_with_policy(&cmd, true).decision, Decision::Block);
+        }
+        // A method-override header turns a read into a write.
+        for header in [
+            &["-H", "X-HTTP-Method-Override: PUT"][..],
+            &["-HX-HTTP-Method: POST"],
+            &["--header", "x-http-method-override:put"],
+            &["--header=X-HTTP-Method-Override: PUT"],
+        ] {
+            let mut args = vec!["api", "repos/o/r/pulls/1/merge"];
+            args.extend_from_slice(header);
+            let cmd = parse_command(&args).unwrap();
+            assert_eq!(
+                evaluate_with_policy(&cmd, true).decision,
+                Decision::Block,
+                "{header:?}"
+            );
         }
         // Paths that do not canonicalize cleanly are refused for reads too.
         for endpoint in [
@@ -10890,6 +10961,34 @@ mod tests {
                 push(&d, &["--recurse-submodules=no"]).is_ok(),
                 "the flag overrides {key}"
             );
+        }
+        // Either key on refuses, in both orders: git lets the later one win.
+        for keys in [
+            [
+                ("push.recurseSubmodules", "no"),
+                ("submodule.recurse", "true"),
+            ],
+            [
+                ("submodule.recurse", "true"),
+                ("push.recurseSubmodules", "no"),
+            ],
+        ] {
+            let (_c, r) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+                .expect("git present: scratch repo must build");
+            for (k, v) in keys {
+                git_setup(&git, &r, &["config", k, v]);
+            }
+            let d = r.to_string_lossy().into_owned();
+            assert!(push(&d, &[]).is_err(), "{keys:?} must be refused");
+        }
+        for off in ["off", "0", "false"] {
+            let (_c, r) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+                .expect("git present: scratch repo must build");
+            git_setup(&git, &r, &["config", "push.recurseSubmodules", off]);
+            let d = r.to_string_lossy().into_owned();
+            assert!(push(&d, &[]).is_ok(), "push.recurseSubmodules={off} is off");
+            let flag = format!("--recurse-submodules={off}");
+            assert!(push(&dir, &[flag.as_str()]).is_ok(), "{flag} is off");
         }
     }
 
