@@ -2652,21 +2652,18 @@ fn detect_global_m2_settings(home: &Path) -> Option<GlobalDetection> {
 }
 
 fn detect_global_agent() -> Option<GlobalDetection> {
-    // Detect which agent binary is available in PATH
-    let agents = [
-        ("copilot", "copilot"),
-        ("opencode", "opencode"),
-        ("aider", "aider"),
-        ("antigravity", "antigravity"),
-        ("claude", "claude"),
-    ];
+    detect_agent_in_path(&std::env::var_os("PATH").unwrap_or_default())
+}
 
-    let mut found: Vec<&str> = Vec::new();
-    for (name, binary) in &agents {
-        if which_exists(binary) {
-            found.push(name);
-        }
-    }
+/// Candidates come from `Agent::ALL`, so init never suggests an agent the next
+/// launch rejects. Shell is not an agent. Any of an agent's binary names counts.
+fn detect_agent_in_path(path_var: &std::ffi::OsStr) -> Option<GlobalDetection> {
+    let found: Vec<&str> = crate::agent::Agent::ALL
+        .iter()
+        .filter(|a| **a != crate::agent::Agent::Shell)
+        .filter(|a| a.binary_names().iter().any(|b| which_exists(b, path_var)))
+        .map(crate::agent::Agent::binary_name)
+        .collect();
 
     // Only suggest if exactly one agent is found (clear default)
     // or if a non-copilot agent is the only one (copilot is already the default)
@@ -2681,9 +2678,8 @@ fn detect_global_agent() -> Option<GlobalDetection> {
     None
 }
 
-fn which_exists(binary: &str) -> bool {
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path_var).any(|dir| dir.join(binary).is_file())
+fn which_exists(binary: &str, path_var: &std::ffi::OsStr) -> bool {
+    std::env::split_paths(path_var).any(|dir| dir.join(binary).is_file())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -2692,6 +2688,38 @@ fn which_exists(binary: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn suggested_agent_with_only(bins: &[&str]) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        for b in bins {
+            fs::write(dir.path().join(b), "").unwrap();
+        }
+        match detect_agent_in_path(dir.path().as_os_str())?
+            .suggestions
+            .pop()?
+        {
+            GlobalSuggestion::SetAgent(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn global_agent_never_suggests_unsupported_aider() {
+        assert_eq!(suggested_agent_with_only(&["aider"]), None);
+    }
+
+    #[test]
+    fn global_agent_suggestions_parse_and_include_pi() {
+        assert_eq!(suggested_agent_with_only(&["pi"]).as_deref(), Some("pi"));
+        for a in crate::agent::Agent::ALL {
+            if *a == crate::agent::Agent::Shell || *a == crate::agent::Agent::Copilot {
+                continue;
+            }
+            let got = suggested_agent_with_only(&[a.binary_name()]).expect("suggested");
+            assert_eq!(got.parse::<crate::agent::Agent>().unwrap(), *a);
+        }
+        assert_eq!(suggested_agent_with_only(&["shell"]), None);
+    }
 
     /// Agent-planted workspace manifests and project files: no hang, no
     /// symlink read, size capped before reading.
