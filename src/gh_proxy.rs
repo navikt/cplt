@@ -370,6 +370,16 @@ fn subcommand_long_value_flags(command: &str, subcommand: Option<&str>) -> &'sta
             "--body",
             "--notes",
             "--search",
+            "--body-file",
+            "--assignee",
+            "--label",
+            "--base",
+            "--head",
+            "--milestone",
+            "--reviewer",
+            "--project",
+            "--add-label",
+            "--remove-label",
             "--subject",
             "--description",
             "--json",
@@ -429,6 +439,23 @@ fn repo_flag_values<'a>(args: &[&'a str]) -> Vec<&'a str> {
         }
     }
     out
+}
+
+/// Whether `-R`/`--repo` words, read without regard to flag arity, name more
+/// than one repository, or name one the parser did not take as the selector.
+/// Fails closed when a value-flag table is wrong or incomplete.
+fn repo_selector_ambiguous(args: &[&str], parsed: Option<&str>) -> bool {
+    if is_api(args) {
+        return false;
+    }
+    let mut seen: Vec<&str> = repo_flag_values(args);
+    if !seen.is_empty() && parsed.is_none() {
+        return true;
+    }
+    seen.extend(parsed);
+    seen.sort_unstable();
+    seen.dedup();
+    seen.len() > 1
 }
 
 /// `gh repo` subcommands whose positional operand is a repository, which gh
@@ -1961,8 +1988,11 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 continue;
             }
             a if a.starts_with('-') => {
-                // Skip flags
-                i += 1;
+                // gh (pflag) gives a value flag the next word even when it
+                // starts with `-` (`--body --repo=x` sets the body to `--repo=x`).
+                let long =
+                    subcommand_long_value_flags(&command, subcommand.as_deref().or(sub_hint));
+                i += 1 + usize::from(flag_takes_next(a, value_flags, long));
                 continue;
             }
             a => {
@@ -3279,6 +3309,19 @@ fn gate_with_scope_resolver_for(
         return Err(Refusal {
             headline: "'gh' was given --hostname more than once.".to_string(),
             guidance: "Pass a single --hostname.".to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
+    // Every word that could select a repository must agree with the one the
+    // parser picked; otherwise an arity mismatch could gate one repository
+    // while gh targets another. Nothing needs two, so refuse rather than pick.
+    if repo_selector_ambiguous(args, cmd.repo_flag.as_deref()) {
+        return Err(Refusal {
+            headline: "'gh' was given an ambiguous repository selector.".to_string(),
+            guidance: "Pass a single -R/--repo, and do not start a flag value with \
+                       '-R' or '--repo'."
+                .to_string(),
             agent_note: &[RESTRICTED, NOTE],
         });
     }
@@ -6667,14 +6710,24 @@ fn matches_allow_push_rule(
 }
 
 /// Simple glob matching for branch patterns.
-/// Supports `*` (any chars within segment) and `**` or trailing `*` for multi-segment.
+/// `prefix/*` matches one `/` segment under `prefix`; `prefix/**` matches one
+/// or more. Another trailing `*` (`copilot-*`) is a plain prefix match.
 fn glob_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern == "**" {
         return true;
     }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        // e.g. "agent/*" matches "agent/fix-123"
-        value.starts_with(prefix) && value.len() > prefix.len() + 1
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        // "agent/**" matches "agent/x" and "agent/x/y"
+        value
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|r| !r.is_empty())
+    } else if let Some(prefix) = pattern.strip_suffix("/*") {
+        // "agent/*" matches "agent/fix-123", not "agent-main" or "agent/x/y"
+        value
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|r| !r.is_empty() && !r.contains('/'))
     } else if let Some(prefix) = pattern.strip_suffix('*') {
         // e.g. "copilot-*" matches "copilot-fix-123"
         value.starts_with(prefix)
@@ -10026,6 +10079,96 @@ mod tests {
         assert!(glob_match("feature", "feature"));
         assert!(!glob_match("agent/*", "other/fix"));
         assert!(!glob_match("feature", "feature2"));
+        assert!(!glob_match("agent/*", "agent-main"));
+        assert!(!glob_match("agent/*", "agent/"));
+        assert!(!glob_match("agent/*", "agent/x/y"));
+        assert!(glob_match("agent/**", "agent/x/y"));
+        assert!(!glob_match("agent/**", "agent-main/x"));
+    }
+
+    #[test]
+    fn repo_selector_follows_gh_arity() {
+        let policy = GatePolicy::default();
+        for args in [
+            &[
+                "pr",
+                "comment",
+                "1",
+                "-R",
+                "evil/repo",
+                "--body",
+                "--repo=good/repo",
+            ][..],
+            &[
+                "issue",
+                "create",
+                "-R",
+                "evil/repo",
+                "--title",
+                "--repo=good/repo",
+                "--body",
+                "x",
+            ],
+            &[
+                "pr",
+                "comment",
+                "1",
+                "-R",
+                "evil/repo",
+                "-b",
+                "--repo=good/repo",
+            ],
+            &["pr", "comment", "1", "-R", "evil/repo", "-b", "-Rgood/repo"],
+            &[
+                "pr",
+                "comment",
+                "1",
+                "-R",
+                "evil/repo",
+                "--body",
+                "--repo",
+                "good/repo",
+            ],
+        ] {
+            let cmd = parse_command(args).unwrap();
+            assert_eq!(cmd.repo_flag.as_deref(), Some("evil/repo"), "{args:?}");
+            assert!(
+                repo_selector_ambiguous(args, cmd.repo_flag.as_deref()),
+                "{args:?}"
+            );
+            assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
+        }
+        // A boolean clustered before a value flag: `-eb` takes the next word.
+        let a = [
+            "pr",
+            "comment",
+            "1",
+            "-R",
+            "evil/repo",
+            "-eb",
+            "--repo=good/repo",
+        ];
+        assert_eq!(
+            parse_command(&a).unwrap().repo_flag.as_deref(),
+            Some("evil/repo")
+        );
+        // `--body=--repo=x` carries its own value and selects nothing.
+        let a = [
+            "pr",
+            "comment",
+            "1",
+            "-R",
+            "evil/repo",
+            "--body=--repo=good/repo",
+        ];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("evil/repo"));
+        assert!(!repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
+        // A single selector stays accepted.
+        let a = ["pr", "comment", "1", "--body", "hi", "--repo=good/repo"];
+        let cmd = parse_command(&a).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("good/repo"));
+        assert!(!repo_selector_ambiguous(&a, cmd.repo_flag.as_deref()));
     }
 
     #[test]
