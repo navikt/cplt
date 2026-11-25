@@ -186,7 +186,7 @@ jobs:
         run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py && python3 -B hack/test-probe-linux-secret-service.py && python3 -B hack/test-check-pr-body.py
 
       - name: Install Java (for JVM integration tests)
-        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # ratchet:actions/setup-java@v6.2.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # ratchet:actions/setup-java@v6.3.0
         with:
           distribution: 'temurin'
           java-version: '21'
