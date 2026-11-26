@@ -128,10 +128,7 @@ impl Credential {
         if cfg!(target_os = "macos") {
             return self.write_dirs.iter().map(|d| home.join(d)).collect();
         }
-        let config_home = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| home.join(".config"));
+        let config_home = super::xdg_dir("XDG_CONFIG_HOME", home, ".config");
         self.linux_write_dirs
             .iter()
             .map(|d| config_home.join(d))

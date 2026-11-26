@@ -327,6 +327,8 @@ pub fn sandbox_python3() -> Option<String> {
             p.is_file()
                 && Command::new(p)
                     .args(["-c", "pass"])
+                    // The xcrun stub caches under $HOME/Library/Caches (#1273).
+                    .env("HOME", scratch_home())
                     .output()
                     .is_ok_and(|o| o.status.success())
                 && in_sandbox(p)

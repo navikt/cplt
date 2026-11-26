@@ -2,7 +2,8 @@
 # Keep successful test runs small; show test failures and build diagnostics.
 log=$(mktemp) || exit 1
 trap 'rm -f "$log"' EXIT
-if CARGO_TERM_COLOR=never cargo test --quiet "$@" >"$log" 2>&1; then
+# home-guard.sh fails the run if a test wrote to the real HOME.
+if CARGO_TERM_COLOR=never sh hack/home-guard.sh cargo test --quiet "$@" >"$log" 2>&1; then
   awk '/^warning(\[[^]]+\])?:/ { show = 1 } show || /^test result:/ { print } show && /^$/ { show = 0 }' "$log"
 else
   status=$?

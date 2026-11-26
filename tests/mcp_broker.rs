@@ -143,6 +143,8 @@ for line in sys.stdin:
     // xcodebuild, which fails inside the sandbox on CI runners.
     let python = Command::new("/usr/bin/python3")
         .args(["-c", "import sys; print(sys.executable)"])
+        // The stub caches under $HOME/Library/Caches (#1273).
+        .env("HOME", common::scratch_home())
         .output()
         .expect("python3 on the host");
     let python = String::from_utf8(python.stdout).unwrap().trim().to_string();

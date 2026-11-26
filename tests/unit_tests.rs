@@ -12958,3 +12958,15 @@ fn a_deny_path_inside_a_credential_dir_grant_keeps_the_grant_and_closes_the_chil
         "child deny must follow the re-allow\n{profile}"
     );
 }
+
+/// Canary for `hack/home-guard.sh`: writes to the real HOME so the guard must
+/// fail. Off unless `CPLT_HOME_GUARD_CANARY=1`; remove the canary afterwards.
+#[test]
+fn home_guard_canary_writes_real_home() {
+    if std::env::var_os("CPLT_HOME_GUARD_CANARY").is_none() {
+        return;
+    }
+    let dir = common::real_home().join(".config/cplt");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("guard-canary"), b"").unwrap();
+}

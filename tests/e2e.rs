@@ -26,8 +26,8 @@ mod e2e_tests {
     use crate::common::{
         bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local,
         fake_agent, git_cmd, git_ok, hold_port, home_temp_dir, make_config_home,
-        processes_with_env, project_dir, real_home, sandbox_usable, scratch_home, shim_cmd,
-        signal_group, temp_repo,
+        processes_with_env, project_dir, sandbox_usable, scratch_home, shim_cmd, signal_group,
+        temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1306,17 +1306,17 @@ print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
 
     #[test]
     fn e2e_doctor_hides_the_home_directory() {
-        // Real HOME, opted in: the checkout must sit under the HOME doctor
-        // shortens to `~`. Doctor writes no launch state.
+        // A project under the scratch HOME doctor shortens to `~`; doctor's
+        // version probes must not fill the real HOME's agent caches (#1273).
+        let proj = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
         let output = cplt_cmd()
-            .env("HOME", real_home())
             .args(["--agent", "shell", "doctor"])
-            .current_dir(project_dir())
+            .current_dir(proj.path())
             .output()
             .expect("binary should run");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let home = std::env::var("HOME").expect("HOME");
+        let home = crate::common::scratch_home().display().to_string();
         // Paths under HOME print as ~/… so the output can be pasted publicly.
         // Findings may legitimately name absolute paths outside HOME.
         assert!(
@@ -1327,11 +1327,12 @@ print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
 
     #[test]
     fn e2e_doctor_verbose_prints_the_inventory() {
-        // Real HOME, opted in, for the same reason as the test above.
+        // A project under the scratch HOME doctor shortens to `~`; doctor's
+        // version probes must not fill the real HOME's agent caches (#1273).
+        let proj = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
         let output = cplt_cmd()
-            .env("HOME", real_home())
             .args(["--agent", "shell", "doctor", "--verbose"])
-            .current_dir(project_dir())
+            .current_dir(proj.path())
             .output()
             .expect("binary should run");
 
@@ -1351,7 +1352,7 @@ print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
             "Copilot-only auth lines shown for the shell.\nstdout: {stdout}"
         );
         // --verbose is what gets attached to bug reports: paste-safe too.
-        let home = std::env::var("HOME").expect("HOME");
+        let home = crate::common::scratch_home().display().to_string();
         assert!(
             !stdout.contains(&home),
             "--verbose must not print the home directory.\nstdout: {stdout}"
@@ -13770,6 +13771,7 @@ paths = [
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/opencode_stub.py");
             #[allow(clippy::disallowed_methods)] // absolute path
             let mut stub = std::process::Command::new("/usr/bin/python3")
+                .env("HOME", crate::common::scratch_home())
                 .arg("-I")
                 .arg(script)
                 .arg(&log)
