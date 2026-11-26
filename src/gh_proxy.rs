@@ -6790,10 +6790,20 @@ fn run_git_any_status(
     args: &[&str],
 ) -> Option<std::process::Output> {
     // Runs in the parent at launch too: only the helper env, no user secret.
-    // GIT_* stays: in the gate it is how a redirected repository shows up.
+    // Repository-location variables stay: in the gate they are how a
+    // redirected repository shows up. Never credentials or config.
     let mut cmd = crate::clean_env::helper_command(real_git);
-    for (key, value) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
         }
     }

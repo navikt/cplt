@@ -297,6 +297,19 @@ mod tests {
     #[test]
     fn an_empty_or_truncated_block_is_refused() {
         let full = encode(vec![(OsString::from("A"), OsString::from("b"))].into_iter());
+        let two = encode(
+            vec![
+                (OsString::from("A"), OsString::from("b")),
+                (OsString::from("C"), OsString::from("d")),
+            ]
+            .into_iter(),
+        );
+        // Cut on a pair boundary: the body still parses, only the length
+        // tells it is short.
+        let (r, mut w) = std::io::pipe().unwrap();
+        std::io::Write::write_all(&mut w, &two[..two.len() - 4]).unwrap();
+        drop(w);
+        assert!(read_env(std::os::fd::IntoRawFd::into_raw_fd(r)).is_err());
         for cut in [0, 4, full.len() - 1] {
             let (r, mut w) = std::io::pipe().unwrap();
             std::io::Write::write_all(&mut w, &full[..cut]).unwrap();
