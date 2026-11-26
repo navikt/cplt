@@ -6648,4 +6648,39 @@ PY"#;
         assert_eq!(fs::read_dir(&would_be).unwrap().count(), 1, "{ctx}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep", "{ctx}");
     }
+
+    /// `/proc/<pid>/environ` is the exec-time environment. cplt re-execs
+    /// itself with an empty one, so a value exported to it is not there.
+    #[test]
+    fn launcher_environ_holds_no_exported_value() {
+        require_landlock!();
+        let project = create_test_project();
+        let script = r#"n="canary-""7f3e"; p=$PPID
+if tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | grep -qx -- --__cplt-env-fd; then echo parent-is-cplt; fi
+if tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -q "$n"; then echo LEAK; else echo clean; fi"#;
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+            ])
+            .arg(project.path())
+            .args(["--", "-c", script])
+            .env("HOME", home_dir())
+            .env("CPLT_TEST_CANARY", "canary-7f3e")
+            .output()
+            .expect("Failed to execute cplt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let ctx = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            stdout.contains("clean") && !stdout.contains("LEAK"),
+            "{ctx}"
+        );
+        if !stdout.contains("parent-is-cplt") {
+            eprintln!("note: parent /proc entry not visible here (pid namespace): {ctx}");
+        }
+    }
 }

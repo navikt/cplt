@@ -757,6 +757,48 @@ mod e2e_tests {
         );
     }
 
+    /// The launcher's exec-time argv and environment stay readable by any
+    /// same-user process, sandboxed or not. A value exported to cplt must not
+    /// appear there: cplt re-execs itself with an empty environment first.
+    #[test]
+    fn e2e_launcher_procargs_hold_no_exported_value() {
+        require_sandbox!();
+        let home = crate::common::make_config_home("clean-env");
+        let repo = crate::common::temp_repo("navikt/probe");
+        // The needle is assembled in the script so argv never carries it.
+        let script = r#"/usr/bin/python3 -I -c '
+import ctypes, os
+mib = (ctypes.c_int * 3)(1, 49, os.getppid())
+n = ctypes.c_size_t(1 << 20)
+b = ctypes.create_string_buffer(n.value)
+assert ctypes.CDLL(None).sysctl(mib, 3, b, ctypes.byref(n), None, 0) == 0
+raw = b.raw[: n.value]
+print("parent-is-cplt" if b"--__cplt-env-fd" in raw else "parent-unknown")
+print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
+'"#;
+        let out = crate::common::cplt_local(&home, repo.path())
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--",
+                "-c",
+                script,
+            ])
+            .env("CPLT_TEST_CANARY", "canary-7f3e")
+            .output()
+            .expect("cplt should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let ctx = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("parent-is-cplt"), "{ctx}");
+        assert!(
+            stdout.contains("clean") && !stdout.contains("LEAK"),
+            "{ctx}"
+        );
+    }
+
     /// #1121: an HTTPS GitHub remote with the gh guard off and no helper gets
     /// one launch line with the command; running that command clears it. SSH
     /// gets nothing, and doctor's `push:` line says which case it is.

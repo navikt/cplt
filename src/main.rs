@@ -6408,8 +6408,10 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).as_deref() == Some(cplt::worktree_ns::HELPER_ARG.as_ref()) {
         return cplt::worktree_ns::helper_main();
     }
+    // SAFETY: no thread exists yet.
+    let args = unsafe { cplt::clean_env::launch() };
     cplt::session_summary::mark_process_start();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args);
     let result = run(cli);
     if result.is_err() {
         cplt::session_summary::setup_failed();
