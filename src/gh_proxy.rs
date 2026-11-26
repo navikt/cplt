@@ -180,12 +180,12 @@ pub fn gh_hosts() -> &'static [String] {
 }
 
 static GH_CONFIG_DIR_PIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-static GH_DATA_DIR_PIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static GH_XDG_DATA_HOME_PIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Set gh's data dir (where extensions live) as located at launch. Once per
-/// process, like [`set_gh_config_dir`].
-pub fn set_gh_data_dir(dir: &Path) {
-    let _ = GH_DATA_DIR_PIN.set(dir.to_path_buf());
+/// Set the `XDG_DATA_HOME` that puts gh's data dir (where extensions live)
+/// where it was at launch. Once per process, like [`set_gh_config_dir`].
+pub fn set_gh_xdg_data_home(dir: &Path) {
+    let _ = GH_XDG_DATA_HOME_PIN.set(dir.to_path_buf());
 }
 
 /// Set gh's config dir as located at launch. Once per process: `gh-gate` sets
@@ -200,14 +200,15 @@ pub fn set_gh_config_dir(dir: &Path) {
 /// `config.yml` gh reads aliases and `http_unix_socket` from, and the agent
 /// sets all three. An agent-written config could define aliases, or route the gate's own lookups and the token it attaches
 /// to a socket the agent listens on. `GH_CONFIG_DIR` outranks the other two.
-/// `GH_DATA_DIR` is pinned the same way: extensions run from it with the
-/// token the gate attaches.
+/// gh's data dir is pinned the same way through `XDG_DATA_HOME`, the only
+/// variable gh reads for it: extensions run from it with the token the gate
+/// attaches.
 pub fn pin_gh_config(cmd: &mut std::process::Command) {
     if let Some(dir) = GH_CONFIG_DIR_PIN.get() {
         cmd.env("GH_CONFIG_DIR", dir);
     }
-    if let Some(dir) = GH_DATA_DIR_PIN.get() {
-        cmd.env("GH_DATA_DIR", dir);
+    if let Some(dir) = GH_XDG_DATA_HOME_PIN.get() {
+        cmd.env("XDG_DATA_HOME", dir);
     }
 }
 
@@ -3408,8 +3409,8 @@ pub fn cplt_unrunnable_body(cplt: &str, feature: &str) -> String {
 /// `real_git` is the trusted Git binary used to verify an implicit target's cwd.
 /// `cplt_bin` is the path to the cplt binary (for calling `gh-gate`).
 /// `gh_config_dir` is gh's config dir as located at launch, pinned for every
-/// real `gh` the gate runs; `gh_data_dir` likewise for its data dir
-/// (extensions).
+/// real `gh` the gate runs; `gh_xdg_data_home` likewise pins its data dir
+/// (extensions) as the parent of the launch data dir.
 /// Policy flags are baked into the wrapper invocation so the gate doesn't
 /// re-read config at runtime (security: agent could edit config files).
 pub fn generate_wrapper_script(
@@ -3419,15 +3420,15 @@ pub fn generate_wrapper_script(
     cplt_bin: &str,
     policy: &crate::config::GhGuardPolicy,
     gh_config_dir: Option<&str>,
-    gh_data_dir: Option<&str>,
+    gh_xdg_data_home: Option<&str>,
 ) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
     let config_dir_flag = gh_config_dir
         .map(|dir| format!(" --gh-config-dir {}", shell_escape(dir)))
         .unwrap_or_default()
-        + &gh_data_dir
-            .map(|dir| format!(" --gh-data-dir {}", shell_escape(dir)))
+        + &gh_xdg_data_home
+            .map(|dir| format!(" --gh-xdg-data-home {}", shell_escape(dir)))
             .unwrap_or_default();
     let repo_scope_flag = repo_scope
         .iter()
@@ -8375,16 +8376,16 @@ mod tests {
     }
 
     #[test]
-    fn pin_gh_config_sets_the_launch_data_dir() {
-        set_gh_data_dir(Path::new("/launch/gh-data"));
+    fn pin_gh_config_sets_the_launch_data_home() {
+        set_gh_xdg_data_home(Path::new("/launch/share"));
         let mut cmd = std::process::Command::new("/bin/true");
-        cmd.env("GH_DATA_DIR", "/agent/gh-data");
+        cmd.env("XDG_DATA_HOME", "/agent/share");
         pin_gh_config(&mut cmd);
         let got = cmd
             .get_envs()
-            .find(|(k, _)| *k == "GH_DATA_DIR")
+            .find(|(k, _)| *k == "XDG_DATA_HOME")
             .and_then(|(_, v)| v);
-        assert_eq!(got, Some(std::ffi::OsStr::new("/launch/gh-data")));
+        assert_eq!(got, Some(std::ffi::OsStr::new("/launch/share")));
     }
 
     #[test]
@@ -8396,11 +8397,11 @@ mod tests {
             "/c",
             &crate::config::GhGuardPolicy::default(),
             Some("/Users/u/.config/gh"),
-            Some("/Users/u/.local/share/gh"),
+            Some("/Users/u/.local/share"),
         );
         assert!(script.contains(
             "--no-allow-pr-merge --gh-config-dir '/Users/u/.config/gh' \
-             --gh-data-dir '/Users/u/.local/share/gh' -- \"$@\""
+             --gh-xdg-data-home '/Users/u/.local/share' -- \"$@\""
         ));
     }
 

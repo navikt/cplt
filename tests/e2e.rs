@@ -265,12 +265,7 @@ mod e2e_tests {
     /// A relative gh dir value is refused, never skipped.
     #[test]
     fn e2e_gh_relative_dir_is_refused() {
-        for var in [
-            "GH_CONFIG_DIR",
-            "XDG_CONFIG_HOME",
-            "GH_DATA_DIR",
-            "XDG_DATA_HOME",
-        ] {
+        for var in ["GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
             let out = cplt_cmd()
                 .args(["--print-profile"])
                 .env(var, "rel/dir")

@@ -4669,6 +4669,56 @@ fn gh_gate_pins_gh_config_dir_for_real_gh() {
     );
 }
 
+/// With real gh: an allowed extension runs from the launch data dir, never
+/// from one the agent's `XDG_DATA_HOME` names. Skipped without gh in PATH.
+#[test]
+fn gh_gate_pins_gh_data_dir_for_real_gh_extensions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(gh) = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join("gh"))
+            .find(|g| g.is_file())
+    }) else {
+        eprintln!("skipped: no gh in PATH");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    for who in ["agent", "launch"] {
+        let dir = temp.path().join(who).join("gh/extensions/gh-hello");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext = dir.join("gh-hello");
+        std::fs::write(&ext, format!("#!/bin/sh\necho HELLO-{who}\n")).unwrap();
+        std::fs::set_permissions(&ext, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cfg = temp.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("hosts.yml"),
+        "github.com:\n  user: x\n  oauth_token: x\n",
+    )
+    .unwrap();
+    let out = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&gh)
+        .args(["--allow-extension", "hello", "--gh-config-dir"])
+        .arg(&cfg)
+        .arg("--gh-xdg-data-home")
+        .arg(temp.path().join("launch"))
+        .args(["--", "hello"])
+        .env("XDG_DATA_HOME", temp.path().join("agent"))
+        .current_dir(temp.path())
+        .output()
+        .expect("cplt gh-gate should run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "HELLO-launch",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The gate's own lookups (`run_gh_lookup` for a gated merge,
 /// `verify_targets` for a review-thread mutation) read the pinned config too.
 #[test]

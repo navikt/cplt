@@ -1094,9 +1094,10 @@ NOTE:
         /// reads its config from here, whatever the agent's environment says.
         #[arg(long)]
         gh_config_dir: Option<PathBuf>,
-        /// gh's data dir as located at launch; pinned the same way.
+        /// `XDG_DATA_HOME` that puts gh's data dir where it was at launch;
+        /// pinned the same way.
         #[arg(long)]
-        gh_data_dir: Option<PathBuf>,
+        gh_xdg_data_home: Option<PathBuf>,
 
         /// Block `gh pr merge` (override for --allow-pr-merge).
         #[arg(long, conflicts_with = "allow_pr_merge")]
@@ -5563,7 +5564,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 gh_host,
                 allow_extension,
                 gh_config_dir,
-                gh_data_dir,
+                gh_xdg_data_home,
                 args,
             } => {
                 if !gh_host.is_empty() {
@@ -5573,8 +5574,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 if let Some(dir) = &gh_config_dir {
                     gh_proxy::set_gh_config_dir(dir);
                 }
-                if let Some(dir) = &gh_data_dir {
-                    gh_proxy::set_gh_data_dir(dir);
+                if let Some(dir) = &gh_xdg_data_home {
+                    gh_proxy::set_gh_xdg_data_home(dir);
                 }
                 let policy = gh_proxy::GatePolicy {
                     mode: match mode.as_str() {
@@ -8699,12 +8700,7 @@ fn assemble_sandbox(
     if resolved.gh_guard.enabled {
         // A relative value resolves against whatever cwd gh runs in: refuse
         // rather than skip the check.
-        for var in [
-            "GH_CONFIG_DIR",
-            "XDG_CONFIG_HOME",
-            "GH_DATA_DIR",
-            "XDG_DATA_HOME",
-        ] {
+        for var in ["GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
             if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty())
                 && !Path::new(&v).is_absolute()
             {
@@ -8730,7 +8726,7 @@ fn assemble_sandbox(
         if let Some((dir, rule)) = cplt::check::gh_dir_writable(&policy, home_dir, &dirs) {
             bail!(
                 "gh guard: gh's config or data dir {} is writable inside the sandbox (via {}). \
-                 Point GH_CONFIG_DIR, XDG_CONFIG_HOME, GH_DATA_DIR or XDG_DATA_HOME outside the \
+                 Point GH_CONFIG_DIR, XDG_CONFIG_HOME or XDG_DATA_HOME outside the \
                  project and other writable paths, or remove the write grant.",
                 dir.display(),
                 rule.display()

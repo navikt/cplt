@@ -1136,6 +1136,7 @@ fn install_command_wrappers(
                 launch_gh_config_dir().as_deref(),
                 std::env::var_os("HOME")
                     .and_then(|h| crate::sandbox::policy::gh_data_dir(Path::new(&h)))
+                    .and_then(|d| d.parent().map(Path::to_path_buf))
                     .and_then(|d| d.to_str().map(str::to_string))
                     .as_deref(),
             )
