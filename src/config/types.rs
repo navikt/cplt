@@ -747,6 +747,9 @@ pub struct SandboxConfig {
     /// only files named exactly `.pem` (default: false, macOS only). See
     /// `SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`.
     pub deny_key_files_by_extension: Option<bool>,
+    /// Narrower macOS reads: named preference domains, per-user temp and
+    /// cache dirs, cache denies after grants (default: false, macOS only).
+    pub strict_macos_reads: Option<bool>,
     /// Keep pnpm's XDG config dir read-only and deny its token files
     /// (`auth.ini`, `rc`) (default: false). See `sandbox_policy::pnpm_config_dirs`.
     pub protect_pnpm_config: Option<bool>,
@@ -1090,6 +1093,7 @@ pub struct Resolved {
     pub refuse_cache_exec_links: bool,
     pub refuse_unenforced: bool,
     pub deny_key_files_by_extension: bool,
+    pub strict_macos_reads: bool,
     pub protect_pnpm_config: bool,
     pub refuse_invalid_repo_config: bool,
     pub skip_untrusted_opencode_config: bool,

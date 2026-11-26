@@ -150,6 +150,24 @@ the fix:
 cached, so a read-only `_npx` would break every `npx` call, MCP servers
 included.
 
+## `sandbox.strict_macos_reads` (off by default)
+
+macOS only. With this key on:
+
+- Preference reads go through only the global domain and the Security and
+  CFNetwork domains. A tool that reads another application's settings with
+  `defaults read <domain>` or `NSUserDefaults` sees the domain as not found.
+  Locale, keyboard and keychain lookups keep working.
+- `/private/var/folders` is narrowed to your own temp (`T/`) and cache (`C/`)
+  dirs. A tool that writes to the per-user state dir (`0/`) or to another
+  folder there fails with a permission error.
+- The personal-app cache denies under `~/Library/Caches` stay in force under a
+  broad grant such as `allow.read = ["~"]`. A grant that names such a cache
+  directly is refused at launch.
+
+Personal-app caches for Microsoft Edge, Brave, Slack, Arc and 1Password are
+denied by default, with or without the key, like those for Chrome and Firefox.
+
 ## Branch tracking is silently dropped
 
 `.git/config` is write-denied on macOS (it is a `core.hooksPath` and

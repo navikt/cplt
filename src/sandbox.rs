@@ -351,6 +351,11 @@ pub struct SandboxConfig<'a> {
     /// ([`SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`]), not only files named exactly `.pem`.
     /// macOS only; Linux has no name-pattern denies.
     pub deny_key_files_by_extension: bool,
+    /// `sandbox.strict_macos_reads`: named preference domains only, the
+    /// per-user temp and cache dirs instead of all of `/private/var/folders`,
+    /// and the personal-app cache denies placed after the user's grants.
+    /// macOS only.
+    pub strict_macos_reads: bool,
     /// `sandbox.protect_pnpm_config`: pnpm's XDG config dir is read-only and
     /// its token files (`auth.ini`, `rc`) are denied, on both backends.
     pub protect_pnpm_config: bool,
@@ -5441,6 +5446,12 @@ fn prepare_impl(
              tls.key or release.keystore in the project stay readable.",
         );
     }
+    if config.strict_macos_reads {
+        crate::ui::warn(
+            "sandbox.strict_macos_reads has no effect on Linux: it narrows macOS-only \
+             rules (preference domains, /private/var/folders, ~/Library/Caches).",
+        );
+    }
     if config.allow_docker {
         crate::ui::warn(
             "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
@@ -5936,6 +5947,20 @@ fn prepare_impl(
 /// Linux uses Landlock's fd-based API which is immune to path injection.
 #[cfg(target_os = "macos")]
 fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
+    // With the key on, the personal-app cache denies follow the user's
+    // grants. A grant naming such a cache would do nothing, so refuse it.
+    if config.strict_macos_reads {
+        for p in config.extra_read.iter().chain(config.extra_write) {
+            if let Some(prefix) = policy::denied_cache_prefix(config.home_dir, p) {
+                return Err(format!(
+                    "{} is a personal-app cache (~/Library/Caches/{prefix}*), which \
+                     sandbox.strict_macos_reads keeps denied. Remove the grant, or set \
+                     sandbox.strict_macos_reads = false.",
+                    p.display()
+                ));
+            }
+        }
+    }
     policy::validate_sbpl_path(config.project_dir).map_err(|e| format!("Project dir: {e}"))?;
     for root in config.named_roots {
         policy::validate_sbpl_path(root).map_err(|e| format!("Named repository: {e}"))?;
@@ -6887,6 +6912,7 @@ mod tests {
             refuse_unenforced: false,
             proxy_enabled: false,
             deny_key_files_by_extension: false,
+            strict_macos_reads: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_copilot_host_persistence: false,
@@ -8050,6 +8076,36 @@ mod tests {
             "cache dots dir missing from {pins:?}"
         );
         assert!(!pins.contains(&home.join(".cache")), "{pins:?}");
+    }
+
+    /// `sandbox.strict_macos_reads` keeps the personal-app cache denies after
+    /// the user's grants, so a grant naming one is refused, not left inert.
+    /// A broader grant (`~`, `~/Library/Caches`) and a dev cache stay fine.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_macos_reads_refuses_a_grant_on_a_personal_app_cache() {
+        let home = Path::new("/Users/test");
+        let caches = home.join("Library/Caches");
+        let bad = [caches.join("com.Brave.Browser/Default")];
+        let mut config = test_config(home, &bad);
+        assert!(
+            super::validate_config_paths(&config).is_ok(),
+            "off: accepted"
+        );
+        config.strict_macos_reads = true;
+        let err = super::validate_config_paths(&config).expect_err("must refuse");
+        assert!(err.contains("sandbox.strict_macos_reads"), "{err}");
+        for ok in [
+            home.to_path_buf(),
+            caches.clone(),
+            caches.join("go-build"),
+            caches.join("com.apple.dt.Xcode"),
+        ] {
+            let grants = [ok];
+            let mut config = test_config(home, &grants);
+            config.strict_macos_reads = true;
+            assert!(super::validate_config_paths(&config).is_ok(), "{grants:?}");
+        }
     }
 
     /// A target the profile cannot name inside a writable tree would get no

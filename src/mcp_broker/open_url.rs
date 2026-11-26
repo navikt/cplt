@@ -1190,6 +1190,7 @@ mod tests {
             refuse_unenforced: false,
             proxy_enabled: false,
             deny_key_files_by_extension: false,
+            strict_macos_reads: false,
             protect_pnpm_config: true,
             deny_copilot_dir_exec: true,
             allow_copilot_host_persistence: false,

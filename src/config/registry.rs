@@ -471,6 +471,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "strict_macos_reads",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "macOS only: optional stricter macOS read scope. Preference reads are limited to the global, Security and CFNetwork domains, so other applications' settings are not readable. /private/var/folders is narrowed to this user's temp (T) and cache (C) dirs. The personal-app cache denies under ~/Library/Caches stay in force under a broader allow.read or allow.write, and a grant naming such a cache is refused. A tool that reads another app's preference domain sees it as unset. No effect on Linux.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "deny_key_files_by_extension",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1260,6 +1268,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.refuse_unenforced,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.refuse_unenforced;
+
+    /// Config-only and off by default (staged rollout): it hides preference
+    /// domains and temp files some tools may read today.
+    strict_macos_reads, "sandbox", "strict_macos_reads",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.strict_macos_reads,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.strict_macos_reads;
 
     /// Config-only and off by default (staged rollout): it blocks key and
     /// certificate files that are readable today, such as a dev server's
