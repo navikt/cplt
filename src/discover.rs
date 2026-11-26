@@ -358,7 +358,7 @@ fn gh_auth_token_with_state(
     let state =
         state.map_err(|e| format!("cannot create a private state dir for gh ({})", e.kind()))?;
     let probe = |no_refresh: bool| {
-        let mut cmd = std::process::Command::new(gh);
+        let mut cmd = crate::clean_env::helper_command(gh);
         cmd.args(["auth", "token", "--hostname", "github.com"]);
         // gh v2.103.0 added both token auto-refresh and `--no-refresh`. A
         // refresh rewrites the keyring with a single-use refresh token, so a
@@ -588,7 +588,7 @@ const COPILOT_CACHE_VARS: &[&str] = &[
 /// agent gets the same treatment: a version string needs none of them.
 #[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
 fn probe_command(path: &Path, args: &[&str]) -> std::process::Command {
-    let mut cmd = std::process::Command::new(path);
+    let mut cmd = crate::clean_env::helper_command(path);
     cmd.args(args);
     for var in COPILOT_CACHE_VARS {
         cmd.env_remove(var);
@@ -3275,9 +3275,11 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     #[test]
     fn version_probe_drops_the_copilot_cache_variables() {
         let cmd = probe_command(Path::new("/usr/bin/copilot"), &["--version"]);
-        let removed: Vec<_> = cmd
+        // The env is cleared to the helper list, then these are removed: a
+        // removal after a clear leaves no entry, so absent or None both pass.
+        let passed: Vec<_> = cmd
             .get_envs()
-            .filter(|(_, v)| v.is_none())
+            .filter(|(_, v)| v.is_some())
             .map(|(k, _)| k.to_owned())
             .collect();
         for var in [
@@ -3286,7 +3288,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
             "COPILOT_HOME",
             "XDG_CACHE_HOME",
         ] {
-            assert!(removed.iter().any(|k| k == var), "{var} reaches the probe");
+            assert!(!passed.iter().any(|k| k == var), "{var} reaches the probe");
         }
     }
 

@@ -3744,7 +3744,7 @@ pub(crate) fn resolve_mise_shim(candidate: &Path, binary_name: &str) -> Option<P
         .iter()
         .filter_map(|tool| crate::git::trusted_binary(tool))
         .filter_map(|tool| {
-            std::process::Command::new(&tool)
+            crate::clean_env::helper_command(&tool)
                 .arg("which")
                 .arg(binary_name)
                 .current_dir(cwd)

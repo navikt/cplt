@@ -36,7 +36,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -240,7 +240,7 @@ fn curl_args(url: &str, timeout_secs: u64) -> Vec<String> {
 /// that must see the whole body first).
 #[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_fetch_inner(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("/usr/bin/curl")
+    let mut child = crate::clean_env::helper_command("/usr/bin/curl")
         .args(curl_args(url, timeout_secs))
         .env_remove("CURL_HOME")
         .stdout(Stdio::piped())

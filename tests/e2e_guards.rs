@@ -5596,3 +5596,65 @@ fn gh_gate_pins_gh_config_dir_for_gate_lookups() {
         );
     }
 }
+
+/// The gate's queries see every session `GIT_*`, as the push does. A ref
+/// store redirected through `GIT_REFERENCE_BACKEND` makes `HEAD` name the
+/// protected default branch for the push; the gate must resolve it the same.
+#[test]
+fn git_gate_refuses_a_push_whose_refs_are_redirected_by_the_environment() {
+    let launch = temp_repo_live("navikt/cplt", "feature", &["feature"]);
+    let facts = launch_facts(launch.path());
+    let other = launch.path().join("other-refs");
+    std::fs::create_dir_all(&other).unwrap();
+    assert!(git_ok(&other, &["init", "--quiet", "-b", "main"]));
+    assert!(git_ok(
+        &other,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "x"
+        ],
+    ));
+    let backend = std::path::PathBuf::from(format!("files://{}", other.join(".git").display()));
+    // Older git ignores the variable: nothing is redirected to test then.
+    let probe = common::git_cmd(launch.path())
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .env("GIT_REFERENCE_BACKEND", &backend)
+        .output()
+        .unwrap();
+    if String::from_utf8_lossy(&probe.stdout).trim() != "main" {
+        eprintln!("SKIPPED: this git does not honour GIT_REFERENCE_BACKEND");
+        return;
+    }
+    let (_, stderr, ok) = git_gate_protect_default_with_env(
+        launch.path(),
+        &facts,
+        &[("GIT_REFERENCE_BACKEND", backend.as_path())],
+        &["push", "origin", "HEAD"],
+    );
+    assert!(
+        !ok,
+        "a redirected HEAD reached the default branch: {stderr}"
+    );
+}
+
+/// `GIT_DISCOVERY_ACROSS_FILESYSTEM` reaches the gate's queries too; a push of
+/// the default branch stays refused with it set.
+#[test]
+fn git_gate_refuses_a_default_branch_push_with_discovery_across_filesystems() {
+    let launch = temp_repo_live("navikt/cplt", "main", &[]);
+    let facts = launch_facts(launch.path());
+    let (_, stderr, ok) = git_gate_protect_default_with_env(
+        launch.path(),
+        &facts,
+        &[("GIT_DISCOVERY_ACROSS_FILESYSTEM", std::path::Path::new("1"))],
+        &["push", "origin", "HEAD"],
+    );
+    assert!(!ok, "{stderr}");
+}

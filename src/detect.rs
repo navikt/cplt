@@ -1387,7 +1387,7 @@ pub fn mise_reports_missing(dir: &Path) -> bool {
         return true;
     };
     #[allow(clippy::disallowed_methods)] // absolute path from trusted_binary
-    let out = std::process::Command::new(mise)
+    let out = crate::clean_env::helper_command(mise)
         .args(["ls", "--missing"])
         .current_dir(dir)
         .stdin(std::process::Stdio::null())

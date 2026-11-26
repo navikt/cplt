@@ -6408,8 +6408,10 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).as_deref() == Some(cplt::worktree_ns::HELPER_ARG.as_ref()) {
         return cplt::worktree_ns::helper_main();
     }
+    // SAFETY: no thread exists yet.
+    let args = unsafe { cplt::clean_env::launch() };
     cplt::session_summary::mark_process_start();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args);
     let result = run(cli);
     if result.is_err() {
         cplt::session_summary::setup_failed();
@@ -6676,6 +6678,7 @@ fn run_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
+    gh_proxy::enter_gate();
     let mut pinned = None;
     let effect = match decide_gh_gate(args, policy, repo_scope, real_git, &mut |repo, lookup| {
         run_gh_lookup(real_gh, repo, lookup)
@@ -7403,6 +7406,7 @@ fn run_git_gate(
     allow_push_rules: &[config::ResolvedPushRule],
     repo_facts: &gh_proxy::RepoFacts,
 ) -> ExitCode {
+    gh_proxy::enter_gate();
     let effect = decide_git_gate(
         args,
         mode,
@@ -16268,7 +16272,10 @@ fn start_denial_stream() -> Option<std::process::Child> {
         // Absolute: a bare name is resolved from the parent's PATH at spawn
         // time, and the sandbox grants the agent write+exec on directories that
         // sit on it. /usr/bin/log is the only valid location.
-        match std::process::Command::new("/usr/bin/log")
+        let mut log = std::process::Command::new("/usr/bin/log");
+        // Lives as long as the session: no inherited secret in its env.
+        cplt::clean_env::helper_env(&mut log);
+        match log
             .args([
                 "stream",
                 "--predicate",

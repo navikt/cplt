@@ -8,6 +8,7 @@ pub mod agent;
 pub mod audit;
 pub mod brief;
 pub mod check;
+pub mod clean_env;
 pub mod config;
 pub mod detect;
 pub mod discover;

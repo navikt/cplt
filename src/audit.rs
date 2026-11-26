@@ -2185,6 +2185,7 @@ fn template_dirs() -> Vec<PathBuf> {
     };
     let ask = |args: &[&str]| -> Option<PathBuf> {
         let mut cmd = Command::new(git);
+        crate::clean_env::helper_env(&mut cmd);
         cmd.args(args).current_dir("/");
         let out = crate::git::output_bounded(cmd, GIT_TIMEOUT).ok()?;
         let s = String::from_utf8(out.stdout).ok()?;
@@ -2674,6 +2675,15 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    #[test]
+    fn template_probe_gets_only_the_helper_env() {
+        let before = crate::clean_env::helper_env_calls();
+        let _ = template_dirs();
+        if crate::git::trusted_git().is_some() {
+            assert!(crate::clean_env::helper_env_calls() > before);
+        }
+    }
+
     use super::*;
     use std::process::Command;
 

@@ -6868,4 +6868,50 @@ PY"#;
         assert_eq!(fs::read_dir(&would_be).unwrap().count(), 1, "{ctx}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep", "{ctx}");
     }
+
+    /// `/proc/<pid>/environ` is the exec-time environment. Read by the
+    /// harness, outside the sandbox, while the session runs: cplt re-execs
+    /// itself with an empty one, so a value exported to it is not there.
+    #[test]
+    fn launcher_environ_holds_no_exported_value() {
+        require_landlock!();
+        let project = create_test_project();
+        let mut child = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+            ])
+            .arg(project.path())
+            .args(["--", "-c", "echo ready; read _"])
+            .env("HOME", home_dir())
+            .env("CPLT_TEST_CANARY", "canary-7f3e")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("Failed to execute cplt");
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let pid = child.id();
+        let environ = fs::read(format!("/proc/{pid}/environ"));
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline"));
+        drop(child.stdin.take());
+        let _ = child.wait();
+        assert_eq!(line.trim(), "ready");
+        let environ = environ.expect("the harness can read the launcher's environ");
+        let cmdline = String::from_utf8_lossy(&cmdline.expect("cmdline")).into_owned();
+        assert!(
+            cmdline.contains("--__cplt-env-fd"),
+            "not the launcher: {cmdline}"
+        );
+        let environ = String::from_utf8_lossy(&environ);
+        assert!(!environ.contains("canary-7f3e"), "{environ}");
+    }
 }

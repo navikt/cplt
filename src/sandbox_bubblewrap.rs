@@ -67,7 +67,6 @@
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -462,7 +461,7 @@ pub(crate) fn test_functionality(
     args.push("--".to_string());
     args.push("/bin/true".to_string());
 
-    let output = Command::new(bwrap_path)
+    let output = crate::clean_env::helper_command(bwrap_path)
         .args(&args)
         .output()
         .map_err(|e| format!("Failed to spawn bwrap test: {e}"))?;
@@ -1768,7 +1767,7 @@ fn check_link_target(
 /// seccomp alone still refuses nested namespaces.
 #[allow(clippy::disallowed_methods)] // bwrap_path comes from git::trusted_binary("bwrap")
 fn supports_disable_userns(bwrap_path: &Path) -> bool {
-    Command::new(bwrap_path)
+    crate::clean_env::helper_command(bwrap_path)
         .arg("--help")
         .output()
         .is_ok_and(|o| help_lists_disable_userns(&String::from_utf8_lossy(&o.stdout)))

@@ -962,8 +962,9 @@ fn sandboxed(pid: i32) -> bool {
 #[cfg(target_os = "macos")]
 fn listens_on(pid: i32, port: u16) -> bool {
     #[allow(clippy::disallowed_methods)] // absolute path
-    std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-a", "-t", "-sTCP:LISTEN"])
+    let mut cmd = std::process::Command::new("/usr/sbin/lsof");
+    crate::clean_env::helper_env(&mut cmd);
+    cmd.args(["-nP", "-a", "-t", "-sTCP:LISTEN"])
         .arg(format!("-p{pid}"))
         .arg(format!("-iTCP@127.0.0.1:{port}"))
         .stdin(std::process::Stdio::null())
@@ -1022,7 +1023,7 @@ fn sqlite_count(db: &Path, table: &str) -> Option<u64> {
     }
     let sqlite = crate::git::trusted_binary("sqlite3")?;
     #[allow(clippy::disallowed_methods)] // resolved above, not a PATH lookup
-    let o = std::process::Command::new(sqlite)
+    let o = crate::clean_env::helper_command(sqlite)
         .args(["-readonly", "-batch", "-init", "/dev/null"])
         .arg(db)
         .arg(format!("SELECT count(*) FROM {table}"))
@@ -1217,6 +1218,14 @@ fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listener_probe_gets_only_the_helper_env() {
+        let before = crate::clean_env::helper_env_calls();
+        let _ = listens_on(i32::try_from(std::process::id()).unwrap(), 1);
+        assert_eq!(crate::clean_env::helper_env_calls(), before + 1);
+    }
+
     #[test]
     fn run_starts_the_session_service_first() {
         let bin = Path::new("/x/opencode");

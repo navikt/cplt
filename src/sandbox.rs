@@ -3297,11 +3297,16 @@ fn copilot_account_check(
 /// 1 s, or there are items for several accounts: cplt cannot tell which one
 /// Copilot uses, so the caller keeps the grant (#1053).
 fn copilot_keychain_acct() -> Result<Option<String>, String> {
+    copilot_keychain_acct_via(Path::new("/usr/bin/security"))
+}
+
+/// [`copilot_keychain_acct`] with the `security` binary named, so a test can
+/// stub it.
+fn copilot_keychain_acct_via(security: &Path) -> Result<Option<String>, String> {
     if !cfg!(target_os = "macos") {
         return Ok(None);
     }
-    #[allow(clippy::disallowed_methods)] // absolute system path
-    let mut cmd = std::process::Command::new("/usr/bin/security");
+    let mut cmd = crate::clean_env::helper_command(security);
     cmd.arg("dump-keychain");
     let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))
         .ok_or("`security dump-keychain` failed or did not answer within 1 s")?;
@@ -3571,7 +3576,7 @@ fn secret_tool_lookup(acct: &str) -> Option<String> {
         return None;
     };
     #[allow(clippy::disallowed_methods)] // resolved into a trusted bin root
-    let mut cmd = std::process::Command::new(bin);
+    let mut cmd = crate::clean_env::helper_command(bin);
     cmd.args(secret_tool_args(acct));
     let cap = std::time::Duration::from_secs(1);
     let start = std::time::Instant::now();
@@ -5960,6 +5965,18 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_probe_gets_only_the_helper_env() {
+        let before = crate::clean_env::helper_env_calls();
+        // A stub, never the real keychain.
+        assert_eq!(
+            copilot_keychain_acct_via(Path::new("/usr/bin/true")),
+            Ok(None)
+        );
+        assert_eq!(crate::clean_env::helper_env_calls(), before + 1);
+    }
 
     /// #1164: literal and data-only write grants count, not only subpaths.
     #[test]
