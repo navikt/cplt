@@ -6580,6 +6580,7 @@ fn run_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
+    let mut pinned = None;
     let effect = match decide_gh_gate(args, policy, repo_scope, real_git, &mut |repo, lookup| {
         run_gh_lookup(real_gh, repo, lookup)
     }) {
@@ -6590,7 +6591,10 @@ fn run_gh_gate(
                 &targets,
                 repo_scope,
             ) {
-                Ok(()) => GateEffect::ExecPlain { notice: None },
+                Ok(()) => {
+                    pinned = Some(cplt::gh_graphql::pin_host(args));
+                    GateEffect::ExecPlain { notice: None }
+                }
                 Err(reason) => {
                     refusal_effect(policy.mode, gh_proxy::graphql_target_refusal(&reason))
                 }
@@ -6598,7 +6602,7 @@ fn run_gh_gate(
         }
         effect => effect,
     };
-    perform_gate_effect(real_gh, "gh", args, effect)
+    perform_gate_effect(real_gh, "gh", pinned.as_deref().unwrap_or(args), effect)
 }
 
 /// Run the real `gh` for a read the gate needs, with `GH_REPO` pinned to `repo`

@@ -949,6 +949,15 @@ fn repo_from_lookup(json: &str, kind: NodeKind) -> Option<String> {
     (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then(|| rest.to_string())
 }
 
+/// `args` with the host pinned to github.com, so the approved mutation reaches
+/// the host [`verify_targets`] looked up. Appended last: a repeated `--hostname`
+/// takes the last value, and [`check`] has already refused any other host.
+pub fn pin_host(args: &[String]) -> Vec<String> {
+    let mut pinned = args.to_vec();
+    pinned.extend(["--hostname".to_string(), "github.com".to_string()]);
+    pinned
+}
+
 /// Look every target up with the real `gh` and require its repository to be in
 /// scope. Runs with the same environment the approved command will, minus
 /// `GH_HOST`/`GH_REPO` exactly as the exec scrubs them, so both reach the same
@@ -966,7 +975,7 @@ pub fn verify_targets(
             cmd.env("GH_TOKEN", token);
         }
         let out = cmd
-            .args(["api", "graphql", "-f"])
+            .args(["api", "graphql", "--hostname", "github.com", "-f"])
             .arg(format!("query={LOOKUP}"))
             .arg("-f")
             .arg(format!("id={}", t.id))

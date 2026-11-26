@@ -461,7 +461,14 @@ pub fn may_inject(host: &str, method: &str, target: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    !(first.starts_with("mcp") || first.contains(['%', '.']))
+    // A dot segment or `%` anywhere in the path can resolve to `/mcp` later.
+    let dotted = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .any(|seg| seg == "." || seg == ".." || seg.contains('%'));
+    !(first.starts_with("mcp") || first.contains(['%', '.']) || dotted)
 }
 
 /// The real-token form of an `Authorization` value, if it carries a known
@@ -842,6 +849,9 @@ pub(crate) mod tests {
             "//mcp",
             "/%6dcp",
             "/./mcp",
+            "/a/../mcp",
+            "/a/%2e%2e/mcp",
+            "https://api.githubcopilot.com/x/../mcp",
             "https://api.githubcopilot.com/mcp/x",
             "HTTPS://api.githubcopilot.com/mcp",
             "/mcp?next=https://x/responses",

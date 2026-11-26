@@ -2070,8 +2070,9 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         let mut override_method: Option<String> = None;
         let mut note_header = |h: &str| {
             let (name, value) = h.split_once(':').unwrap_or((h, ""));
+            // Proxies and frameworks often treat `_` as `-` in header names.
             if matches!(
-                name.trim().to_ascii_lowercase().as_str(),
+                name.trim().to_ascii_lowercase().replace('_', "-").as_str(),
                 "x-http-method-override" | "x-http-method" | "x-method-override"
             ) {
                 let v = value.trim().to_uppercase();
@@ -9297,6 +9298,8 @@ mod tests {
             &["-HX-HTTP-Method: POST"],
             &["--header", "x-http-method-override:put"],
             &["--header=X-HTTP-Method-Override: PUT"],
+            &["-H", "X_HTTP_Method_Override: PUT"],
+            &["-H", "x_method-override: DELETE"],
         ] {
             let mut args = vec!["api", "repos/o/r/pulls/1/merge"];
             args.extend_from_slice(header);
