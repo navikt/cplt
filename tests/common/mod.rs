@@ -255,6 +255,7 @@ pub fn with_real_home(cmd: &mut Command) {
 pub fn shim_cmd(shim: &Path) -> Command {
     let mut cmd = Command::new(shim);
     cmd.env_clear()
+        .env("CPLT_TEST_NO_PLACEHOLDERS", "1")
         .env("CPLT_CONFIG", NO_CONFIG)
         .env("NO_COLOR", "1");
     cmd
@@ -267,7 +268,9 @@ pub fn shim_cmd(shim: &Path) -> Command {
 /// machine might have. If that is not what you meant, use [`cplt_cmd`].
 #[must_use]
 pub fn cplt_cmd_with_ambient_config() -> Command {
-    Command::new(binary_path())
+    let mut cmd = Command::new(binary_path());
+    cmd.env("CPLT_TEST_NO_PLACEHOLDERS", "1");
+    cmd
 }
 
 /// Resolve a binary by name, preferring `/usr/bin` so the developer's PATH
@@ -341,6 +344,7 @@ pub fn sandbox_python3() -> Option<String> {
 pub fn native_cmd(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_clear()
+        .env("CPLT_TEST_NO_PLACEHOLDERS", "1")
         .env("PATH", "/usr/bin:/bin")
         .env("CPLT_CONFIG", NO_CONFIG)
         .env("NO_COLOR", "1");
