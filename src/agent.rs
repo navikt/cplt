@@ -830,18 +830,35 @@ fn opencode_custom_config_dir() -> Option<PathBuf> {
 #[must_use]
 pub fn env_config_dir_on_credentials(agent: Agent, home: &Path) -> Option<(&'static str, PathBuf)> {
     let var = |v: &str| std::env::var_os(v).filter(|s| !s.is_empty());
-    let found = match agent {
-        Agent::Claude => ("CLAUDE_CONFIG_DIR", var("CLAUDE_CONFIG_DIR")?.into()),
-        Agent::Dsh => {
-            var("DSH_HOME")?;
-            ("DSH_HOME", dsh_home(home))
-        }
-        Agent::OpenCode => ("OPENCODE_CONFIG_DIR", opencode_custom_config_dir()?),
-        _ => return None,
+    let custom = match agent {
+        Agent::Claude => var("CLAUDE_CONFIG_DIR").map(|d| ("CLAUDE_CONFIG_DIR", d.into())),
+        Agent::Dsh => var("DSH_HOME").map(|_| ("DSH_HOME", dsh_home(home))),
+        Agent::OpenCode => opencode_custom_config_dir().map(|d| ("OPENCODE_CONFIG_DIR", d)),
+        _ => None,
     };
     // `$HOME` and its ancestors are left to `first_unsafe_agent_dir`'s broader refusal.
-    (!home.starts_with(&found.1) && crate::sandbox::dir_overlaps_credentials(home, &found.1))
-        .then_some(found)
+    let bad = |p: &Path| !home.starts_with(p) && crate::sandbox::dir_overlaps_credentials(home, p);
+    if let Some(found) = custom.filter(|f| bad(&f.1)) {
+        return Some(found);
+    }
+    // An agent dir under a relocated XDG base gets the same refusal.
+    let xdg: Vec<(&'static str, PathBuf)> = [
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ]
+    .into_iter()
+    .filter_map(|v| Some((v, PathBuf::from(var(v)?))))
+    .filter(|(_, p)| p.is_absolute())
+    .collect();
+    if xdg.is_empty() {
+        return None;
+    }
+    agent.config_dirs(home).into_iter().find_map(|d| {
+        let (v, _) = xdg.iter().find(|(_, base)| d.path.starts_with(base))?;
+        bad(&d.path).then_some((*v, d.path))
+    })
 }
 
 /// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
@@ -5267,6 +5284,17 @@ mod tests {
                 });
                 assert_eq!(got.is_some(), bad, "{var}={dir}");
             }
+        }
+        // An agent dir under a relocated XDG base, such as `~/.ssh/opencode`.
+        for (base, bad) in [(".ssh", true), (".config", false)] {
+            let got = temp_env::with_vars(
+                [
+                    ("XDG_DATA_HOME", Some(home.join(base))),
+                    ("OPENCODE_CONFIG_DIR", None),
+                ],
+                || env_config_dir_on_credentials(Agent::OpenCode, &home),
+            );
+            assert_eq!(got.is_some(), bad, "XDG_DATA_HOME={base}");
         }
     }
 

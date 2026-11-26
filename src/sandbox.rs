@@ -5493,6 +5493,10 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     // interpolates it into the managed-root rules as well (#574).
     if let Some(root) = config.managed_worktree_root {
         policy::validate_sbpl_path(root).map_err(|e| format!("Managed worktree root: {e}"))?;
+        // The staging deny names the canonical base, a separate spelling.
+        if let Some(base) = root.parent().and_then(|b| std::fs::canonicalize(b).ok()) {
+            policy::validate_sbpl_path(&base).map_err(|e| format!("Managed worktree base: {e}"))?;
+        }
     }
     if let Some(socket) = config.worktree_socket {
         policy::validate_sbpl_path(socket).map_err(|e| format!("Worktree broker socket: {e}"))?;
@@ -7347,6 +7351,15 @@ mod tests {
         config.managed_worktree_root = Some(&root);
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Managed worktree root"), "{err}");
+
+        // A clean spelling whose base resolves to an unnameable directory.
+        let real = home.join("b\"q");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        std::os::unix::fs::symlink(&real, home.join("link")).expect("symlink");
+        let root = home.join("link/fp");
+        config.managed_worktree_root = Some(&root);
+        let err = super::validate_config_paths(&config).expect_err("must refuse");
+        assert!(err.contains("Managed worktree base"), "{err}");
     }
 
     /// A gh config dir SBPL cannot name launches without the gh grant instead
