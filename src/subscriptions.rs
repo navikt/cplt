@@ -211,6 +211,8 @@ pub fn curl_fetch_lazy(url: &str) -> Result<Vec<u8>, String> {
 /// is always treated as the positional URL, never parsed as a curl flag.
 fn curl_args(url: &str, timeout_secs: u64) -> Vec<String> {
     vec![
+        // -q must come first: no ~/.curlrc.
+        "-q".into(),
         "--fail".into(),
         "--silent".into(),
         "--show-error".into(),
@@ -240,6 +242,7 @@ fn curl_args(url: &str, timeout_secs: u64) -> Vec<String> {
 fn curl_fetch_inner(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
     let mut child = Command::new("/usr/bin/curl")
         .args(curl_args(url, timeout_secs))
+        .env_remove("CURL_HOME")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -972,6 +975,12 @@ mod tests {
             args.len() - 1,
             "the URL must be the final argument"
         );
+    }
+
+    #[test]
+    fn curl_args_skip_curlrc() {
+        let args = curl_args("https://example.com/list.txt", FETCH_TIMEOUT_SECS);
+        assert_eq!(args[0], "-q", "curl reads -q only as the first argument");
     }
 
     #[test]

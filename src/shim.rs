@@ -134,7 +134,8 @@ pub fn real_binary_in(path_var: &str, home: &Path, name: &str) -> Option<PathBuf
         .and_then(|p| std::fs::canonicalize(p).ok());
     path_var
         .split(':')
-        .filter(|d| !d.is_empty() && !is_shim_dir(home, Path::new(d)))
+        // Relative or empty segments resolve against the agent-writable cwd.
+        .filter(|d| Path::new(d).is_absolute() && !is_shim_dir(home, Path::new(d)))
         .map(|d| Path::new(d).join(name))
         .filter(|c| crate::git::is_executable_file(c))
         .find(|c| {
@@ -1099,6 +1100,21 @@ mod tests {
             real_binary_in(&join(&[&other, &bin]), home.path(), "copilot"),
             Some(real)
         );
+    }
+
+    #[test]
+    fn real_binary_skips_relative_path_segments() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = std::fs::canonicalize(home.path()).unwrap().join("bin");
+        exe(&bin, "copilot", "#!/bin/sh\n");
+        let depth = std::env::current_dir().unwrap().components().count();
+        let rel = format!(
+            "{}{}",
+            "../".repeat(depth),
+            bin.strip_prefix("/").unwrap().display()
+        );
+        assert!(Path::new(&rel).join("copilot").is_file());
+        assert_eq!(real_binary_in(&rel, home.path(), "copilot"), None);
     }
 
     #[test]

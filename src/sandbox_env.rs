@@ -468,9 +468,16 @@ pub fn pnpm_store_dir(
         files.push(dir.join("pnpm-workspace.yaml"));
         files.push(dir.join(".npmrc"));
     }
+    // The project and its subdirectories are agent-written: never follow a link
+    // there; a link or non-regular file counts as setting the store.
     let sets_store = |f: &PathBuf| {
+        let read = if f.starts_with(launch_dir) {
+            crate::untrusted::read_untrusted
+        } else {
+            crate::untrusted::read_regular_following
+        };
         f.symlink_metadata().is_ok()
-            && crate::untrusted::read_regular_following(f, 1024 * 1024)
+            && read(f, 1024 * 1024)
                 .ok()
                 .flatten()
                 .is_none_or(|s| s.contains("storeDir") || s.contains("store-dir"))
@@ -1112,6 +1119,25 @@ mod tests {
         // Unreadable counts as a setting.
         std::fs::create_dir(proj.join(".npmrc")).unwrap();
         assert_eq!(at(&[]), None);
+        std::fs::remove_dir(proj.join(".npmrc")).unwrap();
+        // A link in the project is not followed: it counts as a setting even
+        // when its target has none. Outside the project a link is followed.
+        let plain = h.join("plain");
+        std::fs::write(&plain, "packages: []\n").unwrap();
+        std::os::unix::fs::symlink(&plain, proj.join("web/.npmrc")).unwrap();
+        assert_eq!(at(&[]), None, "symlink in project");
+        std::fs::remove_file(proj.join("web/.npmrc")).unwrap();
+        std::os::unix::fs::symlink(&plain, h.join("src/.npmrc")).unwrap();
+        assert!(at(&[]).is_some(), "symlink above project");
+        std::fs::remove_file(h.join("src/.npmrc")).unwrap();
+        nix_mkfifo(&proj.join(".npmrc"));
+        assert_eq!(at(&[]), None, "fifo in project");
+    }
+
+    fn nix_mkfifo(p: &Path) {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     }
 
     #[test]

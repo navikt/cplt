@@ -739,7 +739,7 @@ fn add_with_budget(
         None => local_branch(ctx, reference, budget)?,
     };
     if let Some(branch) = &branch {
-        refuse_busy_branch(ctx, branch, budget)?;
+        refuse_busy_branch(&ctx.common, branch, budget)?;
     }
     let tree = protected_tree(
         run_bounded(
@@ -1130,18 +1130,30 @@ fn local_branch(
 /// no subprocess, no content-filter probe, and the rebase and bisect states
 /// the porcelain listing does not show. The files are agent-writable, so each
 /// is read without following a symlink and with a size cap.
-fn refuse_busy_branch(ctx: &Context, branch: &str, budget: &Budget<'_>) -> Result<(), String> {
+fn refuse_busy_branch(common: &Path, branch: &str, budget: &Budget<'_>) -> Result<(), String> {
     let full = format!("refs/heads/{branch}");
-    let mut admins = vec![ctx.common.clone()];
-    if let Ok(entries) = std::fs::read_dir(ctx.common.join("worktrees")) {
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let mut admins = vec![common.to_path_buf()];
+    let worktrees = common.join("worktrees");
+    // Git never links these: a linked `worktrees` or entry would read outside.
+    if real_dir(&worktrees)
+        && let Ok(entries) = std::fs::read_dir(&worktrees)
+    {
         for entry in entries.flatten() {
-            admins.push(entry.path());
+            if real_dir(&entry.path()) {
+                admins.push(entry.path());
+            }
         }
     }
     for admin in admins {
         budget.check()?;
         let read = |rel: &str| {
-            crate::untrusted::read_untrusted(&admin.join(rel), 4096)
+            let path = admin.join(rel);
+            // `rebase-merge/` and `rebase-apply/` too must be real dirs.
+            if path.parent().is_some_and(|d| d != admin && !real_dir(d)) {
+                return String::new();
+            }
+            crate::untrusted::read_untrusted(&path, 4096)
                 .ok()
                 .flatten()
                 .map(|s| s.trim().to_string())
@@ -2460,6 +2472,33 @@ mod tests {
                 assert!(protected_path(ancestor.as_bytes(), true));
             }
         }
+    }
+
+    #[test]
+    fn busy_branch_check_never_follows_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let common = temp.path().join("common");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(common.join("worktrees/real")).unwrap();
+        std::fs::create_dir_all(outside.join("rebase-merge")).unwrap();
+        std::fs::write(outside.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+        std::fs::write(outside.join("rebase-merge/head-name"), "refs/heads/y\n").unwrap();
+        let stop = AtomicBool::new(false);
+        let busy = |b: &str| refuse_busy_branch(&common, b, &Budget::new(&stop)).is_err();
+        std::os::unix::fs::symlink(&outside, common.join("worktrees/link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("rebase-merge"),
+            common.join("worktrees/real/rebase-merge"),
+        )
+        .unwrap();
+        assert!(!busy("x"), "linked entry");
+        assert!(!busy("y"), "linked rebase-merge");
+        std::fs::write(common.join("worktrees/real/HEAD"), "ref: refs/heads/z\n").unwrap();
+        assert!(busy("z"), "a real entry still counts");
+        let moved = temp.path().join("wt");
+        std::fs::rename(common.join("worktrees"), &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, common.join("worktrees")).unwrap();
+        assert!(!busy("z"), "linked worktrees dir");
     }
 
     #[test]
