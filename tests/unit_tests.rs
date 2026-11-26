@@ -881,6 +881,8 @@ fn landlock_policy_device_files_have_ioctl() {
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
+        repo_hooks_dirs: &[],
+        repo_hooks_unreadable: &[],
         git_common_dir: None,
         root_agents_md: None,
         allow_gpg_signing: false,
@@ -2851,6 +2853,8 @@ fn base_profile_options() -> SandboxConfig<'static> {
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
+        repo_hooks_dirs: &[],
+        repo_hooks_unreadable: &[],
         git_common_dir: None,
         root_agents_md: None,
         allow_gpg_signing: false,
@@ -4548,6 +4552,8 @@ fn allow_localhost_any_affects_both_backends() {
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
+        repo_hooks_dirs: &[],
+        repo_hooks_unreadable: &[],
         git_common_dir: None,
         root_agents_md: None,
         allow_gpg_signing: false,
@@ -4630,6 +4636,8 @@ fn config_options_parity_across_backends() {
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
+        repo_hooks_dirs: &[],
+        repo_hooks_unreadable: &[],
         git_common_dir: None,
         root_agents_md: None,
         allow_gpg_signing: true,
@@ -7276,6 +7284,137 @@ fn profile_allows_git_hooks_path() {
         p.contains("Global git hooks"),
         "Profile must have git hooks section comment"
     );
+}
+
+/// A repository's own `core.hooksPath` (husky's `.husky/_`) is write-denied
+/// like `.git/hooks`, and the directory above it is pinned against rename.
+#[test]
+fn profile_denies_repo_hooks_dir_and_pins_its_ancestors() {
+    let hooks = [std::path::PathBuf::from("/projects/app/.husky/_")];
+    let p = generate_profile(
+        &SandboxConfig {
+            repo_hooks_dirs: &hooks,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        p.contains("(deny file-write* (subpath \"/projects/app/.husky/_\"))"),
+        "{p}"
+    );
+    assert!(
+        p.contains("(deny file-write-unlink (literal \"/projects/app/.husky\"))"),
+        "{p}"
+    );
+    let deny = p.find("Repository hooks directories").unwrap();
+    let last_allow = p.rfind("(allow file-write*").unwrap();
+    assert!(deny > last_allow, "the deny must follow every write allow");
+}
+
+/// `discover::repo_hooks_dirs` reads the repository's value, resolves it
+/// against the worktree, and ignores the `-c core.hooksPath=/dev/null` the
+/// hardened invoker adds.
+#[test]
+fn repo_hooks_dirs_reads_local_core_hookspath() {
+    let repo = common::temp_repo("navikt/cplt-hooks-test");
+    let root = std::fs::canonicalize(repo.path()).unwrap();
+    std::fs::create_dir_all(root.join(".husky/_")).unwrap();
+    assert!(
+        git_cmd(&root)
+            .args(["config", "core.hooksPath", ".husky/_"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (dirs, problems, _) = cplt::discover::repo_hooks_dirs(std::slice::from_ref(&root));
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(dirs, vec![root.join(".husky/_")]);
+}
+
+/// A repository config git cannot read in time (a FIFO) is reported, so the
+/// launch can refuse instead of running with the hooks directory unknown.
+#[test]
+fn repo_hooks_dirs_reports_a_config_read_timeout() {
+    let repo = common::temp_repo("navikt/cplt-hooks-fifo");
+    let root = std::fs::canonicalize(repo.path()).unwrap();
+    let config = root.join(".git/config");
+    std::fs::remove_file(&config).unwrap();
+    let c = std::ffi::CString::new(config.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let (dirs, problems, _) = cplt::discover::repo_hooks_dirs(std::slice::from_ref(&root));
+    assert!(dirs.is_empty());
+    assert_eq!(problems.len(), 1, "{problems:?}");
+}
+
+fn set_hooks_path(dir: &std::path::Path, value: &str) {
+    assert!(
+        git_cmd(dir)
+            .args(["config", "core.hooksPath", value])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+/// A symlinked hooks path yields both spellings, so the link is protected too.
+#[test]
+fn repo_hooks_dirs_returns_the_configured_and_resolved_spelling() {
+    let repo = common::temp_repo("navikt/cplt-hooks-link");
+    let root = std::fs::canonicalize(repo.path()).unwrap();
+    std::fs::create_dir_all(root.join("tools/husky/_")).unwrap();
+    std::os::unix::fs::symlink("tools/husky", root.join(".husky")).unwrap();
+    set_hooks_path(&root, ".husky/_");
+    let (dirs, problems, _) = cplt::discover::repo_hooks_dirs(std::slice::from_ref(&root));
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(
+        dirs,
+        vec![root.join(".husky/_"), root.join("tools/husky/_")]
+    );
+}
+
+/// A value git would use with surrounding whitespace is refused, not trimmed.
+#[test]
+fn repo_hooks_dirs_refuses_whitespace_in_the_value() {
+    let repo = common::temp_repo("navikt/cplt-hooks-ws");
+    let root = std::fs::canonicalize(repo.path()).unwrap();
+    set_hooks_path(&root, " .husky/_");
+    let (dirs, problems, _) = cplt::discover::repo_hooks_dirs(std::slice::from_ref(&root));
+    assert!(dirs.is_empty(), "{dirs:?}");
+    assert_eq!(problems.len(), 1, "{problems:?}");
+}
+
+/// A repository below a root (a submodule, a vendored checkout) is probed for
+/// its own value.
+#[test]
+fn repo_hooks_dirs_probes_nested_repositories() {
+    let repo = common::temp_repo("navikt/cplt-hooks-nested");
+    let root = std::fs::canonicalize(repo.path()).unwrap();
+    let inner = root.join("packages/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    assert!(
+        git_cmd(&inner)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    set_hooks_path(&inner, ".githooks");
+    let (dirs, problems, _) = cplt::discover::repo_hooks_dirs(std::slice::from_ref(&root));
+    assert!(problems.is_empty(), "{problems:?}");
+    assert!(dirs.contains(&inner.join(".githooks")), "{dirs:?}");
+}
+
+/// A tree too large for the nested walk is reported, so the launch warns
+/// that a repository below the cap may not have been probed.
+#[test]
+fn repo_hooks_dirs_reports_a_truncated_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    for i in 0..20_001 {
+        std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+    }
+    let (_, _, truncated) = cplt::discover::repo_hooks_dirs(std::slice::from_ref(&root));
+    assert!(truncated);
 }
 
 #[test]
@@ -10934,6 +11073,8 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
+        repo_hooks_dirs: &[],
+        repo_hooks_unreadable: &[],
         git_common_dir: None,
         root_agents_md: None,
         allow_gpg_signing: false,

@@ -3446,6 +3446,8 @@ mod tests {
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
+            repo_hooks_dirs: &[],
+            repo_hooks_unreadable: &[],
             git_common_dir: None,
             root_agents_md: None,
             allow_gpg_signing: false,

@@ -5011,6 +5011,79 @@ finally:
         );
     }
 
+    /// A repository's `core.hooksPath` directory is bound read-only and the
+    /// directory above it pinned, like `.git/hooks`. Hooks stay readable.
+    #[test]
+    fn bwrap_repo_hooks_path_is_read_only() {
+        require_bwrap!();
+        let dir = create_deny_project();
+        let project = dir.path().canonicalize().unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::create_dir_all(project.join(".husky/_")).unwrap();
+        fs::write(project.join(".husky/_/pre-commit"), "#!/bin/sh\n").unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["config", "core.hooksPath", ".husky/_"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &["--use-bubblewrap"],
+            "sh -c '\
+                (echo pwn >> .husky/_/pre-commit) 2>/dev/null && echo WRITTEN || echo WRITE-DENIED; \
+                (touch .husky/_/post-checkout) 2>/dev/null && echo CREATED || echo CREATE-DENIED; \
+                (mv .husky h2) 2>/dev/null && echo MOVED || echo PINNED; \
+                cat .husky/_/pre-commit >/dev/null && echo READ-OK'",
+        );
+        assert!(
+            code == 0
+                && stdout.contains("WRITE-DENIED")
+                && stdout.contains("CREATE-DENIED")
+                && stdout.contains("PINNED")
+                && stdout.contains("READ-OK")
+                && fs::read_to_string(project.join(".husky/_/pre-commit")).unwrap()
+                    == "#!/bin/sh\n",
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    /// Linux cannot pin a symlink, so a `core.hooksPath` through one inside a
+    /// writable root refuses the launch.
+    #[test]
+    fn repo_hooks_path_through_a_symlink_refuses_the_launch() {
+        let dir = create_deny_project();
+        let project = dir.path().canonicalize().unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::create_dir_all(project.join("tools/husky/_")).unwrap();
+        std::os::unix::fs::symlink("tools/husky", project.join(".husky")).unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["config", "core.hooksPath", ".husky/_"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (code, stdout, stderr) = run_sandboxed(&project, "echo RAN");
+        assert!(
+            code != 0 && !stdout.contains("RAN") && stderr.contains("symlink"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
     #[test]
     fn bwrap_deny_mask_placeholder_cannot_be_softened() {
         // The placeholder lives inside the writable scratch bind (TMPDIR); a

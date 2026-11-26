@@ -201,6 +201,9 @@ mod project_tests {
         require_sandbox!();
         let home = home_temp_dir("copilot-auth");
         let project = TempProject::new("copilot-auth");
+        // Its own repository, so the launch does not resolve to the checkout
+        // and walk into other tests' fixtures there.
+        project.git_init();
         let bin = home.path().join("bin");
         let keychains = home.path().join("Library/Keychains");
         for dir in [&bin, &keychains, &home.path().join("gh")] {
@@ -2487,11 +2490,12 @@ fi
         assert_result_fail(&stdout, "bare_hook_write");
     }
 
-    /// A granted bare repository whose `config` is a planted FIFO times out
-    /// `git rev-parse --git-common-dir`, so git-free discovery must still
-    /// recognize the bare repo layout and emit persistence denies on `hooks/`.
+    /// A granted bare repository whose `config` is a planted FIFO cannot be
+    /// read in time, so its `core.hooksPath` is unknown and the launch refuses
+    /// (fail closed) with a retry hint, rather than running with the hooks
+    /// directory git would use unprotected.
     #[test]
-    fn granted_bare_repo_with_fifo_config_hooks_blocked() {
+    fn granted_bare_repo_with_fifo_config_refuses_the_launch() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
         let bare = TempProject::new("bare-fifo-config");
@@ -2525,11 +2529,10 @@ fi
             run_cplt(&project, &fake_dir, &["--allow-write", &bare_path]);
 
         assert!(
-            success,
-            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+            !success && stderr.contains("core.hooksPath") && stderr.contains("launch again"),
+            "cplt must refuse.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, &stderr, "write_control");
-        assert_result_fail(&stdout, "bare_hook_write");
+        assert!(!stdout.contains("RESULT:bare_hook_write:OK"), "{stdout}");
     }
 
     /// #214: the post-session audit runs git in `project_dir` only. A session
@@ -2845,6 +2848,73 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
         assert!(
             stderr.contains("less restricted"),
             "in terms of what the session can now do.\nstderr: {stderr}"
+        );
+    }
+
+    /// A launch creates the missing directories above the protected project
+    /// paths, so nothing can be renamed onto their names, and leaves them in
+    /// place after the session.
+    #[test]
+    fn launch_creates_protected_ancestors_and_leaves_them() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        project.write_file(".github/keep", "");
+        let root = project.canonical_path();
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--agent", "shell"])
+            .args(["--project-dir", &root.to_string_lossy()])
+            .args([
+                "--",
+                "-c",
+                "test -d .opencode && echo OPENCODE_PRESENT; \
+                 mkdir -p s/plugins; perl -e 'rename(q(s), q(.opencode)) or exit 1' \
+                 && echo RENAME_OK",
+            ])
+            .current_dir(&root)
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .env_remove("CPLT_TEST_NO_PLACEHOLDERS")
+            .output()
+            .expect("cplt should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("OPENCODE_PRESENT"), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("RENAME_OK"), "{stdout}\n{stderr}");
+        assert!(
+            root.join(".opencode").is_dir(),
+            "placeholders stay after the session"
+        );
+        assert!(root.join(".agents").is_dir());
+        assert!(!root.join(".opencode/plugins").exists());
+        assert!(root.join(".github/keep").exists());
+    }
+
+    /// A tree too large for the nested-repository walk is said at launch.
+    #[test]
+    fn a_truncated_nested_walk_warns_at_launch() {
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let root = project.canonical_path();
+        for i in 0..20_001 {
+            fs::create_dir(root.join(format!("d{i}"))).unwrap();
+        }
+        let out = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--agent",
+                "shell",
+                "--print-profile",
+            ])
+            .args(["--project-dir", &root.to_string_lossy()])
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .output()
+            .expect("cplt");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("stopped at its directory limit")
+                && stderr.contains("core.hooksPath set by a repository it did not reach"),
+            "{stderr}"
         );
     }
 

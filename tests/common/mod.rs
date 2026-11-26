@@ -145,6 +145,9 @@ pub fn scratch_home() -> &'static Path {
 /// the developer's shell. A test that sets `HOME` itself afterwards wins.
 pub fn with_scratch_home(cmd: &mut Command) {
     cmd.env("HOME", scratch_home())
+        // Placeholder dirs stay after a launch; a test launching in the
+        // checkout would leave them there. Tests about them remove this.
+        .env("CPLT_TEST_NO_PLACEHOLDERS", "1")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_STATE_HOME")
@@ -252,6 +255,7 @@ pub fn with_real_home(cmd: &mut Command) {
 pub fn shim_cmd(shim: &Path) -> Command {
     let mut cmd = Command::new(shim);
     cmd.env_clear()
+        .env("CPLT_TEST_NO_PLACEHOLDERS", "1")
         .env("CPLT_CONFIG", NO_CONFIG)
         .env("NO_COLOR", "1");
     cmd
@@ -264,7 +268,9 @@ pub fn shim_cmd(shim: &Path) -> Command {
 /// machine might have. If that is not what you meant, use [`cplt_cmd`].
 #[must_use]
 pub fn cplt_cmd_with_ambient_config() -> Command {
-    Command::new(binary_path())
+    let mut cmd = Command::new(binary_path());
+    cmd.env("CPLT_TEST_NO_PLACEHOLDERS", "1");
+    cmd
 }
 
 /// Resolve a binary by name, preferring `/usr/bin` so the developer's PATH
@@ -338,6 +344,7 @@ pub fn sandbox_python3() -> Option<String> {
 pub fn native_cmd(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_clear()
+        .env("CPLT_TEST_NO_PLACEHOLDERS", "1")
         .env("PATH", "/usr/bin:/bin")
         .env("CPLT_CONFIG", NO_CONFIG)
         .env("NO_COLOR", "1");

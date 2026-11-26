@@ -301,6 +301,11 @@ fn profile_locked(
         config.managed_worktree_root,
         config.deny_nested_git,
     );
+    emit_repo_hooks_denies(
+        &mut sb,
+        config.repo_hooks_dirs,
+        &writable_roots(&project_roots, config.extra_write),
+    );
     // Same reason, and the fix for the same bug one tree over: keeps the
     // agent's own auto-executing config unwritable even when a user
     // `allow.write` covers the whole config dir.
@@ -1616,6 +1621,35 @@ const HOME_DENY_ROOTS: &[&str] = &[
     ".nuget",
     ".konan",
 ];
+
+/// Write-deny every hooks directory a repository configures with
+/// `core.hooksPath`, as `<gitdir>/hooks` is: git runs hooks from there, outside
+/// the sandbox. Reading and executing stay allowed, so husky's `.husky/_`
+/// hooks still run for an in-sandbox `git commit`.
+///
+/// The directories between a writable root and the hooks directory are pinned
+/// against rename and rmdir for the reason `emit_gitdir_denies` pins the
+/// gitdir: `mv .husky h2`, a write under `h2/_`, and `mv h2 .husky` would
+/// otherwise never name the denied path. A hooks directory outside every
+/// writable root is denied too, at no cost: nothing there was writable.
+fn emit_repo_hooks_denies(sb: &mut String, hooks_dirs: &[PathBuf], roots: &[String]) {
+    if hooks_dirs.is_empty() {
+        return;
+    }
+    sbpl!(sb, ";; Repository hooks directories (core.hooksPath)");
+    for dir in hooks_dirs {
+        sbpl!(sb, "(deny file-write* (subpath \"{}\"))", dir.display());
+    }
+    let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
+    for anc in crate::sandbox::repo_hooks_ancestors(hooks_dirs, &roots) {
+        sbpl!(
+            sb,
+            "(deny file-write-unlink (literal \"{}\"))",
+            anc.display()
+        );
+    }
+    sbpl!(sb);
+}
 
 fn emit_git_persistence_denies(
     sb: &mut String,
@@ -5437,6 +5471,8 @@ mod tests {
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
+            repo_hooks_dirs: &[],
+            repo_hooks_unreadable: &[],
             git_common_dir: None,
             root_agents_md: None,
             allow_gpg_signing: false,
