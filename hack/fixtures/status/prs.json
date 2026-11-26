@@ -1,0 +1,163 @@
+{
+ "data": {
+  "repository": {
+   "pullRequests": {
+    "nodes": [
+     {
+      "number": 1,
+      "title": "mine",
+      "createdAt": "2026-11-20T10:00:00Z",
+      "headRefOid": "aaaaaaaa11112222",
+      "mergeStateStatus": "CLEAN",
+      "isInMergeQueue": false,
+      "autoMergeRequest": null,
+      "author": {
+       "login": "Starefossen",
+       "__typename": "User"
+      },
+      "authorAssociation": "OWNER",
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": {
+           "contexts": {
+            "nodes": [
+             {
+              "name": "ci-ok",
+              "conclusion": "SUCCESS"
+             }
+            ]
+           }
+          }
+         }
+        }
+       ]
+      },
+      "comments": {
+       "nodes": [
+        {
+         "body": "Fable review: APPROVE\n\nHead reviewed: `bbbbbbbb33334444`",
+         "createdAt": "2026-11-21T10:00:00Z",
+         "authorAssociation": "OWNER",
+         "author": {
+          "login": "Starefossen",
+          "__typename": "User"
+         }
+        },
+        {
+         "body": "Fable review: CHANGES\n\nHead reviewed: `aaaaaaaa11112222`",
+         "createdAt": "2026-11-22T10:00:00Z",
+         "authorAssociation": "NONE",
+         "author": {
+          "login": "rando",
+          "__typename": "User"
+         }
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": []
+      },
+      "reviewThreads": {
+       "nodes": [
+        {
+         "isResolved": false
+        },
+        {
+         "isResolved": true
+        }
+       ]
+      }
+     },
+     {
+      "number": 2,
+      "title": "outsider PR",
+      "createdAt": "2026-01-01T10:00:00Z",
+      "headRefOid": "cccccccc55556666",
+      "mergeStateStatus": "BLOCKED",
+      "isInMergeQueue": true,
+      "autoMergeRequest": {
+       "enabledAt": "x"
+      },
+      "author": {
+       "login": "ext",
+       "__typename": "User"
+      },
+      "authorAssociation": "NONE",
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": null
+         }
+        }
+       ]
+      },
+      "comments": {
+       "nodes": []
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "createdAt": "2099-01-01T00:00:00Z",
+         "authorAssociation": "OWNER",
+         "author": {
+          "login": "Starefossen",
+          "__typename": "User"
+         }
+        }
+       ]
+      },
+      "reviewThreads": {
+       "nodes": []
+      }
+     },
+     {
+      "number": 3,
+      "title": "bot PR",
+      "createdAt": "2026-01-01T10:00:00Z",
+      "headRefOid": "cccccccc55556666",
+      "mergeStateStatus": "BLOCKED",
+      "isInMergeQueue": true,
+      "autoMergeRequest": {
+       "enabledAt": "x"
+      },
+      "author": {
+       "login": "dependabot",
+       "__typename": "Bot"
+      },
+      "authorAssociation": "NONE",
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": null
+         }
+        }
+       ]
+      },
+      "comments": {
+       "nodes": []
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "createdAt": "2099-01-01T00:00:00Z",
+         "authorAssociation": "OWNER",
+         "author": {
+          "login": "Starefossen",
+          "__typename": "User"
+         }
+        }
+       ]
+      },
+      "reviewThreads": {
+       "nodes": []
+      }
+     }
+    ]
+   }
+  }
+ }
+}
