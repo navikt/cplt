@@ -1722,6 +1722,15 @@ pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), S
             dir.display()
         ));
     }
+    // zsh caches next to a protected rc file stay denied under any grant;
+    // an explicit grant on one would be accepted and do nothing.
+    if key == "allow.write" && policy::is_zsh_sibling_of_home(home_dir, p) {
+        return Err(format!(
+            "allow.write names {}: these are zsh caches, which cplt keeps read-only. \
+             Grant the rc file or ~/.cache instead.",
+            p.display()
+        ));
+    }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
             "{key} names {} — inside cplt's own state directory ({}). Nothing in there \
@@ -8706,6 +8715,22 @@ mod tests {
         c.named_root_git_dirs = &git;
         let err = refused(&c, &unset).unwrap_err();
         assert!(err.contains(NAMED_GIT_DIR_SOURCE), "{err}");
+    }
+
+    /// zsh caches cannot be granted: they stay denied, so a grant would be inert.
+    #[test]
+    fn write_grant_on_zsh_cache_is_refused() {
+        let h = Path::new("/h");
+        for f in [".zshrc.zwc", ".zcompdump", ".zcompdump-host-5.9"] {
+            let err = validate_grant_path("allow.write", &h.join(f), h).unwrap_err();
+            assert!(err.contains("zsh caches"), "{err}");
+        }
+        assert!(validate_grant_path("allow.read", &h.join(".zshrc.zwc"), h).is_ok());
+        assert!(validate_grant_path("allow.write", &h.join("x/.zshrc.zwc"), h).is_ok());
+        let mut config = test_config(h, &[]);
+        let grants = [h.join(".zcompdump")];
+        config.extra_write = &grants;
+        assert!(host_persistence_explicit_warnings(&config).is_empty());
     }
 
     /// #1095: a write grant on cplt's state dir or an ancestor (`~/.config`,

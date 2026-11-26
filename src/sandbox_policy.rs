@@ -382,6 +382,21 @@ pub fn is_zsh_sibling(p: &Path) -> bool {
             .is_some_and(|rc| ZSH_RC_FILES.contains(&rc))
 }
 
+/// A zsh sibling ([`is_zsh_sibling`]) in a dir that holds a zsh rc entry:
+/// `$HOME` or `$ZDOTDIR`, as spelled or canonical.
+pub fn is_zsh_sibling_of_home(home: &Path, path: &Path) -> bool {
+    let canon = |p: &Path| crate::config::canonicalize_deepest(p);
+    let dirs: Vec<PathBuf> = host_persistence_candidates(home)
+        .into_iter()
+        .filter(|(_, e)| *e == ".zshrc")
+        .filter_map(|(p, _)| p.parent().map(Path::to_path_buf))
+        .flat_map(|d| [canon(&d), d])
+        .collect();
+    [path.to_path_buf(), canon(path)]
+        .iter()
+        .any(|p| is_zsh_sibling(p) && p.parent().is_some_and(|d| dirs.iter().any(|z| z == d)))
+}
+
 /// How a write grant on `path` relates to the known persistence paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceGrant {
@@ -403,17 +418,9 @@ pub fn host_persistence_grant(home: &Path, path: &Path) -> Option<PersistenceGra
         entries.push(canon(&e));
         entries.push(e);
     }
-    let zsh_dirs: Vec<PathBuf> = entries
-        .iter()
-        .filter(|e| e.file_name().is_some_and(|n| n == ".zshrc"))
-        .filter_map(|e| e.parent().map(Path::to_path_buf))
-        .collect();
-    let sibling = |p: &PathBuf| {
-        is_zsh_sibling(p) && p.parent().is_some_and(|d| zsh_dirs.iter().any(|z| z == d))
-    };
     if paths
         .iter()
-        .any(|p| entries.iter().any(|e| p.starts_with(e)) || sibling(p))
+        .any(|p| entries.iter().any(|e| p.starts_with(e)))
     {
         return Some(PersistenceGrant::Explicit);
     }
