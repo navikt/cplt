@@ -973,13 +973,16 @@ pub fn propose_key_detail(
         "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
         "allow.write" if !propose.allow.write.is_empty() => {
             let mut d = format!("{:?}", propose.allow.write);
-            if let Some(r) = propose
+            let marks: Vec<String> = propose
                 .allow
                 .write
                 .iter()
-                .find_map(|w| crate::config::home_scope_write_reason(w))
-            {
-                d = format!("{d} ({r})");
+                .filter_map(|w| {
+                    crate::config::home_scope_write_reason(w).map(|r| format!("{w} {r}"))
+                })
+                .collect();
+            if !marks.is_empty() {
+                d = format!("{d} ({})", marks.join("; "));
             }
             Some(d)
         }
@@ -1169,6 +1172,13 @@ preset = \"full-trust\"\n",
             p.allow.write = vec!["~".to_string()];
             let d = propose_key_detail(&p, "allow.write", None).unwrap();
             assert!(d.contains("dangerous"), "{d}");
+            p.allow.write = vec!["~/.config".to_string(), "~/.local/bin".to_string()];
+            let d = propose_key_detail(&p, "allow.write", None).unwrap();
+            assert!(
+                d.contains("~/.config is dangerous: it covers")
+                    && d.contains("~/.local/bin is dangerous: it is a known"),
+                "{d}"
+            );
             p.allow.write = vec!["~/Repos/other".to_string()];
             let d = propose_key_detail(&p, "allow.write", None).unwrap();
             assert!(!d.contains("dangerous"), "{d}");

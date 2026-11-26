@@ -994,6 +994,8 @@ mod tests {
             }
             let r = security_confirmation(write, "~/Library/LaunchAgents", false).unwrap();
             assert!(r.contains("honours the grant"), "{r}");
+            let r = security_confirmation(write, "~/.zshrc.zwc", false).unwrap();
+            assert!(r.contains("honours the grant"), "{r}");
             assert!(security_confirmation(write, "~/Repos/x", false).is_none());
             assert!(security_confirmation(write, "~", true).is_none());
         });

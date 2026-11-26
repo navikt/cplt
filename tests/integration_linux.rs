@@ -3460,16 +3460,20 @@ print('BIND_OK')
 
     /// An explicit grant on a login path is honoured, with a launch warning.
     #[test]
-    fn bwrap_honours_an_explicit_grant_on_a_login_path() {
+    fn bwrap_honours_explicit_grants_on_login_paths_and_only_their_subtree() {
         require_bwrap!();
         let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
         let h = &home.path().canonicalize().unwrap();
         let project = h.join("project");
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(h.join(".config/autostart")).unwrap();
+        fs::create_dir_all(h.join(".config/fish/conf.d")).unwrap();
+        fs::write(h.join(".config/fish/config.fish"), "orig\n").unwrap();
         let script = format!(
-            "touch '{a}/x.desktop' && echo AUTOSTART_OK",
-            a = h.join(".config/autostart").display()
+            "touch '{c}/autostart/x.desktop' && echo AUTOSTART_OK; \
+             touch '{c}/fish/conf.d/a.fish' && echo CONFD_OK; \
+             echo x >> '{c}/fish/config.fish' && echo FISH_WRITTEN",
+            c = h.join(".config").display()
         );
         let mut cmd = cplt_cmd();
         crate::common::with_scratch_home(&mut cmd);
@@ -3490,6 +3494,8 @@ print('BIND_OK')
             .arg(h.join(".config"))
             .arg("--allow-write")
             .arg(h.join(".config/autostart"))
+            .arg("--allow-write")
+            .arg(h.join(".config/fish/conf.d"))
             .args(["--agent", "shell", "--", "-c", &script])
             .output()
             .expect("run cplt");
@@ -3498,6 +3504,8 @@ print('BIND_OK')
             String::from_utf8_lossy(&out.stderr),
         );
         assert!(o.contains("AUTOSTART_OK"), "stdout: {o}\nstderr: {e}");
+        assert!(o.contains("CONFD_OK"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("FISH_WRITTEN"), "stdout: {o}\nstderr: {e}");
         assert!(e.contains("known login or autostart path"), "stderr: {e}");
     }
 

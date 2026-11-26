@@ -2803,6 +2803,41 @@ int main(int argc, char **argv) {
         assert!(!output.contains("RC_WRITTEN"), "{output}");
     }
 
+    /// A grant inside an entry exempts only its subtree; an explicit rc file
+    /// grant leaves the other rc files and the zsh siblings denied.
+    #[test]
+    fn real_profile_inner_grant_exempts_only_its_subtree() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(home.join(".config/fish/conf.d")).unwrap();
+        let writes = [
+            home.clone(),
+            home.join(".config/fish/conf.d"),
+            home.join(".zshrc"),
+        ];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        let profile = write_real_profile(&opts);
+        let h = home.display();
+        let script = format!(
+            "touch '{h}/.config/fish/conf.d/a.fish' && echo CONFD_OK; \
+             touch '{h}/.config/fish/config.fish' && echo FISH_WRITTEN; \
+             touch '{h}/.zshrc' && echo ZSHRC_OK; \
+             touch '{h}/.zprofile' && echo ZPROFILE_WRITTEN; \
+             touch '{h}/.zshrc.zwc' && echo ZWC_WRITTEN"
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        for ok in ["CONFD_OK", "ZSHRC_OK"] {
+            assert!(output.contains(ok), "{ok}: {output}");
+        }
+        for leak in ["FISH_WRITTEN", "ZPROFILE_WRITTEN", "ZWC_WRITTEN"] {
+            assert!(!output.contains(leak), "{leak}: {output}");
+        }
+    }
+
     /// A directory clone must not carry a read-denied file out with it, while
     /// an ordinary file clone (APFS copy-on-write, used by build tools) works.
     #[test]

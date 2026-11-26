@@ -13040,16 +13040,22 @@ fn run_config_set_via(
     };
 
     if !unset && !force {
-        for val in &values {
-            if let Some(reason) = config::security_confirmation(op.key_info, val, false) {
-                let scope = if local { "--local " } else { "" };
-                ui::error(&format!(
-                    "{key} = {val} {reason}.\n  \
-                     Add --force to confirm: cplt config set {scope}{key} {} --force",
-                    values.join(" ")
-                ));
-                return ExitCode::FAILURE;
-            }
+        // Every value that needs confirming, each with its own reason.
+        let marks: Vec<String> = values
+            .iter()
+            .filter_map(|val| {
+                config::security_confirmation(op.key_info, val, false)
+                    .map(|reason| format!("{key} = {val} {reason}."))
+            })
+            .collect();
+        if !marks.is_empty() {
+            let scope = if local { "--local " } else { "" };
+            ui::error(&format!(
+                "{}\n  Add --force to confirm: cplt config set {scope}{key} {} --force",
+                marks.join("\n"),
+                values.join(" ")
+            ));
+            return ExitCode::FAILURE;
         }
     }
 
@@ -13301,17 +13307,21 @@ fn run_config_set_repo(
         return ExitCode::FAILURE;
     }
 
+    let marks: Vec<String> = values
+        .iter()
+        .filter_map(|v| {
+            config::home_scope_write_reason(v).map(|r| format!("allow.write = {v} {r}."))
+        })
+        .collect();
     if key_info.section == "allow"
         && key_info.key == "write"
         && !unset
         && !force
-        && let Some((val, reason)) = values
-            .iter()
-            .find_map(|v| config::home_scope_write_reason(v).map(|r| (v, r)))
+        && !marks.is_empty()
     {
         ui::error(&format!(
-            "allow.write = {val} {reason}.\n  \
-             Add --force to confirm: cplt config set --repo allow.write {} --force",
+            "{}\n  Add --force to confirm: cplt config set --repo allow.write {} --force",
+            marks.join("\n"),
             values.join(" ")
         ));
         return ExitCode::FAILURE;

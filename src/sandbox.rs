@@ -72,6 +72,7 @@ pub(crate) mod bubblewrap_probe {
                 pins: &plan.pins,
                 host_run: &plan.host_run,
                 mask_missing: &super::missing_dir_masks(config, true),
+                rebind_writable: &super::host_persistence_exempt_grants(config),
             },
             &plan.deny_masks,
             false,
@@ -917,12 +918,8 @@ fn prepare_locked(
     validate_pnpm_tool_dirs(config)?;
     // No silent grants: an explicit grant on a login or autostart path wins
     // over the built-in protection, so say so.
-    for w in host_persistence_explicit_grants(config) {
-        crate::ui::warn(&format!(
-            "allow.write {} is a known login or autostart path. It is writable as \
-             granted, and code the agent puts there runs on the host outside the sandbox.",
-            w.display()
-        ));
+    for w in host_persistence_explicit_warnings(config) {
+        crate::ui::warn(&w);
     }
     #[cfg(target_os = "linux")]
     if config.restrict_oauth_bind && !inspect_only {
@@ -2026,11 +2023,10 @@ fn host_persistence_protected(config: &SandboxConfig) -> Vec<(PathBuf, PathBuf)>
     for (named, _) in host_persistence_candidates(config.home_dir) {
         let target = crate::config::canonicalize_deepest(&named);
         let pair = [named, target];
-        // An explicit grant on either spelling opts the whole entry out.
-        if pair
-            .iter()
-            .any(|p| config.extra_write.iter().any(|w| w.starts_with(p)))
-        {
+        // A grant equal to the entry (either spelling) opts that entry out. A
+        // grant inside it exempts only its own subtree
+        // ([`host_persistence_exempt`]); the rest stays protected.
+        if pair.iter().any(|p| config.extra_write.contains(p)) {
             continue;
         }
         for p in pair {
@@ -2050,6 +2046,35 @@ fn host_persistence_protected(config: &SandboxConfig) -> Vec<(PathBuf, PathBuf)>
     out.sort();
     out.dedup();
     out
+}
+
+/// Explicit grants strictly inside a protected path, with that path: the
+/// granted subtree stays writable, the rest of the entry does not.
+pub(crate) fn host_persistence_exempt(config: &SandboxConfig) -> Vec<(PathBuf, PathBuf)> {
+    let protected = host_persistence_protect_paths(config);
+    let mut out: Vec<(PathBuf, PathBuf)> = config
+        .extra_write
+        .iter()
+        .filter_map(|w| {
+            protected
+                .iter()
+                .find(|p| w.starts_with(p) && w != *p)
+                .map(|p| (w.clone(), p.clone()))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The grants of [`host_persistence_exempt`], for bubblewrap to bind
+/// writable again on top of the entry's read-only bind.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn host_persistence_exempt_grants(config: &SandboxConfig) -> Vec<PathBuf> {
+    host_persistence_exempt(config)
+        .into_iter()
+        .map(|(w, _)| w)
+        .collect()
 }
 
 /// The directories strictly between each protected path and the grant that
@@ -2077,7 +2102,11 @@ pub(crate) fn host_persistence_pin_dirs(config: &SandboxConfig) -> Vec<PathBuf> 
 pub(crate) fn host_persistence_zsh_dirs(config: &SandboxConfig) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = host_persistence_protect_paths(config)
         .into_iter()
-        .filter(|p| p.file_name().is_some_and(|n| n == ".zshrc"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| policy::ZSH_RC_FILES.contains(&n))
+        })
         .filter_map(|p| p.parent().map(Path::to_path_buf))
         .collect();
     out.sort();
@@ -2085,14 +2114,30 @@ pub(crate) fn host_persistence_zsh_dirs(config: &SandboxConfig) -> Vec<PathBuf> 
     out
 }
 
-/// Explicit `allow.write` grants equal to or inside a known persistence path.
-/// Honoured as written on both backends; the launch names each one.
-pub(crate) fn host_persistence_explicit_grants(config: &SandboxConfig) -> Vec<PathBuf> {
+/// Launch warnings for explicit `allow.write` grants on known persistence
+/// paths: what is exempt from the built-in protection, exactly.
+pub(crate) fn host_persistence_explicit_warnings(config: &SandboxConfig) -> Vec<String> {
+    let exempt = host_persistence_exempt(config);
     config
         .extra_write
         .iter()
         .filter(|w| host_persistence_grant(config.home_dir, w) == Some(PersistenceGrant::Explicit))
-        .cloned()
+        .map(|w| match exempt.iter().find(|(g, _)| g == w) {
+            Some((_, entry)) => format!(
+                "allow.write {} is inside the known login or autostart path {}. {} is \
+                 writable as granted, and code the agent puts there runs on the host outside \
+                 the sandbox; the rest of {} stays read-only.",
+                w.display(),
+                entry.display(),
+                w.display(),
+                entry.display()
+            ),
+            None => format!(
+                "allow.write {} is a known login or autostart path. It is writable as \
+                 granted, and code the agent puts there runs on the host outside the sandbox.",
+                w.display()
+            ),
+        })
         .collect()
 }
 
@@ -3842,6 +3887,7 @@ fn mcp_wrapper(
                 pins: &plan.pins,
                 host_run: &plan.host_run,
                 mask_missing: &missing_dir_masks(config, true),
+                rebind_writable: &host_persistence_exempt_grants(config),
             },
             &plan.deny_masks,
             false,
@@ -4482,16 +4528,8 @@ fn agent_and_tool_ro_paths(config: &SandboxConfig, ro_protect: &mut Vec<PathBuf>
     }
 }
 
-/// A zsh compiled rc file or completion dump.
 #[cfg(any(target_os = "linux", test))]
-fn is_zsh_sibling(p: &Path) -> bool {
-    let Some(n) = p.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    n.starts_with(".zcompdump")
-        || n.strip_suffix(".zwc")
-            .is_some_and(|rc| policy::ZSH_RC_FILES.contains(&rc))
-}
+use policy::is_zsh_sibling;
 
 /// Launch warnings for the credential entries a symlink moves into a grant
 /// and no mount mask covers (#551): which entry, where it resolves, which
@@ -5324,6 +5362,7 @@ fn prepare_impl(
             pins: &pins,
             host_run: &host_run,
             mask_missing: &mask_missing,
+            rebind_writable: &host_persistence_exempt_grants(config),
         },
         &deny_masks,
     )?;
@@ -5426,6 +5465,7 @@ fn prepare_impl(
                 pins: &pins,
                 host_run: &host_run,
                 mask_missing: &mask_missing,
+                rebind_writable: &host_persistence_exempt_grants(config),
             };
             let rebuilt =
                 bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
@@ -6481,10 +6521,9 @@ mod tests {
             "{paths:?}"
         );
         assert!(paths.contains(&PathBuf::from("/h/.zshrc")), "{paths:?}");
-        assert_eq!(
-            host_persistence_explicit_grants(&config),
-            [PathBuf::from("/h/.local/bin")]
-        );
+        let w = host_persistence_explicit_warnings(&config);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("/h/.local/bin is a known"), "{w:?}");
         let profile = generate_profile(&config, &[]);
         assert!(
             !profile.contains("(subpath \"/h/.local/bin\"))\n(deny"),
@@ -6510,6 +6549,41 @@ mod tests {
             "{profile}"
         );
         assert!(profile.contains("zcompdump"), "{profile}");
+    }
+
+    #[test]
+    fn host_persistence_inner_grant_exempts_only_its_subtree() {
+        let home = Path::new("/h");
+        let mut config = test_config(home, &[]);
+        let grants = [PathBuf::from("/h"), PathBuf::from("/h/.config/fish/conf.d")];
+        config.extra_write = &grants;
+        assert!(
+            host_persistence_protect_paths(&config).contains(&PathBuf::from("/h/.config/fish"))
+        );
+        assert_eq!(
+            host_persistence_exempt_grants(&config),
+            [PathBuf::from("/h/.config/fish/conf.d")]
+        );
+        let profile = generate_profile(&config, &[]);
+        assert!(
+            profile.contains(
+                "(deny file-write* (require-all (subpath \"/h/.config/fish\") (require-not (subpath \"/h/.config/fish/conf.d\"))))"
+            ),
+            "{profile}"
+        );
+        let w = host_persistence_explicit_warnings(&config);
+        assert!(
+            w[0].contains("the rest of /h/.config/fish stays read-only"),
+            "{w:?}"
+        );
+
+        // An explicit ~/.zshrc keeps the other rc files and the siblings denied.
+        let grants = [PathBuf::from("/h"), PathBuf::from("/h/.zshrc")];
+        config.extra_write = &grants;
+        let paths = host_persistence_protect_paths(&config);
+        assert!(!paths.contains(&PathBuf::from("/h/.zshrc")), "{paths:?}");
+        assert!(paths.contains(&PathBuf::from("/h/.zprofile")), "{paths:?}");
+        assert_eq!(host_persistence_zsh_dirs(&config), [PathBuf::from("/h")]);
     }
 
     #[test]

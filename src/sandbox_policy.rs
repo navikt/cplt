@@ -372,6 +372,16 @@ pub fn host_persistence_candidates(home: &Path) -> Vec<(PathBuf, &'static str)> 
     out
 }
 
+/// A zsh compiled rc file (`.zshrc.zwc`) or completion dump (`.zcompdump*`).
+pub fn is_zsh_sibling(p: &Path) -> bool {
+    let Some(n) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    n.starts_with(".zcompdump")
+        || n.strip_suffix(".zwc")
+            .is_some_and(|rc| ZSH_RC_FILES.contains(&rc))
+}
+
 /// How a write grant on `path` relates to the known persistence paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceGrant {
@@ -393,9 +403,17 @@ pub fn host_persistence_grant(home: &Path, path: &Path) -> Option<PersistenceGra
         entries.push(canon(&e));
         entries.push(e);
     }
+    let zsh_dirs: Vec<PathBuf> = entries
+        .iter()
+        .filter(|e| e.file_name().is_some_and(|n| n == ".zshrc"))
+        .filter_map(|e| e.parent().map(Path::to_path_buf))
+        .collect();
+    let sibling = |p: &PathBuf| {
+        is_zsh_sibling(p) && p.parent().is_some_and(|d| zsh_dirs.iter().any(|z| z == d))
+    };
     if paths
         .iter()
-        .any(|p| entries.iter().any(|e| p.starts_with(e)))
+        .any(|p| entries.iter().any(|e| p.starts_with(e)) || sibling(p))
     {
         return Some(PersistenceGrant::Explicit);
     }

@@ -2978,9 +2978,25 @@ fn emit_host_login_write_denies(sb: &mut String, config: &SandboxConfig) {
         sb,
         ";; Host login and autostart files stay read-only under allow.write"
     );
+    let exempt = super::host_persistence_exempt(config);
     for p in paths {
+        // An explicit grant inside the entry keeps its own subtree writable.
+        let keep: Vec<String> = exempt
+            .iter()
+            .filter(|(_, e)| *e == p)
+            .filter(|(g, _)| validate_sbpl_path(g).is_ok())
+            .map(|(g, _)| format!(" (require-not (subpath \"{}\"))", g.display()))
+            .collect();
         let p = p.display();
-        sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+        if keep.is_empty() {
+            sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+        } else {
+            let keep = keep.concat();
+            sbpl!(
+                sb,
+                "(deny file-write* (require-all (subpath \"{p}\"){keep}))"
+            );
+        }
     }
     for dir in super::host_persistence_zsh_dirs(config) {
         let d = escape_regex(&dir.to_string_lossy());
