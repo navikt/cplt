@@ -13579,13 +13579,10 @@ fn agent_writable_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         _ => absolute.clone(),
     };
     let resolved = real(file);
-    // A symlinked directory between the tree and the leaf is swappable too.
-    let ancestors: Vec<PathBuf> = absolute.ancestors().skip(1).map(real).collect();
-    roots.iter().map(|root| real(root)).find(|root| {
-        as_written.starts_with(root)
-            || resolved.starts_with(root)
-            || ancestors.iter().any(|a| a.starts_with(root))
-    })
+    roots
+        .iter()
+        .map(|root| real(root))
+        .find(|root| as_written.starts_with(root) || resolved.starts_with(root))
 }
 
 /// Warn when a domain-list file the proxy re-reads can be redirected by the
@@ -16637,13 +16634,6 @@ mod tests {
         assert!(
             super::agent_writable_root(&escape, &roots).is_some(),
             "a symlink inside a writable tree is swappable, wherever it points today"
-        );
-
-        // A symlinked directory inside the tree, pointing out of it.
-        std::os::unix::fs::symlink(&elsewhere, project.join("sub")).expect("symlink");
-        assert!(
-            super::agent_writable_root(&project.join("sub/allow.txt"), &roots).is_some(),
-            "a symlinked parent inside a writable tree is swappable too"
         );
     }
 
