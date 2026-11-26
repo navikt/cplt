@@ -4884,22 +4884,28 @@ fn push_deletion_refused<'a>(
     })
 }
 
-/// Whether `remote` has `refs/heads/<name>` and no `refs/tags/<name>`.
+/// Whether every URL a push to `remote` writes to has `refs/heads/<name>` and
+/// no `refs/tags/<name>`. Probes the push URLs (`pushurl`, `pushInsteadOf`
+/// applied), not the fetch URL. No resolvable push URL means no.
 /// `ls-remote` patterns match on a path tail, so the refs are compared whole.
 fn remote_has_only_branch(real_git: &Path, repo_args: &[&str], remote: &str, name: &str) -> bool {
-    let Some(out) = run_git(
-        real_git,
-        repo_args,
-        &["ls-remote", "--heads", "--tags", "--", remote, name],
-    ) else {
-        return false;
-    };
-    let refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split('\t').nth(1).map(ToString::to_string))
-        .collect();
-    refs.iter().any(|r| *r == format!("refs/heads/{name}"))
-        && !refs.iter().any(|r| *r == format!("refs/tags/{name}"))
+    let urls = push_urls(real_git, repo_args, remote);
+    !urls.is_empty()
+        && urls.iter().all(|url| {
+            let Some(out) = run_git(
+                real_git,
+                repo_args,
+                &["ls-remote", "--heads", "--tags", "--", url, name],
+            ) else {
+                return false;
+            };
+            let refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split('\t').nth(1).map(ToString::to_string))
+                .collect();
+            refs.iter().any(|r| *r == format!("refs/heads/{name}"))
+                && !refs.iter().any(|r| *r == format!("refs/tags/{name}"))
+        })
 }
 
 /// Config key prefixes that can redirect where a push lands (`remote.*`, `url.*`,
@@ -5531,9 +5537,18 @@ pub fn gate_git(
 
     // A deletion is not a force push, but it has to be provably an ordinary
     // branch: see `push_deletion_refused`.
-    if sub == "push" && !push_deleted_refs(sub_args).is_empty() {
+    // Skipped when every push is refused below anyway. A namespace
+    // (`--namespace`, GIT_NAMESPACE) moves the remote refs out of what the probe
+    // sees, so a deletion under one is refused.
+    let push_refused_anyway =
+        prevent_push && !protect_default_branch_only && allow_push_rules.is_empty();
+    if sub == "push" && !push_refused_anyway && !push_deleted_refs(sub_args).is_empty() {
         let remote = push_dest_remote(sub_args, real_git, &repo_args);
-        let default_branch = repo_facts.default_branch(&remote, &repo_args, real_git);
+        let namespaced = args[..i].iter().any(|a| a.starts_with("--namespace"))
+            || std::env::var_os("GIT_NAMESPACE").is_some();
+        let default_branch = repo_facts
+            .default_branch(&remote, &repo_args, real_git)
+            .filter(|_| !namespaced);
         if let Some(name) = push_deletion_refused(sub_args, default_branch, |b| {
             real_git.is_some_and(|git| remote_has_only_branch(git, &repo_args, &remote, b))
         }) {

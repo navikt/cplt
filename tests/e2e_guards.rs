@@ -3098,6 +3098,114 @@ fn real_push_bare_name_deletion_refused_when_it_names_a_tag() {
 }
 
 #[test]
+fn real_push_bare_name_deletion_needs_branch_and_no_tag() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    // `both` is a branch AND a tag; `tag`/`notes/commits` are not branches.
+    assert!(git_ok(&work, &["tag", "v0"]));
+    assert!(git_ok(&work, &["tag", "both"]));
+    assert!(git_ok(&work, &["notes", "add", "-m", "n"]));
+    assert!(git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "v0",
+            "both",
+            "feat:refs/heads/both",
+            "refs/notes/commits"
+        ]
+    ));
+    for args in [
+        &["push", "origin", "--delete", "tag", "v0"][..],
+        &["push", "origin", "--delete", "notes/commits"],
+        &["push", "origin", "--delete", "both"],
+        &["push", "origin", ":both"],
+    ] {
+        let (stderr, ok) = real_push_gate(&work, &facts, FORCE_ONLY, &[], args);
+        assert_refused(&stderr, ok, "not allowed");
+        for r in [
+            "refs/tags/v0",
+            "refs/tags/both",
+            "refs/heads/both",
+            "refs/notes/commits",
+        ] {
+            assert!(remote_ref(&origin, r).is_some(), "{args:?}: {r}");
+        }
+    }
+}
+
+#[test]
+fn real_push_deletion_probe_uses_the_push_url() {
+    let (_t, work, fetch) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let push = fetch.with_file_name("push.git");
+    assert!(git_ok(
+        &work,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            fetch.to_str().unwrap(),
+            push.to_str().unwrap()
+        ]
+    ));
+    assert!(git_ok(
+        &work,
+        &["config", "remote.origin.pushurl", push.to_str().unwrap()]
+    ));
+    // Fetch URL has branch `x`, push URL has tag `x`: refused, tag stays.
+    assert!(git_ok(&fetch, &["branch", "x", "main"]));
+    assert!(git_ok(&push, &["tag", "x", "main"]));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "origin", "--delete", "x"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert!(remote_ref(&push, "refs/tags/x").is_some());
+    // Fetch URL has tag `y`, push URL has branch `y`: allowed, branch deleted.
+    assert!(git_ok(&fetch, &["tag", "y", "main"]));
+    assert!(git_ok(&push, &["branch", "y", "main"]));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "-q", "origin", "--delete", "y"],
+    );
+    assert!(ok, "{stderr}");
+    assert_eq!(remote_ref(&push, "refs/heads/y"), None);
+}
+
+#[test]
+fn real_push_deletion_refused_under_a_namespace() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["--namespace=n", "push", "origin", ":refs/heads/victim"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[("GIT_NAMESPACE", "n")],
+        &["push", "origin", ":refs/heads/victim"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert!(remote_ref(&origin, "refs/heads/victim").is_some());
+}
+
+#[test]
 fn real_push_deletion_refused_when_default_branch_unknown() {
     let (_t, work, origin) = pushed_repo("main");
     let facts = launch_facts(&work);
