@@ -765,7 +765,8 @@ pub(super) fn resolve_allow_path(
     config_dir: Option<&PathBuf>,
 ) -> Result<PathBuf, ConfigError> {
     let resolved = resolve_config_path(path, config_dir)?;
-    let spelled = std::path::absolute(anchored(path, config_dir)).unwrap_or_default();
+    let spelled = std::path::absolute(anchored(path, config_dir))
+        .map_err(|e| ConfigError::Validation(format!("Cannot resolve {path}: {e}")))?;
     if nofollow_names_symlink(&spelled) {
         return Err(ConfigError::Validation(NOFOLLOW_LINK_MESSAGE.into()));
     }

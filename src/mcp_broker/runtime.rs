@@ -877,6 +877,12 @@ fn child_temp_base(home: &Path) -> std::io::Result<PathBuf> {
         .recursive(true)
         .mode(0o700)
         .create(&state)?;
+    if std::fs::symlink_metadata(&state)?.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "{} is a symlink; cplt keeps its state in a real directory",
+            state.display()
+        )));
+    }
     // Canonical: Seatbelt matches resolved paths (a symlinked HOME).
     let base = state.canonicalize()?.join("mcp-tmp");
     match std::fs::DirBuilder::new().mode(0o700).create(&base) {
@@ -2679,6 +2685,18 @@ mod tests {
         let link = home.path().join("link");
         std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
         assert!(check_private_dir(&link).is_err());
+        // A symlinked state dir is refused before anything is created through it.
+        let home2 = tempfile::tempdir().unwrap();
+        let config = home2.path().join(".config");
+        std::fs::create_dir(&config).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            target.path(),
+            home2.path().join(crate::sandbox::CPLT_STATE_DIR),
+        )
+        .unwrap();
+        assert!(child_temp_dir(home2.path()).is_err(), "symlinked state dir");
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
     }
 
     #[cfg(target_os = "macos")]

@@ -1661,6 +1661,23 @@ fn validate_repo_dirs(
             );
         }
 
+        // The same holds for a symlinked directory on the way, when it sits
+        // inside the project: the agent can repoint it between sessions.
+        if let Some(link) = absolute.ancestors().skip(1).find(|a| {
+            a.symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+                && a.parent()
+                    .and_then(|p| std::fs::canonicalize(p).ok())
+                    .is_some_and(|p| p.starts_with(project_dir))
+        }) {
+            bail!(
+                "{named_as} passes through a symlink inside the project directory,\n  {}\n  \
+                 which is agent-writable, so the repository it names could be changed \
+                 between sessions. Name the real path.",
+                link.display()
+            );
+        }
+
         if dir == project_dir {
             bail!("{named_as} is the launch repository itself, which is always in scope.");
         }
@@ -13562,10 +13579,13 @@ fn agent_writable_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         _ => absolute.clone(),
     };
     let resolved = real(file);
-    roots
-        .iter()
-        .map(|root| real(root))
-        .find(|root| as_written.starts_with(root) || resolved.starts_with(root))
+    // A symlinked directory between the tree and the leaf is swappable too.
+    let ancestors: Vec<PathBuf> = absolute.ancestors().skip(1).map(real).collect();
+    roots.iter().map(|root| real(root)).find(|root| {
+        as_written.starts_with(root)
+            || resolved.starts_with(root)
+            || ancestors.iter().any(|a| a.starts_with(root))
+    })
 }
 
 /// Warn when a domain-list file the proxy re-reads can be redirected by the
@@ -16617,6 +16637,13 @@ mod tests {
         assert!(
             super::agent_writable_root(&escape, &roots).is_some(),
             "a symlink inside a writable tree is swappable, wherever it points today"
+        );
+
+        // A symlinked directory inside the tree, pointing out of it.
+        std::os::unix::fs::symlink(&elsewhere, project.join("sub")).expect("symlink");
+        assert!(
+            super::agent_writable_root(&project.join("sub/allow.txt"), &roots).is_some(),
+            "a symlinked parent inside a writable tree is swappable too"
         );
     }
 
@@ -19707,6 +19734,29 @@ mod tests {
         }
         let roots = validate_flags(std::slice::from_ref(&inner), &project).unwrap();
         assert_eq!(dirs_of(&roots), vec![inner]);
+    }
+
+    /// A symlinked directory inside the project, above the named repository,
+    /// is refused like a symlinked leaf. One outside the project is tolerated.
+    #[test]
+    fn repo_dir_refuses_a_symlinked_ancestor_inside_the_project() {
+        let (_guard, project) = canonical_tempdir();
+        let (_other, outside) = canonical_tempdir();
+        let api = outside.join("api");
+        std::fs::create_dir(&api).unwrap();
+        if !init_repo(&project) || !init_repo(&api) {
+            return;
+        }
+        std::os::unix::fs::symlink(&outside, project.join("a")).unwrap();
+        let err = validate_flags(&[project.join("a/api")], &project)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("passes through a symlink"), "{err}");
+
+        let (_g3, elsewhere) = canonical_tempdir();
+        std::os::unix::fs::symlink(&outside, elsewhere.join("b")).unwrap();
+        let roots = validate_flags(&[elsewhere.join("b/api")], &project).unwrap();
+        assert_eq!(dirs_of(&roots), vec![api]);
     }
 
     #[test]
