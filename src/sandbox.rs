@@ -8081,6 +8081,7 @@ mod tests {
     /// `sandbox.strict_macos_reads` keeps the personal-app cache denies after
     /// the user's grants, so a grant naming one is refused, not left inert.
     /// A broader grant (`~`, `~/Library/Caches`) and a dev cache stay fine.
+    #[cfg(target_os = "macos")]
     #[test]
     fn strict_macos_reads_refuses_a_grant_on_a_personal_app_cache() {
         let home = Path::new("/Users/test");
