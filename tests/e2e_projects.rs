@@ -29,12 +29,16 @@ mod project_tests {
 
     use crate::common::{git_cmd, home_temp_dir};
 
-    /// These tests drive real toolchains (Go, Gradle, .NET, Maven caches)
-    /// that live under the real HOME, so they run with it, and with cplt's
-    /// state moved to the scratch HOME so no launch state lands in it.
+    /// The scratch HOME: toolchain caches (Gradle, Maven, npm, .NET) the
+    /// tests fill must not land in the real HOME (#1273).
+    /// The real JDK and .NET SDK stay granted: they live outside HOME.
     fn cplt_cmd() -> std::process::Command {
         let mut cmd = crate::common::cplt_cmd();
-        crate::common::with_real_home(&mut cmd);
+        for var in ["JAVA_HOME", "DOTNET_ROOT"] {
+            if let Some(v) = std::env::var_os(var) {
+                cmd.env(var, v);
+            }
+        }
         cmd
     }
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1101,7 +1105,21 @@ fun main() {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_copilot_dir.display());
 
+        // Under the scratch HOME a runner's JDK and .NET SDK (in the real
+        // HOME's toolcache) are outside every known SDK root: grant them.
+        let sdks: Vec<String> = ["JAVA_HOME", "DOTNET_ROOT"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .filter(|p| Path::new(p).is_dir())
+            .flat_map(|p| ["--allow-exec".to_string(), p.to_string_lossy().into_owned()])
+            .collect();
+        // Java takes user.home from the passwd entry, not HOME, so Gradle
+        // would use the real ~/.gradle: point it at the scratch HOME's.
+        let gradle_home = crate::common::scratch_home().join(".gradle");
+        fs::create_dir_all(&gradle_home).unwrap();
         let output = cplt_cmd()
+            .args(&sdks)
+            .env("GRADLE_USER_HOME", &gradle_home)
             .args(["--yes", "--no-validate"])
             // These tests read detail-tier output: per-file audit lines, proxy start.
             .arg("--verbose")
@@ -2019,17 +2037,12 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
         require_sandbox!();
         let project = TempProject::scaffold_node();
 
-        // Only test dirs that actually exist on this machine
-        let mut home_dirs = Vec::new();
-        let home = std::env::var("HOME").unwrap();
-        for dir in &[".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker"] {
-            if Path::new(&home).join(dir).exists() {
-                home_dirs.push(*dir);
-            }
-        }
-        if home_dirs.is_empty() {
-            eprintln!("SKIPPED: no sensitive home dirs exist to test");
-            return;
+        // Planted in the scratch HOME the child runs with.
+        let home = crate::common::scratch_home();
+        let home_dirs = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker"];
+        for dir in &home_dirs {
+            fs::create_dir_all(home.join(dir)).unwrap();
+            fs::write(home.join(dir).join("secret"), "x").unwrap();
         }
 
         let script = script_read_secrets(&[], &home_dirs);
@@ -3302,7 +3315,11 @@ allow_env_files = true
             return; // the temp dir is not under $HOME here; nothing to spell
         };
         let tilde = format!("~/{}", rel.display());
-        let output = cplt_cmd()
+        // `~` must expand to the HOME `rel` came from; the launch is refused
+        // before any tool runs, so nothing is written there.
+        let mut cmd = cplt_cmd();
+        crate::common::with_real_home(&mut cmd);
+        let output = cmd
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             .args(["--repo-dir", &named_path.to_string_lossy()])
@@ -4137,6 +4154,8 @@ echo "RESULT:sent:OK"
     fn go_available() -> bool {
         Command::new("go")
             .arg("version")
+            // Go keeps telemetry state under HOME (#1273).
+            .env("HOME", crate::common::scratch_home())
             .output()
             .is_ok_and(|o| o.status.success())
     }
@@ -5549,7 +5568,7 @@ esac
         // Create fake .m2 and .gradle dirs under the real HOME so the
         // sandbox profile's home-tool-dir rules apply.
         // The HOME the child runs with: see `cplt_cmd` above.
-        let home = crate::common::real_home().display().to_string();
+        let home = crate::common::scratch_home().display().to_string();
         let m2_dir = PathBuf::from(&home).join(".m2/repository/com/example");
         let gradle_dir = PathBuf::from(&home).join(".gradle/caches/test-cplt-e2e");
 
@@ -5631,7 +5650,7 @@ fi
         let project = TempProject::scaffold_maven();
 
         // The HOME the child runs with: see `cplt_cmd` above.
-        let home = crate::common::real_home().display().to_string();
+        let home = crate::common::scratch_home().display().to_string();
         let socket_dir = PathBuf::from(&home).join(".gradle/daemon/cplt-test");
         fs::create_dir_all(&socket_dir).ok();
 
@@ -5703,7 +5722,8 @@ fi
 
 # Test 2: UDS in scratch dir (TMPDIR) — build tools may create sockets here
 if command -v python3 >/dev/null 2>&1; then
-    SCRATCH_SOCK="${{TMPDIR:-/tmp}}/cplt-test-scratch.sock"
+    # Short: under the scratch HOME the TMPDIR path nears sun_path's 104 bytes.
+    SCRATCH_SOCK="${{TMPDIR:-/tmp}}/s.sock"
     rm -f "$SCRATCH_SOCK"
     SCRATCH_RESULT=$(python3 -c "
 import socket, os

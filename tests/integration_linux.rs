@@ -88,8 +88,9 @@ mod linux_tests {
         dir
     }
 
+    /// The scratch HOME, never the runner's real one (#1273).
     fn home_dir() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").expect("HOME not set"))
+        crate::common::scratch_home().to_path_buf()
     }
 
     /// Path to the built binary.

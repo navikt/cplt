@@ -1654,6 +1654,12 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             })
             .map(|rule| rule.path.clone()),
     );
+    // Never create under another HOME (the passwd one, when this launch was
+    // given a different HOME): its tool dirs belong to that account (#1273).
+    // A relocated dir outside every HOME (GOPATH=/opt/go) is still created.
+    let other_home = crate::config::account_home().filter(|a| a != home);
+    precreate_dirs
+        .retain(|d| d.starts_with(home) || other_home.as_ref().is_none_or(|a| !d.starts_with(a)));
     precreate_dirs.sort();
     precreate_dirs.dedup();
 
@@ -3408,6 +3414,42 @@ mod tests {
                  the exec-only child must stay safe"
             );
         }
+    }
+
+    /// Pre-create skips another HOME's dirs, not a relocated dir outside every HOME (#1273).
+    #[test]
+    fn precreate_dirs_stay_under_home() {
+        let home = Path::new("/home/scratch");
+        let dir = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .find(|d| d.write)
+            .unwrap();
+        let tool_dirs = [
+            crate::sandbox::ResolvedToolDir {
+                path: PathBuf::from("/account/.gradle"),
+                target: None,
+                dir,
+            },
+            crate::sandbox::ResolvedToolDir {
+                path: PathBuf::from("/opt/go"),
+                target: None,
+                dir,
+            },
+            crate::sandbox::ResolvedToolDir {
+                path: home.join(".inside"),
+                target: None,
+                dir,
+            },
+        ];
+        let mut config = test_config(Path::new("/project"), home);
+        config.existing_home_tool_dirs = Some(&tool_dirs);
+        let policy = temp_env::with_var("CPLT_TEST_ACCOUNT_HOME", Some("/account"), || {
+            generate_policy(&config)
+        });
+        let got = &policy.precreate_dirs;
+        assert!(got.contains(&home.join(".inside")), "{got:?}");
+        assert!(got.contains(&PathBuf::from("/opt/go")), "{got:?}");
+        assert!(!got.contains(&PathBuf::from("/account/.gradle")), "{got:?}");
     }
 
     /// Build a minimal SandboxConfig for testing.

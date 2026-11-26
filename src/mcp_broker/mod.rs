@@ -82,6 +82,39 @@ pub use spec::{
 };
 pub use status::{GithubMcp, run_status, status_json};
 
+/// The XDG base dir `var` for `home`. The host's `$var` describes the host's
+/// HOME, so it applies only when `home` is that HOME (or HOME is unset); a
+/// broker handed another HOME derives every XDG dir from it instead (#1273).
+pub(crate) fn xdg_dir(var: &str, home: &std::path::Path, default: &str) -> std::path::PathBuf {
+    match std::env::var_os("HOME") {
+        Some(h) if std::path::Path::new(&h) != home => home.join(default),
+        _ => crate::opencode_v2::xdg_base(var, home, default),
+    }
+}
+
+#[cfg(test)]
+mod xdg_tests {
+    use std::path::Path;
+
+    #[test]
+    fn xdg_dir_follows_an_explicit_home() {
+        let got = temp_env::with_vars(
+            [
+                ("HOME", Some("/host")),
+                ("XDG_CONFIG_HOME", Some("/host/xdg")),
+            ],
+            || {
+                (
+                    super::xdg_dir("XDG_CONFIG_HOME", Path::new("/other"), ".config"),
+                    super::xdg_dir("XDG_CONFIG_HOME", Path::new("/host"), ".config"),
+                )
+            },
+        );
+        assert_eq!(got.0, Path::new("/other/.config"));
+        assert_eq!(got.1, Path::new("/host/xdg"));
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_util {
     use super::META_KEY;

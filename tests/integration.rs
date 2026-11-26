@@ -210,6 +210,8 @@ mod macos_tests {
                 .arg("-c")
                 .arg(python_inline_command(&source))
                 .env("PATH", "/usr/bin:/bin")
+                // The xcrun stub caches under $HOME/Library/Caches (#1273).
+                .env("HOME", crate::common::scratch_home())
                 .output()
                 .expect("run generated Python source");
 
@@ -1668,7 +1670,11 @@ int main(int argc, char **argv) {
             );
             match try_chrome_probe(
                 "direct Chrome for Testing control (Chromium sandbox enabled, no cplt Seatbelt)",
-                Command::new(&chrome).args(chrome_probe_args(control_data_dir.path())),
+                // CoreFoundation resolves the home from the passwd entry, not
+                // HOME; this keeps Chrome's prefs and Crashpad out of it (#1273).
+                Command::new(&chrome)
+                    .env("CFFIXED_USER_HOME", control_data_dir.path())
+                    .args(chrome_probe_args(control_data_dir.path())),
                 control_data_dir.path(),
                 &control_url,
                 &control_token,
@@ -1705,6 +1711,7 @@ int main(int argc, char **argv) {
         run_chrome_probe(
             "sandboxed Chrome for Testing launch",
             Command::new("sandbox-exec")
+                .env("CFFIXED_USER_HOME", sandbox_data_dir.path())
                 .arg("-f")
                 .arg(profile.as_os_str())
                 .arg(&chrome)
@@ -3222,7 +3229,8 @@ int main(int argc, char **argv) {
         require_sandbox!();
         let fixture = crate::common::home_temp_dir("prepare-placeholders");
         let project = fs::canonicalize(fixture.path()).unwrap();
-        let home = home_dir();
+        // prepare creates the Copilot cache dir under this HOME (#1273).
+        let home = fs::canonicalize(crate::common::scratch_home()).unwrap();
         let opts = default_opts(&project, &home);
         cplt::sandbox::prepare(&opts).expect("prepare");
         assert!(

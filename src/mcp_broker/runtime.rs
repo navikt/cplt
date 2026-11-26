@@ -1071,10 +1071,7 @@ fn linux_child_command(
     })?;
     let cplt = std::env::current_exe()?;
     let disable_userns = disables_userns(&bwrap);
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| shared.home.join(".config"));
+    let config_home = super::xdg_dir("XDG_CONFIG_HOME", &shared.home, ".config");
     let write_dirs: Vec<PathBuf> = spec
         .credential
         .linux_write_dirs
@@ -1120,9 +1117,10 @@ fn linux_child_command(
     }
     // HOME, then the config and data dirs nais may be pointed at outside it:
     // each hidden unless /tmp, /run or an earlier one covers it already.
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && spec.credential.keychain);
+    let data_home = spec
+        .credential
+        .keychain
+        .then(|| super::xdg_dir("XDG_DATA_HOME", home, ".local/share"));
     let hide = hidden_dirs(home, &config_home, data_home.as_deref());
     let read_paths: Vec<PathBuf> = spec
         .credential
@@ -2336,6 +2334,8 @@ mod tests {
         // The real interpreter, not the /usr/bin stub (see below).
         let out = Command::new("/usr/bin/python3")
             .args(["-c", "import sys; print(sys.executable)"])
+            // The stub caches under $HOME/Library/Caches (#1273).
+            .env("HOME", std::env::temp_dir())
             .output()
             .unwrap();
         let py_bin = String::from_utf8(out.stdout).unwrap().trim().to_string();
@@ -2386,6 +2386,7 @@ mod tests {
             Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--"])
                 .args(args)
+                .env("HOME", &home)
                 .output()
                 .unwrap()
                 .status
@@ -2406,6 +2407,8 @@ mod tests {
         // and fails inside a sandbox on CI runners (as in tests/mcp_broker.rs).
         let out = Command::new("/usr/bin/python3")
             .args(["-c", "import sys; print(sys.executable)"])
+            // The stub caches under $HOME/Library/Caches (#1273).
+            .env("HOME", std::env::temp_dir())
             .output()
             .unwrap();
         let py_bin = String::from_utf8(out.stdout).unwrap().trim().to_string();
@@ -2415,7 +2418,12 @@ mod tests {
             "import socket;socket.socket(socket.AF_UNIX).connect({:?})",
             sock.display().to_string()
         );
-        let host = |a: &[&str]| Command::new(a[0]).args(&a[1..]).status().unwrap().success();
+        let host = |a: &[&str]| {
+            // python's xcrun stub caches under $HOME/Library/Caches (#1273).
+            let mut c = Command::new(a[0]);
+            c.args(&a[1..]).env("HOME", &home);
+            c.status().unwrap().success()
+        };
         assert!(
             host(&[py_bin, "-c", &s]),
             "control: socket unreachable on the host"

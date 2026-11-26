@@ -199,7 +199,7 @@ pub(crate) struct Login {
 
 /// `$XDG_CONFIG_HOME/cplt/mcp`, the directory nav-pilot writes specs to.
 pub fn spec_dir(home: &Path) -> PathBuf {
-    crate::opencode_v2::xdg_base("XDG_CONFIG_HOME", home, ".config")
+    super::xdg_dir("XDG_CONFIG_HOME", home, ".config")
         .join("cplt")
         .join("mcp")
 }
@@ -1182,11 +1182,7 @@ pub(crate) mod tests {
         let want = if cfg!(target_os = "macos") {
             home.join("Library/Application Support/nais")
         } else {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| home.join(".config"))
-                .join("nais")
+            super::super::xdg_dir("XDG_CONFIG_HOME", home, ".config").join("nais")
         };
         assert_eq!(login, std::slice::from_ref(&want));
 
