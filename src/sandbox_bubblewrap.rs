@@ -1548,8 +1548,9 @@ pub(crate) fn resolve(
 /// absolute one makes bwrap abort, which auto-detect would turn into a
 /// Landlock-only session without any of the overlays. Both are refused here,
 /// before either arm of [`resolve`], the way [`nested_repo_roots`] refuses to
-/// follow links. Only components below a writable root are checked: the agent
-/// cannot plant a link above one, and hosts legitimately link `/home` and the like.
+/// follow links. Only components below the deepest writable root holding the
+/// path are checked: the agent cannot plant a link above it, and hosts and
+/// dotfile setups legitimately link `/home` or an agent config dir.
 pub(crate) fn refuse_symlinked_overlays(
     fs_rules: &[FsRule],
     overlays: Overlays<'_>,
@@ -1561,7 +1562,13 @@ pub(crate) fn refuse_symlinked_overlays(
         .flatten()
         .collect();
     for path in overlays.read_only.iter().chain(overlays.pins) {
-        for root in roots.iter().filter(|r| path.starts_with(r)) {
+        // The deepest root only: a linked agent config dir (`~/.copilot` into a
+        // dotfiles repo) is itself a root, and the agent cannot replace it.
+        let deepest = roots
+            .iter()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.components().count());
+        if let Some(root) = deepest {
             let mut cur = root.clone();
             for part in path
                 .strip_prefix(root)
