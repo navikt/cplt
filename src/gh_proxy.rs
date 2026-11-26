@@ -5408,6 +5408,27 @@ fn is_remote_scope_mutation(sub: &str, sub_args: &[&str]) -> bool {
     }
 }
 
+/// `git config` flags that never write.
+const SAFE_READ_FLAGS: &[&str] = &[
+    "--get",
+    "--get-all",
+    "--get-regexp",
+    "--get-urlmatch",
+    "--list",
+    "-l",
+    "--local",
+    "--global",
+    "--system",
+    "--worktree",
+    "--includes",
+    "--no-includes",
+    "-z",
+    "--null",
+    "--name-only",
+    "--show-origin",
+    "--show-scope",
+];
+
 /// True if `git config` args write to a key that can redirect the enforced scope.
 ///
 /// Key families that qualify:
@@ -5424,26 +5445,6 @@ fn is_remote_scope_mutation(sub: &str, sub_args: &[&str]) -> bool {
 /// invocation whose flags are exclusively known value-less read/location flags
 /// and whose positionals are `[<key>]` or `["get", <key>]` is allowed as a read.
 fn config_sets_remote_url(sub_args: &[&str]) -> bool {
-    const SAFE_READ_FLAGS: &[&str] = &[
-        "--get",
-        "--get-all",
-        "--get-regexp",
-        "--get-urlmatch",
-        "--list",
-        "-l",
-        "--local",
-        "--global",
-        "--system",
-        "--worktree",
-        "--includes",
-        "--no-includes",
-        "-z",
-        "--null",
-        "--name-only",
-        "--show-origin",
-        "--show-scope",
-    ];
-
     let lowered: Vec<String> = sub_args.iter().map(|a| a.to_lowercase()).collect();
     if lowered.iter().any(|a| {
         matches!(a.as_str(), "-e" | "edit")
@@ -5464,15 +5465,20 @@ fn config_sets_remote_url(sub_args: &[&str]) -> bool {
     }) {
         return true;
     }
-    let touches_scope_key = lowered.iter().any(|key| {
+    config_writes_key(&lowered, |key| {
         key == "remote.origin.url"
             || key == "remote.origin.pushurl"
             || key == "include.path"
             || (key.starts_with("url.")
                 && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof")))
             || (key.starts_with("includeif.") && key.ends_with(".path"))
-    });
-    if !touches_scope_key {
+    })
+}
+
+/// Whether lowercased `git config` args name a key matching `is_key` in any
+/// form other than a plain read.
+fn config_writes_key(lowered: &[String], is_key: impl Fn(&str) -> bool) -> bool {
+    if !lowered.iter().any(|k| is_key(k)) {
         return false;
     }
     let all_flags_safe_read = lowered
@@ -5485,6 +5491,28 @@ fn config_sets_remote_url(sub_args: &[&str]) -> bool {
         .collect();
     let is_read_shape = all_flags_safe_read && matches!(positionals.as_slice(), [_] | ["get", _]);
     !is_read_shape
+}
+
+/// Whether `git remote set-url --push` or a `git config` write sets any
+/// remote's `pushurl`. Under `protect_default_branch_only` the next launch
+/// would record such a URL, so it is refused in the session that could set it.
+fn writes_push_url(sub: &str, sub_args: &[&str]) -> bool {
+    match sub {
+        "remote" => {
+            remote_verb(sub_args).is_some_and(|(_, v)| v == "set-url")
+                && sub_args.contains(&"--push")
+        }
+        "config" => {
+            let lowered: Vec<String> = sub_args.iter().map(|a| a.to_lowercase()).collect();
+            lowered.iter().any(|a| {
+                matches!(a.as_str(), "-e" | "edit")
+                    || (a.starts_with("--e") && "--edit".starts_with(a.as_str()))
+            }) || config_writes_key(&lowered, |k| {
+                k.starts_with("remote.") && k.ends_with(".pushurl")
+            })
+        }
+        _ => false,
+    }
 }
 
 /// True if the invocation is `git subtree push` (the only remote-write subtree form).
@@ -5685,6 +5713,16 @@ pub fn gate_git(
         });
     }
 
+    if prevent_push && protect_default_branch_only && writes_push_url(sub, sub_args) {
+        return Err(Refusal {
+            headline: format!("'git {sub}' would set a remote's push URL."),
+            guidance: "protect_default_branch_only judges pushes by the push URLs recorded when a session\n\
+                       starts, so a push URL may only be changed outside the sandbox."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
+    }
+
     // `git remote set-head` writes `refs/remotes/<remote>/HEAD` — the very ref
     // the push guard's default-branch yardstick used to be read from
     // (GHSA-cm6f-3wjh-x9qx). The facts are baked at launch now, so this cannot
@@ -5814,6 +5852,38 @@ pub fn gate_git(
         });
     }
 
+    // `--receive-pack`/`--exec` and `remote.<n>.receivepack`/`uploadpack` pick
+    // the program git runs for the push, and with it the repository written to,
+    // so the guard's verdict about the remote's URL would not bind. A push URL
+    // with surrounding whitespace or control characters is read by the guard
+    // under another spelling than git uses. Refuse both while a push guard is on.
+    if (prevent_push || prevent_force_push) && sub == "push" {
+        let program_override = sub_args
+            .iter()
+            .take_while(|a| **a != "--")
+            .find(|a| {
+                ["--receive-pack", "--exec"]
+                    .iter()
+                    .any(|f| *a == f || a.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
+            })
+            .map(|a| format!("'git push {}'", a.split('=').next().unwrap_or(a)))
+            .or_else(|| {
+                real_git
+                    .and_then(|git| unsafe_push_config(git, &repo_args))
+                    .map(|key| format!("Config '{key}'"))
+            });
+        if let Some(what) = program_override {
+            return Err(Refusal {
+                headline: format!("{what} is not allowed while push prevention is active."),
+                guidance: "Pushes are judged by the repository git will write to. A custom receive-pack program,\n\
+                           or a push URL with surrounding whitespace or control characters, makes that differ\n\
+                           from what the guard checks. Remove it and push to the remote by name."
+                    .to_string(),
+                agent_note: &[NOTE],
+            });
+        }
+    }
+
     // A destination that is not a configured remote — `--repo=<url>`, or the
     // positional repository argument `git push <url|path> [refspec…]` — overrides
     // where the push lands, so any remote/URL authorization the guard performs
@@ -5846,27 +5916,46 @@ pub fn gate_git(
 
         // The repository's real default branch, resolved in the repo this
         // command targets. `None` means it could not be determined.
-        let default_branch =
-            if sub == "push" && (protect_default_branch_only || !allow_push_rules.is_empty()) {
-                // The remote the push truly lands on, not an assumed `origin`:
-                // the *branch* yardstick has to come from the same remote the
-                // push writes to, or `remote.pushDefault` picks which remote's
-                // default branch the guard compares against.
-                let remote = push_dest_remote(&args[i + 1..], real_git, &repo_args);
-                // Baked at launch, never re-read here: `refs/remotes/<remote>/HEAD`
-                // is agent-writable, so asking the sandboxed repository at gate time
-                // let the agent choose the guard's yardstick (GHSA-cm6f-3wjh-x9qx).
-                let resolved = repo_facts
-                    .default_branch(&remote, &repo_args, real_git)
-                    .map(ToString::to_string);
-                if resolved.is_none() && protect_default_branch_only {
-                    block_hints.push(if repo_facts.describes(&repo_args, real_git) {
+        let default_branch = if sub == "push"
+            && (protect_default_branch_only || !allow_push_rules.is_empty())
+        {
+            // The remote the push truly lands on, not an assumed `origin`:
+            // the *branch* yardstick has to come from the same remote the
+            // push writes to, or `remote.pushDefault` picks which remote's
+            // default branch the guard compares against.
+            let remote = push_dest_remote(&args[i + 1..], real_git, &repo_args);
+            // Baked at launch, never re-read here: `refs/remotes/<remote>/HEAD`
+            // is agent-writable, so asking the sandboxed repository at gate time
+            // let the agent choose the guard's yardstick (GHSA-cm6f-3wjh-x9qx).
+            let mut resolved = repo_facts
+                .default_branch(&remote, &repo_args, real_git)
+                .map(ToString::to_string);
+            // The yardstick describes the repository the remote pushed to at
+            // launch. If its push URL has changed since, it describes nothing
+            // this push writes to.
+            let moved = resolved.is_some()
+                && protect_default_branch_only
+                && !repo_facts.push_urls_unchanged(&remote, &repo_args, real_git);
+            if moved {
+                resolved = None;
+                block_hints.push(format!(
+                    "protect_default_branch_only is set, but remote '{remote}' no longer pushes \
+                         to the URL it had when this session started (pushurl or \
+                         insteadOf/pushInsteadOf changed), so the protected branch recorded for it \
+                         does not describe where this push goes. Restore the remote's push URL, or \
+                         start a new session."
+                ));
+            }
+            if resolved.is_none() && protect_default_branch_only && !moved {
+                block_hints.push(if repo_facts.describes(&repo_args, real_git) {
                         format!(
                             "protect_default_branch_only is set, but the default branch of remote \
-                         '{remote}' could not be determined when this session started, so the \
-                         guard cannot tell a feature branch from the protected one. Run \
-                         `git remote set-head {remote} -a` (it records refs/remotes/{remote}/HEAD \
-                         locally, no push) OUTSIDE the sandbox and start a new session."
+                         '{remote}' could not be determined for the URL it pushes to when this \
+                         session started, so the guard cannot tell a feature branch from the \
+                         protected one. Run `git remote set-head {remote} --auto` (it records \
+                         refs/remotes/{remote}/HEAD locally, no push) OUTSIDE the sandbox and start \
+                         a new session. If the remote has a separate push URL, it must name the \
+                         same repository as its fetch URL (check `git remote -v`)."
                         )
                     } else if repo_args.is_empty() {
                         // No redirect flag, and still not the launch repository:
@@ -5902,11 +5991,11 @@ pub fn gate_git(
                      the redirect, or from a session launched in that repository."
                             .to_string()
                     });
-                }
-                resolved
-            } else {
-                None
-            };
+            }
+            resolved
+        } else {
+            None
+        };
 
         if protect_default_branch_only && sub == "push" {
             let push_args = &args[i + 1..];
@@ -6664,13 +6753,24 @@ fn repo_target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// and the caller fails closed. The token is always a push positional, which
 /// `push_positionals` never lets start with `-`, so it cannot be read as a flag.
 /// Run a read-only query against `real_git`, bounded by [`crate::git::GIT_TIMEOUT`].
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn run_git(real_git: &Path, repo_args: &[&str], args: &[&str]) -> Option<std::process::Output> {
+    run_git_any_status(real_git, repo_args, args).filter(|o| o.status.success())
+}
+
+/// [`run_git`] without the success filter, for callers that read the exit code.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn run_git_any_status(
+    real_git: &Path,
+    repo_args: &[&str],
+    args: &[&str],
+) -> Option<std::process::Output> {
     let mut cmd = std::process::Command::new(real_git);
-    cmd.args(repo_args).args(args);
-    crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT)
-        .ok()
-        .filter(|o| o.status.success())
+    // The session runs git with GIT_CONFIG_NOSYSTEM=1 (HARDENING_ENV_VARS);
+    // facts captured at launch must see the same config the gate later does.
+    cmd.args(repo_args)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    crate::git::output_bounded(cmd, crate::git::GIT_TIMEOUT).ok()
 }
 
 fn resolve_token_branch(real_git: &Path, repo_args: &[&str], token: &str) -> Option<String> {
@@ -6757,6 +6857,50 @@ fn push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// The first config key that changes which program or repository a push
+/// reaches in a way the guard does not model: any `remote.<n>.receivepack` or
+/// `uploadpack`, any `remote.<n>.vcs` (git runs `git-remote-<vcs>` from
+/// PATH), or a remote URL / `url.<base>` rewrite whose value or base has
+/// surrounding whitespace or a control character. `git remote get-url` output
+/// is line-split and trimmed, so such a URL is probed under another spelling
+/// than the one git pushes to.
+fn unsafe_push_config(real_git: &Path, repo_args: &[&str]) -> Option<String> {
+    let output = run_git_any_status(
+        real_git,
+        repo_args,
+        &[
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^(remote\..*\.(url|pushurl|receivepack|uploadpack|vcs)|url\..*\.(insteadof|pushinsteadof))$",
+        ],
+    );
+    // Exit status 1 with no output is "no match". Anything else that is not
+    // success — an unreadable config, a timeout — cannot be shown safe.
+    let output = match output {
+        Some(o) if o.status.success() => o,
+        Some(o) if o.status.code() == Some(1) && o.stdout.is_empty() => return None,
+        _ => return Some("<git config could not be read>".to_string()),
+    };
+    let bad = |s: &str| s != s.trim() || s.chars().any(char::is_control);
+    String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|r| !r.is_empty())
+        .find_map(|record| {
+            let (key, value) = record.split_once('\n').unwrap_or((record, ""));
+            let base = key
+                .strip_prefix("url.")
+                .and_then(|k| k.rsplit_once('.'))
+                .map_or("", |(b, _)| b);
+            (key.ends_with(".receivepack")
+                || key.ends_with(".uploadpack")
+                || (key.starts_with("remote.") && key.ends_with(".vcs"))
+                || bad(value)
+                || bad(base))
+            .then(|| key.to_string())
+        })
 }
 
 /// A single git config value in the repository `repo_args` targets, or `None`.
@@ -6868,6 +7012,11 @@ pub struct RepoFacts {
     /// Remote name → its default branch, from `refs/remotes/<remote>/HEAD`.
     #[serde(default)]
     pub default_branches: std::collections::BTreeMap<String, String>,
+    /// Remote name → its push URLs as git spells them (after insteadOf,
+    /// pushInsteadOf and `pushurl`), so a push is judged by the repository it
+    /// writes to: the default branch above describes these URLs and no others.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub push_urls: std::collections::BTreeMap<String, Vec<String>>,
     /// The same facts for each repository named with `--repo-dir`, captured at
     /// the same moment from the same trusted git.
     ///
@@ -7001,6 +7150,23 @@ impl RepoFacts {
             .get(remote)
             .map(String::as_str)
     }
+
+    /// Whether `remote` still pushes to the URLs captured for it at launch.
+    /// A remote with no captured URLs never matches (fail closed).
+    fn push_urls_unchanged(
+        &self,
+        remote: &str,
+        repo_args: &[&str],
+        real_git: Option<&Path>,
+    ) -> bool {
+        let (Some(member), Some(git)) = (self.target(repo_args, real_git), real_git) else {
+            return false;
+        };
+        member
+            .push_urls
+            .get(remote)
+            .is_some_and(|baked| *baked == push_urls(git, repo_args, remote))
+    }
 }
 
 /// Canonical `git rev-parse --git-common-dir` of the repository `repo_args`
@@ -7071,8 +7237,22 @@ fn capture_repo_facts_for(real_git: &Path, project_dir: &Path, remotes: &[String
         ..RepoFacts::default()
     };
     for remote in remotes {
-        if let Some(branch) = resolve_default_branch(real_git, &repo_args, remote) {
+        let urls = push_urls(real_git, &repo_args, remote);
+        // `refs/remotes/<remote>/HEAD` was learned from the fetch URL. It is a
+        // fact about the push only when every push URL names that repository;
+        // a push URL set later (perhaps by an earlier session) gets no
+        // yardstick, and pushes to it fail closed until one is learned for it.
+        let fetch = run_git(real_git, &repo_args, &["remote", "get-url", "--", remote])
+            .map(|o| crate::trust::normalize_remote_url(String::from_utf8_lossy(&o.stdout).trim()));
+        let same_repo = !urls.is_empty()
+            && urls
+                .iter()
+                .all(|u| fetch.as_deref() == Some(crate::trust::normalize_remote_url(u).as_str()));
+        if same_repo && let Some(branch) = resolve_default_branch(real_git, &repo_args, remote) {
             facts.default_branches.insert(remote.clone(), branch);
+        }
+        if !urls.is_empty() {
+            facts.push_urls.insert(remote.clone(), urls);
         }
     }
     facts
@@ -12880,21 +13060,21 @@ mod tests {
             &["push", "--set-upstream", "origin", "agent/fix-123"][..],
             &["push", "--no-verify", "origin", "agent/fix-123"][..],
             &["push", "--atomic", "--signed", "origin", "agent/fix-123"][..],
-            &[
-                "push",
-                "--receive-pack=/usr/bin/git-receive-pack",
-                "origin",
-                "agent/fix-123",
-            ][..],
-            &[
-                "push",
-                "--exec=/usr/bin/git-receive-pack",
-                "origin",
-                "agent/fix-123",
-            ][..],
             &["push", "origin", "--", "agent/fix-123"][..],
         ] {
             assert!(gate(args, &[]).is_ok(), "{args:?} must stay allowed");
+        }
+        // A custom receive-pack program decides which repository is written to.
+        for opt in [
+            "--receive-pack=/usr/bin/git-receive-pack",
+            "--exec=/usr/bin/git-receive-pack",
+            "--receive-pack",
+            "--exec",
+        ] {
+            assert!(
+                gate(&["push", opt, "origin", "agent/fix-123"], &[]).is_err(),
+                "{opt} must be refused"
+            );
         }
 
         // Refspecs stay refspecs from the second positional on.
@@ -13963,6 +14143,75 @@ mod tests {
         assert_eq!(launch_repo(&git, &repo).as_deref(), Ok("o/o"));
     }
 
+    /// Push config the guard cannot model is named; ordinary remotes are not.
+    #[test]
+    fn unsafe_push_config_flags_programs_and_odd_spellings() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        let args = ["-C", dir.as_str()];
+        assert_eq!(unsafe_push_config(&git, &args), None);
+        for (key, value) in [
+            ("remote.origin.receivepack", "git-receive-pack"),
+            ("remote.origin.uploadpack", "git-upload-pack"),
+            ("remote.origin.vcs", "x"),
+            ("remote.origin.pushurl", "https://github.com/o/o.git "),
+            ("remote.origin.pushurl", "a\nb"),
+            ("url. https://github.com/o/.pushinsteadof", "x"),
+        ] {
+            assert!(run_in(&git, &repo, &["config", key, value]), "{key}");
+            assert!(
+                unsafe_push_config(&git, &args).is_some(),
+                "{key}={value:?} must be flagged"
+            );
+            assert!(run_in(&git, &repo, &["config", "--unset-all", key]));
+        }
+        assert_eq!(unsafe_push_config(&git, &args), None);
+        // A git that cannot answer is not proof of safety.
+        assert!(unsafe_push_config(Path::new("/nonexistent/git"), &args).is_some());
+        let failing = repo.join("failing-git.sh");
+        std::fs::write(&failing, "#!/bin/sh\nexit 128\n").unwrap();
+        std::fs::set_permissions(
+            &failing,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(unsafe_push_config(&failing, &args).is_some());
+    }
+
+    /// Under protect_default_branch_only a session may not set any remote's
+    /// push URL; reads and other modes are unaffected.
+    #[test]
+    fn protect_mode_refuses_push_url_writes() {
+        for args in [
+            &["remote", "set-url", "--push", "upstream", "u"][..],
+            &["config", "remote.upstream.pushurl", "u"][..],
+            &["config", "--add", "remote.upstream.pushurl", "u"][..],
+        ] {
+            assert!(
+                gate_git_t(args, true, true, true, &[], None).is_err(),
+                "{args:?}"
+            );
+            assert!(
+                gate_git_t(args, true, true, false, &[], None).is_ok(),
+                "{args:?} outside protect mode"
+            );
+        }
+        for args in [
+            &["config", "--get", "remote.upstream.pushurl"][..],
+            &["remote", "set-url", "upstream", "u"][..],
+        ] {
+            assert!(
+                gate_git_t(args, true, true, true, &[], None).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
     /// The advisory, verbatim: default branch `trunk`, stock configuration.
     /// `git push origin trunk` is refused; the agent rewrites
     /// `refs/remotes/origin/HEAD` (an ordinary ref file, `symbolic-ref` is an
@@ -14077,7 +14326,7 @@ mod tests {
         .expect_err("no baked default branch must refuse, not fall back to allowing")
         .to_string();
         assert!(
-            err.contains("could not be determined when this session started"),
+            err.contains("could not be determined for the URL it pushes to"),
             "the refusal must name the missing launch-time fact, got: {err}"
         );
     }
