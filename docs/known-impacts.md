@@ -2049,6 +2049,7 @@ With bubblewrap, cplt mounts some paths read-only. A symbolic link at or above o
 | Setup | Now | What to do |
 | --- | --- | --- |
 | `.git/hooks` or `.github/hooks` is a link to a shared hooks directory | refuses to launch, names the link | Remove the link and run `git config core.hooksPath <dir>`, or replace the link with a copy |
-| Another git persistence path under `.git` is a link | refuses to launch, names the link | Replace the link with a copy |
-| An agent config file is a link (stow-style `~/.claude/settings.json`) | launches, warns | Nothing required. Replace the link with a copy to make the link itself read-only too |
+| Another protected repository path is a link (under `.git`, or `.cplt.toml`, `.mcp.json`, `.claude/settings.json` and the other entries listed in SECURITY.md, Linux limitation 10), in the project or a nested repository | refuses to launch, names the link | Replace the link with a copy |
+| A checkout made with `git-new-workdir` or `repo`, whose `.git` entries are links into another repository | refuses to launch | Use `git worktree add` instead, or launch with `--no-bubblewrap` (the read-only mounts are then off) |
+| An agent config file is a link (stow-style `~/.claude/settings.json`), or a tool dir such as mise's `shims` | launches, warns; the mount protects the link's target | Nothing required. Replace the link with a copy to make the link itself read-only too |
 | The whole agent config dir is a link (`~/.copilot` into a dotfiles repo) | launches as before | Nothing |

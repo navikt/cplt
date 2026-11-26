@@ -3450,6 +3450,37 @@ except PermissionError:
         }
     }
 
+    /// A link at a read-only overlay that is not host-run (mise's `shims/`,
+    /// stow-style) is bound at its target. An absolute link must not make
+    /// bwrap abort: with `--use-bubblewrap` that would fail the launch.
+    #[test]
+    fn bwrap_binds_a_linked_tool_overlay_at_its_target() {
+        require_bwrap!();
+        let project = create_test_project();
+        let home = tempfile::tempdir().unwrap();
+        let mise = home.path().join(".local/share/mise");
+        let real = home.path().join("real-shims");
+        fs::create_dir_all(&mise).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, mise.join("shims")).unwrap();
+        let script = format!(
+            "touch {}/x 2>/dev/null && echo WROTE; echo RAN",
+            real.display()
+        );
+        let (code, out, err) = run_sandboxed_home_with_flags(
+            project.path(),
+            home.path(),
+            &["--use-bubblewrap"],
+            &script,
+        );
+        assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
+        assert!(out.contains("RAN"), "stdout: {out}\nstderr: {err}");
+        assert!(
+            !out.contains("WROTE"),
+            "the target must be read-only: {out}\n{err}"
+        );
+    }
+
     #[test]
     fn bwrap_grants_only_its_private_devpts() {
         require_bwrap!();

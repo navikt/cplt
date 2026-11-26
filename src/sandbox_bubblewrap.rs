@@ -378,6 +378,10 @@ pub(crate) struct Overlays<'a> {
     /// Bound read-WRITE onto themselves, so the path becomes a mountpoint and
     /// its *name* cannot be renamed or removed ([`rename_pin_paths`]).
     pub pins: &'a [PathBuf],
+    /// The subset of `read_only` whose contents run on the host from a
+    /// repository (git persistence, `.git/config`). A symlink at or above one
+    /// of these, or above a pin holding one, refuses the launch.
+    pub host_run: &'a [PathBuf],
     /// Directories in `read_only` that get an empty read-only tmpfs when they
     /// do not exist (`sandbox.mask_missing_deny_paths`), plus missing
     /// `config.worktree` files masked with `--ro-bind /dev/null <path>`, so the
@@ -708,9 +712,9 @@ pub(crate) fn build_bwrap_args(
     // Emitted after the writable binds (so the source resolves to the real
     // directory) and before the read-only ones (so those still shadow them).
     for path in overlays.pins {
-        if !path.exists() {
+        let Some(path) = overlay_bind_path(path) else {
             continue;
-        }
+        };
         let path_str = path.to_string_lossy().into_owned();
         args.extend(["--bind".to_string(), path_str.clone(), path_str]);
     }
@@ -718,8 +722,8 @@ pub(crate) fn build_bwrap_args(
     // ── Read-only overlays for git-persistence paths (Finding 1) ──
     // Emitted last so they shadow the writable project bind above.
     for path in overlays.read_only {
-        if path.exists() {
-            let path_str = path.to_string_lossy().into_owned();
+        if let Some(bind) = overlay_bind_path(path) {
+            let path_str = bind.to_string_lossy().into_owned();
             args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
         } else if is_missing_gitdir_dir_overlay(path)
             && bound_writable.iter().any(|w| path.starts_with(w))
@@ -1554,10 +1558,12 @@ pub(crate) fn resolve(
 /// absolute one makes bwrap abort, which auto-detect would turn into a
 /// Landlock-only session without any of the overlays.
 ///
-/// For a git or hook persistence path ([`runs_on_host`]) this is a refusal:
-/// what lands there runs unsandboxed. Any other overlay, such as a stow-style
-/// link to an agent's `settings.json`, keeps today's bind and gets a warning,
-/// so existing dotfile setups keep working.
+/// For a path in [`Overlays::host_run`] (git persistence and the repository
+/// files agents load, at any depth: nested repositories are in it too), or a
+/// pin above one, this is a refusal: what lands there runs unsandboxed. Any
+/// other overlay, such as a stow-style link to an agent's `settings.json`, is
+/// bound at its resolved target by [`build_bwrap_args`] and gets a warning, so
+/// existing dotfile setups keep working and bwrap never aborts on the link.
 ///
 /// Only components below the deepest writable root holding the path are
 /// checked: the agent cannot plant a link above it, and hosts and dotfile
@@ -1596,7 +1602,8 @@ pub(crate) fn symlinked_overlays(
             if !std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
                 continue;
             }
-            if runs_on_host(root, rel) {
+            // A pin counts when it holds a host-run path, as `.github` does.
+            if overlays.host_run.iter().any(|h| h.starts_with(path)) {
                 return (
                     Some(format!(
                         "`{}` is a symbolic link at or above `{}`, a path whose contents \
@@ -1622,31 +1629,12 @@ pub(crate) fn symlinked_overlays(
     (None, warnings)
 }
 
-/// Whether `rel`, under writable root `root`, is a git or hook persistence
-/// path: inside a git directory (at any depth), or an entry of [`PROTECTED_IN_ROOT`] (or an
-/// ancestor of one, as a rename pin is).
-fn runs_on_host(root: &Path, rel: &Path) -> bool {
-    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
-    // Any `.git` component: nested repositories are protected without being roots.
-    if parts.iter().any(|c| *c == ".git") || is_git_dir(root) {
-        return true;
-    }
-    PROTECTED_IN_ROOT
-        .iter()
-        .filter(|p| p.linux == LinuxCoverage::Bwrap)
-        .any(|p| {
-            !parts.is_empty()
-                && p.rel
-                    .split('/')
-                    .zip(&parts)
-                    .all(|(want, got)| want == "*" || std::ffi::OsStr::new(want) == *got)
-        })
-}
-
-/// A bare repository or a `.git` directory granted as a root of its own.
-fn is_git_dir(dir: &Path) -> bool {
-    dir.file_name().is_some_and(|n| n == ".git")
-        || (dir.join("HEAD").is_file() && dir.join("objects").is_dir())
+/// Where an overlay or pin is bound: its resolved path, so a link (one
+/// [`symlinked_overlays`] warned about) moves the bind onto the real file
+/// instead of making bwrap resolve, or abort on, the link. `None` when it does
+/// not exist.
+fn overlay_bind_path(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok()
 }
 
 /// Whether this bwrap accepts `--disable-userns` (bubblewrap 0.8+).
@@ -2781,6 +2769,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -2827,6 +2816,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -2907,6 +2897,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -2988,6 +2979,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3211,6 +3203,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3327,17 +3320,29 @@ mod tests {
         }
     }
 
-    /// `Err` for a refusal, `Ok(warnings)` otherwise.
+    /// `Err` for a refusal, `Ok(warnings)` otherwise. Every path given is
+    /// host-run, as git persistence paths are.
     fn check_links(
         rules: &[FsRule],
         read_only: &[PathBuf],
         pins: &[PathBuf],
+    ) -> Result<Vec<String>, String> {
+        let host_run: Vec<PathBuf> = read_only.iter().chain(pins).cloned().collect();
+        check_links_with(rules, read_only, pins, &host_run)
+    }
+
+    fn check_links_with(
+        rules: &[FsRule],
+        read_only: &[PathBuf],
+        pins: &[PathBuf],
+        host_run: &[PathBuf],
     ) -> Result<Vec<String>, String> {
         match symlinked_overlays(
             rules,
             Overlays {
                 read_only,
                 pins,
+                host_run,
                 mask_missing: &[],
             },
         ) {
@@ -3356,10 +3361,52 @@ mod tests {
         std::fs::write(base.join("dotfiles-settings.json"), "{}").unwrap();
         let settings = cfg.join("settings.json");
         std::os::unix::fs::symlink(base.join("dotfiles-settings.json"), &settings).unwrap();
-        let warnings = check_links(&[write_rule(&cfg)], std::slice::from_ref(&settings), &[])
-            .expect("agent config links must not refuse the launch");
+        let warnings = check_links_with(
+            &[write_rule(&cfg)],
+            std::slice::from_ref(&settings),
+            &[],
+            &[],
+        )
+        .expect("agent config links must not refuse the launch");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("settings.json"), "{warnings:?}");
+    }
+
+    /// A warned link, absolute included, is bound at its resolved target: bwrap
+    /// never sees the link as a destination, so it cannot abort on it.
+    #[test]
+    fn linked_overlay_is_bound_at_its_target() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        let target = base.join("dotfiles-settings.json");
+        std::fs::write(&target, "{}").unwrap();
+        let link = base.join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let args = build_bwrap_args(
+            &[],
+            Overlays {
+                read_only: std::slice::from_ref(&link),
+                pins: std::slice::from_ref(&link),
+                host_run: &[],
+                mask_missing: &[],
+            },
+            &DenyMasks::default(),
+        );
+        let t = target.to_string_lossy().into_owned();
+        assert!(
+            args.windows(3)
+                .any(|w| w == ["--ro-bind", t.as_str(), t.as_str()]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(3)
+                .any(|w| w == ["--bind", t.as_str(), t.as_str()]),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| *a == link.to_string_lossy()),
+            "{args:?}"
+        );
     }
 
     /// 0e740624: a linked agent config dir that is a writable root of its own is
@@ -3443,6 +3490,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3480,6 +3528,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3535,6 +3584,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3599,6 +3649,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &masks,
@@ -4328,6 +4379,7 @@ mod tests {
         let overlays = Overlays {
             read_only: std::slice::from_ref(&ro),
             pins: &[],
+            host_run: &[],
             mask_missing: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &masks);
@@ -4373,6 +4425,7 @@ mod tests {
         let overlays = Overlays {
             read_only: &overlays_vec,
             pins: &[],
+            host_run: &[],
             mask_missing: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &DenyMasks::default());
@@ -4458,6 +4511,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -4469,6 +4523,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &ro,
             },
             &DenyMasks::default(),
@@ -4522,6 +4577,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -4531,6 +4587,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &masks,
             },
             &DenyMasks::default(),
@@ -4604,6 +4661,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &masks,
             },
             &DenyMasks::default(),
@@ -4658,6 +4716,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &masks,
             },
             &DenyMasks::default(),
