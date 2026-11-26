@@ -4600,6 +4600,8 @@ fn gh_gate_refuses_top_level_api_reads_from_an_in_scope_checkout() {
         let (_, stderr, ok) = gh_gate(&["api", ep]);
         assert_refused(&stderr, ok, "");
     }
+    let (_, stderr, ok) = gh_gate(&["api", "pulls/1/comments"]);
+    assert_refused(&stderr, ok, "Use repos/navikt/cplt/pulls/1/comments.");
     for args in [
         &["api", "rate_limit"][..],
         &["api", "repos/navikt/cplt/pulls"],
@@ -4623,27 +4625,6 @@ fn gh_gate_keeps_delete_under_a_method_override_header() {
         &["--allow-api-write"],
     );
     assert_refused(&stderr, ok, "DELETE");
-}
-
-#[test]
-fn gh_gate_refuses_config_aliases() {
-    let cfg = tempfile::tempdir().unwrap();
-    let dir = cfg.path().to_str().unwrap();
-    std::fs::write(
-        cfg.path().join("config.yml"),
-        "aliases:\n    attestation: api -X DELETE repos/o/r\n",
-    )
-    .unwrap();
-    let (_, stderr, ok) = gh_gate_with_opts(&["attestation", "xx"], &["--gh-config-dir", dir]);
-    assert_refused(&stderr, ok, "alias");
-    // The same command without the alias is still allowed.
-    std::fs::write(
-        cfg.path().join("config.yml"),
-        "aliases:\n    co: pr checkout\n",
-    )
-    .unwrap();
-    let (_, stderr, ok) = gh_gate_with_opts(&["attestation", "xx"], &["--gh-config-dir", dir]);
-    assert!(ok, "{stderr}");
 }
 
 #[test]

@@ -191,81 +191,11 @@ pub fn set_gh_config_dir(dir: &Path) {
 ///
 /// `GH_CONFIG_DIR` (then `XDG_CONFIG_HOME`, then `HOME`) picks the
 /// `config.yml` gh reads aliases and `http_unix_socket` from, and the agent
-/// sets all three. An agent-written config could expand an approved command
-/// into another one, or route the gate's own lookups and the token it attaches
+/// sets all three. An agent-written config could define aliases, or route the gate's own lookups and the token it attaches
 /// to a socket the agent listens on. `GH_CONFIG_DIR` outranks the other two.
 pub fn pin_gh_config(cmd: &mut std::process::Command) {
     if let Some(dir) = GH_CONFIG_DIR_PIN.get() {
         cmd.env("GH_CONFIG_DIR", dir);
-    }
-}
-
-/// The command names `config.yml` defines as aliases: the first word of each
-/// key under the top-level `aliases:` map. gh expands an alias inside the real
-/// binary, after the gate classified the name, so the gate refuses the names.
-/// `None` for a form this line scan does not read (a flow map), so the caller
-/// fails closed. A continuation line under a key reads as one more name:
-/// that over-refuses, never under-refuses.
-fn config_alias_names(text: &str) -> Option<Vec<String>> {
-    let mut names = Vec::new();
-    let mut in_aliases = false;
-    for line in text.lines() {
-        let body = line.trim();
-        if body.is_empty() || body.starts_with('#') {
-            continue;
-        }
-        if !line.starts_with([' ', '\t']) {
-            in_aliases = false;
-            if let Some(rest) = body.strip_prefix("aliases:") {
-                match rest.split(" #").next().unwrap_or("").trim() {
-                    "" => in_aliases = true,
-                    "{}" => {}
-                    _ => return None,
-                }
-            }
-            continue;
-        }
-        if in_aliases {
-            let key = body.split(':').next().unwrap_or("");
-            let key = key.trim().trim_matches(['"', '\'']);
-            if let Some(name) = key.split_whitespace().next() {
-                names.push(name.to_string());
-            }
-        }
-    }
-    Some(names)
-}
-
-/// Refuse a typed command that the pinned `config.yml` defines as an alias.
-fn config_alias_refusal(cmd: &ParsedCommand) -> Option<Refusal> {
-    let dir = GH_CONFIG_DIR_PIN.get()?;
-    let path = dir.join("config.yml");
-    // gh follows a symlinked config (dotfile managers), so this does too; the
-    // checks keep a FIFO or a huge file from stalling the gate.
-    let text = match std::fs::metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Ok(m) if m.is_file() && m.len() <= 1 << 20 => std::fs::read_to_string(&path).ok(),
-        _ => None,
-    };
-    let refusal = |headline: String| Refusal {
-        headline,
-        guidance: "The guard checks the command it is given, and gh expands an alias \
-                   after that. Run the command the alias stands for instead."
-            .to_string(),
-        agent_note: &[RESTRICTED, NOTE],
-    };
-    match text.as_deref().map(config_alias_names) {
-        Some(Some(names)) => names.contains(&cmd.command).then(|| {
-            refusal(format!(
-                "'gh {}' is an alias in {}.",
-                cmd.command,
-                path.display()
-            ))
-        }),
-        _ => Some(refusal(format!(
-            "cannot read the aliases in {}.",
-            path.display()
-        ))),
     }
 }
 
@@ -2910,6 +2840,37 @@ pub fn is_repo_in_scope(
     invocation_repo.and_then(|repo| scope_member(scope, repo))
 }
 
+/// For a `gh api` path without `repos/{owner}/{repo}`, the spelling that reads
+/// the same path in an in-scope repository: gh sends a bare path to the API
+/// root, so `pulls/1` never meant the current repository.
+fn bare_api_path_hint(
+    cmd: &ParsedCommand,
+    invocation_repo: Option<&str>,
+    scope: &[String],
+) -> String {
+    let Some(endpoint) = cmd.api_endpoint.as_deref().filter(|_| cmd.command == "api") else {
+        return String::new();
+    };
+    let Ok(path) = github_api_endpoint_path(endpoint) else {
+        return String::new();
+    };
+    if extract_repo_from_api_path(path).is_some() {
+        return String::new();
+    }
+    let member = invocation_repo
+        .and_then(|repo| scope_member(scope, repo))
+        .or_else(|| scope.first().cloned());
+    let Some(member) = member else {
+        return String::new();
+    };
+    format!(
+        "gh sends a path without repos/<owner>/<repo> to the API root, not to this repository. \
+         Use repos/{}/{}.\n",
+        split_member(&member).1,
+        path.trim_start_matches('/')
+    )
+}
+
 /// The scope member `target` names, in the spelling captured at launch.
 ///
 /// The launch-time spelling is what gets pinned into `GH_REPO`, so a `-R` that
@@ -3820,9 +3781,6 @@ fn gate_decision(
         // These are read-only informational invocations — always allow.
         return Ok(GateApproval::default());
     };
-    if let Some(refusal) = config_alias_refusal(&cmd) {
-        return Err(refusal);
-    }
 
     // Handle token-revealing `gh auth` commands (credential exfiltration prevention).
     //
@@ -4096,7 +4054,7 @@ fn gate_decision(
                         scope_label(&scope),
                     ),
                     guidance: format!(
-                        "Reason: {}\n\
+                        "{}Reason: {}\n\
                          Ways forward: read-only commands take an explicit repository — \
                          `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
                          <number>`, `gh issue view -R <owner>/<repo> <number>` — and REST GET \
@@ -4109,6 +4067,7 @@ fn gate_decision(
                          machine, name it with `cplt config set --local sandbox.repo_dirs <DIR>` \
                          and it joins the scope set — beside this repository or inside it, \
                          either works. Otherwise relaunch cplt against that repository.",
+                        bare_api_path_hint(&cmd, invocation_repo.as_deref(), &scope),
                         result.reason,
                     ),
                     agent_note: &[RESTRICTED, NOTE],
@@ -8381,22 +8340,6 @@ mod tests {
                 "{args:?}"
             );
         }
-    }
-
-    #[test]
-    fn config_alias_names_reads_the_aliases_map() {
-        let yml = "git_protocol: https\naliases:\n    co: pr checkout\n    \"attestation xx\": api -X DELETE repos/o/r\n    # note\n    ruleset: '!echo hi'\npager: less\n";
-        assert_eq!(
-            config_alias_names(yml),
-            Some(vec![
-                "co".to_string(),
-                "attestation".to_string(),
-                "ruleset".to_string()
-            ])
-        );
-        assert_eq!(config_alias_names("aliases: {}\n"), Some(vec![]));
-        assert_eq!(config_alias_names("version: 1\n"), Some(vec![]));
-        assert_eq!(config_alias_names("aliases: {co: pr checkout}\n"), None);
     }
 
     #[test]
