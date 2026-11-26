@@ -29,6 +29,19 @@ Contributions are welcome. For a large change, open an issue first to discuss th
 
 The hooks run formatting and Clippy checks before commits. `mise run check` runs formatting, Clippy, unit and library tests, and the offline probe checks.
 
+## Linux sandbox from a Mac
+
+The Landlock, seccomp and bubblewrap code only runs on Linux. To build and test it from a Mac, use the Debian container in `hack/linux-dev.sh`. It needs docker or podman; [colima](https://github.com/abiosoft/colima) works.
+
+```bash
+mise run linux:check             # cargo build + clippy for Linux
+mise run linux:test-integration  # tests/integration_linux.rs, as in CI
+mise run linux:shell             # shell in the container
+sh hack/linux-dev.sh run cargo test --lib seccomp   # any other command
+```
+
+The checkout is mounted at `/work/cplt`. `target/` and the cargo registry live in the volumes `cplt-linuxdev-target` and `cplt-linuxdev-cargo`, so builds are cached and kept apart from the macOS build. Tests run as a non-root user with your uid. The container drops the default seccomp and AppArmor profiles and the `/proc` masks, because bubblewrap needs user namespaces, `mount` and a fresh `/proc`. It adds no capabilities and does not run privileged. To force an engine, set `CPLT_CONTAINER_ENGINE=podman`.
+
 ## Output policy
 
 Every line cplt prints at launch or exit belongs to one of four tiers. Pick the tier before you add a line.
