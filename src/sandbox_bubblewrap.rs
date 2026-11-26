@@ -1861,18 +1861,28 @@ fn run_inner() {
 ///
 /// `TIOCSTI`/`TIOCLINUX` stay denied by seccomp on every fd, so an ioctl
 /// grant here cannot inject keystrokes even into the sandbox's own PTYs.
+///
+/// No host `st_dev` (the parent's stat failed) means the comparison cannot be
+/// made, so no grant (#1211).
 fn private_devpts_rule(host_pts_dev: Option<u64>) -> Option<FsRule> {
+    is_private_devpts(c"/dev/pts", host_pts_dev?).then(devpts_grant)
+}
+
+/// True only if `path` is devpts and its device id differs from `host_dev`.
+fn is_private_devpts(path: &std::ffi::CStr, host_dev: u64) -> bool {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     // 0x1cd1 is DEVPTS_SUPER_MAGIC, a bare literal because f_type's width varies by libc.
-    if unsafe { libc::statfs(c"/dev/pts".as_ptr(), &raw mut fs) } != 0 || fs.f_type != 0x1cd1 {
-        return None;
+    if unsafe { libc::statfs(path.as_ptr(), &raw mut fs) } != 0 || fs.f_type != 0x1cd1 {
+        return false;
     }
-    let dev = std::fs::symlink_metadata("/dev/pts").ok()?.dev();
-    if host_pts_dev == Some(dev) {
-        return None;
-    }
-    Some(FsRule {
+    let p = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.dev() != host_dev)
+}
+
+fn devpts_grant() -> FsRule {
+    FsRule {
         nofollow: false,
         path: PathBuf::from("/dev/pts"),
         access: FsAccess {
@@ -1881,7 +1891,7 @@ fn private_devpts_rule(host_pts_dev: Option<u64>) -> Option<FsRule> {
             ioctl: true,
             ..Default::default()
         },
-    })
+    }
 }
 
 /// Read the whole policy pipe until EOF, then close the fd.
@@ -1943,6 +1953,38 @@ fn exec_agent(argv: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    /// #1211: no host `st_dev` means no grant, whatever `/dev/pts` is.
+    #[test]
+    fn devpts_rule_fails_closed_without_host_dev() {
+        assert!(super::private_devpts_rule(None).is_none());
+    }
+
+    /// #1211: the host devpts itself (same `st_dev`) is refused.
+    #[test]
+    fn devpts_same_dev_as_host_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(m) = std::fs::symlink_metadata("/dev/pts") else {
+            return;
+        };
+        assert!(!super::is_private_devpts(c"/dev/pts", m.dev()));
+        // Sanity: with another host id the same mount passes, so the
+        // assertion above rests on the st_dev guard, not the magic check.
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(c"/dev/pts".as_ptr(), &raw mut fs) } == 0 && fs.f_type == 0x1cd1 {
+            assert!(super::is_private_devpts(c"/dev/pts", m.dev() ^ 1));
+        }
+    }
+
+    /// #1211: a non-devpts filesystem is refused even with a distinct `st_dev`.
+    #[test]
+    fn devpts_non_devpts_fs_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = std::fs::metadata(tmp.path()).unwrap().dev();
+        let c = std::ffi::CString::new(tmp.path().as_os_str().as_encoded_bytes()).unwrap();
+        assert!(!super::is_private_devpts(&c, dev ^ 1));
+    }
+
     /// #796: a late writable file lands among the writable binds, before
     /// the deny masks and overlays that must still cover it.
     #[test]
