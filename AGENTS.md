@@ -3,7 +3,7 @@
 Rust project. A kernel-enforced sandbox for AI coding agents, using macOS
 Seatbelt (SBPL) and Linux Landlock plus seccomp-BPF and optional bubblewrap,
 with an HTTP CONNECT proxy in front of outbound traffic. It wraps Copilot,
-OpenCode, Antigravity, Pi, Claude Code, and a plain shell.
+OpenCode, Antigravity, Pi, Claude Code, Goose, DSH, and a plain shell.
 
 ## Product direction: the sandbox for teams
 
@@ -27,21 +27,21 @@ Always run `mise run check` at the end of a coding session.
 | `mise run check` | fmt + clippy + unit + lib + offline probe | ✅ | ✅ | ✅ | Python 3 + Node.js (safe everywhere) |
 | `mise run test:unit` | unit_tests, github_mcp_spec, config_corpus, state_pin, state_root | ✅ | ✅ | ✅ | None |
 | `mise run test:lib` | lib (modules) | ✅ | ✅ | ✅ | None |
-| `mise run test:probe` | offline probe checks | ✅ | ✅ | ✅ | Python 3 + Node.js; PTY case macOS-only |
+| `mise run test:probe` | offline probe checks | ✅ | ✅ | ✅ | Python 3 + Node.js; PTY case macOS-only; `hack/test-status.sh` runs locally only |
 | `mise run test:integration` | integration | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
 | `mise run test:integration-linux` | integration_linux | ❌ | ✅ | ❌ | Linux with Landlock (5.13+) |
-| `mise run test:network-audit` | network_audit | ✅ | ❌ | ✅ | macOS or Linux; binds localhost TCP |
+| `mise run test:network-audit` | network_audit | ✅ | ✅ | ✅ | macOS or Linux; binds localhost TCP |
 | `mise run test:e2e` | e2e, message_commands | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
-| `mise run test:e2e-guards` | e2e_guards | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
-| `mise run test:e2e-git-hardening` | e2e_git_hardening | ✅ | ❌ | ✅ | macOS `sandbox-exec`, real git |
-| `mise run test:e2e-golden` | e2e_golden | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
+| `mise run test:e2e-guards` | e2e_guards | ✅ | ✅ | ✅ | macOS or Linux; one helper uses macOS `sandbox-exec` |
+| `mise run test:e2e-git-hardening` | e2e_git_hardening | ✅ | ✅ | ✅ | macOS or Linux, real git |
+| `mise run test:e2e-golden` | e2e_golden | ✅ | ✅ | ✅ | macOS or Linux; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:mcp-broker` | mcp_broker | ❌ | ✅ | ✅ | macOS keychain or Linux bubblewrap + session bus |
 | `mise run test:worktree-broker` | worktree_broker | ❌ | ❌ | ✅ | macOS; real git, binds a Unix socket |
-| `mise run test:e2e-live` | e2e (ignored), 6 smoke tests | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
-| `mise run test:all` | the suites above except live, including guard and broker suites | ✅ | ❌ | ✅ | macOS + `copilot` in PATH |
-| `mise run test:everything` | all + live | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
-| `mise run test` | every suite via `cargo test` | ❌ | ❌ | ✅ | macOS |
+| `mise run test:e2e-live` | e2e (ignored), 6 smoke tests | ❌ | ❌ | ❌ | macOS + Copilot auth + network |
+| `mise run test:all` | the suites above except live, including guard and broker suites | ❌ | ❌ | ✅ | macOS + `copilot` in PATH |
+| `mise run test:everything` | all + live | ❌ | ❌ | ❌ | macOS + Copilot auth + network |
+| `mise run test` | every suite via `cargo test` | ❌ | ✅ | ✅ | macOS or Linux (platform-compiled suites) |
 
 Both e2e suites spawn a fake agent binary from inside the project tree, and the sandbox denies exec under `/tmp` and `/var/folders` by design. A checkout there fails nearly every test in `e2e_projects` and hangs `e2e`, with no hint that the location is the cause. Clone somewhere else.
 
@@ -88,7 +88,7 @@ set.
 - `src/sandbox_landlock.rs` Landlock LSM + seccomp-BPF (cross-platform policy, Linux-only enforcement)
 - `src/sandbox_bubblewrap.rs` optional bubblewrap namespace layer and in-namespace re-entry (Linux)
 - `src/config/` config file parsing, CLI/config merging, key registry, per-repo keys, `Resolved` struct
-- `src/worktree_broker.rs` parent-side `cplt worktree add` broker and client (#531)
+- `src/worktree_broker.rs` + `src/worktree_ns.rs` parent-side `cplt worktree add`/`remove` broker and client (macOS and Linux)
 - `src/discover.rs` runtime environment probing (`cplt doctor`)
 - `src/detect.rs` project and machine ecosystem detectors behind `cplt init`
 - `src/gh_proxy.rs` gh and git command guards, policy tables, wrapper scripts
@@ -102,7 +102,7 @@ set.
 - `src/subscriptions.rs` blocklist subscriptions
 - `src/update.rs` self-update check and download
 - `src/scratch.rs` per-session scratch directory
-- `src/agent.rs` agent abstraction (Copilot, OpenCode, Antigravity, Pi, Claude Code, Shell). Binary discovery, config dirs, session flag translation, default domain allowlists, auth hints. Also holds the agent unit tests, which run as lib tests
+- `src/agent.rs` agent abstraction (Copilot, OpenCode, Antigravity, Pi, Claude Code, Goose, DSH, Shell). Binary discovery, config dirs, session flag translation, default domain allowlists, auth hints. Also holds the agent unit tests, which run as lib tests
 - `src/main.rs` CLI entry point, orchestration
 - `src/lib.rs` library crate root (re-exports modules for test access)
 - `src/proxy.rs` CONNECT proxy, domain blocking, audit log

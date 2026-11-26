@@ -55,8 +55,6 @@ cplt --gh-guard          # enable gh guard
 cplt --no-gh-guard       # disable gh guard
 cplt --git-guard         # enable git push prevention
 cplt --no-git-guard      # disable git push prevention
-cplt --allow-api-write   # allow gh api write operations to current repo (overrides config)
-cplt --no-allow-api-write # deny gh api write operations (overrides config)
 ```
 </details>
 
@@ -149,9 +147,7 @@ as `GH_REPO` and may name any repository, since the guard does not check what
 a listed extension does; any other flag before the name is refused.
 
 gh finds extensions under `$XDG_DATA_HOME/gh/extensions` (default
-`~/.local/share/gh/extensions`). The guard inherits `XDG_DATA_HOME` from the
-agent, so the agent chooses which directory that is, and can plant its own
-`gh-<name>` there for a listed name.
+`~/.local/share/gh/extensions`). At launch cplt records gh's config directory and this data directory, refuses to start if either is relative or writable inside the sandbox, and pins `GH_CONFIG_DIR` and `XDG_DATA_HOME` on every `gh` the guard runs. The agent cannot redirect them or plant a `gh-<name>` for a listed name.
 
 ### Backward compatibility
 
@@ -168,7 +164,7 @@ cplt bakes the policy flags, the absolute paths to the real `gh` and trusted
 `git` binaries, and the verified repository scope into the wrapper script when
 the sandbox starts. The `gh-gate` subcommand receives `--repo-scope`,
 `--real-git`, `--scope-check`, `--block-auth-token`, `--unknown-command=block`,
-and `--allow-api-write`/`--no-allow-api-write` as CLI flags. Runtime working
+and `--allow-api-write`/`--no-allow-api-write` as CLI flags (these exist on `gh-gate` only, not on the top-level `cplt` command). Runtime working
 directories, nested repositories, Git configuration, and `PATH` cannot redefine
 the approved scope; the cwd is only checked as evidence for an implicit target.
 
@@ -201,7 +197,7 @@ A flag before the subcommand, other than `-R`/`--repo`, `--hostname`/`-h` or `--
 | **Allow** | Read-only; repo-scoped reads resolve against the scope set, and an unverifiable cwd is pinned to the only member rather than refused (pinned to nothing when the set has several) | `pr list`, `issue view`, `run list`, `search` |
 | **ScopeCheck** | Permitted only for a repository in the scope set: the startup repo plus every `--repo-dir` root with a GitHub origin. Implicit targets must resolve to one of them from cwd | `pr create`, `issue comment`, `pr close` |
 | **Block** | Never permitted | `repo delete`, `pr merge`, `release create`, `workflow run` |
-| **Unknown** | Not in the policy table, blocked by default | anything GitHub adds to `gh` after the table was last updated |
+| **Unknown** | A subcommand of a built-in command that is not in the policy table, blocked by default | a subcommand GitHub adds to a known group after the table was last updated, such as `gh pr newthing` |
 
 Merging, deleting, and releasing need human judgment, which is why they sit in
 the Block tier rather than being scope-checked. `gh api` is the one command with
@@ -442,6 +438,7 @@ subcommand.
 | `-X DELETE` | Block | Block | Destructive, always blocked |
 | `-f`, `-F` without `-X GET`, or `--input` | Block | ScopeCheck | Implies POST or sends a request body; opt-in required (in-scope only) |
 | `graphql` endpoint | See [below](#gh-api-graphql) | See [below](#gh-api-graphql) | Read-only queries of allowlisted pull request and review-thread fields on a repository in scope, and three review-thread mutations with verified targets. Everything else is blocked |
+| `-H` with `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (`_` counts as `-`) | Block | ScopeCheck, Block for `DELETE` or a repeated header | The header overrides `-X`, except `-X DELETE`. An empty value, `GET` and `HEAD` count as `POST` |
 | Write to `repos/{o}/{r}/pulls/{n}/merge` or `repos/{o}/{r}/merges` | Block | Block | A merge must go through `gh pr merge` and its `allow_pr_merge` check |
 
 Note that `allow_api_write = true` scope-checks writes rather than freeing them.
@@ -467,9 +464,9 @@ enabled = true
 allow_api_write = true
 ```
 
-**Or for a single run:**
+**Or from the command line:**
 ```bash
-cplt --allow-api-write -- -p "post review comment replies"
+cplt config set --force gh_guard.allow_api_write true
 ```
 
 > **Note:** `allow_api_write` has no effect on `gh api graphql`. What GraphQL allows is
@@ -613,8 +610,10 @@ Where it stops:
   scalar or leads only to another allowlisted type. If GitHub changed one of
   these fields to return something else, the guard would not notice.
 - **The lookup runs in the sandbox, as the agent.** The gate calls the real
-  `gh` with the agent's environment, minus `GH_HOST` and `GH_REPO`, just as it
-  runs the approved command. That keeps both on the same host, but it stops a
+  `gh` with the agent's environment, minus `GH_HOST` and `GH_REPO`, plus the
+  launch-pinned `GH_CONFIG_DIR` and `XDG_DATA_HOME`, just as it runs the
+  approved command. The gate pins the host to `github.com` for lookups, mutations
+  and queries. That keeps both on the same host, but it stops a
   cooperative or confused agent, not a hostile one. A hostile agent can already
   call the real `gh` directly (see
   [What it does NOT protect against](#what-it-does-not-protect-against)).
@@ -647,8 +646,8 @@ opening lines:
 
 ```
 ⚠️ BLOCKED by sandbox: 'gh repo delete' is not allowed in this environment.
-⚠️ BLOCKED by sandbox: 'gh pr create' targets 'other/repo' which is outside the current repo 'navikt/cplt'.
-⚠️ BLOCKED by sandbox: 'gh newthing' is not recognized by the policy table.
+⚠️ BLOCKED by sandbox: 'gh pr create' targets 'other/repo' which is outside the startup repo 'navikt/cplt'.
+⚠️ BLOCKED by sandbox: 'gh pr newthing' is not recognized by the policy table.
 ⚠️ BLOCKED by sandbox: 'gh pr create' cannot verify target repository scope.
 ⚠️ BLOCKED by sandbox: 'gh api' targets an endpoint outside 'https://api.github.com'.
 ⚠️ BLOCKED by sandbox: 'gh issue list' targets GitHub host 'ghe.example.com', outside the approved host 'github.com'.

@@ -6,7 +6,7 @@
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, DeepSeek Harness, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
+**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Antigravity CLI, Pi, Claude Code, goose, DeepSeek Harness, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF + optional Bubblewrap namespace isolation (kernel 5.13+, full network filtering on 6.7+)
@@ -90,7 +90,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | --- | --- | --- |
 | Read/write project directory | ✅ Allowed | |
 | Read/write/delete `.env*`, `.pem`, `.key`, `id_rsa` in project | 🔒 Kernel-blocked | Prevents secret exfiltration and destruction. `--allow-env-files` overrides. Key files are matched by exact name (`.pem`), not extension (`server.pem`), unless `sandbox.deny_key_files_by_extension` is set |
-| Write `.git/hooks`, `.git/config`, `.gitmodules` | 🔒 Kernel-blocked (macOS), ⚠️ partial on Linux | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking. **Linux:** Landlock cannot deny a subpath inside an allowed tree, so these stay writable on the Landlock-only path. `bwrap` re-binds `.git/hooks` read-only but deliberately leaves `.git/config` and `.gitmodules` writable, so `core.hooksPath` remains a persistence route, see [Linux limitations](docs/security.md#linux). Applies to **every** writable root, the project and each `allow.write` grant, including a granted worktree or bare repo whose real hooks live outside `<root>/.git` |
+| Write `.git/hooks`, `.git/config`, `.gitmodules` | 🔒 Kernel-blocked (macOS), ⚠️ partial on Linux | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking. **Linux:** Landlock cannot deny a subpath inside an allowed tree, so these stay writable on the Landlock-only path. `bwrap` re-binds `.git/hooks` and any `core.hooksPath` directory the repository configures read-only. It also binds `.git/config` read-only when `sandbox.allow_git_config_write = false` (written by `cplt config init`). Without that key `.git/config` stays writable, so `core.hooksPath` remains a persistence route, and `.gitmodules` always stays writable, see [Linux limitations](docs/security.md#linux). Applies to **every** writable root, the project and each `allow.write` grant, including a granted worktree or bare repo whose real hooks live outside `<root>/.git` |
 | Execute from `/tmp`, `/var/folders` | 🔒 Kernel-blocked | Prevents write-then-exec. The scratch dir redirects TMPDIR to a safe location, on by default |
 | Write PATH-resolved bin/shim dirs (`~/.bun/bin`, `~/.deno/bin`, `$PNPM_HOME`, mise `shims/` and all of `installs/`) | 🔒 Kernel-blocked (macOS), ⚠️ mise partial on Linux | Prevents trojaning a binary your next *unsandboxed* command resolves through PATH. Same reason `~/.cargo/bin` and `~/go/bin` have always been read-only. Breaks `bun install -g`, `deno install`, `pnpm add -g`, `mise install`, `mise upgrade`, `mise use -g` inside cplt, deliberately, and a repo pinning an uninstalled toolchain no longer bootstraps. Project-local installs are unaffected. **Linux:** mise's two ride the `bwrap` read-only overlay; the rest hold natively. See [Global tool installs](docs/known-impacts.md#global-tool-installs) |
 | Execute from `~/Library/Caches` | 🔒 Kernel-blocked by default | Prevents binary-drop staging. Copilot native modules are exempted via a carve-out. Add targeted exemptions with `--allow-cache-exec <SUBDIR>`, e.g. `ms-playwright` |
@@ -138,7 +138,7 @@ For the full security model, threat analysis, and test strategy, read [SECURITY.
 | Environment handling | Allowlist plus hardening env injection | More basic pass-through model |
 | Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
 | Repo policy | [`.cplt.toml`](docs/configuration.md#per-repo-configuration-cplttoml) with an explicit trust/approval flow | No repo-level policy file |
-| Agent support | Copilot, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, DeepSeek Harness, or shell | Codex only |
+| Agent support | Copilot, OpenCode, Antigravity CLI, Pi, Claude Code, goose, DeepSeek Harness, or shell | Codex only |
 
 cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
 
@@ -170,14 +170,14 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Area | cplt | Anthropic srt |
 | --- | --- | --- |
 | Language / delivery | Single Rust binary | Node.js + npm package + external deps |
-| Linux backend | Landlock LSM (no deps, no namespaces) | bubblewrap (container via user namespaces) |
+| Linux backend | Landlock LSM + seccomp, optional bubblewrap namespaces | bubblewrap (container via user namespaces) |
 | Environment filtering | Strict allowlist + suffix-deny (`_TOKEN`, `_SECRET`) | Inherits the parent env on macOS and Linux. Variables listed under `credentials.envVars` can be withheld or masked |
 | Credential dir protection | 15+ dirs denied by default | User must configure manually |
 | Resolved-address checks | Post-DNS IP checked against loopback, link-local, RFC 1918, CGNAT and IPv6 ULA ranges by default | Post-DNS IP checked against loopback, link-local, cloud metadata and the host's own addresses. Private ranges only when listed in `deniedResolvedAddresses` |
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
-| SSH git | No key: agent socket denied at kernel on macOS, on Linux only `SSH_AUTH_SOCK` is withheld. The transport is not blocked, `ssh.github.com:443` is reachable | Proxied via SOCKS5 |
+| SSH git | No key: agent socket denied at kernel on macOS, on Linux `SSH_AUTH_SOCK` is withheld and socket connections are only partly blocked, see [Linux limitations](docs/security.md#linux). The transport is not blocked, `ssh.github.com:443` is reachable | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`, `pnpm_config_ignore_scripts`, `YARN_IGNORE_SCRIPTS`, `YARN_ENABLE_SCRIPTS`). Yarn 2+ still runs the project's own scripts | Not blocked |
-| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, DSH, Shell | Claude Code |
+| Agent support | Copilot, OpenCode, Antigravity, Pi, Claude Code, goose, DSH, Shell | Claude Code |
 | Credential injection | Opt-in placeholder GitHub token, real token restored at the proxy (`proxy.inject_github_token`) | Opt-in masking and injection at the proxy for listed variables, AWS SigV4 re-signing (`credentials.sigv4`) |
 | Config | TOML (global + per-repo) | JSON (`~/.srt-settings.json` or `--settings`) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
@@ -520,7 +520,7 @@ What the shims do not cover: an agent started by absolute path (`/opt/homebrew/b
 cplt [OPTIONS] [-- <AGENT_ARGS>...]
 ```
 
-Everything after `--` goes straight to the agent process (copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, or shell).
+Everything after `--` goes straight to the agent process (copilot, opencode, antigravity, pi, claude, goose, dsh, or shell).
 
 ### Policy presets
 
@@ -581,7 +581,7 @@ Variables cplt itself reads:
 | Variable | What it does |
 | --- | --- |
 | `CPLT_CONFIG` | Use this config file instead of `~/.config/cplt/config.toml`. See [docs/configuration.md](docs/configuration.md#precedence) |
-| `CPLT_MANAGED_CONFIG` | Absolute path to a managed config from a wrapper (nav-pilot). Adds its `proxy.allow_private_domains` to yours; accepted only under `~/.config/cplt/managed.d/`. See [docs/configuration.md](docs/configuration.md#managed-config-from-a-wrapper-cplt_managed_config) |
+| `CPLT_MANAGED_CONFIG` | Absolute path to a managed config from a wrapper (nav-pilot). Adds its `proxy.allow_private_domains` and `allow.domains` to yours; accepted only under `~/.config/cplt/managed.d/`. See [docs/configuration.md](docs/configuration.md#managed-config-from-a-wrapper-cplt_managed_config) |
 | `CPLT_SESSION_SUMMARY` | Absolute path where cplt writes a JSON summary of the session at exit, for a wrapper (nav-pilot). Never passed into the sandbox. `CPLT_SESSION_SUMMARY_HOSTS` names DNS suffixes whose blocked hostnames may appear in it. See [docs/configuration.md](docs/configuration.md#session-summary-for-a-wrapper-cplt_session_summary) |
 
 | Flag | What it does |
@@ -599,7 +599,7 @@ Variables cplt itself reads:
 | `--allow-msbuild` | Allow MSBuild worker-node unix sockets in `/tmp`. Needed for `dotnet build`. Does not enable the persistent MSBuild Server. See [MSBuild worker-node IPC](docs/known-impacts.md#msbuild-worker-node-ipc) |
 | `--no-scratch-dir` | Disable the per-session scratch directory, which is on by default. TMPDIR will not be redirected |
 | `--scratch-dir` | Explicitly enable the per-session scratch directory. Already the default, so this is for overriding `scratch_dir = false` in config |
-| `--brief` | Write the agent-facing sandbox brief to the scratch dir (`CPLT_BRIEF.md`) and load it into Copilot and OpenCode as instructions. On in configs written by `cplt config init`. Also `sandbox.brief = true` in config |
+| `--brief` | Write the agent-facing sandbox brief to the scratch dir (`CPLT_BRIEF.md`) and load it into Copilot, OpenCode and Claude Code as instructions. On in configs written by `cplt config init`. Also `sandbox.brief = true` in config |
 | `--no-brief` | Turn the sandbox brief off for this run, overriding `sandbox.brief = true` in config. Also suppresses the `AGENTS.md` block, which is gated on the brief |
 | `--agents-md` | 🧪 Experimental. With `--brief`, also write the managed cplt block into the project's `AGENTS.md`. Off by default. Also `sandbox.agents_md = true` in config. No effect without `--brief`. Unstable, so it may change or be removed in a future release |
 | `--no-agents-md` | Turn the `AGENTS.md` block off for this run, overriding `sandbox.agents_md = true` in config. Leaves the scratch-dir brief alone |
@@ -697,6 +697,7 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 | [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) | `antigravity`, aliases `agy` and `agi` | yes, priority 3 | Google OAuth in the browser |
 | [Pi](https://github.com/earendil-works/pi) | `pi` | no | `--pass-env ANTHROPIC_API_KEY` and friends |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude`, aliases `cc` and `claude-code` | no | Subscription OAuth in `~/.claude` or the Keychain, `CLAUDE_CODE_OAUTH_TOKEN` (drops the Keychain grant), or `--pass-env ANTHROPIC_API_KEY` |
+| [goose](https://github.com/aaif-goose/goose) | `goose` | no | `--pass-env <PROVIDER_API_KEY>`, or the macOS Keychain or `secrets.yaml` |
 | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | `dsh`, aliases `deepseek` and `deepseek-harness` | no | `--pass-env DEEPSEEK_API_KEY`, or `$DSH_HOME/.env` (`~/.dsh/.env`) |
 | Your shell | `shell` | no | none |
 
@@ -917,7 +918,7 @@ cplt init --global    # generate a personal ~/.config/cplt/config.toml
 
 It knows JVM (Gradle/Maven), Node.js, Docker, Python, Rust, Go, Playwright, Spring Boot, Ktor, TestContainers, Next.js, Vite, Flyway, Cypress, mise, and environment secrets from `.env.example`. Dangerous permissions come out of the generator with a risk warning attached. `--global` looks at machine-level things instead: Playwright browsers, GPG signing, registry credentials, alternative agents.
 
-Some keys are global-only and rejected from `.cplt.toml` because they are machine-specific or a local preference: `sandbox.agent`, `sandbox.quiet`, `sandbox.yes`, `sandbox.validate`, `sandbox.scratch_dir`, `sandbox.inherit_env`, `sandbox.allow_cache_exec`, `sandbox.allow_cache_exec_any`, `proxy.enabled`, `proxy.port`, `proxy.log_file`, `proxy.log_level`, `proxy.blocked_domains`, `proxy.allowed_domains`, and every `[gh_guard]` and `[git_guard]` key.
+Some keys are global-only and rejected from `.cplt.toml` because they are machine-specific or a local preference: `sandbox.agent`, `sandbox.quiet`, `sandbox.yes`, `sandbox.validate`, `sandbox.scratch_dir`, `sandbox.inherit_env`, `sandbox.allow_cache_exec`, `sandbox.allow_cache_exec_any`, `proxy.enabled`, `proxy.port`, `proxy.log_file`, `proxy.log_level`, `proxy.blocked_domains`, `proxy.allowed_domains`, and every `[gh_guard]` and `[git_guard]` key except `gh_guard.enabled` and `git_guard.enabled`.
 
 Full details, including the trust model, path expansion rules, and the complete config file reference: [docs/configuration.md](docs/configuration.md).
 
@@ -972,7 +973,7 @@ What cplt protects against:
 - Unauthorized code execution from temp dirs: kernel-blocked
 - Persistence via cache-dir binaries: kernel-blocked, since those dirs are denied exec
 - Persistence via git hooks in the project: `.git/hooks` is write-denied at the kernel on macOS. On Linux, with Landlock and no Bubblewrap, it stays writable, and cplt's own parent-side `git` then runs with `core.hooksPath=/dev/null` so it never executes a planted hook, though a `git` you run yourself still will
-- Persistence via package-manager tool dirs that are both writable and executable (mise shims, `PNPM_HOME`, `~/.deno/bin`, `~/.bun/bin`): write is granted there so `pnpm add -g` and friends work in-sandbox, so an agent can leave a binary behind that a *later* shell picks up off your `PATH`
+- Persistence via package-manager tool dirs that your `PATH` resolves (mise `shims/` and `installs/`, `PNPM_HOME`, `~/.deno/bin`, `~/.bun/bin`): writes are kernel-denied on macOS. On Linux bun, deno and pnpm are read-only natively, and mise `shims/` and `installs/` are read-only only when Bubblewrap is active, so without it an agent can leave a binary behind that a *later* shell picks up off your `PATH`
 - A planted binary hijacking the **agent** cplt launches: at launch and audit, cplt resolves the helpers it runs itself (`git`, `bwrap`, `sandbox-exec`, `mise`, and the `gh` it reads a token from) from fixed system directories rather than `PATH`, but the agent binary itself runs from wherever it was discovered, which for an npm-global install is commonly under a writable mise or node tree. cplt cannot resolve it from a fixed directory — it legitimately lives where your version manager put it — so it checks the resolved path against the write rules the sandbox is about to apply and **warns at launch**, naming the binary and the writable tree, then proceeds
 - `cplt doctor`: its `--version` probes run each agent binary it finds on your `PATH`, in the parent, so a planted one executes there — the same discovered-path exposure as the launch above, which is why doctor is a report and not a boundary. Its `gh` check is resolved from the trusted directories and its kernel-release read spawns nothing at all
 - Data exfiltration to unauthorized domains: proxy-blocked

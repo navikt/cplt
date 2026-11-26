@@ -243,7 +243,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "",
-        description: "Preferred AI coding agent (copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, shell). Auto-detected from PATH if not set.",
+        description: "Preferred AI coding agent (copilot, opencode, antigravity, pi, claude, goose, dsh, shell). Auto-detected from PATH if not set.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -579,7 +579,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: true,
         default_display: "false",
-        description: "\u{26a0}\u{fe0f}  DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and ~/.m2/settings.xml (the files only; read-only on macOS, while Linux leaves the Maven and Gradle files read/write either way). Exposes every registry token in them, not only the one the project uses.",
+        description: "\u{26a0}\u{fe0f}  DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and ~/.m2/settings.xml (the files only; read-only on macOS; on Linux the Maven and Gradle files are readable either way, not writable). Exposes every registry token in them, not only the one the project uses.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -681,7 +681,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         // Same disagreement, same fix.
         dangerous: true,
         default_display: "false",
-        description: "Allow 'gh api' write operations (POST/PATCH/PUT and input flags). Writes are scope-checked to the current repo. GraphQL is always blocked.",
+        description: "Allow 'gh api' write operations (POST/PATCH/PUT and input flags). Writes are scope-checked to the current repo. Does not affect `gh api graphql`.",
     },
     ConfigKeyInfo {
         section: "gh_guard",

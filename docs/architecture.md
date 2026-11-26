@@ -344,7 +344,7 @@ duplicated across test files. Use `tempfile::TempDir` for filesystem tests.
 
 - Do not add `Co-authored-by` trailers
 - GPG signing may be unavailable in the sandbox; use `git -c commit.gpgSign=false commit`
-- Run `mise run check` before pushing (fmt + clippy + unit + lib tests)
+- Run `mise run check` before pushing (fmt + clippy + unit + lib tests + offline probe checks)
 
 ## What not to do
 

@@ -218,7 +218,7 @@ inject_github_token = true
 # ─── Sandbox behavior ───────────────────────────────────────
 [sandbox]
 # Preferred AI coding agent. Auto-detected from PATH if not set.
-# Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, shell
+# Supported: copilot, opencode, antigravity, pi, claude, goose, dsh, shell
 # agent = "copilot"
 #
 # Named policy preset. Sets a baseline for the five sandbox toggles below
@@ -406,7 +406,8 @@ strip_otlp_vendor_auth = true
 # Give sub-agents a place to create Git worktrees: read, write and execute on a
 # cplt-owned directory for this repository only (~/.cplt-worktrees/<id>),
 # exported as CPLT_WORKTREE_ROOT. Worktrees and branches there persist after the
-# session; cplt never removes them. macOS only. Global or local config only.
+# session; cplt never removes them. On Linux it needs bubblewrap 0.8 or later.
+# Global or local config only.
 # allow_git_worktrees = false
 #
 # Linux: let the agent write .git/config (in-session `git config`, `git remote`).

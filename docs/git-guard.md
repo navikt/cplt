@@ -144,8 +144,8 @@ and ask nothing. The remote is only asked when `protect_default_branch_only` is
 on. A default branch with a slash in it (`release/2026`) is
 compared whole, because that is how both sides arrive: the symref gives up only
 its `<remote>/` prefix, and the push argument is the branch name entire. `main`
-and `master` stay protected as a floor alongside it, recognized with or without
-an `origin/` prefix. When several refspecs are
+and `master` stay protected as a floor alongside it, matched on the last path
+segment, so `origin/main` and `feature/main` are both blocked. When several refspecs are
 given, the guard checks all of them and blocks if any names a protected branch,
 so `git push origin feature main` does not slip through.
 
@@ -216,7 +216,8 @@ reads that file outside the sandbox, checks each entry against the repository
 and the guard's own policy, and writes only `branch.<b>.remote` and
 `branch.<b>.merge` for those that pass. The checks are listed in
 [known impacts](known-impacts.md#branch-tracking-is-silently-dropped). On Linux
-the flag works as is and nothing is recorded.
+the flag is not stripped and nothing is recorded: it writes `.git/config`, which fails
+when `sandbox.allow_git_config_write` is `false` (set in new configs).
 
 ## Blocked commands
 
@@ -225,7 +226,9 @@ the flag works as is and nothing is recorded.
 | `git push` | Remote write, a human should review and push |
 | `git request-pull` | Initiates upstream merge requests |
 | `git send-pack` | Plumbing equivalent of push, also a remote write |
-| `git subtree push` | A remote write in subtree clothing. The local forms `add`, `pull`, `split`, and `merge` stay allowed |
+| `git subtree push`, `git lfs push` | A remote write in subtree or LFS clothing. The local forms, such as `subtree add` and `lfs ls-files`, stay allowed |
+| `git push --receive-pack`, `--exec` | Picks the program that runs the push, so the guard's verdict about the remote would not bind |
+| `git push --all`, `--branches`, `--mirror`, `--tags`, `--follow-tags`, `--prune`, or a tag refspec | Updates refs a branch rule cannot bound. Refused under `protect_default_branch_only` and `allow_push` |
 | `git remote add origin …`, `git remote set-url origin …`, `git remote rename <old> origin` | Retargets the `origin` remote, which is where the gh guard reads the enforced repo scope from |
 | `git config remote.origin.url …`, `git config remote.origin.pushurl …` | Same retargeting, through config instead of the `remote` subcommand |
 | `git config url.<base>.insteadOf …`, `…pushInsteadOf …` | git's URL-rewrite rules silently redirect transport for any matching URL |
@@ -247,6 +250,7 @@ The guard also spots the force-push flags on `git push`:
 | `--force` / `-f` | Force-push detection |
 | `--force-with-lease` | Including the `--force-with-lease=ref` form |
 | `--force-if-includes` | Modern force-push variant |
+| `+<ref>` refspec, `--mirror`, `--prune` | Force or discard remote refs without `--force` |
 
 Force push is blocked wherever it lands while `prevent_force_push` is on, which
 is the default, including on a feature branch under
@@ -274,22 +278,25 @@ the root is baked into the wrapper at launch, not read from the agent's env) is
 allowed, resolved against the working
 directory and any `-C`, with symlinks followed; an unknown option or a `..`
 the guard can't resolve is refused. Otherwise use `cplt worktree add <name>
-<ref>` when `CPLT_WORKTREE_SOCKET` is set, or prepare worktrees outside cplt.
+<ref>` (and `cplt worktree remove <name> [--force]`) when `CPLT_WORKTREE_SOCKET` is set, on macOS or Linux, or prepare worktrees outside cplt.
 Other `git worktree` subcommands (`list`, `prune`, `remove`, ...) are allowed.
 Warn mode prints the refusal and runs the command.
 
 **Aliases set for one command are refused**, also with push prevention off:
 `git -c alias.w='worktree add' w ../x` would expand inside git after the guard
 has decided. This covers `-c`, `--config-env` and `GIT_CONFIG_PARAMETERS` /
-`GIT_CONFIG_KEY_<n>`; aliases in a config file are unaffected, including one named via
-`GIT_CONFIG_GLOBAL` or `-c include.path`.
+`GIT_CONFIG_KEY_<n>`. While push or force-push prevention is on, `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM` and `-c include.*` / `includeIf.*` are refused too, as are `-c` keys
+that redirect a push (`remote.*`, `url.*`, `push.*`, `branch.*`). Aliases already in the
+normal config files are unaffected.
 
 **Default-deny while push prevention is active.** An unrecognized subcommand is
-blocked, not passed through, whenever `prevent_push` is on. An agent can define
+blocked, not passed through, whenever `prevent_push` or `prevent_force_push` is on. An agent can define
 an alias that resolves to a blocked subcommand, and git expands aliases inside
 the real binary after the guard has approved the command, so anything the guard
-cannot classify has to be refused. If only `prevent_force_push` is on, the
-guard checks force flags on `push` and lets everything else through.
+cannot classify has to be refused. If only `prevent_force_push` is on, plain `git push` and `git request-pull` are
+allowed. Force pushes, `git send-pack`, unrecognized subcommands, injected config,
+`--receive-pack`/`--exec` and unmanaged `git worktree add` stay blocked.
 
 ## Security boundaries
 
@@ -300,7 +307,7 @@ guard checks force flags on `push` and lets everything else through.
 | **Agent commits on main locally** | Local commit is allowed | Push guard prevents remote effect; human reviews before push |
 | **Wrapper bypass via real binary** | Agent can read wrapper script to find real git path | Wrapper is in scratch dir; kernel blocks writes there but path is readable |
 | **SSH push (if creds available)** | Agent could use raw SSH if keys were accessible | Kernel sandbox blocks `~/.ssh/` access entirely |
-| **Agent modifies `.git/hooks`** | Post-push hooks or other persistence | Kernel sandbox blocks writes to `.git/hooks/` on both platforms, and to `.git/config` on macOS only. On Linux `.git/config` stays writable, so `core.hooksPath` can still redirect hooks. |
+| **Agent modifies `.git/hooks`** | Post-push hooks or other persistence | Kernel sandbox blocks writes to `.git/hooks/` and a configured `core.hooksPath` directory on macOS and, under Bubblewrap, on Linux. It blocks `.git/config` on macOS, and on Linux under Bubblewrap when `sandbox.allow_git_config_write = false` (set in new configs). Where `.git/config` stays writable, `core.hooksPath` can still redirect hooks. |
 | **Git credential helper** | Could theoretically extract tokens | `GIT_TERMINAL_PROMPT=0` disables interactive prompts; credential files blocked |
 | **Agent rewrites the recorded default branch** | `protect_default_branch_only` used to resolve the default branch inside the sandbox, from `.git/refs/remotes/<remote>/HEAD`, at the moment the push was judged. That ref is agent-writable, so the agent chose the guard's yardstick (GHSA-cm6f-3wjh-x9qx). | Closed. The default branch is captured at launch, in the parent, with the trusted git binary, and baked into the wrapper; the gate never re-reads it. The ref file is denied and its parent directories are pinned against rename, so it cannot be rewritten for the *next* launch either. Write-form `git symbolic-ref refs/remotes/<remote>/HEAD` and `git remote set-head` are refused by the gate, which is what covers repositories using the `reftable` backend, where the ref is not a file and no path deny can see it. Reads are unaffected. Residual: on a Landlock-only Linux host the filesystem half is unenforced, so only the launch-time capture and the gate blocks apply. Server-side branch protection remains the boundary that holds against an agent invoking git by absolute path. |
 
@@ -315,7 +322,7 @@ it. These are the layers around it:
 | AGENTS.md | Instructs agent not to push | Soft (compliance-based) |
 | `GIT_TERMINAL_PROMPT=0` | Blocks interactive credential prompts | Medium |
 | **Git wrapper (this feature)** | Blocks `git push` at command level | Strong (kernel PATH) |
-| Kernel sandbox | Blocks `~/.ssh/` and `.git/hooks` writes. `.git/config` only on macOS | Strongest (unbypassable) |
+| Kernel sandbox | Blocks `~/.ssh/` and `.git/hooks` writes. `.git/config` on macOS, and on Linux under Bubblewrap with `sandbox.allow_git_config_write = false` | Strongest (unbypassable) |
 | Server branch protection | Rejects unauthorized pushes server-side | Strongest (server-side) |
 
 Use the git wrapper as the primary enforcement and AGENTS.md as the UX layer, so
@@ -340,11 +347,11 @@ and carry on. The opening lines:
 
 ```
 ⚠️ BLOCKED by sandbox: 'git push' is not allowed in this environment.
-⚠️ BLOCKED by sandbox: 'git push --force' is not allowed in this environment.
+⚠️ BLOCKED by sandbox: Force push is not allowed in this environment.
 ⚠️ BLOCKED by sandbox: 'git subtree push' is not allowed in this environment.
 ⚠️ BLOCKED by sandbox: 'git frobnicate' is not a recognized subcommand.
 ⚠️ BLOCKED by sandbox: 'git remote' would change a remote's URL.
-⚠️ BLOCKED by sandbox: 'git -c alias.*' is not allowed.
+⚠️ BLOCKED by sandbox: 'git -c alias.p=…' is not allowed while push prevention is active.
 ```
 
 In `warn` mode the same text is prefixed with `⚠️  WARNING (would block):` and

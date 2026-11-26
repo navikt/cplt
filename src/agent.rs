@@ -3318,7 +3318,7 @@ impl FromStr for Agent {
             "dsh" | "deepseek" | "deepseek-harness" => Ok(Agent::Dsh),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, antigravity, pi, claude, goose, dsh, shell"
             )),
         }
     }

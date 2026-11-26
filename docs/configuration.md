@@ -556,13 +556,14 @@ Nested repositories are found by a bounded scan (three levels, 20 000
 directories), as for `.git/hooks`. A hard link to `.git/config` from the
 writable tree fails with `EXDEV`, because the bound file is its own mount.
 With `extensions.worktreeConfig` on, a `config.worktree` that does not exist at
-launch is not bound, so the agent can create one. Linked worktree directories
+launch is masked with `/dev/null` when `sandbox.mask_missing_deny_paths` is true.
+With that key off it is not bound, so the agent can create one. Linked worktree directories
 under `.git/worktrees` are pinned, so `git worktree remove` and `prune` fail in
 the session.
 
 ## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
 
-Off by default, macOS only, since 2026.09.24-164900-53d4462. When on, cplt
+Off by default. Works on macOS, and on Linux with Bubblewrap 0.8 or later. When on, cplt
 gives the session one directory outside your checkout where sub-agents can
 create Git worktrees for parallel work:
 
@@ -604,7 +605,7 @@ policy, checks the private checkout, and publishes it atomically. It:
   is never replaced;
 - also refuses dangling symlinks and symlink targets with `..` after a named
   component, matching the launch/exit checks;
-- creates no branch, so a refused or failed request leaves no ref behind.
+- creates a branch only when you pass `-b`, and deletes it again if the request fails before publishing, so a refused or failed request leaves no ref behind.
 
 `cplt worktree remove` takes a name or a path directly under
 `$CPLT_WORKTREE_ROOT`. It removes only a linked worktree of this repository that
@@ -766,9 +767,9 @@ Two other layouts work too:
 The launch fails, rather than running without the root, if it cannot be
 granted: the root or `~/.cplt-worktrees` is a symlink, is not a directory, or
 is owned by another user, the repository's `commondir` does not match the
-layout Git writes, or a worktree link fails the check above. It also fails on
-Linux, where nothing inside the root would be kernel-enforced; there `cplt config
-set sandbox.allow_git_worktrees true` is refused as well.
+layout Git writes, or a worktree link fails the check above. On Linux it also fails when
+Bubblewrap 0.8 or later is unavailable. `cplt config set
+sandbox.allow_git_worktrees true` is refused only on other operating systems.
 
 Outside a Git repository there is no root to grant. With the key in your
 global config, cplt warns and runs without it. With the key in this checkout's
@@ -969,8 +970,8 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `proxy.upstream` | the corporate proxy is machine-specific and network-specific |
 | `proxy.upstream_no_proxy` | same, and it only means anything alongside `proxy.upstream` |
 | all `[proxy.subscriptions]` keys | subscription sources are security-sensitive, and a repo must not be able to add one |
-| all `[gh_guard]` keys | guard policy is configured globally, not per-repo |
-| all `[git_guard]` keys | guard policy is configured globally, not per-repo |
+| all `[gh_guard]` keys except `gh_guard.enabled` | guard policy is configured globally, not per-repo |
+| all `[git_guard]` keys except `git_guard.enabled` | guard policy is configured globally, not per-repo |
 | `shell.skip` | the PATH shims are shared by every repository on the machine; also refused in `config set --local` |
 
 ### `shell.skip`
@@ -1266,7 +1267,7 @@ On Linux, the agent's host-persistence denies (Copilot's `agents/` and `extensio
 cplt config set sandbox.mask_missing_deny_paths true
 ```
 
-With the key on, a missing directory gets an empty read-only mount, so creating it or writing inside it fails. The agent sees an empty directory where there was none, and bubblewrap leaves that empty directory on disk. It is masked only when its parent directory exists and lies inside a writable grant, after symlinks and `XDG_*` or `CLAUDE_CONFIG_DIR` roots are resolved, so cplt never creates a parent in your home directory. A directory that cannot be masked gets a launch warning naming it. Missing files (`settings.json`, `hooks.json`) are not masked. A config without the key keeps today's behaviour, and `cplt doctor` suggests the change; set the key to `false` to silence that. The key needs bubblewrap and has no effect on macOS, which denies these paths whether they exist or not. See [known impacts](known-impacts.md#linux-missing-host-persistence-directories-appear-empty).
+With the key on, a missing directory gets an empty read-only mount, so creating it or writing inside it fails. The agent sees an empty directory where there was none, and bubblewrap leaves that empty directory on disk. It is masked only when its parent directory exists and lies inside a writable grant, after symlinks and `XDG_*` or `CLAUDE_CONFIG_DIR` roots are resolved, so cplt never creates a parent in your home directory. A directory that cannot be masked gets a launch warning naming it. Missing agent config files (`settings.json`, `hooks.json`) are not masked. A missing `config.worktree` (with `extensions.worktreeConfig` on and `sandbox.allow_git_config_write = false`) is masked with `/dev/null`. The missing login and autostart files under a broad `allow.write` are masked the same way, whether or not this key is on. `--print-profile` and `cplt check` skip these masks, so they create nothing on the host. A config without the key keeps today's behaviour, and `cplt doctor` suggests the change; set the key to `false` to silence that. The key needs bubblewrap and has no effect on macOS, which denies these paths whether they exist or not. See [known impacts](known-impacts.md#linux-missing-host-persistence-directories-appear-empty).
 
 ## Other keys
 
@@ -1321,7 +1322,7 @@ Which paths follow `CPLT_CONFIG`:
 - **Follows `CPLT_CONFIG`:** `config.toml` and its directory, which also holds per-repo overrides in `local/`, approvals in `trust/` and the blocklist cache in `subscriptions/`.
 - **Does not follow `CPLT_CONFIG` ([#830](https://github.com/navikt/cplt/issues/830)):** runtime state such as launch fingerprints, update staging and one-off markers. These live in `$XDG_CONFIG_HOME/cplt` or `~/.config/cplt`, depending on the file and on which copy already exists. A scratch `HOME` and `XDG_CONFIG_HOME` cover both.
 
-`cplt config init` writes a commented starter template to `config.toml`. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key documented inline. Two keys are set: `proxy.forced = true` ([#822](https://github.com/navikt/cplt/issues/822)), left commented out on Linux below Landlock ABI 4, where forced mode cannot launch, and `sandbox.strip_otlp_vendor_auth = true` ([#878](https://github.com/navikt/cplt/issues/878)). Every other key is commented out. An existing config is never changed: without the keys both stay off, and `cplt doctor` suggests them. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
+`cplt config init` writes a commented starter template to `config.toml`. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key documented inline. Eight keys are set: `proxy.forced = true` ([#822](https://github.com/navikt/cplt/issues/822)), left commented out on Linux below Landlock ABI 4, where forced mode cannot launch, `proxy.inject_github_token = true`, `sandbox.refuse_unenforced = true`, `sandbox.allow_copilot_host_persistence = false`, `sandbox.mask_missing_deny_paths = true`, `sandbox.brief = true`, `sandbox.strip_otlp_vendor_auth = true` ([#878](https://github.com/navikt/cplt/issues/878)) and `sandbox.allow_git_config_write = false`. Every other key is commented out. An existing config is never changed: without the keys the older defaults stay, and `cplt doctor` suggests them. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
 ```bash
 cplt config init
@@ -1806,4 +1807,4 @@ It detects:
 | Gradle registry credentials | `~/.gradle/gradle.properties` mentioning `repository`, `nexus`, or `artifactory` | `allow.read` for that file |
 | npm registry credentials | `~/.npmrc` with a `registry` or `_authToken` line | `allow.read` for that file |
 | Maven repository settings | `~/.m2/settings.xml` with a `<server>`, `<mirror>`, or `<repository>` | `allow.read` for that file |
-| Default agent | `copilot`, `opencode`, `aider`, `antigravity`, `claude` in PATH | `agent = "..."`, but only when exactly one is found and it is not `copilot` |
+| Default agent | `copilot`, `opencode`, `antigravity` (`agy`), `pi`, `claude`, `goose`, `dsh` in PATH | `agent = "..."`, but only when exactly one is found and it is not `copilot` |
