@@ -245,6 +245,192 @@ pub const DENIED_FILES: &[&str] = &[
     ".vault-token",
 ];
 
+/// Known host login and autostart paths, relative to `$HOME`: files and
+/// directories the user's own shell, session manager or tools run from
+/// outside the sandbox. One list for macOS and Linux, like
+/// [`HOME_TOOL_DIRS`]; a missing path costs nothing.
+///
+/// Best effort, not a guarantee: these are the well-known places, and a
+/// shell or tool can be configured to run code from anywhere else under a
+/// broad grant. The list only constrains a *broader* `allow.write` (`~`,
+/// `~/.config`, `~/Library`, a parent of `$HOME`): macOS emits a write deny
+/// after every user allow and pins the directories between grant and entry,
+/// and Linux binds the paths read-only through bubblewrap. An explicit grant
+/// equal to or inside an entry is the user's choice and is honoured on both
+/// backends, with a launch warning. `.config/...` entries also apply under a
+/// relocated `XDG_CONFIG_HOME`, and the zsh rc files under `$ZDOTDIR`.
+///
+/// Not listed: `~/.npmrc` and `~/.ssh` are already denied as credentials;
+/// `~/.gitconfig` is read-only through [`HOME_CONFIG_FILES`];
+/// `~/Library/LaunchDaemons` and the crontab spool are root-owned.
+pub const HOST_PERSISTENCE_PATHS: &[&str] = &[
+    // Shell startup files, run by every new interactive or login shell.
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".bash_aliases",
+    ".bashrc.d",
+    ".profile",
+    ".profile.d",
+    ".config/zsh",
+    ".config/fish",
+    ".config/nushell",
+    "Library/Application Support/nushell",
+    // X session and PAM login environment.
+    ".xprofile",
+    ".xsessionrc",
+    ".pam_environment",
+    ".config/environment.d",
+    // macOS per-user launchd jobs, loaded at login.
+    "Library/LaunchAgents",
+    // XDG autostart entries and systemd user units, started with the session.
+    ".config/autostart",
+    ".config/systemd/user",
+    ".local/share/systemd/user",
+    // Commonly first on PATH: a binary dropped here shadows a system command.
+    ".local/bin",
+    "bin",
+    // sshd runs `~/.ssh/rc` at login and trusts `authorized_keys`. `~/.ssh` is
+    // denied already; these stay closed even if a grant reopens it.
+    ".ssh/rc",
+    ".ssh/authorized_keys",
+    // Global git hooks (`core.hooksPath`) and included config live here.
+    ".config/git",
+];
+
+/// zsh rc files, which also live under `$ZDOTDIR` and have compiled `.zwc`
+/// siblings zsh prefers when newer.
+pub const ZSH_RC_FILES: &[&str] = &[".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout"];
+
+/// The [`HOST_PERSISTENCE_PATHS`] files that bubblewrap masks with an empty
+/// read-only file when they are missing. An empty file here changes nothing
+/// for the program that reads it. `.bash_profile` and `.bash_login` are left
+/// out: an empty one would stop bash reading `~/.profile`. So is `~/.ssh`,
+/// which is masked as a credential directory already, and where an empty
+/// `rc` would stop sshd running xauth.
+#[cfg(any(target_os = "linux", test))]
+pub const HOST_PERSISTENCE_MASKABLE_FILES: &[&str] = &[
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".bashrc",
+    ".bash_logout",
+    ".bash_aliases",
+    ".profile",
+    ".xprofile",
+    ".xsessionrc",
+    ".pam_environment",
+];
+
+/// The [`HOST_PERSISTENCE_PATHS`] entries that are directories.
+#[cfg(any(target_os = "linux", test))]
+pub fn host_persistence_is_dir(entry: &str) -> bool {
+    entry.starts_with(".config/")
+        || entry.ends_with(".d")
+        || matches!(
+            entry,
+            "Library/LaunchAgents"
+                | "Library/Application Support/nushell"
+                | ".local/bin"
+                | ".local/share/systemd/user"
+                | "bin"
+        )
+}
+
+/// Every known persistence path as an absolute path, with its table entry:
+/// the `$HOME` spelling, the `XDG_CONFIG_HOME` one for `.config/...`, and the
+/// `$ZDOTDIR` one for zsh rc files. Read from the launching environment,
+/// which is what the host's shell sees too.
+pub fn host_persistence_candidates(home: &Path) -> Vec<(PathBuf, &'static str)> {
+    let env_dir = |k: &str| {
+        std::env::var_os(k)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let xdg = env_dir("XDG_CONFIG_HOME");
+    let zdot = env_dir("ZDOTDIR");
+    let mut out = Vec::new();
+    for e in HOST_PERSISTENCE_PATHS {
+        out.push((home.join(e), *e));
+        if let (Some(x), Some(rest)) = (&xdg, e.strip_prefix(".config/")) {
+            out.push((x.join(rest), *e));
+        }
+        if let Some(z) = zdot.as_ref().filter(|_| ZSH_RC_FILES.contains(e)) {
+            out.push((z.join(e), *e));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A zsh compiled rc file (`.zshrc.zwc`) or completion dump (`.zcompdump*`).
+pub fn is_zsh_sibling(p: &Path) -> bool {
+    let Some(n) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    n.starts_with(".zcompdump")
+        || n.strip_suffix(".zwc")
+            .is_some_and(|rc| ZSH_RC_FILES.contains(&rc))
+}
+
+/// A zsh sibling ([`is_zsh_sibling`]) in a dir that holds a zsh rc entry:
+/// `$HOME` or `$ZDOTDIR`, as spelled or canonical.
+pub fn is_zsh_sibling_of_home(home: &Path, path: &Path) -> bool {
+    let canon = |p: &Path| crate::config::canonicalize_deepest(p);
+    let dirs: Vec<PathBuf> = host_persistence_candidates(home)
+        .into_iter()
+        .filter(|(_, e)| *e == ".zshrc")
+        .filter_map(|(p, _)| p.parent().map(Path::to_path_buf))
+        .flat_map(|d| [canon(&d), d])
+        .collect();
+    [path.to_path_buf(), canon(path)]
+        .iter()
+        .any(|p| is_zsh_sibling(p) && p.parent().is_some_and(|d| dirs.iter().any(|z| z == d)))
+}
+
+/// How a write grant on `path` relates to the known persistence paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceGrant {
+    /// `$HOME`, a parent of it, or a parent of an entry: the entries under it
+    /// stay read-only.
+    Broader,
+    /// Equal to or inside an entry (or its link target): honoured as written.
+    Explicit,
+}
+
+/// Classify a write grant against [`host_persistence_candidates`], comparing
+/// as spelled and canonically, so a symlinked spelling of `~` and a grant on
+/// an entry's link target both count. Used to mark grants as dangerous.
+pub fn host_persistence_grant(home: &Path, path: &Path) -> Option<PersistenceGrant> {
+    let canon = |p: &Path| crate::config::canonicalize_deepest(p);
+    let paths = [path.to_path_buf(), canon(path)];
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for (e, _) in host_persistence_candidates(home) {
+        entries.push(canon(&e));
+        entries.push(e);
+    }
+    if paths
+        .iter()
+        .any(|p| entries.iter().any(|e| p.starts_with(e)))
+    {
+        return Some(PersistenceGrant::Explicit);
+    }
+    let homes = [home.to_path_buf(), canon(home)];
+    paths
+        .iter()
+        .any(|p| homes.iter().any(|h| h.starts_with(p)) || entries.iter().any(|e| e.starts_with(p)))
+        .then_some(PersistenceGrant::Broader)
+}
+
 /// Home config files granted read-only on both backends, relative to `$HOME`.
 ///
 /// One list so the backends cannot drift apart (#522): a config that works on

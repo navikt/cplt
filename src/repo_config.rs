@@ -972,7 +972,19 @@ pub fn propose_key_detail(
     match key {
         "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
         "allow.write" if !propose.allow.write.is_empty() => {
-            Some(format!("{:?}", propose.allow.write))
+            let mut d = format!("{:?}", propose.allow.write);
+            let marks: Vec<String> = propose
+                .allow
+                .write
+                .iter()
+                .filter_map(|w| {
+                    crate::config::home_scope_write_reason(w).map(|r| format!("{w} {r}"))
+                })
+                .collect();
+            if !marks.is_empty() {
+                d = format!("{d} ({})", marks.join("; "));
+            }
+            Some(d)
         }
         "allow.ports" if !propose.allow.ports.is_empty() => {
             Some(format!("{:?}", propose.allow.ports))
@@ -1152,6 +1164,26 @@ preset = \"full-trust\"\n",
         assert!(toml::from_str::<RepoConfig>("this is = = not toml [[[\n").is_err());
     }
     use super::*;
+
+    #[test]
+    fn propose_detail_marks_home_scope_write() {
+        crate::with_env_lock_no_xdg(|| {
+            let mut p = ProposeSection::default();
+            p.allow.write = vec!["~".to_string()];
+            let d = propose_key_detail(&p, "allow.write", None).unwrap();
+            assert!(d.contains("dangerous"), "{d}");
+            p.allow.write = vec!["~/.config".to_string(), "~/.local/bin".to_string()];
+            let d = propose_key_detail(&p, "allow.write", None).unwrap();
+            assert!(
+                d.contains("~/.config is dangerous: it covers")
+                    && d.contains("~/.local/bin is dangerous: it is a known"),
+                "{d}"
+            );
+            p.allow.write = vec!["~/Repos/other".to_string()];
+            let d = propose_key_detail(&p, "allow.write", None).unwrap();
+            assert!(!d.contains("dangerous"), "{d}");
+        });
+    }
 
     #[test]
     fn every_token_inject_ca_var_is_reserved() {

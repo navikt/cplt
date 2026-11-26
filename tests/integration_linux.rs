@@ -3399,6 +3399,148 @@ print('BIND_OK')
         );
     }
 
+    /// A broad `allow.write` stays writable, except for the host's login and
+    /// autostart files, which bubblewrap binds read-only under it.
+    #[test]
+    fn bwrap_keeps_login_files_read_only_under_a_broad_write_grant() {
+        require_bwrap!();
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = &home.path().canonicalize().unwrap();
+        let project = h.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(h.join(".config/fish")).unwrap();
+        fs::create_dir_all(h.join(".config/other")).unwrap();
+        fs::create_dir_all(h.join(".config/systemd/user")).unwrap();
+        fs::write(h.join(".config/fish/config.fish"), "orig\n").unwrap();
+        let script = format!(
+            "echo x >> '{c}/fish/config.fish' && echo FISH_WRITTEN; \
+             mkdir -p '{c}/autostart' && touch '{c}/autostart/a.desktop' && echo AUTOSTART_CREATED; \
+             mv '{c}/systemd' '{c}/s2' && echo SYSTEMD_MOVED; \
+             touch '{c}/other/ok' && echo OTHER_OK",
+            c = h.join(".config").display()
+        );
+        let mut cmd = cplt_cmd();
+        crate::common::with_scratch_home(&mut cmd);
+        let out = cmd
+            .env("HOME", h)
+            // Elsewhere, so the `~/.config` grant does not cover gh's config.
+            .env("XDG_CONFIG_HOME", h.join("xdg-config"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("XDG_CACHE_HOME", h.join(".cache"))
+            .args([
+                "--yes",
+                "--no-validate",
+                "--use-bubblewrap",
+                "--project-dir",
+            ])
+            .arg(&project)
+            .arg("--allow-write")
+            .arg(h.join(".config"))
+            .args(["--agent", "shell", "--", "-c", &script])
+            .output()
+            .expect("run cplt");
+        let (o, e) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(o.contains("OTHER_OK"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("FISH_WRITTEN"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("AUTOSTART_CREATED"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("SYSTEMD_MOVED"), "stdout: {o}\nstderr: {e}");
+        assert!(
+            !h.join(".config/autostart/a.desktop").exists(),
+            "a missing autostart dir must be masked"
+        );
+        assert_eq!(
+            fs::read_to_string(h.join(".config/fish/config.fish")).unwrap(),
+            "orig\n"
+        );
+    }
+
+    /// An explicit grant on a login path is honoured, with a launch warning.
+    #[test]
+    fn bwrap_honours_explicit_grants_on_login_paths_and_only_their_subtree() {
+        require_bwrap!();
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = &home.path().canonicalize().unwrap();
+        let project = h.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(h.join(".config/autostart")).unwrap();
+        fs::create_dir_all(h.join(".config/fish/conf.d")).unwrap();
+        fs::write(h.join(".config/fish/config.fish"), "orig\n").unwrap();
+        let script = format!(
+            "touch '{c}/autostart/x.desktop' && echo AUTOSTART_OK; \
+             touch '{c}/fish/conf.d/a.fish' && echo CONFD_OK; \
+             echo x >> '{c}/fish/config.fish' && echo FISH_WRITTEN",
+            c = h.join(".config").display()
+        );
+        let mut cmd = cplt_cmd();
+        crate::common::with_scratch_home(&mut cmd);
+        let out = cmd
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join("xdg-config"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("XDG_CACHE_HOME", h.join(".cache"))
+            .args([
+                "--yes",
+                "--no-validate",
+                "--use-bubblewrap",
+                "--project-dir",
+            ])
+            .arg(&project)
+            .arg("--allow-write")
+            .arg(h.join(".config"))
+            .arg("--allow-write")
+            .arg(h.join(".config/autostart"))
+            .arg("--allow-write")
+            .arg(h.join(".config/fish/conf.d"))
+            .args(["--agent", "shell", "--", "-c", &script])
+            .output()
+            .expect("run cplt");
+        let (o, e) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(o.contains("AUTOSTART_OK"), "stdout: {o}\nstderr: {e}");
+        assert!(o.contains("CONFD_OK"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("FISH_WRITTEN"), "stdout: {o}\nstderr: {e}");
+        assert!(e.contains("known login or autostart path"), "stderr: {e}");
+    }
+
+    /// Without bubblewrap the login and autostart paths under a broad grant
+    /// stay writable, and the launch says so.
+    #[test]
+    fn no_bwrap_warns_about_login_files_under_a_broad_write_grant() {
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = &home.path().canonicalize().unwrap();
+        let project = h.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(h.join(".config")).unwrap();
+        let mut cmd = cplt_cmd();
+        crate::common::with_scratch_home(&mut cmd);
+        let out = cmd
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join("xdg-config"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("XDG_CACHE_HOME", h.join(".cache"))
+            .args(["--yes", "--no-validate", "--no-bubblewrap", "--project-dir"])
+            .arg(&project)
+            .arg("--allow-write")
+            .arg(h.join(".config"))
+            .args(["--agent", "shell", "--", "-c", "true"])
+            .output()
+            .expect("run cplt");
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            e.contains("host login and autostart paths that stay writable")
+                && e.contains(".config/autostart"),
+            "stderr: {e}"
+        );
+    }
+
     // ── Private devpts under bubblewrap (#1016) ───────────────────
 
     /// Opens a PTY pair, reopens the slave by path (the Landlock rule), sets

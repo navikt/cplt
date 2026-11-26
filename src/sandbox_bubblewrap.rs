@@ -387,6 +387,9 @@ pub(crate) struct Overlays<'a> {
     /// `config.worktree` files masked with `--ro-bind /dev/null <path>`, so the
     /// agent cannot create them. Empty unless the key is on.
     pub mask_missing: &'a [PathBuf],
+    /// Explicit write grants inside a read-only overlay, bound writable again
+    /// after it: a grant on `~/.config/fish/conf.d` under a broad `~` grant.
+    pub rebind_writable: &'a [PathBuf],
 }
 
 #[cfg(test)]
@@ -738,6 +741,13 @@ pub(crate) fn build_bwrap_args(
         }
     }
 
+    // ── Explicit grants inside a read-only overlay, writable again ──
+    // Only the granted subtree: the rest of the overlay stays read-only.
+    for path in overlays.rebind_writable.iter().filter(|p| p.exists()) {
+        let p = path.to_string_lossy().into_owned();
+        args.extend(["--bind".to_string(), p.clone(), p]);
+    }
+
     // ── Missing host-persistence dirs (`sandbox.mask_missing_deny_paths`) ──
     // The paths arrive canonical, so the bind check compares like with like,
     // and a resolved parent outside every writable bind is never mkdir'ed.
@@ -862,7 +872,10 @@ pub(crate) fn build_bwrap_args(
 /// the host), or an empty read-only tmpfs for a missing directory.
 fn emit_missing_mask(args: &mut Vec<String>, path: &Path) {
     let p = path.to_string_lossy().into_owned();
-    if path.file_name() == Some(std::ffi::OsStr::new("config.worktree")) {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "config.worktree"
+        || crate::sandbox::policy::HOST_PERSISTENCE_MASKABLE_FILES.contains(&name)
+    {
         args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), p]);
     } else {
         args.extend([
@@ -2890,6 +2903,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -2937,6 +2951,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -3018,6 +3033,7 @@ mod tests {
                 pins: &pins,
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -3100,6 +3116,7 @@ mod tests {
                 pins: &pins,
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -3324,6 +3341,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -3463,6 +3481,7 @@ mod tests {
                 pins,
                 host_run,
                 mask_missing: &[],
+                rebind_writable: &[],
             },
         ) {
             (Some(refusal), _, _) => Err(refusal),
@@ -3550,6 +3569,7 @@ mod tests {
             pins: std::slice::from_ref(&link),
             host_run: &[],
             mask_missing: &[],
+            rebind_writable: &[],
         };
         let (refusal, _, targets) = symlinked_overlays(&[write_rule(&cfg)], overlays);
         assert_eq!(refusal, None);
@@ -3709,6 +3729,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -3747,6 +3768,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -3803,6 +3825,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -3868,6 +3891,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &masks,
         );
@@ -4598,6 +4622,7 @@ mod tests {
             pins: &[],
             host_run: &[],
             mask_missing: &[],
+            rebind_writable: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &masks);
         let s = |p: &Path| p.to_string_lossy().into_owned();
@@ -4644,6 +4669,7 @@ mod tests {
             pins: &[],
             host_run: &[],
             mask_missing: &[],
+            rebind_writable: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &DenyMasks::default());
         let s = |p: &Path| p.to_string_lossy().into_owned();
@@ -4730,6 +4756,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -4742,6 +4769,7 @@ mod tests {
                 pins: &[],
                 host_run: &[],
                 mask_missing: &ro,
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -4796,6 +4824,7 @@ mod tests {
                 pins: &pins,
                 host_run: &[],
                 mask_missing: &[],
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -4806,6 +4835,7 @@ mod tests {
                 pins: &pins,
                 host_run: &[],
                 mask_missing: &masks,
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -4880,6 +4910,7 @@ mod tests {
                 pins: &pins,
                 host_run: &[],
                 mask_missing: &masks,
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );
@@ -4935,6 +4966,7 @@ mod tests {
                 pins: &pins,
                 host_run: &[],
                 mask_missing: &masks,
+                rebind_writable: &[],
             },
             &DenyMasks::default(),
         );

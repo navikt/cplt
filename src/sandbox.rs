@@ -72,6 +72,7 @@ pub(crate) mod bubblewrap_probe {
                 pins: &plan.pins,
                 host_run: &plan.host_run,
                 mask_missing: &super::missing_dir_masks(config, true),
+                rebind_writable: &super::host_persistence_exempt_grants(config),
             },
             &plan.deny_masks,
             false,
@@ -144,26 +145,27 @@ pub use policy::{
     AppDir, AppDirKind, BUILD_CREDENTIAL_FILES, CLONE_CACHE_DIRS, CPLT_STATE_DIR, CacheEnv,
     DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, DockerAccess, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS,
-    HOST_EXEC_APP_DIRS, HOST_EXEC_TOOL_PATHS, HOST_TOOL_RO_OVERLAYS, HardeningCategory,
-    HardeningEnvVar, HomeToolDir, HostExec, HostExecPath, LinuxCoverage, OAUTH_CALLBACK_PORT,
-    PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
-    PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
-    PROTECTED_IN_ROOT, PathBinDir, Protected, READONLY_HOST_TOOL_TWINS, ResolvedToolDir,
-    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
-    TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, XDG_PINNED_MARKER,
-    active_tool_dirs, app_dirs, app_root_warning, apply_readonly_host_tool_paths,
-    build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
-    copilot_ro_protect_paths, cplt_exe_no_exec_dir, cplt_state_ancestor_grant, cplt_state_dir,
-    cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
-    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
-    ensure_split_tool_dirs, env_dir_move_fix, env_tool_dir_allowed, env_tool_dir_hint_ok,
-    env_tool_path_protected, env_tool_path_readonly_host, env_tool_temp_roots,
-    exec_write_conflicts, first_party_read_target, gradle_loopback_hint, grant_is_refused,
-    home_config_link_targets, home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays,
-    host_tool_ro_overlays_unenforced_warning, linux_docker_socket_paths,
-    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
-    missing_split_tool_dirs, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
-    no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
+    HOST_EXEC_APP_DIRS, HOST_EXEC_TOOL_PATHS, HOST_PERSISTENCE_PATHS, HOST_TOOL_RO_OVERLAYS,
+    HardeningCategory, HardeningEnvVar, HomeToolDir, HostExec, HostExecPath, LinuxCoverage,
+    OAUTH_CALLBACK_PORT, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
+    PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
+    PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, PersistenceGrant, Protected,
+    READONLY_HOST_TOOL_TWINS, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS,
+    SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar,
+    ToolPathOverride, ToolRoot, XDG_PINNED_MARKER, active_tool_dirs, app_dirs, app_root_warning,
+    apply_readonly_host_tool_paths, build_credential_grants, copilot_default_pkg_dir,
+    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, cplt_exe_no_exec_dir,
+    cplt_state_ancestor_grant, cplt_state_dir, cplt_state_dir_grant, cplt_state_file,
+    credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
+    cypress_runtime_intent, dir_overlaps_credentials, ensure_split_tool_dirs, env_dir_move_fix,
+    env_tool_dir_allowed, env_tool_dir_hint_ok, env_tool_path_protected,
+    env_tool_path_readonly_host, env_tool_temp_roots, exec_write_conflicts,
+    first_party_read_target, gradle_loopback_hint, grant_is_refused, home_config_link_targets,
+    home_tool_dirs, host_persistence_candidates, host_persistence_grant,
+    host_tool_ro_overlay_links, host_tool_ro_overlays, host_tool_ro_overlays_unenforced_warning,
+    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, missing_split_tool_dirs, missing_wrapper_dist_hint, nested_alternation,
+    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
     readonly_wrapper_lock_files, refused_writable_app_root, relocatable_tool_prefix,
     report_state_pinned, shim_ro_protect_paths, socket_mask_paths, state_pinned_message,
@@ -914,6 +916,11 @@ fn prepare_locked(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
+    // No silent grants: an explicit grant on a login or autostart path wins
+    // over the built-in protection, so say so.
+    for w in host_persistence_explicit_warnings(config) {
+        crate::ui::warn(&w);
+    }
     #[cfg(target_os = "linux")]
     if config.restrict_oauth_bind && !inspect_only {
         warn_oauth_bind_gaps(config, landlock_mod::available_abi_version());
@@ -1715,6 +1722,15 @@ pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), S
             dir.display()
         ));
     }
+    // zsh caches next to a protected rc file stay denied under any grant;
+    // an explicit grant on one would be accepted and do nothing.
+    if key == "allow.write" && policy::is_zsh_sibling_of_home(home_dir, p) {
+        return Err(format!(
+            "allow.write names {}: these are zsh caches, which cplt keeps read-only. \
+             Grant the rc file or ~/.cache instead.",
+            p.display()
+        ));
+    }
     if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
         return Err(format!(
             "{key} names {} — inside cplt's own state directory ({}). Nothing in there \
@@ -1989,6 +2005,149 @@ fn maintain_cplt_state(config: &SandboxConfig) -> Result<(), String> {
     policy::flush_state_pinned(config.home_dir, config.project_dir)?;
     crate::launch_state::prune(config.home_dir);
     Ok(())
+}
+
+/// The known persistence paths ([`host_persistence_candidates`]) that a
+/// *broader* user `allow.write` grant covers, at their spelled path and, for
+/// a link, at its target. Both backends protect exactly these, so a launch
+/// without such a grant is unchanged.
+///
+/// Left out: an entry with an explicit grant equal to or inside it (the
+/// user's choice, see [`host_persistence_explicit_grants`]), and a path at,
+/// inside or around a project or named root, which are writable by design (a
+/// dotfiles repo opened as the project keeps working).
+pub(crate) fn host_persistence_protect_paths(config: &SandboxConfig) -> Vec<PathBuf> {
+    host_persistence_protected(config)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// [`host_persistence_protect_paths`] with the broader grant that covers each.
+fn host_persistence_protected(config: &SandboxConfig) -> Vec<(PathBuf, PathBuf)> {
+    let roots: Vec<&Path> = std::iter::once(config.project_dir)
+        .chain(config.named_roots.iter().map(PathBuf::as_path))
+        .collect();
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (named, _) in host_persistence_candidates(config.home_dir) {
+        let target = crate::config::canonicalize_deepest(&named);
+        let pair = [named, target];
+        // A grant equal to the entry (either spelling) opts that entry out. A
+        // grant inside it exempts only its own subtree
+        // ([`host_persistence_exempt`]); the rest stays protected.
+        if pair.iter().any(|p| config.extra_write.contains(p)) {
+            continue;
+        }
+        for p in pair {
+            if roots.iter().any(|r| p.starts_with(r) || r.starts_with(&p)) {
+                continue;
+            }
+            if let Some(w) = config
+                .extra_write
+                .iter()
+                .filter(|w| p.starts_with(w))
+                .min_by_key(|w| w.components().count())
+            {
+                out.push((p, w.clone()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Explicit grants strictly inside a protected path, with that path: the
+/// granted subtree stays writable, the rest of the entry does not.
+pub(crate) fn host_persistence_exempt(config: &SandboxConfig) -> Vec<(PathBuf, PathBuf)> {
+    let protected = host_persistence_protect_paths(config);
+    let mut out: Vec<(PathBuf, PathBuf)> = config
+        .extra_write
+        .iter()
+        .filter_map(|w| {
+            protected
+                .iter()
+                .find(|p| w.starts_with(p) && w != *p)
+                .map(|p| (w.clone(), p.clone()))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The grants of [`host_persistence_exempt`], for bubblewrap to bind
+/// writable again on top of the entry's read-only bind.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn host_persistence_exempt_grants(config: &SandboxConfig) -> Vec<PathBuf> {
+    host_persistence_exempt(config)
+        .into_iter()
+        .map(|(w, _)| w)
+        .collect()
+}
+
+/// The directories strictly between each protected path and the grant that
+/// covers it. Pinned against rename and unlink, so the agent cannot move
+/// `~/.local` or `~/Library` aside and recreate the entry under a fresh tree.
+pub(crate) fn host_persistence_pin_dirs(config: &SandboxConfig) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = host_persistence_protected(config)
+        .into_iter()
+        .flat_map(|(p, w)| {
+            p.ancestors()
+                .skip(1)
+                .take_while(|a| *a != w.as_path() && a.starts_with(&w))
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The dirs whose zsh rc files are protected: their `.zwc` and
+/// `.zcompdump*` siblings are protected too (zsh loads a newer `.zwc` in
+/// place of the rc file, and sources the completion dump).
+pub(crate) fn host_persistence_zsh_dirs(config: &SandboxConfig) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = host_persistence_protect_paths(config)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| policy::ZSH_RC_FILES.contains(&n))
+        })
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Launch warnings for explicit `allow.write` grants on known persistence
+/// paths: what is exempt from the built-in protection, exactly.
+pub(crate) fn host_persistence_explicit_warnings(config: &SandboxConfig) -> Vec<String> {
+    let exempt = host_persistence_exempt(config);
+    config
+        .extra_write
+        .iter()
+        .filter(|w| host_persistence_grant(config.home_dir, w) == Some(PersistenceGrant::Explicit))
+        .map(|w| match exempt.iter().find(|(g, _)| g == w) {
+            Some((_, entry)) => format!(
+                "allow.write {} is inside the known login or autostart path {}. {} is \
+                 writable as granted, and code the agent puts there runs on the host outside \
+                 the sandbox; the rest of {} stays read-only.",
+                w.display(),
+                entry.display(),
+                w.display(),
+                entry.display()
+            ),
+            None => format!(
+                "allow.write {} is a known login or autostart path. It is writable as \
+                 granted, and code the agent puts there runs on the host outside the sandbox.",
+                w.display()
+            ),
+        })
+        .collect()
 }
 
 /// [`writable_trees`] canonicalized, for matching against the canonical paths
@@ -3737,6 +3896,7 @@ fn mcp_wrapper(
                 pins: &plan.pins,
                 host_run: &plan.host_run,
                 mask_missing: &missing_dir_masks(config, true),
+                rebind_writable: &host_persistence_exempt_grants(config),
             },
             &plan.deny_masks,
             false,
@@ -4093,6 +4253,8 @@ fn pin_paths(
     // walk-aroundable by `mv .git g2 && mkdir .git`.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
+    // The dirs between a broad grant and a protected login or autostart path.
+    pins.extend(host_persistence_pin_dirs(config));
     // #386: the ancestors of the `config.worktree` binds in `ro_protect_paths`.
     if !config.allow_git_config_write {
         pins.extend(linked_worktree_pin_paths(&write_roots, &git_dirs));
@@ -4353,7 +4515,30 @@ fn agent_and_tool_ro_paths(config: &SandboxConfig, ro_protect: &mut Vec<PathBuf>
     // gives, so this bind is the only thing keeping the config read-only —
     // and without bwrap nothing does (`prepare_impl` warns at launch).
     ro_protect.extend(home_config_link_targets(config.home_dir));
+
+    // Host login and autostart files: Landlock cannot subtract them from a
+    // user `allow.write` on `~` or `~/.config`, so the bind is the control.
+    // Without bwrap nothing applies. Missing ones too: `build_bwrap_args`
+    // binds what exists when it runs, and the probe launch can create a
+    // masked path's mountpoint first.
+    ro_protect.extend(host_persistence_protect_paths(config));
+    // Their `.zwc` and `.zcompdump*` siblings, those that exist: bwrap takes
+    // no patterns, so one created later is a stated gap (SECURITY.md).
+    for dir in host_persistence_zsh_dirs(config) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        ro_protect.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| is_zsh_sibling(p)),
+        );
+    }
 }
+
+#[cfg(any(target_os = "linux", test))]
+use policy::is_zsh_sibling;
 
 /// Launch warnings for the credential entries a symlink moves into a grant
 /// and no mount mask covers (#551): which entry, where it resolves, which
@@ -4707,8 +4892,14 @@ fn missing_dir_masks_with(
     nested_repos: &[PathBuf],
     inspect_only: bool,
 ) -> Vec<PathBuf> {
-    if inspect_only || !config.mask_missing_deny_paths {
+    if inspect_only {
         return Vec::new();
+    }
+    // Not behind `mask_missing_deny_paths`: these masks exist only under a
+    // broad `allow.write`, which already changes this launch.
+    let persist = host_persistence_missing_masks(config);
+    if !config.mask_missing_deny_paths {
+        return persist;
     }
     // Resolved, because the writable binds `build_bwrap_args` compares
     // against are canonical: an agent root reached through `XDG_*`,
@@ -4730,7 +4921,70 @@ fn missing_dir_masks_with(
         write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
         masks.extend(missing_worktree_config_masks(&write_roots, &git_dirs));
     }
+    masks.extend(persist);
     masks
+}
+
+/// The missing host login and autostart paths under a broad `allow.write`
+/// that bubblewrap can mask: directories with an empty read-only tmpfs,
+/// [`policy::HOST_PERSISTENCE_MASKABLE_FILES`] with `/dev/null`. bwrap leaves
+/// the empty mountpoint on the host.
+#[cfg(any(target_os = "linux", test))]
+fn host_persistence_missing_masks(config: &SandboxConfig) -> Vec<PathBuf> {
+    let covered = host_persistence_protect_paths(config);
+    host_persistence_candidates(config.home_dir)
+        .into_iter()
+        .filter(|(_, e)| {
+            policy::host_persistence_is_dir(e)
+                || policy::HOST_PERSISTENCE_MASKABLE_FILES.contains(e)
+        })
+        .map(|(p, _)| crate::config::canonicalize_deepest(&p))
+        .filter(|p| p.symlink_metadata().is_err())
+        .filter(|p| covered.contains(p))
+        .collect()
+}
+
+/// What a broad `allow.write` leaves writable among the host login and
+/// autostart paths: all of them without bubblewrap (Landlock cannot subtract
+/// from a grant), and with it the missing ones no mask covers.
+#[cfg(any(target_os = "linux", test))]
+fn host_persistence_unprotected(
+    config: &SandboxConfig,
+    bwrap_args: Option<&[String]>,
+) -> Vec<PathBuf> {
+    let paths = host_persistence_protect_paths(config);
+    let Some(args) = bwrap_args else {
+        return paths;
+    };
+    let missing: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| p.symlink_metadata().is_err())
+        .collect();
+    unmasked_missing_dirs(&missing, args)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn host_persistence_warning(config: &SandboxConfig, unprotected: &[PathBuf]) -> Option<String> {
+    if unprotected.is_empty() {
+        return None;
+    }
+    let grants: Vec<String> = config
+        .extra_write
+        .iter()
+        .filter(|w| unprotected.iter().any(|p| p.starts_with(w)))
+        .map(|w| w.display().to_string())
+        .collect();
+    let paths: Vec<String> = unprotected
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    Some(format!(
+        "allow.write {} covers host login and autostart paths that stay writable on this \
+         host: {}. Landlock cannot subtract them from the grant; only Bubblewrap can, and \
+         only for paths that exist or can be masked. Narrow the grant, or install bubblewrap.",
+        grants.join(", "),
+        paths.join(", ")
+    ))
 }
 
 /// The masks [`missing_dir_masks`] asked for that the wrapper did not
@@ -5117,6 +5371,7 @@ fn prepare_impl(
             pins: &pins,
             host_run: &host_run,
             mask_missing: &mask_missing,
+            rebind_writable: &host_persistence_exempt_grants(config),
         },
         &deny_masks,
     )?;
@@ -5129,8 +5384,19 @@ fn prepare_impl(
     {
         ui::warn(&w);
     }
+    // No silent grants: say which login and autostart paths stay writable.
+    let unprotected = host_persistence_unprotected(
+        config,
+        bwrap_wrapper.as_ref().map(|w| w.bwrap_args.as_slice()),
+    );
+    if let Some(w) = host_persistence_warning(config, &unprotected) {
+        ui::warn(&w);
+    }
     if let Some(w) = &bwrap_wrapper {
-        for p in unmasked_missing_dirs(&mask_missing, &w.bwrap_args) {
+        for p in unmasked_missing_dirs(&mask_missing, &w.bwrap_args)
+            .into_iter()
+            .filter(|p| !unprotected.contains(p))
+        {
             ui::warn(&format!(
                 "sandbox.mask_missing_deny_paths: {} is missing and could not be masked \
                  (its parent is missing or outside the writable grant), so the agent may \
@@ -5208,6 +5474,7 @@ fn prepare_impl(
                 pins: &pins,
                 host_run: &host_run,
                 mask_missing: &mask_missing,
+                rebind_writable: &host_persistence_exempt_grants(config),
             };
             let rebuilt =
                 bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
@@ -6131,6 +6398,209 @@ mod tests {
             let err = validate_hard_denied_grants(&config).unwrap_err();
             assert!(err.contains("uv(real)"), "{err}");
         });
+    }
+
+    #[test]
+    fn host_persistence_paths_protected_only_under_a_write_grant() {
+        let home = Path::new("/h");
+        let mut config = test_config(home, &[]);
+        assert!(host_persistence_protect_paths(&config).is_empty());
+        let profile = generate_profile(&config, &[]);
+        assert!(!profile.contains("Host login and autostart"), "{profile}");
+
+        let grant = [PathBuf::from("/h")];
+        config.extra_write = &grant;
+        let paths = host_persistence_protect_paths(&config);
+        for p in [
+            "/h/.zshrc",
+            "/h/Library/LaunchAgents",
+            "/h/.config/systemd/user",
+        ] {
+            assert!(paths.contains(&PathBuf::from(p)), "{p}: {paths:?}");
+        }
+        let profile = generate_profile(&config, &[]);
+        let deny = "(deny file-write* (subpath \"/h/.zshrc\"))";
+        let allow = "(allow file-write* (subpath \"/h\"))";
+        assert!(
+            profile.find(allow).unwrap() < profile.find(deny).unwrap(),
+            "deny must follow the user allow: {profile}"
+        );
+
+        // A narrower grant protects only what it covers.
+        let grant = [PathBuf::from("/h/.config")];
+        config.extra_write = &grant;
+        let paths = host_persistence_protect_paths(&config);
+        assert!(
+            paths.contains(&PathBuf::from("/h/.config/fish")),
+            "{paths:?}"
+        );
+        assert!(!paths.contains(&PathBuf::from("/h/.zshrc")), "{paths:?}");
+
+        // A project inside a persistence path stays writable.
+        let grant = [PathBuf::from("/h")];
+        config.extra_write = &grant;
+        config.project_dir = Path::new("/h/bin/tool");
+        assert!(!host_persistence_protect_paths(&config).contains(&PathBuf::from("/h/bin")));
+    }
+
+    #[test]
+    fn host_persistence_missing_paths_are_masked_or_warned() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::write(h.join(".zshrc"), "").unwrap();
+        let grant = [h.clone()];
+        let mut config = test_config(&h, &[]);
+        config.extra_write = &grant;
+        let masks = host_persistence_missing_masks(&config);
+        assert!(masks.contains(&h.join(".bashrc")), "{masks:?}");
+        assert!(masks.contains(&h.join("bin")), "{masks:?}");
+        assert!(!masks.contains(&h.join(".zshrc")), "exists: {masks:?}");
+        assert!(!masks.contains(&h.join(".bash_profile")), "{masks:?}");
+        assert!(!masks.contains(&h.join(".ssh/rc")), "{masks:?}");
+
+        // Without bubblewrap every covered path is named in the warning.
+        let all = host_persistence_unprotected(&config, None);
+        assert!(all.contains(&h.join(".zshrc")), "{all:?}");
+        let w = host_persistence_warning(&config, &all).unwrap();
+        assert!(
+            w.contains(&h.display().to_string()) && w.contains(".zshrc"),
+            "{w}"
+        );
+
+        // With it, only missing paths no mask covers remain.
+        let args: Vec<String> = ["--ro-bind", "/dev/null"]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .chain([h.join(".bashrc").display().to_string()])
+            .collect();
+        let left = host_persistence_unprotected(&config, Some(&args));
+        assert!(!left.contains(&h.join(".bashrc")), "{left:?}");
+        assert!(!left.contains(&h.join(".zshrc")), "{left:?}");
+        assert!(left.contains(&h.join(".bash_profile")), "{left:?}");
+
+        config.extra_write = &[];
+        assert!(
+            host_persistence_warning(&config, &host_persistence_unprotected(&config, None))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn host_persistence_grant_classifies_broader_and_explicit() {
+        let home = Path::new("/h");
+        let broader = Some(PersistenceGrant::Broader);
+        let explicit = Some(PersistenceGrant::Explicit);
+        for p in ["/", "/h", "/h/Library", "/h/.config", "/h/.local"] {
+            assert_eq!(host_persistence_grant(home, Path::new(p)), broader, "{p}");
+        }
+        for p in [
+            "/h/Library/LaunchAgents",
+            "/h/.config/fish/conf.d",
+            "/h/bin",
+        ] {
+            assert_eq!(host_persistence_grant(home, Path::new(p)), explicit, "{p}");
+        }
+        for p in ["/h/Repos", "/h/.cache", "/opt"] {
+            assert_eq!(host_persistence_grant(home, Path::new(p)), None, "{p}");
+        }
+        // A symlinked spelling of home, and a grant on an entry's link target.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = root.join("home");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(host_persistence_grant(&real, &link), broader);
+        let dots = root.join("dotfiles/fish");
+        std::fs::create_dir_all(&dots).unwrap();
+        std::fs::create_dir_all(real.join(".config")).unwrap();
+        std::os::unix::fs::symlink(&dots, real.join(".config/fish")).unwrap();
+        assert_eq!(host_persistence_grant(&real, &dots), explicit);
+    }
+
+    #[test]
+    fn host_persistence_explicit_grant_wins_and_ancestors_are_pinned() {
+        let home = Path::new("/h");
+        let mut config = test_config(home, &[]);
+        let grants = [PathBuf::from("/h"), PathBuf::from("/h/.local/bin")];
+        config.extra_write = &grants;
+        let paths = host_persistence_protect_paths(&config);
+        assert!(
+            !paths.contains(&PathBuf::from("/h/.local/bin")),
+            "{paths:?}"
+        );
+        assert!(paths.contains(&PathBuf::from("/h/.zshrc")), "{paths:?}");
+        let w = host_persistence_explicit_warnings(&config);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("/h/.local/bin is a known"), "{w:?}");
+        let profile = generate_profile(&config, &[]);
+        assert!(
+            !profile.contains("(subpath \"/h/.local/bin\"))\n(deny"),
+            "{profile}"
+        );
+        assert!(
+            !profile.contains("(deny file-write* (subpath \"/h/.local/bin\"))"),
+            "{profile}"
+        );
+
+        let pins = host_persistence_pin_dirs(&config);
+        for d in [
+            "/h/Library",
+            "/h/.config",
+            "/h/.config/systemd",
+            "/h/.local/share/systemd",
+        ] {
+            assert!(pins.contains(&PathBuf::from(d)), "{d}: {pins:?}");
+        }
+        assert!(!pins.contains(&PathBuf::from("/h")), "{pins:?}");
+        assert!(
+            profile.contains("(deny file-write-unlink (literal \"/h/.config/systemd\"))"),
+            "{profile}"
+        );
+        assert!(profile.contains("zcompdump"), "{profile}");
+    }
+
+    #[test]
+    fn host_persistence_inner_grant_exempts_only_its_subtree() {
+        let home = Path::new("/h");
+        let mut config = test_config(home, &[]);
+        let grants = [PathBuf::from("/h"), PathBuf::from("/h/.config/fish/conf.d")];
+        config.extra_write = &grants;
+        assert!(
+            host_persistence_protect_paths(&config).contains(&PathBuf::from("/h/.config/fish"))
+        );
+        assert_eq!(
+            host_persistence_exempt_grants(&config),
+            [PathBuf::from("/h/.config/fish/conf.d")]
+        );
+        let profile = generate_profile(&config, &[]);
+        assert!(
+            profile.contains(
+                "(deny file-write* (require-all (subpath \"/h/.config/fish\") (require-not (subpath \"/h/.config/fish/conf.d\"))))"
+            ),
+            "{profile}"
+        );
+        let w = host_persistence_explicit_warnings(&config);
+        assert!(
+            w[0].contains("the rest of /h/.config/fish stays read-only"),
+            "{w:?}"
+        );
+
+        // An explicit ~/.zshrc keeps the other rc files and the siblings denied.
+        let grants = [PathBuf::from("/h"), PathBuf::from("/h/.zshrc")];
+        config.extra_write = &grants;
+        let paths = host_persistence_protect_paths(&config);
+        assert!(!paths.contains(&PathBuf::from("/h/.zshrc")), "{paths:?}");
+        assert!(paths.contains(&PathBuf::from("/h/.zprofile")), "{paths:?}");
+        assert_eq!(host_persistence_zsh_dirs(&config), [PathBuf::from("/h")]);
+    }
+
+    #[test]
+    fn zsh_siblings_are_recognised() {
+        assert!(is_zsh_sibling(Path::new("/h/.zshrc.zwc")));
+        assert!(is_zsh_sibling(Path::new("/h/.zcompdump-host-5.9")));
+        assert!(!is_zsh_sibling(Path::new("/h/.zshrc")));
+        assert!(!is_zsh_sibling(Path::new("/h/other.zwc")));
     }
 
     pub(super) fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
@@ -8245,6 +8715,22 @@ mod tests {
         c.named_root_git_dirs = &git;
         let err = refused(&c, &unset).unwrap_err();
         assert!(err.contains(NAMED_GIT_DIR_SOURCE), "{err}");
+    }
+
+    /// zsh caches cannot be granted: they stay denied, so a grant would be inert.
+    #[test]
+    fn write_grant_on_zsh_cache_is_refused() {
+        let h = Path::new("/h");
+        for f in [".zshrc.zwc", ".zcompdump", ".zcompdump-host-5.9"] {
+            let err = validate_grant_path("allow.write", &h.join(f), h).unwrap_err();
+            assert!(err.contains("zsh caches"), "{err}");
+        }
+        assert!(validate_grant_path("allow.read", &h.join(".zshrc.zwc"), h).is_ok());
+        assert!(validate_grant_path("allow.write", &h.join("x/.zshrc.zwc"), h).is_ok());
+        let mut config = test_config(h, &[]);
+        let grants = [h.join(".zcompdump")];
+        config.extra_write = &grants;
+        assert!(host_persistence_explicit_warnings(&config).is_empty());
     }
 
     /// #1095: a write grant on cplt's state dir or an ancestor (`~/.config`,

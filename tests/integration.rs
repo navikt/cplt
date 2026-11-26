@@ -2737,6 +2737,107 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A whole-home `allow.write` is honoured, except for the host's login and
+    /// autostart files, which stay read-only under it.
+    #[test]
+    fn real_profile_home_write_grant_keeps_login_files_read_only() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
+        fs::create_dir_all(home.join(".config/fish")).unwrap();
+        fs::write(home.join(".zshrc"), "orig\n").unwrap();
+        let writes = [home.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        let profile = write_real_profile(&opts);
+        let h = home.display();
+        let script = format!(
+            "echo x >> '{h}/.zshrc' && echo RC_WRITTEN; \
+             touch '{h}/Library/LaunchAgents/a.plist' && echo AGENT_WRITTEN; \
+             touch '{h}/.config/fish/config.fish' && echo FISH_WRITTEN; \
+             touch '{h}/.bash_profile' && echo PROFILE_WRITTEN; \
+             touch '{h}/.zshrc.zwc' && echo ZWC_WRITTEN; \
+             mv '{h}/Library' '{h}/Lib2' && echo LIBRARY_MOVED; \
+             mv '{h}/.config' '{h}/cfg2' && echo CONFIG_MOVED; \
+             touch '{h}/notes.txt' && echo OTHER_OK"
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(output.contains("OTHER_OK"), "{output}");
+        for leak in [
+            "RC_WRITTEN",
+            "AGENT_WRITTEN",
+            "FISH_WRITTEN",
+            "PROFILE_WRITTEN",
+            "ZWC_WRITTEN",
+            "LIBRARY_MOVED",
+            "CONFIG_MOVED",
+        ] {
+            assert!(!output.contains(leak), "{leak}: {output}");
+        }
+        assert_eq!(fs::read_to_string(home.join(".zshrc")).unwrap(), "orig\n");
+    }
+
+    /// An explicit grant on a login path is the user's choice: it is
+    /// honoured, while a broader grant alone leaves the path read-only.
+    #[test]
+    fn real_profile_explicit_grant_on_login_path_is_honoured() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        let writes = [home.clone(), home.join(".local/bin")];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        let profile = write_real_profile(&opts);
+        let h = home.display();
+        let script = format!(
+            "touch '{h}/.local/bin/tool' && echo BIN_OK; touch '{h}/.zshrc' && echo RC_WRITTEN"
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(output.contains("BIN_OK"), "{output}");
+        assert!(!output.contains("RC_WRITTEN"), "{output}");
+    }
+
+    /// A grant inside an entry exempts only its subtree; an explicit rc file
+    /// grant leaves the other rc files and the zsh siblings denied.
+    #[test]
+    fn real_profile_inner_grant_exempts_only_its_subtree() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(home.join(".config/fish/conf.d")).unwrap();
+        let writes = [
+            home.clone(),
+            home.join(".config/fish/conf.d"),
+            home.join(".zshrc"),
+        ];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        let profile = write_real_profile(&opts);
+        let h = home.display();
+        let script = format!(
+            "touch '{h}/.config/fish/conf.d/a.fish' && echo CONFD_OK; \
+             touch '{h}/.config/fish/config.fish' && echo FISH_WRITTEN; \
+             touch '{h}/.zshrc' && echo ZSHRC_OK; \
+             touch '{h}/.zprofile' && echo ZPROFILE_WRITTEN; \
+             touch '{h}/.zshrc.zwc' && echo ZWC_WRITTEN"
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        for ok in ["CONFD_OK", "ZSHRC_OK"] {
+            assert!(output.contains(ok), "{ok}: {output}");
+        }
+        for leak in ["FISH_WRITTEN", "ZPROFILE_WRITTEN", "ZWC_WRITTEN"] {
+            assert!(!output.contains(leak), "{leak}: {output}");
+        }
+    }
+
     /// A directory clone must not carry a read-denied file out with it, while
     /// an ordinary file clone (APFS copy-on-write, used by build tools) works.
     #[test]

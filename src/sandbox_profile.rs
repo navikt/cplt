@@ -317,6 +317,12 @@ fn profile_locked(
     // project or an `allow.write` tree, and the deny at its target must beat
     // that grant (#524).
     emit_home_config_write_denies(&mut sb, config, &home);
+    // Same reason: a broad `allow.write` (`~`, `~/.config`, `~/Library`) is
+    // accepted, but the host's login and autostart files stay read-only.
+    // Unlike other explicit user grants, which go after the denies so the
+    // user wins, this deny follows them: it protects the host outside the
+    // sandbox, not data the agent works on.
+    emit_host_login_write_denies(&mut sb, config);
     // Same reason, in the other direction: `process-exec` is granted
     // profile-wide, so an `allow.write` tree is executable unless something
     // says otherwise, and only a rule after every allow can say it.
@@ -2953,6 +2959,60 @@ fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: 
     for dir in pins {
         let d = dir.display();
         sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
+    }
+    sbpl!(sb);
+}
+
+/// Write denies for the host login and autostart paths a user `allow.write`
+/// covers ([`super::host_persistence_protect_paths`]). `subpath` matches a file
+/// exactly and a directory with everything under it.
+fn emit_host_login_write_denies(sb: &mut String, config: &SandboxConfig) {
+    let paths: Vec<PathBuf> = super::host_persistence_protect_paths(config)
+        .into_iter()
+        .filter(|p| validate_sbpl_path(p).is_ok())
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    sbpl!(
+        sb,
+        ";; Host login and autostart files stay read-only under allow.write"
+    );
+    let exempt = super::host_persistence_exempt(config);
+    for p in paths {
+        // An explicit grant inside the entry keeps its own subtree writable.
+        let keep: Vec<String> = exempt
+            .iter()
+            .filter(|(_, e)| *e == p)
+            .filter(|(g, _)| validate_sbpl_path(g).is_ok())
+            .map(|(g, _)| format!(" (require-not (subpath \"{}\"))", g.display()))
+            .collect();
+        let p = p.display();
+        if keep.is_empty() {
+            sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+        } else {
+            let keep = keep.concat();
+            sbpl!(
+                sb,
+                "(deny file-write* (require-all (subpath \"{p}\"){keep}))"
+            );
+        }
+    }
+    for dir in super::host_persistence_zsh_dirs(config) {
+        let d = escape_regex(&dir.to_string_lossy());
+        sbpl!(
+            sb,
+            "(deny file-write* (regex #\"^{d}/\\.(zshrc|zprofile|zshenv|zlogin|zlogout)\\.zwc$\"))"
+        );
+        sbpl!(sb, "(deny file-write* (regex #\"^{d}/\\.zcompdump\"))");
+    }
+    // Rename pins (#923 pattern): moving an ancestor aside would leave the
+    // entry recreatable under a fresh tree the denies do not name.
+    for dir in super::host_persistence_pin_dirs(config) {
+        if validate_sbpl_path(&dir).is_ok() {
+            let d = dir.display();
+            sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
+        }
     }
     sbpl!(sb);
 }
