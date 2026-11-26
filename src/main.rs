@@ -6791,6 +6791,12 @@ fn exec_real(
     if name == "gh" {
         gh_proxy::pin_gh_config(&mut command);
     }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if name == "git"
+        && let Some(path) = gh_proxy::push_path(&arg_refs, std::env::var_os("PATH").as_deref())
+    {
+        command.env("PATH", path);
+    }
     let mut host_pinned = false;
     if let Some(repo) = repo_scope {
         command.env("GH_REPO", repo);
@@ -6806,7 +6812,6 @@ fn exec_real(
         command.env("GH_HOST", host);
         host_pinned = true;
     }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     if name == "gh"
         && gh_proxy::is_auth_git_credential_get_request(&arg_refs)
         && !gh_proxy::is_help_request(&arg_refs)

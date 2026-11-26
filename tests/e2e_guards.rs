@@ -2960,6 +2960,7 @@ fn git_gate_refuses_a_push_when_a_transport_env_var_changed_since_launch() {
         "GIT_SSH",
         "GIT_SSH_VARIANT",
         "GIT_PROXY_COMMAND",
+        "GIT_EXEC_PATH",
     ] {
         // Set at launch: the same value pushes, another value is refused.
         let mut facts: serde_json::Value = serde_json::from_str(&plain).unwrap();
@@ -3086,6 +3087,59 @@ fn real_push_gate(
 
 const PROTECT: [bool; 3] = [true, true, true];
 const FORCE_ONLY: [bool; 3] = [false, true, false];
+
+/// An approved push finds `ssh` in the trusted system directories before a
+/// directory the agent put first on PATH.
+#[test]
+fn real_push_does_not_run_an_ssh_planted_first_on_path() {
+    let (t, work, origin) = pushed_repo("main");
+    assert!(git_ok(
+        &work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://cplt-test.invalid/x.git"
+        ]
+    ));
+    let facts = launch_facts(&work);
+    let planted = t.path().join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    let marker = t.path().join("planted-ran");
+    let ssh = planted.join("ssh");
+    // Would complete the push into the local origin, so a run is visible.
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexec git-receive-pack '{}'\n",
+            marker.display(),
+            origin.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", planted.display(), std::env::var("PATH").unwrap());
+    let _ = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[("PATH", path.as_str()), ("GIT_SSH_COMMAND", "")],
+        &["push", "-q", "origin", "feat"],
+    );
+    assert!(!marker.exists(), "the planted ssh ran");
+    assert_eq!(remote_ref(&origin, "refs/heads/feat"), None);
+}
+
+#[test]
+fn git_gate_refuses_exec_path_flag_under_push_prevention() {
+    let (_, stderr, ok) = git_gate(&["--exec-path=/x", "push", "origin", "f"], true, true);
+    assert_refused(&stderr, ok, "--exec-path");
+    let (_, stderr, ok) = git_gate(&["--exec-path"], true, true);
+    assert!(ok, "bare --exec-path only prints.\n{stderr}");
+}
 
 #[test]
 fn real_push_feature_branch_still_allowed() {

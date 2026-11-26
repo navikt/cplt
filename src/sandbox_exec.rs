@@ -15,6 +15,19 @@ pub(crate) use crate::discover::bounded_stdout;
 use crate::discover::gh_auth_token;
 use crate::ui;
 
+/// Set the inherited transport vars on `cmd` explicitly, so the git guard
+/// can record the child's value from `cmd` alone (`--inherit-env` leaves
+/// them implicit).
+fn spell_out_inherited_transport_env(cmd: &mut Command) {
+    for name in crate::gh_proxy::TRANSPORT_ENV_VARS {
+        if let Some(v) = std::env::var_os(name)
+            && !cmd.get_envs().any(|(k, _)| k == *name)
+        {
+            cmd.env(name, v);
+        }
+    }
+}
+
 /// Config filenames that mise searches for in ancestor directories.
 const MISE_CONFIG_FILENAMES: &[&str] = &[".tool-versions", ".mise.toml", "mise.toml"];
 
@@ -258,15 +271,7 @@ fn configure_command(
         for (key, val) in &sandbox_env.vars {
             cmd.env(key, val);
         }
-        // Spell out the inherited transport vars, so the git guard can record
-        // the child's value from `cmd` alone.
-        for name in crate::gh_proxy::TRANSPORT_ENV_VARS {
-            if let Some(v) = std::env::var_os(name)
-                && !cmd.get_envs().any(|(k, _)| k == *name)
-            {
-                cmd.env(name, v);
-            }
-        }
+        spell_out_inherited_transport_env(cmd);
     }
 
     // After the filtered env, so a parent `YARN_IGNORE_SCRIPTS=false` that the
@@ -3226,6 +3231,10 @@ mod git_transport_env_record_tests {
         #[allow(clippy::disallowed_methods)] // absolute path, never run: only carries env
         let mut cmd = std::process::Command::new("/usr/bin/true");
         cmd.env("GIT_SSH_COMMAND", "ssh -i key");
+        // Inherited, not set on `cmd`: the `--inherit-env` shape.
+        temp_env::with_var("GIT_SSH", Some("/k/ssh"), || {
+            super::spell_out_inherited_transport_env(&mut cmd);
+        });
         super::install_command_wrappers(
             &mut cmd,
             &scratch,
@@ -3242,7 +3251,8 @@ mod git_transport_env_record_tests {
             return; // no git available
         };
         assert!(
-            script.contains(r#""transport_env":{"GIT_SSH_COMMAND":"ssh -i key"}"#),
+            script
+                .contains(r#""transport_env":{"GIT_SSH":"/k/ssh","GIT_SSH_COMMAND":"ssh -i key"}"#),
             "{script}"
         );
     }

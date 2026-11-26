@@ -5201,6 +5201,8 @@ pub const TRANSPORT_ENV_VARS: &[&str] = &[
     "GIT_SSH",
     "GIT_SSH_VARIANT",
     "GIT_PROXY_COMMAND",
+    // Where git looks for `git-remote-<scheme>` and its other helpers.
+    "GIT_EXEC_PATH",
 ];
 
 /// The first `-c` / `--config-env` key an agent supplied that matches a
@@ -5708,6 +5710,17 @@ pub fn gate_git(
         });
     }
 
+    // The flag form of GIT_EXEC_PATH. Bare `--exec-path` only prints.
+    if prevent_push && args[..i].iter().any(|a| a.starts_with("--exec-path=")) {
+        return Err(Refusal {
+            headline: "'git --exec-path=…' is not allowed while push prevention is active."
+                .to_string(),
+            guidance: "It picks the helper programs that connect to a remote. Run git without it."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
+    }
+
     if (prevent_push || prevent_force_push)
         && let Some((flag, key)) = injected_sensitive_config_key(&args[..i])
     {
@@ -5947,7 +5960,7 @@ pub fn gate_git(
     {
         return Err(Refusal {
             headline: "Git transport settings changed since this session started.".to_string(),
-            guidance: "core.sshCommand, core.gitProxy and ssh.* are recorded at launch, because they decide\n\
+            guidance: "core.sshCommand, core.gitProxy, ssh.* and the http/remote proxy keys are recorded at launch, because they decide\n\
                        where a push connects. Restore them, or change them outside the sandbox and start a new session."
                 .to_string(),
             agent_note: &[NOTE],
@@ -6973,8 +6986,32 @@ fn unsafe_push_config(real_git: &Path, repo_args: &[&str]) -> Option<String> {
         })
 }
 
-/// The non-empty [`TRANSPORT_ENV_VARS`] in `vars`. An empty value counts as
-/// unset, as git treats it.
+/// PATH for an approved `git push`: [`crate::git::TRUSTED_BIN_DIRS`] first,
+/// then the agent's PATH. git finds `ssh` and `git-remote-<scheme>` through
+/// PATH, so without this a directory the agent put first would pick the
+/// program that connects, with no setting changed. The agent's PATH stays
+/// after them, so hooks still find their tools. `None` for anything else.
+pub fn push_path(
+    args: &[&str],
+    agent_path: Option<&std::ffi::OsStr>,
+) -> Option<std::ffi::OsString> {
+    if args.get(git_subcommand_index(args)?) != Some(&"push") {
+        return None;
+    }
+    let mut dirs: Vec<std::path::PathBuf> = crate::git::TRUSTED_BIN_DIRS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    dirs.extend(
+        agent_path
+            .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    std::env::join_paths(dirs).ok()
+}
+
+/// The non-empty [`TRANSPORT_ENV_VARS`] in `vars`. An empty value is dropped:
+/// git would try to run it and fail, so it cannot pick a destination.
 pub fn transport_env(
     vars: impl Iterator<Item = (String, String)>,
 ) -> std::collections::BTreeMap<String, String> {
@@ -6982,7 +7019,8 @@ pub fn transport_env(
         .collect()
 }
 
-/// The transport settings (`core.sshCommand`, `core.gitProxy`, `ssh.*`) git
+/// The transport settings (`core.sshCommand`, `core.gitProxy`, `ssh.*`,
+/// `http.proxy`, `http.<url>.proxy`, `remote.<name>.proxy`) git
 /// sees in the repository `repo_args` targets, as raw `config -z` output.
 /// `None` when git cannot answer.
 fn transport_config(real_git: &Path, repo_args: &[&str]) -> Option<String> {
@@ -6993,7 +7031,7 @@ fn transport_config(real_git: &Path, repo_args: &[&str]) -> Option<String> {
             "config",
             "-z",
             "--get-regexp",
-            r"^(core\.(sshcommand|gitproxy)|ssh\..*)$",
+            r"^(core\.(sshcommand|gitproxy)|ssh\..*|http\.(.*\.)?proxy|remote\..*\.proxy)$",
         ],
     )?;
     match output.status.code() {
@@ -7128,7 +7166,7 @@ pub struct RepoFacts {
     /// level by construction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub named: Vec<RepoFacts>,
-    /// `core.sshCommand`, `core.gitProxy` and `ssh.*` as git reported them at
+    /// `core.sshCommand`, `core.gitProxy`, `ssh.*` and the proxy keys as git reported them at
     /// launch (`config -z` records). They pick where a push connects, so a push
     /// is refused when they differ at gate time.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -7921,6 +7959,7 @@ pub fn generate_git_wrapper_script(
         && repo_facts.worktree_root.is_empty()
         && repo_facts.git_common_dir.is_empty()
         && repo_facts.transport_env.is_empty()
+        && repo_facts.transport_config.is_empty()
     {
         String::new()
     } else {
