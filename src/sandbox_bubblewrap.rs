@@ -1512,7 +1512,13 @@ pub(crate) fn resolve(
         for rule in policy.fs_rules.iter().filter(|r| r.nofollow) {
             landlock_mod::nofollow_host_id(&rule.path)?;
         }
-        refuse_symlinked_overlays(&policy.fs_rules, overlays)?;
+        let (refusal, warnings) = symlinked_overlays(&policy.fs_rules, overlays);
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
+        for w in warnings {
+            crate::ui::warn_id("warn.bubblewrap-overlay-link", &w);
+        }
     }
     match use_bubblewrap {
         Some(false) => Ok(None),
@@ -1540,21 +1546,30 @@ pub(crate) fn resolve(
     }
 }
 
-/// Refuses a read-only overlay or rename pin that is, or sits below, a
-/// symlink inside a writable root.
+/// Checks the read-only overlays and rename pins for a symlink at or above
+/// them, below the writable root that holds them.
 ///
 /// bwrap resolves a bind destination through links. A relative link moves the
 /// read-only bind onto its target and leaves the link itself replaceable; an
 /// absolute one makes bwrap abort, which auto-detect would turn into a
-/// Landlock-only session without any of the overlays. Both are refused here,
-/// before either arm of [`resolve`], the way [`nested_repo_roots`] refuses to
-/// follow links. Only components below the deepest writable root holding the
-/// path are checked: the agent cannot plant a link above it, and hosts and
-/// dotfile setups legitimately link `/home` or an agent config dir.
-pub(crate) fn refuse_symlinked_overlays(
+/// Landlock-only session without any of the overlays.
+///
+/// For a git or hook persistence path ([`runs_on_host`]) this is a refusal:
+/// what lands there runs unsandboxed. Any other overlay, such as a stow-style
+/// link to an agent's `settings.json`, keeps today's bind and gets a warning,
+/// so existing dotfile setups keep working.
+///
+/// Only components below the deepest writable root holding the path are
+/// checked: the agent cannot plant a link above it, and hosts and dotfile
+/// setups legitimately link `/home` or a whole agent config dir. This is a
+/// point-in-time check at launch; a link created later meets the bind already
+/// mounted on the real directory.
+///
+/// Returns the refusal, if any, and the warnings.
+pub(crate) fn symlinked_overlays(
     fs_rules: &[FsRule],
     overlays: Overlays<'_>,
-) -> Result<(), String> {
+) -> (Option<String>, Vec<String>) {
     let roots: Vec<PathBuf> = fs_rules
         .iter()
         .filter(|r| r.access.write || r.access.create_dirs)
@@ -1563,34 +1578,74 @@ pub(crate) fn refuse_symlinked_overlays(
         // A private tmpfs in the namespace: host links there cannot be replaced.
         .filter(|p| p != Path::new("/tmp"))
         .collect();
+    let mut warnings = Vec::new();
     for path in overlays.read_only.iter().chain(overlays.pins) {
         // The deepest root only: a linked agent config dir (`~/.copilot` into a
         // dotfiles repo) is itself a root, and the agent cannot replace it.
-        let deepest = roots
+        let Some(root) = roots
             .iter()
             .filter(|r| path.starts_with(r))
-            .max_by_key(|r| r.components().count());
-        if let Some(root) = deepest {
-            let mut cur = root.clone();
-            for part in path
-                .strip_prefix(root)
-                .unwrap_or(Path::new(""))
-                .components()
-            {
-                cur.push(part);
-                if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
-                    return Err(format!(
-                        "{} is a symbolic link, and cplt keeps {} read-only. \
-                         Remove the link (`rm {}`) and launch again.",
-                        cur.display(),
-                        path.display(),
-                        cur.display()
-                    ));
-                }
+            .max_by_key(|r| r.components().count())
+        else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(Path::new(""));
+        let mut cur = root.clone();
+        for part in rel.components() {
+            cur.push(part);
+            if !std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                continue;
             }
+            if runs_on_host(root, rel) {
+                return (
+                    Some(format!(
+                        "`{}` is a symbolic link at or above `{}`, a path whose contents \
+                         run on the host, so cplt will not launch through it. Replace the \
+                         link with a copy, or for a hooks directory remove the link and \
+                         point git at the shared hooks with `git config core.hooksPath <dir>`.",
+                        cur.display(),
+                        path.display()
+                    )),
+                    warnings,
+                );
+            }
+            warnings.push(format!(
+                "`{}` is a symbolic link, so the read-only mount for `{}` lands on its \
+                 target and the link itself stays replaceable. Replace the link with a \
+                 copy to protect it.",
+                cur.display(),
+                path.display()
+            ));
+            break;
         }
     }
-    Ok(())
+    (None, warnings)
+}
+
+/// Whether `rel`, under writable root `root`, is a git or hook persistence
+/// path: inside a git directory, or an entry of [`PROTECTED_IN_ROOT`] (or an
+/// ancestor of one, as a rename pin is).
+fn runs_on_host(root: &Path, rel: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    if parts.first().is_some_and(|c| *c == ".git") || is_git_dir(root) {
+        return true;
+    }
+    PROTECTED_IN_ROOT
+        .iter()
+        .filter(|p| p.linux == LinuxCoverage::Bwrap)
+        .any(|p| {
+            !parts.is_empty()
+                && p.rel
+                    .split('/')
+                    .zip(&parts)
+                    .all(|(want, got)| want == "*" || std::ffi::OsStr::new(want) == *got)
+        })
+}
+
+/// A bare repository or a `.git` directory granted as a root of its own.
+fn is_git_dir(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n == ".git")
+        || (dir.join("HEAD").is_file() && dir.join("objects").is_dir())
 }
 
 /// Whether this bwrap accepts `--disable-userns` (bubblewrap 0.8+).
@@ -1624,6 +1679,11 @@ pub(crate) fn build_wrapper(
             crate::git::TRUSTED_BIN_DIRS.join(", ")
         )
     })?;
+    // `resolve` checked already and printed the warnings; the doctor, probe
+    // and post-#553 rebuild reach here directly.
+    if let (Some(refusal), _) = symlinked_overlays(&policy.fs_rules, overlays) {
+        return Err(refusal);
+    }
     let bind_rules = mount_rules(policy);
     let disable_userns = supports_disable_userns(&bwrap_path);
     test_functionality(
@@ -3255,6 +3315,88 @@ mod tests {
         );
     }
 
+    fn write_rule(path: &Path) -> FsRule {
+        FsRule {
+            path: path.to_path_buf(),
+            access: FsAccess {
+                write: true,
+                ..FsAccess::default()
+            },
+            nofollow: false,
+        }
+    }
+
+    /// `Err` for a refusal, `Ok(warnings)` otherwise.
+    fn check_links(
+        rules: &[FsRule],
+        read_only: &[PathBuf],
+        pins: &[PathBuf],
+    ) -> Result<Vec<String>, String> {
+        match symlinked_overlays(
+            rules,
+            Overlays {
+                read_only,
+                pins,
+                mask_missing: &[],
+            },
+        ) {
+            (Some(refusal), _) => Err(refusal),
+            (None, warnings) => Ok(warnings),
+        }
+    }
+
+    /// A stow-style link to an agent config file keeps working: warned, not refused.
+    #[test]
+    fn symlinked_agent_config_file_warns() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        let cfg = base.join(".claude");
+        std::fs::create_dir(&cfg).unwrap();
+        std::fs::write(base.join("dotfiles-settings.json"), "{}").unwrap();
+        let settings = cfg.join("settings.json");
+        std::os::unix::fs::symlink(base.join("dotfiles-settings.json"), &settings).unwrap();
+        let warnings = check_links(&[write_rule(&cfg)], std::slice::from_ref(&settings), &[])
+            .expect("agent config links must not refuse the launch");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("settings.json"), "{warnings:?}");
+    }
+
+    /// 0e740624: a linked agent config dir that is a writable root of its own is
+    /// not checked from a broader root above it.
+    #[test]
+    fn linked_root_is_checked_only_below_itself() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("dotfiles/copilot/.git/hooks")).unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let link = base.join("home/.copilot");
+        std::os::unix::fs::symlink(base.join("dotfiles/copilot"), &link).unwrap();
+        let hooks = link.join(".git/hooks");
+        let rules = [write_rule(&base), write_rule(&link)];
+        assert_eq!(
+            check_links(&rules, std::slice::from_ref(&hooks), &[]),
+            Ok(vec![])
+        );
+        // Without the deeper root the link sits below a writable root and refuses.
+        assert!(check_links(&rules[..1], std::slice::from_ref(&hooks), &[]).is_err());
+    }
+
+    /// 221b672e: `/tmp` is a private tmpfs in the namespace, never a root here.
+    #[test]
+    fn tmp_is_not_a_root_for_the_link_check() {
+        let t = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let base = t.path().to_path_buf();
+        std::fs::create_dir_all(base.join("elsewhere/hooks")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), base.join(".github")).unwrap();
+        let hooks = base.join(".github/hooks");
+        let tmp = [write_rule(Path::new("/tmp"))];
+        assert_eq!(
+            check_links(&tmp, std::slice::from_ref(&hooks), &[]),
+            Ok(vec![])
+        );
+        assert!(check_links(&[write_rule(&base)], std::slice::from_ref(&hooks), &[]).is_err());
+    }
+
     #[test]
     fn symlinked_protected_paths_are_refused() {
         let proj = tempfile::tempdir().expect("tempdir");
@@ -3270,16 +3412,7 @@ mod tests {
             nofollow: false,
         }];
         let hooks = root.join(".github/hooks");
-        let check = |read_only: &[PathBuf], pins: &[PathBuf]| {
-            refuse_symlinked_overlays(
-                &rules,
-                Overlays {
-                    read_only,
-                    pins,
-                    mask_missing: &[],
-                },
-            )
-        };
+        let check = |read_only: &[PathBuf], pins: &[PathBuf]| check_links(&rules, read_only, pins);
         std::fs::create_dir(&hooks).unwrap();
         assert!(check(std::slice::from_ref(&hooks), &[]).is_ok());
         std::fs::remove_dir(&hooks).unwrap();

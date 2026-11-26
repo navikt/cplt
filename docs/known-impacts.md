@@ -2041,3 +2041,14 @@ part of that path below your home resolves somewhere else, for example a
 symlinked `~/Library/Caches`, cplt skips the cleanup and says so, rather than
 delete anything in the link's target. No action is needed; remove old
 directories there by hand if they take up space.
+
+## Linux: symlinks at protected paths (behaviour change)
+
+With bubblewrap, cplt mounts some paths read-only. A symbolic link at or above one of them now changes what happens at launch.
+
+| Setup | Now | What to do |
+| --- | --- | --- |
+| `.git/hooks` or `.github/hooks` is a link to a shared hooks directory | refuses to launch, names the link | Remove the link and run `git config core.hooksPath <dir>`, or replace the link with a copy |
+| Another git persistence path under `.git` is a link | refuses to launch, names the link | Replace the link with a copy |
+| An agent config file is a link (stow-style `~/.claude/settings.json`) | launches, warns | Nothing required. Replace the link with a copy to make the link itself read-only too |
+| The whole agent config dir is a link (`~/.copilot` into a dotfiles repo) | launches as before | Nothing |
