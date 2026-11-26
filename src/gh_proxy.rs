@@ -118,6 +118,22 @@ fn non_builtin_decision(command: &str, allowed: &[String]) -> Option<PolicyResul
     })
 }
 
+/// For a listed extension, the argv that runs it as `gh extension exec <name>`.
+/// The plain `gh <name>` form runs a same-named user alias when no extension is
+/// installed, and aliases live in config the agent can write; `extension exec`
+/// ignores aliases and fails when the extension is absent.
+pub fn listed_extension_argv(args: &[&str]) -> Option<Vec<String>> {
+    let root = root_command(args).0?;
+    let word = args[root];
+    if is_gh_builtin(word) || !gh_extensions().iter().any(|n| n == word) {
+        return None;
+    }
+    let mut out: Vec<String> = args[..root].iter().map(ToString::to_string).collect();
+    out.extend(["extension".to_string(), "exec".to_string()]);
+    out.extend(args[root..].iter().map(ToString::to_string));
+    Some(out)
+}
+
 /// The GitHub hosts the guard accepts; `["github.com"]` unless configured.
 pub fn gh_hosts() -> &'static [String] {
     GH_HOSTS.get_or_init(|| vec![DEFAULT_GH_HOST.to_string()])

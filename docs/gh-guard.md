@@ -141,9 +141,15 @@ cplt config set --force gh_guard.allow_extensions dash   # for gh dash (gh-dash)
 ```
 
 Only the exact names in the list run, and they run unchecked with the gh
-token. Built-in command names are refused at `config set`. If a listed name is
-also a gh alias, gh decides which one runs, so list only names you have
-installed as extensions.
+token. Built-in command names are refused at `config set`. The guard runs a
+listed name as `gh extension exec <name>`, so a user alias with the same name
+never runs in its place; with no such extension installed, gh fails with
+`extension "<name>" not found`.
+
+gh finds extensions under `$XDG_DATA_HOME/gh/extensions` (default
+`~/.local/share/gh/extensions`). The guard inherits `XDG_DATA_HOME` from the
+agent, so the agent chooses which directory that is, and can plant its own
+`gh-<name>` there for a listed name.
 
 ### Backward compatibility
 

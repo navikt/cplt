@@ -331,6 +331,85 @@ fn gh_gate_resolves_aliases_under_unknown_allow() {
     assert!(ok, "pr ls is pr list: {stderr}");
 }
 
+/// #1099: a listed name runs as `gh extension exec`, so a user alias of the
+/// same name (gh config the agent can write) never runs in its place. Needs a
+/// real gh; skipped without one.
+#[test]
+fn gh_gate_listed_extension_never_runs_same_named_alias() {
+    let Some(gh) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("gh"))
+        .find(|p| p.is_file() && !p.to_string_lossy().contains("shims"))
+        .or_else(|| {
+            ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .find(|p| p.is_file())
+        })
+    else {
+        eprintln!("skipping: no gh binary");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("gh-config");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.yml"),
+        "aliases:\n    dash: '!echo ALIAS-RAN'\n",
+    )
+    .unwrap();
+    let run = || {
+        let repo = temp_repo("navikt/cplt");
+        let out = cplt_cmd()
+            .args(["gh-gate", "--real-gh"])
+            .arg(&gh)
+            .arg("--real-git")
+            .arg(binary_in_path("git"))
+            .args([
+                "--repo-scope",
+                "navikt/cplt",
+                "--allow-extension",
+                "dash",
+                "--",
+                "dash",
+            ])
+            .env("HOME", tmp.path())
+            .env("GH_CONFIG_DIR", &cfg)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .env("XDG_STATE_HOME", tmp.path())
+            .env("XDG_CACHE_HOME", tmp.path())
+            .env("GH_TOKEN", "dummy")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).to_string()
+                + &String::from_utf8_lossy(&out.stderr),
+            out.status.success(),
+        )
+    };
+    let (out, ok) = run();
+    assert!(
+        !ok && !out.contains("ALIAS-RAN"),
+        "alias must not run: {out}"
+    );
+    assert!(out.contains("not found"), "{out}");
+
+    let ext = data.join("gh/extensions/gh-dash");
+    std::fs::create_dir_all(&ext).unwrap();
+    std::fs::write(ext.join("gh-dash"), "#!/bin/sh\necho EXT-RAN\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(ext.join("gh-dash"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (out, ok) = run();
+    assert!(
+        ok && out.contains("EXT-RAN") && !out.contains("ALIAS-RAN"),
+        "{out}"
+    );
+}
+
 /// #1099: only extensions named in `gh_guard.allow_extensions` run, by exact
 /// name; `stack` is an extension in gh 2.105, not a built-in.
 #[test]

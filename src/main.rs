@@ -6481,6 +6481,9 @@ enum GateEffect {
     /// `-u` taken out, whose only effect was a `.git/config` write the sandbox
     /// denies (#402).
     ExecWithout { notice: String, args: Vec<String> },
+    /// Run `args` instead of the invocation, unpinned: a listed extension run
+    /// as `gh extension exec <name>`, so a same-named alias cannot stand in.
+    ExecArgs(Vec<String>),
     /// Serve the cached token from the scratch dir instead of running `gh`.
     ServeCachedToken,
     /// Refuse, printing this refusal and the guard's escape hatch.
@@ -6549,6 +6552,13 @@ fn decide_gh_gate(
     match verdict {
         Ok((approval, _)) if !approval.graphql_targets.is_empty() => {
             GateEffect::VerifyGraphql(approval.graphql_targets)
+        }
+        Ok((approval, None)) if gh_proxy::listed_extension_argv(&arg_refs).is_some() => {
+            let args = gh_proxy::listed_extension_argv(&arg_refs).unwrap_or_default();
+            match approval.repo_scope {
+                Some(repo) => GateEffect::ExecRewritten { repo, args },
+                None => GateEffect::ExecArgs(args),
+            }
         }
         Ok((approval, pinned)) => match (approval.repo_scope, approval.host_pin, pinned) {
             (Some(repo), _, Some(args)) => GateEffect::ExecRewritten { repo, args },
@@ -6665,6 +6675,7 @@ fn perform_gate_effect(
             eprintln!("{notice}");
             exec_real(real_binary, name, &args, None, None)
         }
+        GateEffect::ExecArgs(args) => exec_real(real_binary, name, &args, None, None),
     }
 }
 
