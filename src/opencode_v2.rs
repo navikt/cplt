@@ -1023,7 +1023,7 @@ fn sqlite_count(db: &Path, table: &str) -> Option<u64> {
     }
     let sqlite = crate::git::trusted_binary("sqlite3")?;
     #[allow(clippy::disallowed_methods)] // resolved above, not a PATH lookup
-    let o = std::process::Command::new(sqlite)
+    let o = crate::clean_env::helper_command(sqlite)
         .args(["-readonly", "-batch", "-init", "/dev/null"])
         .arg(db)
         .arg(format!("SELECT count(*) FROM {table}"))

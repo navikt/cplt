@@ -3289,7 +3289,7 @@ fn decode_api_path(path: &str) -> Option<String> {
 /// subcommand that reads working-tree content, move it onto the shared path.
 #[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String, String> {
-    let mut command = std::process::Command::new(real_git);
+    let mut command = crate::clean_env::helper_command(real_git);
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
             command.env_remove(key);
@@ -6789,7 +6789,14 @@ fn run_git_any_status(
     repo_args: &[&str],
     args: &[&str],
 ) -> Option<std::process::Output> {
-    let mut cmd = std::process::Command::new(real_git);
+    // Runs in the parent at launch too: only the helper env, no user secret.
+    // GIT_* stays: in the gate it is how a redirected repository shows up.
+    let mut cmd = crate::clean_env::helper_command(real_git);
+    for (key, value) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env(key, value);
+        }
+    }
     // The session runs git with GIT_CONFIG_NOSYSTEM=1 (HARDENING_ENV_VARS);
     // facts captured at launch must see the same config the gate later does.
     cmd.args(repo_args)
@@ -7837,6 +7844,17 @@ exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_repo_lookup_gets_only_the_helper_env() {
+        let Some(git) = crate::git::trusted_git() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let before = crate::clean_env::helper_env_calls();
+        let _ = detect_current_repo(git, dir.path());
+        assert_eq!(crate::clean_env::helper_env_calls(), before + 1);
+    }
 
     /// One object, three renderings: the launch prints the block form, warn
     /// mode the same body under a label that does not say BLOCKED, and the

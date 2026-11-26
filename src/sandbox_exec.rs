@@ -1934,7 +1934,7 @@ pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
     // Absolute: `sandbox-exec` only ever lives in /usr/bin (SIP-protected), and
     // resolving it by name would go through the parent's PATH, which contains
     // directories the sandbox itself grants the agent write+exec on.
-    let output = Command::new(SANDBOX_EXEC)
+    let output = crate::clean_env::helper_command(SANDBOX_EXEC)
         .arg("-p")
         .arg(&sandbox.profile_text)
         .arg("/usr/bin/true")

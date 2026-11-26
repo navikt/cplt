@@ -338,7 +338,7 @@ fn past_xcrun_shim(git: PathBuf) -> PathBuf {
     if git != Path::new("/usr/bin/git") {
         return git;
     }
-    let Ok(out) = Command::new("/usr/bin/xcrun")
+    let Ok(out) = crate::clean_env::helper_command("/usr/bin/xcrun")
         .args(["--find", "git"])
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
@@ -1060,7 +1060,6 @@ mod tests {
     fn no_raw_git_command_outside_git_rs() {
         const ALLOWED: &[(&str, usize)] = &[
             ("audit.rs", 2),    // cwd `/`; env cleared with `--file -`
-            ("gh_proxy.rs", 2), // guard wrappers, inside the sandbox
             ("upstream.rs", 1), // gate side, inside the sandbox
         ];
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

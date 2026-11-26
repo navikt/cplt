@@ -800,6 +800,76 @@ print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
         );
     }
 
+    /// Scans every process while a launch runs: apart from the launcher's
+    /// own first image and its pipe writer (the stated window), nothing cplt
+    /// starts may carry an exported value. Sampling, so it catches a leaking
+    /// spawn often rather than always; the per-site tests are exact.
+    #[test]
+    fn e2e_no_process_started_by_a_launch_carries_an_exported_value() {
+        require_sandbox!();
+        let home = crate::common::make_config_home("clean-env-scan");
+        let repo = crate::common::temp_repo("navikt/probe");
+        for _ in 0..3 {
+            let mut child = crate::common::cplt_local(&home, repo.path())
+                .args([
+                    "--yes",
+                    "--no-validate",
+                    "--quiet",
+                    "--agent",
+                    "shell",
+                    "--",
+                    "-c",
+                    "sleep 1",
+                ])
+                .env("CPLT_TEST_CANARY", "canary-7f3e")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("cplt should run");
+            let launcher = child.id().to_string();
+            while child.try_wait().unwrap().is_none() {
+                let ps = Command::new("/bin/ps")
+                    .args(["-E", "-axww", "-o", "pid=,ppid=,command="])
+                    .output()
+                    .expect("ps runs");
+                let text = String::from_utf8_lossy(&ps.stdout);
+                let rows: Vec<(&str, &str, &str)> = text
+                    .lines()
+                    .filter_map(|l| {
+                        let mut f = l.split_whitespace();
+                        Some((f.next()?, f.next()?, l))
+                    })
+                    .collect();
+                // Only what the launcher started: other processes on this
+                // machine may name the canary in their argv.
+                let mut tree = vec![launcher.as_str()];
+                let mut grew = true;
+                while grew {
+                    grew = false;
+                    for (pid, ppid, _) in &rows {
+                        if tree.contains(ppid) && !tree.contains(pid) {
+                            tree.push(pid);
+                            grew = true;
+                        }
+                    }
+                }
+                let bin = binary_path();
+                for (pid, _, line) in &rows {
+                    // The stated window: the launcher's first image and the
+                    // pipe writer forked from it (same binary, no marker).
+                    let cmd = line.split_whitespace().nth(2).unwrap_or("");
+                    let writer = Path::new(cmd) == bin && !line.contains("--__cplt-env-fd");
+                    if *pid != launcher && !writer && tree.contains(pid) {
+                        assert!(
+                            !line.contains("canary-7f3e"),
+                            "a spawn carries the exported value: {line}\nlauncher {launcher}, tree {tree:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A re-exec that cannot happen is reported, and the launch goes on.
     #[test]
     fn e2e_failed_clean_env_reexec_warns_and_continues() {

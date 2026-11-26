@@ -82,6 +82,7 @@ pub const HELPER_ENV: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
+    "GH_CONFIG_DIR",
     "HTTPS_PROXY",
     "https_proxy",
     "HTTP_PROXY",
@@ -103,6 +104,15 @@ pub fn helper_env(cmd: &mut std::process::Command) {
             cmd.env(k, v);
         }
     }
+}
+
+/// `Command::new(program)` with [`helper_env`] applied. The caller still
+/// owes `program` a trusted, absolute path, as for `Command::new`.
+#[allow(clippy::disallowed_methods)] // the caller resolves `program`
+pub fn helper_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    helper_env(&mut cmd);
+    cmd
 }
 
 #[cfg(test)]
@@ -193,19 +203,31 @@ fn send(block: &[u8]) -> std::io::Result<i32> {
     }
 }
 
+/// `KEY\0VALUE\0` pairs behind an 8-byte length, so a block cut short (the
+/// writer died, the second fork failed) is told apart from an empty
+/// environment and refused.
 fn encode(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut body = Vec::new();
     for (k, v) in vars {
-        out.extend_from_slice(k.as_bytes());
-        out.push(0);
-        out.extend_from_slice(v.as_bytes());
-        out.push(0);
+        body.extend_from_slice(k.as_bytes());
+        body.push(0);
+        body.extend_from_slice(v.as_bytes());
+        body.push(0);
     }
+    let mut out = (body.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&body);
     out
 }
 
 fn decode(bytes: &[u8]) -> Option<Vec<(OsString, OsString)>> {
-    let body = bytes.strip_suffix(&[0])?;
+    let (len, body) = bytes.split_first_chunk::<8>()?;
+    if u64::from_le_bytes(*len) != body.len() as u64 {
+        return None;
+    }
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let body = body.strip_suffix(&[0])?;
     let parts: Vec<&[u8]> = body.split(|b| *b == 0).collect();
     if !parts.len().is_multiple_of(2) {
         return None;
@@ -241,9 +263,6 @@ fn read_env(fd: i32) -> std::io::Result<Vec<(OsString, OsString)>> {
     if buf.len() as u64 > LIMIT {
         return Err(std::io::Error::other("environment block over the limit"));
     }
-    if buf.is_empty() {
-        return Ok(Vec::new());
-    }
     decode(&buf).ok_or_else(bad)
 }
 
@@ -262,10 +281,29 @@ mod tests {
 
     #[test]
     fn refuses_malformed_blocks() {
-        assert_eq!(decode(b"A\0"), None);
-        assert_eq!(decode(b"A=B\0v\0"), None);
-        assert_eq!(decode(b"\0v\0"), None);
-        assert_eq!(decode(b"A\0v"), None);
+        let framed = |b: &[u8]| {
+            let mut v = (b.len() as u64).to_le_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        };
+        assert_eq!(decode(&framed(b"A\0")), None);
+        assert_eq!(decode(&framed(b"A=B\0v\0")), None);
+        assert_eq!(decode(&framed(b"\0v\0")), None);
+        assert_eq!(decode(&framed(b"A\0v")), None);
+        assert_eq!(decode(&framed(b"")), Some(Vec::new()));
+    }
+
+    /// A writer that dies early leaves an empty or short pipe: refused.
+    #[test]
+    fn an_empty_or_truncated_block_is_refused() {
+        let full = encode(vec![(OsString::from("A"), OsString::from("b"))].into_iter());
+        for cut in [0, 4, full.len() - 1] {
+            let (r, mut w) = std::io::pipe().unwrap();
+            std::io::Write::write_all(&mut w, &full[..cut]).unwrap();
+            drop(w);
+            let fd = std::os::fd::IntoRawFd::into_raw_fd(r);
+            assert!(read_env(fd).is_err(), "cut at {cut}");
+        }
     }
 
     #[test]
