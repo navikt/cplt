@@ -3420,7 +3420,8 @@ print('BIND_OK')
         crate::common::with_scratch_home(&mut cmd);
         let out = cmd
             .env("HOME", h)
-            .env("XDG_CONFIG_HOME", h.join(".config"))
+            // Elsewhere, so the `~/.config` grant does not cover gh's config.
+            .env("XDG_CONFIG_HOME", h.join("xdg-config"))
             .env("XDG_DATA_HOME", h.join(".local/share"))
             .env("XDG_STATE_HOME", h.join(".local/state"))
             .env("XDG_CACHE_HOME", h.join(".cache"))
