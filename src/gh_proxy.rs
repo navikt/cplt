@@ -6782,18 +6782,22 @@ fn run_git(real_git: &Path, repo_args: &[&str], args: &[&str]) -> Option<std::pr
     run_git_any_status(real_git, repo_args, args).filter(|o| o.status.success())
 }
 
-/// [`run_git`] without the success filter, for callers that read the exit code.
-#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
-fn run_git_any_status(
-    real_git: &Path,
-    repo_args: &[&str],
-    args: &[&str],
-) -> Option<std::process::Output> {
-    // Runs in the parent at launch too: only the helper env, no user secret.
-    // Repository-location variables stay: in the gate they are how a
-    // redirected repository shows up. Never credentials or config.
-    let mut cmd = crate::clean_env::helper_command(real_git);
-    for key in [
+/// Set by the gh and git gates, which run inside the sandbox as the agent.
+static IN_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as a gate: its git queries must see the session's own
+/// `GIT_*`, exactly as the command it gates will, or a variable the queries
+/// drop (`GIT_REFERENCE_BACKEND`) redirects the push past them.
+pub fn enter_gate() {
+    IN_GATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Which inherited `GIT_*` a query keeps. In the gate: all of them, see
+/// [`enter_gate`]. At launch, in the parent outside the sandbox: only where the
+/// repository is, never credentials or config (`GIT_PASSWORD`,
+/// `GIT_CONFIG_PARAMETERS`, `GIT_ASKPASS`).
+fn git_env_passes(key: &str, in_gate: bool) -> bool {
+    const LOCATION: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_COMMON_DIR",
@@ -6802,8 +6806,28 @@ fn run_git_any_status(
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CEILING_DIRECTORIES",
-    ] {
-        if let Some(value) = std::env::var_os(key) {
+    ];
+    if in_gate {
+        key.starts_with("GIT_")
+    } else {
+        LOCATION.contains(&key)
+    }
+}
+
+/// [`run_git`] without the success filter, for callers that read the exit code.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn run_git_any_status(
+    real_git: &Path,
+    repo_args: &[&str],
+    args: &[&str],
+) -> Option<std::process::Output> {
+    // Runs in the parent at launch too: only the helper env, no user secret.
+    let mut cmd = crate::clean_env::helper_command(real_git);
+    for (key, value) in std::env::vars_os() {
+        if git_env_passes(
+            &key.to_string_lossy(),
+            IN_GATE.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
             cmd.env(key, value);
         }
     }
@@ -7854,6 +7878,56 @@ exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    /// Runs only as the child of [`launch_and_gate_git_env_is_exact`]: real
+    /// process env, a fake git that records the env it was given.
+    #[test]
+    #[ignore = "child of launch_and_gate_git_env_is_exact"]
+    fn git_env_child() {
+        let Some(git) = std::env::var_os("CPLT_TEST_FAKE_GIT") else {
+            return;
+        };
+        if std::env::var_os("CPLT_TEST_GATE").is_some() {
+            enter_gate();
+        }
+        let _ = capture_repo_facts(Path::new(&git), Path::new("/"));
+    }
+
+    /// Launch facts get only repository-location GIT_*; the gate gets every
+    /// session GIT_*, so its queries see what the gated command will.
+    #[test]
+    fn launch_and_gate_git_env_is_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        for gate in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let git = dir.path().join("git");
+            std::fs::write(&git, "#!/bin/sh\nenv >> \"$0.env\"\nexit 1\n").unwrap();
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--ignored", "--exact", "gh_proxy::tests::git_env_child"])
+                .env("CPLT_TEST_FAKE_GIT", &git)
+                .env("GIT_DIR", "/loc")
+                .env("GIT_PASSWORD", "canary-pw")
+                .env("GIT_CONFIG_PARAMETERS", "'x.y=canary-cfg'")
+                .env("GIT_REFERENCE_BACKEND", "canary-refs")
+                .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1");
+            if gate {
+                cmd.env("CPLT_TEST_GATE", "1");
+            }
+            assert!(cmd.output().unwrap().status.success());
+            let seen = std::fs::read_to_string(dir.path().join("git.env")).unwrap();
+            assert!(seen.contains("GIT_DIR=/loc"), "{seen}");
+            assert!(!seen.contains("CPLT_TEST_FAKE_GIT"), "{seen}");
+            for leak in [
+                "canary-pw",
+                "canary-cfg",
+                "canary-refs",
+                "GIT_DISCOVERY_ACROSS",
+            ] {
+                assert_eq!(seen.contains(leak), gate, "gate={gate} {leak}: {seen}");
+            }
+        }
+    }
 
     #[test]
     fn launch_repo_lookup_gets_only_the_helper_env() {

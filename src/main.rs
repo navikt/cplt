@@ -6678,6 +6678,7 @@ fn run_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
+    gh_proxy::enter_gate();
     let mut pinned = None;
     let effect = match decide_gh_gate(args, policy, repo_scope, real_git, &mut |repo, lookup| {
         run_gh_lookup(real_gh, repo, lookup)
@@ -7389,6 +7390,7 @@ fn run_git_gate(
     allow_push_rules: &[config::ResolvedPushRule],
     repo_facts: &gh_proxy::RepoFacts,
 ) -> ExitCode {
+    gh_proxy::enter_gate();
     let effect = decide_git_gate(
         args,
         mode,
