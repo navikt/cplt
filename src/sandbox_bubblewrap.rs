@@ -1623,11 +1623,12 @@ pub(crate) fn symlinked_overlays(
 }
 
 /// Whether `rel`, under writable root `root`, is a git or hook persistence
-/// path: inside a git directory, or an entry of [`PROTECTED_IN_ROOT`] (or an
+/// path: inside a git directory (at any depth), or an entry of [`PROTECTED_IN_ROOT`] (or an
 /// ancestor of one, as a rename pin is).
 fn runs_on_host(root: &Path, rel: &Path) -> bool {
     let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
-    if parts.first().is_some_and(|c| *c == ".git") || is_git_dir(root) {
+    // Any `.git` component: nested repositories are protected without being roots.
+    if parts.iter().any(|c| *c == ".git") || is_git_dir(root) {
         return true;
     }
     PROTECTED_IN_ROOT
@@ -3377,11 +3378,8 @@ mod tests {
             check_links(&rules, std::slice::from_ref(&hooks), &[]),
             Ok(vec![])
         );
-        // Without the deeper root the link sits below a writable root and is reported.
-        assert_eq!(
-            check_links(&rules[..1], std::slice::from_ref(&hooks), &[]).map(|w| w.len()),
-            Ok(1)
-        );
+        // Without the deeper root the link sits below a writable root and refuses.
+        assert!(check_links(&rules[..1], std::slice::from_ref(&hooks), &[]).is_err());
     }
 
     /// 221b672e: `/tmp` is a private tmpfs in the namespace, never a root here.
