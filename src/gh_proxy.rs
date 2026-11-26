@@ -7034,7 +7034,8 @@ pub fn push_ssh_command(args: &[&str], facts: &RepoFacts, real_git: &Path) -> Op
     }
     let repo_args = repo_target_args(&args[..i]);
     (!facts.ssh_recorded(&repo_args, Some(real_git)))
-        .then(|| format!("'{}'", facts.trusted_ssh.replace('\'', "'\\''")))
+        .then(|| facts.pinned_ssh_command())
+        .flatten()
 }
 
 /// Whether `url` is one git reaches over ssh: an `ssh://` URL or the
@@ -7357,11 +7358,24 @@ impl RepoFacts {
         &self,
         vars: impl Iterator<Item = (String, String)>,
     ) -> Option<&'static str> {
-        let now = transport_env(vars);
+        let mut now = transport_env(vars);
+        // The pin an approved push sets is not a change: a pre-push hook's own
+        // `git push` inherits it.
+        if !self.transport_env.contains_key("GIT_SSH_COMMAND")
+            && now.get("GIT_SSH_COMMAND") == self.pinned_ssh_command().as_ref()
+        {
+            now.remove("GIT_SSH_COMMAND");
+        }
         TRANSPORT_ENV_VARS
             .iter()
             .copied()
             .find(|name| now.get(*name) != self.transport_env.get(*name))
+    }
+
+    /// The `GIT_SSH_COMMAND` an approved push sets: the trusted ssh, quoted.
+    fn pinned_ssh_command(&self) -> Option<String> {
+        (!self.trusted_ssh.is_empty())
+            .then(|| format!("'{}'", self.trusted_ssh.replace('\'', "'\\''")))
     }
 
     /// Whether the session recorded its own ssh program for the targeted

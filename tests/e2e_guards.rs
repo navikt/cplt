@@ -3149,6 +3149,30 @@ fn real_push_runs_the_launch_ssh_not_one_planted_on_path() {
     assert!(!planted_marker.exists(), "the planted ssh ran");
     assert!(trusted_marker.exists(), "the launch ssh did not run");
     assert!(remote_ref(&origin, "refs/heads/feat").is_some());
+
+    // A nested push (a pre-push hook's) inherits the pin and is not refused.
+    let pin = format!("'{}'", t.path().join("trusted/ssh").display());
+    assert!(git_ok(
+        &work,
+        &["commit", "-q", "--allow-empty", "-m", "more"]
+    ));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts.to_string(),
+        PROTECT,
+        &[("PATH", path.as_str()), ("GIT_SSH_COMMAND", pin.as_str())],
+        &push,
+    );
+    assert!(ok, "{stderr}");
+    // Any other value still is.
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts.to_string(),
+        PROTECT,
+        &[("GIT_SSH_COMMAND", "'/other/ssh'")],
+        &push,
+    );
+    assert_refused(&stderr, ok, "GIT_SSH_COMMAND");
 }
 
 #[test]
