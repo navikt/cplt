@@ -97,7 +97,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --no-fail-fast --test unit_tests --test github_mcp_spec --lib --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          sh hack/home-guard.sh cargo test --no-fail-fast --test unit_tests --test github_mcp_spec --lib --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       - name: Annotate failing tests
         if: failure()
@@ -225,7 +225,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --no-fail-fast --verbose -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          sh hack/home-guard.sh cargo test --no-fail-fast --verbose -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       - name: Annotate failing tests
         if: failure()
@@ -739,7 +739,7 @@ jobs:
           sed "s|<listen>.*</listen>|<listen>unix:path=$XDG_RUNTIME_DIR/bus</listen>|" \
             /usr/share/dbus-1/session.conf > "$RUNNER_TEMP/session.conf"
           dbus-run-session --config-file="$RUNNER_TEMP/session.conf" -- \
-            cargo test --no-fail-fast --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+            sh hack/home-guard.sh cargo test --no-fail-fast --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       - name: Annotate failing tests
         if: failure()
