@@ -44,6 +44,8 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// and then it is short — a legitimate background process the user wanted is
 /// left running and named in the report, not killed.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bytes the settle probe drains before it gives up and reports unsettled.
+const SETTLE_MAX_BYTES: usize = 1 << 20;
 
 /// Maximum time used to stop proxy admission and classify accepted clients.
 pub const SNAPSHOT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
@@ -1348,7 +1350,13 @@ impl SettleProbe {
         let deadline = Instant::now() + grace;
         let mut wrote = 0usize;
         let outcome = loop {
+            // Checked on every pass, not only when `poll` times out: a
+            // descendant that keeps the pipe readable would otherwise make
+            // every `poll` return at once and hold the audit open forever.
             let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || wrote > SETTLE_MAX_BYTES {
+                break Settle::TimedOut { wrote };
+            }
             let mut pfd = libc::pollfd {
                 fd: self.read,
                 events: libc::POLLIN,
@@ -2966,6 +2974,70 @@ mod tests {
     /// about; `settle_probe_reports_unsettled_while_a_descendant_lives` keeps
     /// the real one. The ordering assertion is untouched: a probe that
     /// returns without waiting still finds no write.
+    /// Run `outcome_within(grace)` on a probe whose write end a thread keeps
+    /// feeding, `chunk` bytes every `pause`. Panics if the probe has not
+    /// returned within `limit`, so a regression fails instead of hanging.
+    fn settle_probe_against_endless_writer(
+        grace: Duration,
+        chunk: usize,
+        pause: Duration,
+        limit: Duration,
+    ) -> Settle {
+        let probe = SettleProbe::arm().expect("pipe");
+        // SAFETY: duplicating a descriptor this probe owns.
+        let fd = unsafe { libc::dup(probe.write) };
+        assert!(fd >= 0, "dup");
+        let writer = std::thread::spawn(move || {
+            let buf = vec![b'x'; chunk];
+            // Stops at EPIPE once the probe closes its read end.
+            // SAFETY: `buf` is valid for `buf.len()` bytes; `fd` is ours.
+            while unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) } > 0 {
+                std::thread::sleep(pause);
+            }
+            // SAFETY: `fd` is ours and closed exactly once.
+            unsafe { libc::close(fd) };
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(probe.outcome_within(grace)));
+        let outcome = rx
+            .recv_timeout(limit)
+            .expect("settle probe did not stop while a descendant kept writing");
+        writer.join().unwrap();
+        outcome
+    }
+
+    /// A pipe that stays readable must not keep the probe reading past its
+    /// deadline: with no grace left it reports unsettled without draining.
+    #[test]
+    fn settle_probe_stops_at_deadline_while_data_is_pending() {
+        let probe = SettleProbe::arm().expect("pipe");
+        // SAFETY: duplicating a descriptor this probe owns.
+        let fd = unsafe { libc::dup(probe.write) };
+        assert!(fd >= 0, "dup");
+        let buf = [b'x'; 8192];
+        // SAFETY: `buf` is valid for `buf.len()` bytes; fits a pipe buffer.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        assert_eq!(n, buf.len() as isize, "prefill");
+        let outcome = probe.outcome_within(Duration::ZERO);
+        // SAFETY: `fd` is ours and closed exactly once.
+        unsafe { libc::close(fd) };
+        assert_eq!(outcome, Settle::TimedOut { wrote: 0 });
+    }
+
+    #[test]
+    fn settle_probe_stops_at_byte_cap_under_a_flood() {
+        let outcome = settle_probe_against_endless_writer(
+            Duration::from_secs(3600),
+            64 * 1024,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(outcome, Settle::TimedOut { wrote } if wrote > SETTLE_MAX_BYTES),
+            "{outcome:?}"
+        );
+    }
+
     #[test]
     fn settle_probe_waits_for_a_backgrounded_descendant() {
         use std::os::unix::ffi::OsStrExt as _;
