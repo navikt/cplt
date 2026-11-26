@@ -2082,26 +2082,12 @@ pub fn exec(
             }
             BwrapOutcome::Fallback(reason) => {
                 ui::warn(&format_bwrap_fallback_warning(sandbox.agent, &reason));
-                if wrapper.deny_mask_count > 0 {
-                    // prepare() already announced these as enforced.
-                    ui::warn(&format!(
-                        "{} deny path(s) are NOT enforced in this run: the mount masks \
-                         went with Bubblewrap, and Landlock cannot deny subpaths within \
-                         allowed directories.",
-                        wrapper.deny_mask_count
-                    ));
-                }
-                if wrapper.socket_mask_count > 0 {
-                    // Security-relevant, not just a downgrade: below Landlock
-                    // ABI v9 (kernel 7.1) nothing else restricts connect(2) to
-                    // a pathname UNIX socket, so losing the masks re-opens the
-                    // D-Bus / systemd / container-daemon escape entirely.
-                    ui::warn(&format!(
-                        "{} UNIX-socket mask(s) are NOT applied in this run (D-Bus, systemd, \
-                         container runtimes). Below kernel 7.1 Landlock cannot gate connect(2) \
-                         to a pathname socket, so those sockets are reachable from the agent.",
-                        wrapper.socket_mask_count
-                    ));
+                for w in bwrap_fallback_lost_warnings(
+                    wrapper.deny_mask_count,
+                    wrapper.socket_mask_count,
+                    &wrapper.ro_overlays_on_fallback,
+                ) {
+                    ui::warn(&w);
                 }
                 if wrapper.proc_limited_on_fallback {
                     ui::warn(&super::proc_self_limit_text(super::ProcAdvice::SpawnFailed));
@@ -2191,6 +2177,38 @@ fn format_bwrap_fallback_warning(agent: crate::agent::Agent, reason: &str) -> St
     } else {
         format!("Bubblewrap could not start ({reason}); using Landlock + seccomp only.")
     }
+}
+
+/// What a spawn-time fallback to plain Landlock loses, one warning each:
+/// the protections `prepare()` already announced as enforced.
+#[cfg(any(target_os = "linux", test))]
+fn bwrap_fallback_lost_warnings(
+    deny_masks: usize,
+    socket_masks: usize,
+    ro_overlays: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if deny_masks > 0 {
+        out.push(format!(
+            "{deny_masks} deny path(s) are NOT enforced in this run: the mount masks \
+             went with Bubblewrap, and Landlock cannot deny subpaths within \
+             allowed directories."
+        ));
+    }
+    if socket_masks > 0 {
+        // Security-relevant, not just a downgrade: below Landlock
+        // ABI v9 (kernel 7.1) nothing else restricts connect(2) to
+        // a pathname UNIX socket, so losing the masks re-opens the
+        // D-Bus / systemd / container-daemon escape entirely.
+        out.push(format!(
+            "{socket_masks} UNIX-socket mask(s) are NOT applied in this run (D-Bus, systemd, \
+             container runtimes). Below kernel 7.1 Landlock cannot gate connect(2) \
+             to a pathname socket, so those sockets are reachable from the agent."
+        ));
+    }
+    // The read-only binds went with Bubblewrap too (#1184).
+    out.extend(super::host_tool_ro_overlays_unenforced_warning(ro_overlays));
+    out
 }
 
 /// Outcome of attempting the bubblewrap-wrapped execution.
@@ -2821,6 +2839,17 @@ fn read_confirm_byte_with_timeout(
 #[cfg(test)]
 mod child_pid_tests {
     use super::*;
+
+    #[test]
+    fn bwrap_fallback_lost_warnings_names_the_overlays() {
+        assert!(bwrap_fallback_lost_warnings(0, 0, &[]).is_empty());
+        let p = std::path::PathBuf::from("/home/u/.cache/pre-commit");
+        let w = bwrap_fallback_lost_warnings(2, 1, std::slice::from_ref(&p));
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].starts_with("2 deny path(s)"));
+        assert!(w[1].starts_with("1 UNIX-socket mask(s)"));
+        assert!(w[2].contains("/home/u/.cache/pre-commit"), "{}", w[2]);
+    }
 
     /// #724: once the child is reaped, the forwarding handler must have no pid.
     #[test]

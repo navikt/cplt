@@ -5263,6 +5263,8 @@ fn prepare_impl(
     let proc_dropped = proc_grant && policy.fs_rules.pop().is_some();
     if let Some(w) = bwrap_wrapper.as_mut() {
         w.proc_limited_on_fallback = proc_dropped;
+        w.ro_overlays_on_fallback =
+            host_tool_ro_overlays(config.home_dir, config.readonly_host_tool_paths);
     }
     let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
@@ -6196,6 +6198,7 @@ mod tests {
             deny_mask_count: 0,
             socket_mask_count: 0,
             proc_limited_on_fallback: false,
+            ro_overlays_on_fallback: Vec::new(),
             proxy_forced: false,
             plain_file: None,
         });
@@ -6280,6 +6283,7 @@ mod tests {
             deny_mask_count: 0,
             socket_mask_count: 0,
             proc_limited_on_fallback: false,
+            ro_overlays_on_fallback: Vec::new(),
             proxy_forced: false,
             plain_file: None,
         });
@@ -6376,6 +6380,7 @@ mod tests {
                 deny_mask_count: 0,
                 socket_mask_count: 0,
                 proc_limited_on_fallback: false,
+                ro_overlays_on_fallback: Vec::new(),
                 proxy_forced: false,
                 plain_file: Some(1),
             });
