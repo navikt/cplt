@@ -130,6 +130,18 @@ pub fn listed_extension_argv(args: &[&str]) -> Option<Result<ExtensionRun, Strin
     listed_extension_argv_for(args, gh_extensions())
 }
 
+/// Refusal for a word before a listed extension's name that cannot be carried
+/// over to `gh extension exec <name>`.
+pub fn extension_flag_refusal(flag: &str) -> Refusal {
+    Refusal {
+        headline: format!("'{flag}' before a gh extension name is not allowed."),
+        guidance: "The guard runs a listed extension as 'gh extension exec <name>', where \
+            only -R/--repo can be carried over. Put other flags after the extension name."
+            .to_string(),
+        agent_note: &[RESTRICTED, NOTE],
+    }
+}
+
 /// A listed extension's argv (`extension exec <name> ...`) and the `-R` repo
 /// given before the name, if any.
 pub type ExtensionRun = (Vec<String>, Option<String>);
@@ -3698,13 +3710,7 @@ fn gate_decision(
         });
     }
     if let Some(Err(flag)) = listed_extension_argv(args) {
-        return Err(Refusal {
-            headline: format!("'{flag}' before a gh extension name is not allowed."),
-            guidance: "The guard runs a listed extension as 'gh extension exec <name>', where \
-                only -R/--repo can be carried over. Put other flags after the extension name."
-                .to_string(),
-            agent_note: &[RESTRICTED, NOTE],
-        });
+        return Err(extension_flag_refusal(&flag));
     }
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.

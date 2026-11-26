@@ -144,7 +144,9 @@ Only the exact names in the list run, and they run unchecked with the gh
 token. Built-in command names are refused at `config set`. The guard runs a
 listed name as `gh extension exec <name>`, so a user alias with the same name
 never runs in its place; with no such extension installed, gh fails with
-`extension "<name>" not found`.
+`extension "<name>" not found`. A `-R`/`--repo` before the name is passed on
+as `GH_REPO` and may name any repository, since the guard does not check what
+a listed extension does; any other flag before the name is refused.
 
 gh finds extensions under `$XDG_DATA_HOME/gh/extensions` (default
 `~/.local/share/gh/extensions`). The guard inherits `XDG_DATA_HOME` from the

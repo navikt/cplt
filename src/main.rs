@@ -6549,15 +6549,21 @@ fn decide_gh_gate(
             }
             Ok((a, pinned))
         });
+    let extension = gh_proxy::listed_extension_argv(&arg_refs);
     match verdict {
         Ok((approval, _)) if !approval.graphql_targets.is_empty() => {
             GateEffect::VerifyGraphql(approval.graphql_targets)
         }
-        Ok((approval, None))
-            if matches!(gh_proxy::listed_extension_argv(&arg_refs), Some(Ok(_))) =>
-        {
-            let Some(Ok((args, repo))) = gh_proxy::listed_extension_argv(&arg_refs) else {
-                unreachable!("checked by the guard above")
+        // Fail closed: a plain exec of `gh <flag> <name>` could run a same-named alias.
+        Ok(_) if matches!(extension, Some(Err(_))) => {
+            let Some(Err(flag)) = extension else {
+                unreachable!()
+            };
+            refusal_effect(policy.mode, gh_proxy::extension_flag_refusal(&flag))
+        }
+        Ok((approval, None)) if matches!(extension, Some(Ok(_))) => {
+            let Some(Ok((args, repo))) = extension else {
+                unreachable!()
             };
             match repo.or(approval.repo_scope) {
                 Some(repo) => GateEffect::ExecRewritten { repo, args },

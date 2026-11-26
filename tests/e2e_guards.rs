@@ -397,6 +397,10 @@ fn gh_gate_listed_extension_never_runs_same_named_alias() {
         "alias must not run: {out}"
     );
     assert!(out.contains("not found"), "{out}");
+    for args in [&["--help", "dash"][..], &["-h", "x", "dash"]] {
+        let (out, ok) = run(args);
+        assert!(!ok && !out.contains("RAN"), "{args:?} must refuse: {out}");
+    }
 
     let ext = data.join("gh/extensions/gh-dash");
     std::fs::create_dir_all(&ext).unwrap();
