@@ -159,9 +159,10 @@ pub use policy::{
     env_tool_path_protected, env_tool_path_readonly_host, env_tool_temp_roots,
     exec_write_conflicts, first_party_read_target, gradle_loopback_hint, grant_is_refused,
     home_config_link_targets, home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays,
-    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, missing_split_tool_dirs, missing_wrapper_dist_hint, nested_alternation,
-    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
+    host_tool_ro_overlays_unenforced_warning, linux_docker_socket_paths,
+    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
+    missing_split_tool_dirs, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
+    no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
     readonly_wrapper_lock_files, refused_writable_app_root, relocatable_tool_prefix,
     report_state_pinned, shim_ro_protect_paths, socket_mask_paths, state_pinned_message,
@@ -5073,6 +5074,15 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+    // Stated gap: without Bubblewrap the keyed overlays stay writable (#1184).
+    if bwrap_wrapper.is_none()
+        && let Some(w) = host_tool_ro_overlays_unenforced_warning(&host_tool_ro_overlays(
+            config.home_dir,
+            config.readonly_host_tool_paths,
+        ))
+    {
+        ui::warn(&w);
+    }
     if let Some(w) = &bwrap_wrapper {
         for p in unmasked_missing_dirs(&mask_missing, &w.bwrap_args) {
             ui::warn(&format!(

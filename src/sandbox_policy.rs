@@ -3124,6 +3124,29 @@ pub fn host_tool_ro_overlays(home: &Path, readonly_host_tool_paths: bool) -> Vec
     out
 }
 
+/// The launch warning for keyed overlays that stay writable because
+/// Bubblewrap is not wrapping the session, or `None` when there are none.
+///
+/// Stated gap (Linux): Landlock rules only add access, so a deny inside a
+/// tree that is granted write cannot be expressed; only Bubblewrap's
+/// read-only bind takes the write back. Warn rather than drop it silently.
+#[must_use]
+pub fn host_tool_ro_overlays_unenforced_warning(overlays: &[PathBuf]) -> Option<String> {
+    if overlays.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = overlays
+        .iter()
+        .map(|p| p.to_string_lossy().escape_debug().to_string())
+        .collect();
+    Some(format!(
+        "sandbox.readonly_host_tool_paths is on, but Bubblewrap is not in use, so these paths \
+         stay writable this session (Landlock cannot make part of a writable tree read-only): \
+         {}. Install bubblewrap or run `cplt doctor` to see why it is not used.",
+        names.join(", ")
+    ))
+}
+
 /// Each keyed overlay whose path goes through a symlink below `home`, or
 /// whose own entry is a symlink under an external `XDG_*` dir, with its
 /// resolved target.
@@ -6672,6 +6695,19 @@ mod tests {
                 assert!(missing_split_tool_dirs(h, ro).is_empty());
             }
         });
+    }
+
+    #[test]
+    fn host_tool_ro_overlays_unenforced_warning_names_every_path() {
+        assert!(host_tool_ro_overlays_unenforced_warning(&[]).is_none());
+        let home = Path::new("/home/u");
+        let paths = host_tool_ro_overlays(home, true);
+        assert!(!paths.is_empty());
+        let w = host_tool_ro_overlays_unenforced_warning(&paths).expect("warns");
+        for p in &paths {
+            assert!(w.contains(&*p.to_string_lossy()), "{} missing", p.display());
+        }
+        assert!(host_tool_ro_overlays(home, false).is_empty());
     }
 
     #[test]
