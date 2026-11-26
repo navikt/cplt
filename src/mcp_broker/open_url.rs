@@ -623,14 +623,15 @@ fn show_to(line: &str, stderr_is_tty: bool, tty: &Path) {
 /// The allowed hosts, comma-separated, for the Linux shim.
 const HOSTS_ENV: &str = "CPLT_OPEN_URL_HOSTS";
 
-/// Linux: the line to show instead of opening `url`. The shim prints only an
-/// allowed URL, and `check` refuses control bytes. This is not a boundary: the
-/// agent can run `cplt mcp-open-url` with its own `CPLT_OPEN_URL_HOSTS`, and it
-/// can print any text itself. Never spawns.
+/// Linux: the message to show instead of opening `url` (#1023). The shim prints
+/// only an allowed URL, and `check` refuses control bytes. The URL sits alone on
+/// its own line with no surrounding punctuation so it is easy to copy. This is
+/// not a boundary: the agent can run `cplt mcp-open-url` with its own
+/// `CPLT_OPEN_URL_HOSTS`, and it can print any text itself. Never spawns.
 fn print_link(url: &str, hosts: &[String]) -> Result<String, String> {
     match check(url, hosts) {
         Ok(()) => Ok(format!(
-            "cplt: open this link in your browser to log in: {url}"
+            "cplt: cannot open a browser from the sandbox on Linux; open this link manually:\n{url}"
         )),
         Err(why) => Err(format!("cplt: not showing the link: {why}")),
     }
@@ -1332,7 +1333,10 @@ mod tests {
         assert_eq!(HOST_OPENER, cfg!(target_os = "macos"));
         assert_eq!(
             print_link("https://fgw.example/a?b=c", &hosts()),
-            Ok("cplt: open this link in your browser to log in: https://fgw.example/a?b=c".into())
+            Ok(
+                "cplt: cannot open a browser from the sandbox on Linux; open this link manually:\nhttps://fgw.example/a?b=c"
+                    .into()
+            )
         );
         for bad in [
             "https://evil.example/",
@@ -1344,6 +1348,34 @@ mod tests {
             assert!(e.starts_with("cplt: not showing the link: "), "{e}");
             assert!(!e.contains("evil") && !e.contains('\u{1b}'), "{e}");
         }
+    }
+
+    /// #1023 option C: Linux print-only output puts the URL alone on its own
+    /// line with no surrounding punctuation, preceded by one short explanation.
+    #[test]
+    fn linux_print_link_exact_output_format() {
+        let url = "https://fgw.example/oauth/authorize?state=abc&code_challenge=xyz";
+        let out = print_link(url, &hosts()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "cplt: cannot open a browser from the sandbox on Linux; open this link manually:\n{url}"
+            )
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], url);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tty = dir.path().join("tty");
+        std::fs::write(&tty, "").unwrap();
+        show_to(&out, false, &tty);
+        assert_eq!(
+            std::fs::read_to_string(&tty).unwrap(),
+            format!(
+                "cplt: cannot open a browser from the sandbox on Linux; open this link manually:\n{url}\n"
+            )
+        );
     }
 
     #[test]

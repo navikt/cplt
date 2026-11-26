@@ -963,8 +963,11 @@ Only the first link needs to be allowed, the authorize URL of the MCP gateway. T
 - At most 3 links a minute are opened.
 - Domains a teammate's `.cplt.toml` or the managed layer adds to `proxy.allow_private_domains` are also hosts the agent can open in your browser. `cplt trust` says so when you approve them, and the next launch names them once (again whenever the list changes). `cplt doctor` lists every opener host and where it came from. See [SECURITY.md](../SECURITY.md) for the silent-SSO and cookie gap this leaves.
 - Off with `sandbox.mcp_broker = false`, and not needed with `allow_browser`.
-- Linux has no host opener: the link is printed for you to open, and only during an MCP OAuth flow.
 - Known gap: with `proxy.netns` on (Linux), the browser's callback cannot reach the tool inside the sandbox's network namespace, so the login does not complete.
+
+| Platform | Behaviour | Manual step |
+| --- | --- | --- |
+| Linux | cplt cannot open a browser from the sandbox (`xdg-open` stays print-only). During an MCP OAuth flow, cplt checks the URL against the allowed hosts and prints a short note with the URL alone on its own line. | Copy the printed URL and open it in your browser manually. |
 
 ## Localhost blocking
 
