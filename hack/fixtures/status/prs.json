@@ -1,0 +1,7 @@
+{"data":{"repository":{"pullRequests":{"nodes":[
+{"number":1,"title":"mine","createdAt":"2026-11-20T10:00:00Z","headRefOid":"aaaaaaaa11112222","mergeStateStatus":"CLEAN","isInMergeQueue":false,"autoMergeRequest":null,"author":{"login":"Starefossen","__typename":"User"},"authorAssociation":"OWNER",
+ "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"name":"ci-ok","conclusion":"SUCCESS"}]}}}}]},
+ "comments":{"nodes":[{"body":"Fable review: APPROVE\n\nHead reviewed: `bbbbbbbb33334444`","createdAt":"2026-11-21T10:00:00Z","authorAssociation":"OWNER","author":{"login":"Starefossen"}}]},
+ "reviewThreads":{"nodes":[{"isResolved":false},{"isResolved":true}]}},
+{"number":2,"title":"outsider PR","createdAt":"2026-01-01T10:00:00Z","headRefOid":"cccccccc55556666","mergeStateStatus":"BLOCKED","isInMergeQueue":true,"autoMergeRequest":{"enabledAt":"x"},"author":{"login":"ext","__typename":"User"},"authorAssociation":"NONE",
+ "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]},"comments":{"nodes":[]},"reviewThreads":{"nodes":[]}}]}}}}
