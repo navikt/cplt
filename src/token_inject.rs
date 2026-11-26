@@ -461,13 +461,14 @@ pub fn may_inject(host: &str, method: &str, target: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    // A dot segment or `%` anywhere in the path can resolve to `/mcp` later.
+    // A dot segment (also with a `;` parameter) or `%` anywhere in the path
+    // can resolve to `/mcp` later; a `#` does not end the path here.
     let dotted = path
-        .split(['?', '#'])
+        .split('?')
         .next()
         .unwrap_or("")
         .split('/')
-        .any(|seg| seg == "." || seg == ".." || seg.contains('%'));
+        .any(|seg| seg.starts_with('.') || seg.contains('%'));
     !(first.starts_with("mcp") || first.contains(['%', '.']) || dotted)
 }
 
@@ -856,6 +857,10 @@ pub(crate) mod tests {
             "HTTPS://api.githubcopilot.com/mcp",
             "/mcp?next=https://x/responses",
             "/mcp#https://x/responses",
+            "/a/..;x/mcp",
+            "/a/.;/mcp",
+            "/#/../mcp",
+            "/x#/../../mcp",
         ] {
             assert!(!may_inject(h, "POST", t), "{t}");
         }

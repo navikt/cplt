@@ -84,7 +84,14 @@ fn e2e_planted_launch_state_is_never_touched_before_the_refusal() {
         }
 
         let mut child = common::cplt_local(&home, &project)
-            .args(["--agent", "copilot", "--yes", "--allow-write"])
+            // gh guard off: its own config-dir refusal would fire first.
+            .args([
+                "--agent",
+                "copilot",
+                "--yes",
+                "--no-gh-guard",
+                "--allow-write",
+            ])
             .arg(&granted)
             .env("XDG_CONFIG_HOME", granted.join("xdg"))
             .stdout(std::process::Stdio::null())

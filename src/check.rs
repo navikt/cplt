@@ -413,6 +413,21 @@ pub fn writable_on_or_under_except(
         .map(|r| r.path.clone())
 }
 
+/// The first of gh's config and data dirs (as the gh guard pins them) that
+/// the session can write, with the write rule that reaches it. The guard hands
+/// a token to the `gh` it runs, and gh reads `hosts.yml`, `config.yml` and
+/// extensions from these dirs, so they must not be agent-controlled.
+/// Matched by identity, so a link pointing into a writable tree counts.
+#[must_use]
+pub fn gh_dir_writable(
+    policy: &LandlockPolicy,
+    home: &Path,
+    dirs: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    dirs.iter()
+        .find_map(|d| writable_on_or_under(policy, home, d).map(|rule| (d.clone(), rule)))
+}
+
 fn rule_inside(rule: &Path, dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let lexical = if cfg!(target_os = "macos") {
@@ -1655,6 +1670,37 @@ mod tests {
             Some(real.clone())
         );
         assert_eq!(writable_tree_over(&p, &home, &t.join("other/s.json")), None);
+    }
+
+    #[test]
+    fn gh_dir_writable_follows_links_into_a_writable_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = t.join("home");
+        let project = t.join("project");
+        let safe = home.join(".config/gh");
+        std::fs::create_dir_all(project.join("gh")).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        let p = policy(vec![rule(project.to_str().unwrap(), true, true, false)]);
+        assert_eq!(
+            gh_dir_writable(&p, &home, std::slice::from_ref(&safe)),
+            None
+        );
+        let inside = project.join("gh");
+        assert_eq!(
+            gh_dir_writable(&p, &home, &[safe.clone(), inside.clone()]),
+            Some((inside, project.clone()))
+        );
+        // A link outside the tree whose target is inside it.
+        let link = t.join("link-gh");
+        std::os::unix::fs::symlink(project.join("gh"), &link).unwrap();
+        assert_eq!(
+            gh_dir_writable(&p, &home, std::slice::from_ref(&link)),
+            Some((link, project.clone()))
+        );
+        // Not created yet, inside the tree.
+        let later = project.join("later/gh");
+        assert!(gh_dir_writable(&p, &home, &[later]).is_some());
     }
 
     /// #1112: a write rule on a file or subdir inside a credential dir makes

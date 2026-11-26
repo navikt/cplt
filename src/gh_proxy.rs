@@ -180,6 +180,13 @@ pub fn gh_hosts() -> &'static [String] {
 }
 
 static GH_CONFIG_DIR_PIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static GH_XDG_DATA_HOME_PIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Set the `XDG_DATA_HOME` that puts gh's data dir (where extensions live)
+/// where it was at launch. Once per process, like [`set_gh_config_dir`].
+pub fn set_gh_xdg_data_home(dir: &Path) {
+    let _ = GH_XDG_DATA_HOME_PIN.set(dir.to_path_buf());
+}
 
 /// Set gh's config dir as located at launch. Once per process: `gh-gate` sets
 /// it from the flag baked into its wrapper. A later call is ignored.
@@ -193,9 +200,15 @@ pub fn set_gh_config_dir(dir: &Path) {
 /// `config.yml` gh reads aliases and `http_unix_socket` from, and the agent
 /// sets all three. An agent-written config could define aliases, or route the gate's own lookups and the token it attaches
 /// to a socket the agent listens on. `GH_CONFIG_DIR` outranks the other two.
+/// gh's data dir is pinned the same way through `XDG_DATA_HOME`, the only
+/// variable gh reads for it: extensions run from it with the token the gate
+/// attaches.
 pub fn pin_gh_config(cmd: &mut std::process::Command) {
     if let Some(dir) = GH_CONFIG_DIR_PIN.get() {
         cmd.env("GH_CONFIG_DIR", dir);
+    }
+    if let Some(dir) = GH_XDG_DATA_HOME_PIN.get() {
+        cmd.env("XDG_DATA_HOME", dir);
     }
 }
 
@@ -2252,6 +2265,12 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 if override_method.as_deref() == Some("DELETE") {
                     return;
                 }
+                // Repeated: which one the server honours is not ours to
+                // guess, so it is blocked the way DELETE is.
+                if override_method.is_some() {
+                    override_method = Some("DELETE".to_string());
+                    return;
+                }
                 override_method = Some(if matches!(v.as_str(), "" | "GET" | "HEAD") {
                     "POST".to_string()
                 } else {
@@ -3390,7 +3409,8 @@ pub fn cplt_unrunnable_body(cplt: &str, feature: &str) -> String {
 /// `real_git` is the trusted Git binary used to verify an implicit target's cwd.
 /// `cplt_bin` is the path to the cplt binary (for calling `gh-gate`).
 /// `gh_config_dir` is gh's config dir as located at launch, pinned for every
-/// real `gh` the gate runs.
+/// real `gh` the gate runs; `gh_xdg_data_home` likewise pins its data dir
+/// (extensions) as the parent of the launch data dir.
 /// Policy flags are baked into the wrapper invocation so the gate doesn't
 /// re-read config at runtime (security: agent could edit config files).
 pub fn generate_wrapper_script(
@@ -3400,12 +3420,16 @@ pub fn generate_wrapper_script(
     cplt_bin: &str,
     policy: &crate::config::GhGuardPolicy,
     gh_config_dir: Option<&str>,
+    gh_xdg_data_home: Option<&str>,
 ) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
     let config_dir_flag = gh_config_dir
         .map(|dir| format!(" --gh-config-dir {}", shell_escape(dir)))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        + &gh_xdg_data_home
+            .map(|dir| format!(" --gh-xdg-data-home {}", shell_escape(dir)))
+            .unwrap_or_default();
     let repo_scope_flag = repo_scope
         .iter()
         .map(|repo| format!("--repo-scope {}", shell_escape(repo)))
@@ -4171,7 +4195,8 @@ fn graphql_approval(
     let graphql_targets = crate::gh_graphql::check(args, &scope).map_err(refuse)?;
     Ok(GateApproval {
         repo_scope: None,
-        host_pin: None,
+        // The check names repositories without a host: hold gh to github.com.
+        host_pin: Some(DEFAULT_GH_HOST.to_string()),
         check_merge_protection: false,
         graphql_targets,
     })
@@ -8736,6 +8761,14 @@ mod tests {
                 "DELETE",
                 "repos/navikt/cplt/x",
             ],
+            &[
+                "api",
+                "-H",
+                "X-HTTP-Method-Override: PATCH",
+                "-H",
+                "x-method-override: POST",
+                "repos/navikt/cplt/x",
+            ],
         ] {
             let cmd = parse_command(args).unwrap();
             assert_eq!(cmd.method.as_deref(), Some("DELETE"), "{args:?}");
@@ -8748,6 +8781,19 @@ mod tests {
     }
 
     #[test]
+    fn pin_gh_config_sets_the_launch_data_home() {
+        set_gh_xdg_data_home(Path::new("/launch/share"));
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env("XDG_DATA_HOME", "/agent/share");
+        pin_gh_config(&mut cmd);
+        let got = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "XDG_DATA_HOME")
+            .and_then(|(_, v)| v);
+        assert_eq!(got, Some(std::ffi::OsStr::new("/launch/share")));
+    }
+
+    #[test]
     fn wrapper_script_bakes_in_gh_config_dir() {
         let script = generate_wrapper_script(
             "/usr/bin/gh",
@@ -8756,10 +8802,12 @@ mod tests {
             "/c",
             &crate::config::GhGuardPolicy::default(),
             Some("/Users/u/.config/gh"),
+            Some("/Users/u/.local/share"),
         );
-        assert!(
-            script.contains("--no-allow-pr-merge --gh-config-dir '/Users/u/.config/gh' -- \"$@\"")
-        );
+        assert!(script.contains(
+            "--no-allow-pr-merge --gh-config-dir '/Users/u/.config/gh' \
+             --gh-xdg-data-home '/Users/u/.local/share' -- \"$@\""
+        ));
     }
 
     #[test]
@@ -8889,6 +8937,7 @@ mod tests {
             "/usr/local/bin/cplt",
             &crate::config::GhGuardPolicy::default(),
             None,
+            None,
         );
         assert_eq!(
             script,
@@ -8908,7 +8957,7 @@ mod tests {
             hosts: ghe_hosts(),
             ..Default::default()
         };
-        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy, None);
+        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy, None, None);
         assert!(
             script.contains(
                 "--no-allow-pr-merge --gh-host 'github.com' --gh-host 'example.ghe.com' -- \"$@\""
@@ -9442,6 +9491,7 @@ mod tests {
             "/usr/local/bin/cplt",
             &policy,
             None,
+            None,
         );
         assert!(script.contains("/usr/bin/gh"));
         assert!(script.contains("--repo-scope 'navikt/cplt'"));
@@ -9468,6 +9518,7 @@ mod tests {
             "/usr/local/bin/cplt",
             &policy,
             None,
+            None,
         );
         assert!(
             script.contains("--allow-api-write"),
@@ -9481,7 +9532,7 @@ mod tests {
             allow_extensions: vec!["dash".to_string()],
             ..Default::default()
         };
-        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy, None);
+        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy, None, None);
         assert!(script.contains(" --allow-extension "), "{script}");
     }
 
@@ -9498,6 +9549,7 @@ mod tests {
                 None,
                 "/usr/local/bin/cplt",
                 &policy,
+                None,
                 None,
             );
             assert!(script.contains(flag), "{flag} missing: {script}");
@@ -10232,6 +10284,17 @@ mod tests {
                 .unwrap();
         assert_eq!(approval.graphql_targets.len(), 1);
         assert_eq!(approval.repo_scope, None);
+        assert_eq!(approval.host_pin.as_deref(), Some("github.com"));
+        let read = [
+            "api",
+            "graphql",
+            "-f",
+            "query={ repository(owner: \"navikt\", name: \"cplt\") { pullRequests(first: 1) { nodes { number } } } }",
+        ];
+        let approval =
+            gate_with_repo_scope(&read, &GatePolicy::default(), &["navikt/cplt".into()], None)
+                .unwrap();
+        assert_eq!(approval.host_pin.as_deref(), Some("github.com"));
     }
 
     // Only exact `graphql` reaches the GraphQL checker; every other spelling of
@@ -10915,6 +10978,7 @@ mod tests {
             Some("/path/with'quote/git"),
             "/path/with\"dq/cplt",
             &policy,
+            None,
             None,
         );
         assert!(script.contains("gh-gate"));

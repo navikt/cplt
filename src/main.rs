@@ -1094,6 +1094,10 @@ NOTE:
         /// reads its config from here, whatever the agent's environment says.
         #[arg(long)]
         gh_config_dir: Option<PathBuf>,
+        /// `XDG_DATA_HOME` that puts gh's data dir where it was at launch;
+        /// pinned the same way.
+        #[arg(long)]
+        gh_xdg_data_home: Option<PathBuf>,
 
         /// Block `gh pr merge` (override for --allow-pr-merge).
         #[arg(long, conflicts_with = "allow_pr_merge")]
@@ -1603,7 +1607,10 @@ fn symlink_hop_inside(path: &Path, tree: &Path) -> Option<PathBuf> {
                     if hops > 40 || real_parent.starts_with(tree) {
                         return Some(next);
                     }
-                    let target = std::fs::read_link(&next).ok()?;
+                    // A link that vanished or changed since the stat: refuse.
+                    let Ok(target) = std::fs::read_link(&next) else {
+                        return Some(next);
+                    };
                     for c in target.iter().rev() {
                         todo.push_front(c.to_owned());
                     }
@@ -5557,6 +5564,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 gh_host,
                 allow_extension,
                 gh_config_dir,
+                gh_xdg_data_home,
                 args,
             } => {
                 if !gh_host.is_empty() {
@@ -5565,6 +5573,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 gh_proxy::set_gh_extensions(&allow_extension);
                 if let Some(dir) = &gh_config_dir {
                     gh_proxy::set_gh_config_dir(dir);
+                }
+                if let Some(dir) = &gh_xdg_data_home {
+                    gh_proxy::set_gh_xdg_data_home(dir);
                 }
                 let policy = gh_proxy::GatePolicy {
                     mode: match mode.as_str() {
@@ -8686,6 +8697,42 @@ fn assemble_sandbox(
         note_dirs_a_launch_creates(&sandbox_config, resolved.readonly_host_tool_paths);
     }
     let policy = sandbox::generate_policy(&sandbox_config);
+    if resolved.gh_guard.enabled {
+        // A relative value resolves against whatever cwd gh runs in: refuse
+        // rather than skip the check.
+        for var in ["GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+            if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty())
+                && !Path::new(&v).is_absolute()
+            {
+                bail!(
+                    "gh guard: {var}={} is a relative path. Set it to an absolute path, or unset it.",
+                    Path::new(&v).display()
+                );
+            }
+        }
+        let dirs: Vec<PathBuf> = [
+            cplt::sandbox::gh_config_dir(home_dir),
+            cplt::sandbox::gh_data_dir(home_dir),
+        ]
+        .into_iter()
+        .flatten()
+        // The defaults under HOME are exempt only when HOME itself is in a
+        // writable tree (a scratch HOME), where every launch would refuse.
+        .filter(|d| {
+            !((*d == home_dir.join(".config/gh") || *d == home_dir.join(".local/share/gh"))
+                && cplt::check::writable_tree_on_path(&policy, home_dir, home_dir).is_some())
+        })
+        .collect();
+        if let Some((dir, rule)) = cplt::check::gh_dir_writable(&policy, home_dir, &dirs) {
+            bail!(
+                "gh guard: gh's config or data dir {} is writable inside the sandbox (via {}). \
+                 Point GH_CONFIG_DIR, XDG_CONFIG_HOME or XDG_DATA_HOME outside the \
+                 project and other writable paths, or remove the write grant.",
+                dir.display(),
+                rule.display()
+            );
+        }
+    }
     // The broker socket is added after this, so the policy it is judged by
     // is the session's own. Bound for `--print-profile` too.
     // Inspect-only runs start no broker (#1220): it binds a socket, sweeps

@@ -148,7 +148,8 @@ pub fn with_scratch_home(cmd: &mut Command) {
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_STATE_HOME")
-        .env_remove("XDG_CACHE_HOME");
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("GH_CONFIG_DIR");
     // The developer's own GOPATH, PNPM_HOME, ... point outside the scratch
     // HOME, so cplt would warn that it ignores them (#1128).
     for tv in cplt::sandbox::TOOL_PATH_ENV_VARS {

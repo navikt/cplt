@@ -225,6 +225,93 @@ mod e2e_tests {
         );
     }
 
+    /// gh's config dir moved into the project is refused at launch, also
+    /// through a link from outside the project; the default location is not.
+    #[test]
+    fn e2e_gh_config_dir_in_writable_tree_is_refused() {
+        let project = project_dir().join("target/e2e-ghcfg");
+        let gh = project.join("gh");
+        std::fs::create_dir_all(&gh).unwrap();
+        let link = scratch_home().join("linked-gh");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&gh, &link).unwrap();
+        for (var, val) in [
+            ("GH_CONFIG_DIR", gh.clone()),
+            ("GH_CONFIG_DIR", link.clone()),
+            ("XDG_DATA_HOME", project.clone()),
+        ] {
+            let out = cplt_cmd()
+                .args(["--print-profile"])
+                .env(var, &val)
+                .current_dir(&project)
+                .output()
+                .expect("binary should run");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{var}={}", val.display());
+            assert!(stderr.contains("writable inside the sandbox"), "{stderr}");
+        }
+        let out = cplt_cmd()
+            .args(["--print-profile"])
+            .current_dir(&project)
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A relative gh dir value is refused, never skipped.
+    #[test]
+    fn e2e_gh_relative_dir_is_refused() {
+        for var in ["GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+            let out = cplt_cmd()
+                .args(["--print-profile"])
+                .env(var, "rel/dir")
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{var}: {stderr}");
+            assert!(stderr.contains("is a relative path"), "{var}: {stderr}");
+        }
+    }
+
+    /// The default gh dirs are checked too when HOME is not itself writable.
+    #[test]
+    fn e2e_gh_default_dir_write_grant_is_refused() {
+        let home = home_temp_dir("ghdefault");
+        for sub in [".config/gh", ".local/share/gh"] {
+            let dir = home.path().join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            let out = cplt_cmd()
+                .args(["--print-profile", "--allow-write"])
+                .arg(&dir)
+                .env("HOME", home.path())
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{sub}: {stderr}");
+            assert!(
+                stderr.contains("writable inside the sandbox"),
+                "{sub}: {stderr}"
+            );
+        }
+        let out = cplt_cmd()
+            .args(["--print-profile"])
+            .env("HOME", home.path())
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn e2e_print_profile_blocks_sensitive_dirs() {
         let output = cplt_cmd()
@@ -384,7 +471,8 @@ mod e2e_tests {
             .expect("tempdir");
         let xdg = tmp.path().join("xdg");
         let output = cplt_cmd()
-            .args(["--print-profile", "--agent", "opencode"])
+            // gh guard off: XDG_CONFIG_HOME sits in the project on purpose.
+            .args(["--print-profile", "--agent", "opencode", "--no-gh-guard"])
             .env("XDG_CONFIG_HOME", &xdg)
             .current_dir(project_dir())
             .output()
@@ -2983,7 +3071,15 @@ mod e2e_tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
             let out = cplt_cmd()
-                .args(["--agent", "copilot", "mcp", "status", "--json"])
+                // gh guard off: XDG_CONFIG_HOME sits in a writable tree on purpose.
+                .args([
+                    "--agent",
+                    "copilot",
+                    "--no-gh-guard",
+                    "mcp",
+                    "status",
+                    "--json",
+                ])
                 .env("HOME", &home_path)
                 .env("XDG_CONFIG_HOME", xdg)
                 .current_dir(project_dir())
@@ -14288,7 +14384,15 @@ mod agent_stubs {
         let out = cplt_cmd()
             .arg("--allow-write")
             .arg(h.join(".config"))
-            .args(["--no-quiet", "exec", "--", "/bin/echo", "ok"])
+            // gh guard off: the ~/.config grant would trip its config-dir refusal.
+            .args([
+                "--no-gh-guard",
+                "--no-quiet",
+                "exec",
+                "--",
+                "/bin/echo",
+                "ok",
+            ])
             .current_dir(&proj)
             .env("HOME", &h)
             .env("XDG_CONFIG_HOME", h.join(".config"))
@@ -14396,7 +14500,15 @@ mod agent_stubs {
         // warning line names the layer's own remedy.
         let launch_err = |pre: &[&str]| {
             let mut args = pre.to_vec();
-            args.extend(["--no-quiet", "exec", "--", "/bin/echo", "ok"]);
+            // gh guard off: grants over ~/.config would trip its config-dir refusal.
+            args.extend([
+                "--no-gh-guard",
+                "--no-quiet",
+                "exec",
+                "--",
+                "/bin/echo",
+                "ok",
+            ]);
             let out = cplt(&args);
             let err = String::from_utf8_lossy(&out.stderr).into_owned();
             assert!(out.status.success(), "{err}");
