@@ -523,6 +523,7 @@ impl Config {
         let refuse_cache_exec_links = bools.refuse_cache_exec_links;
         let refuse_unenforced = bools.refuse_unenforced;
         let deny_key_files_by_extension = bools.deny_key_files_by_extension;
+        let strict_macos_reads = bools.strict_macos_reads;
         let protect_pnpm_config = bools.protect_pnpm_config;
 
         let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
@@ -742,6 +743,7 @@ impl Config {
             refuse_cache_exec_links,
             refuse_unenforced,
             deny_key_files_by_extension,
+            strict_macos_reads,
             protect_pnpm_config,
             refuse_invalid_repo_config,
             skip_untrusted_opencode_config,
@@ -4806,6 +4808,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.refuse_unenforced,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.strict_macos_reads",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.strict_macos_reads,
                 default: false,
                 preset: None,
             },

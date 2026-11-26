@@ -26,14 +26,15 @@ use super::policy::{
     DENIED_HOME_SUBPATHS, DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES,
     HOME_CONFIG_FILES, HomeToolDir, OAUTH_CALLBACK_PORT, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT,
     PathBinDir, Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS,
-    SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES, SYSTEM_READ_FILES, TOOL_READ_DIRS,
-    XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs, ancestor_alternation, app_dirs,
-    colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
-    cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, host_tool_ro_overlays, is_readonly_wrapper_lock_path,
-    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    pnpm_config_dirs, pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES, STRICT_PREFERENCE_DOMAINS,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs,
+    ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex, first_party_read_target,
+    grant_is_refused, home_config_link_targets, host_tool_ro_overlays,
+    is_readonly_wrapper_lock_path, missing_home_config_link_targets, nested_alternation,
+    path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files,
+    read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
+    validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -147,6 +148,7 @@ fn profile_locked(
         allow_cypress_runtime,
         config.deny_clipboard,
         config.deny_dns,
+        config.strict_macos_reads,
     );
     emit_tool_dirs(
         &mut sb,
@@ -176,6 +178,11 @@ fn profile_locked(
         allow_chromium_runtime
             .then_some(playwright_socket_dir)
             .flatten(),
+        config
+            .strict_macos_reads
+            .then(darwin_user_dirs)
+            .flatten()
+            .as_deref(),
     );
     // A temporary HOME puts Copilot's extracted SEA cache under /var/folders.
     // Restore exec only for its pinned, write-denied pkg tree after the broad
@@ -1118,6 +1125,7 @@ fn emit_home_config_read(sb: &mut String, home: &str, rel: &str) {
     sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_system_access(
     sb: &mut String,
     home: &str,
@@ -1126,6 +1134,7 @@ fn emit_system_access(
     allow_cypress_runtime: bool,
     deny_clipboard: bool,
     deny_dns: bool,
+    strict_reads: bool,
 ) {
     // Mach IPC — Node.js and macOS frameworks need service lookups
     // (Keychain, security framework, DNS, system services)
@@ -1321,7 +1330,16 @@ fn emit_system_access(
 
     // User preferences — Keychain and security framework read preferences
     sbpl!(sb, ";; User preferences (Keychain, security framework)");
-    sbpl!(sb, "(allow user-preference-read)");
+    if strict_reads {
+        for domain in STRICT_PREFERENCE_DOMAINS {
+            sbpl!(
+                sb,
+                "(allow user-preference-read (preference-domain \"{domain}\"))"
+            );
+        }
+    } else {
+        sbpl!(sb, "(allow user-preference-read)");
+    }
     sbpl!(sb);
 
     // Security framework databases — needed for Keychain/TLS operations
@@ -2104,29 +2122,7 @@ fn emit_tool_dirs(
     // pass through automatically without needing an explicit allowlist.
     // Xcode dev tools (com.apple.dt.*) are re-allowed after the broad com.apple. deny.
     sbpl!(sb, ";; Non-dev cache dirs denied (browsers, system apps)");
-    // Both the home path and the prefix are escaped: a `.` in `/Users/first.last`
-    // would otherwise match any character (#552).
-    let home_re = escape_regex(&home);
-    for prefix in DENIED_CACHE_PREFIXES {
-        let escaped = escape_regex(prefix);
-        sbpl!(
-            sb,
-            "(deny file-read* (regex #\"^{home_re}/Library/Caches/{escaped}\"))"
-        );
-        sbpl!(
-            sb,
-            "(deny file-write* (regex #\"^{home_re}/Library/Caches/{escaped}\"))"
-        );
-    }
-    // Re-allow Xcode dev tools (com.apple.dt.Xcode, com.apple.dt.xcodebuild)
-    sbpl!(
-        sb,
-        "(allow file-read* (regex #\"^{home_re}/Library/Caches/com\\.apple\\.dt\\.\"))"
-    );
-    sbpl!(
-        sb,
-        "(allow file-write* (regex #\"^{home_re}/Library/Caches/com\\.apple\\.dt\\.\"))"
-    );
+    emit_cache_denies(sb, &home);
 
     // Copilot CLI v1.0.22+ stores native modules and helper binaries in
     // ~/Library/Caches/copilot/pkg/. The Library/Caches deny above blocks
@@ -2181,6 +2177,73 @@ fn emit_tool_dirs(
             sbpl!(sb);
         }
     }
+}
+
+/// The personal-app cache denies under `~/Library/Caches`, with the Xcode
+/// re-allow after them. Emitted with the tool dirs, and again after the user
+/// grants under `sandbox.strict_macos_reads`.
+fn emit_cache_denies(sb: &mut String, home: &str) {
+    // Both the home path and the prefix are escaped: a `.` in `/Users/first.last`
+    // would otherwise match any character (#552).
+    let home_re = escape_regex(home);
+    for prefix in DENIED_CACHE_PREFIXES {
+        let escaped = escape_regex(prefix);
+        sbpl!(
+            sb,
+            "(deny file-read* (regex #\"^{home_re}/Library/Caches/{escaped}\"))"
+        );
+        sbpl!(
+            sb,
+            "(deny file-write* (regex #\"^{home_re}/Library/Caches/{escaped}\"))"
+        );
+    }
+    // Re-allow Xcode dev tools (com.apple.dt.Xcode, com.apple.dt.xcodebuild)
+    sbpl!(
+        sb,
+        "(allow file-read* (regex #\"^{home_re}/Library/Caches/com\\.apple\\.dt\\.\"))"
+    );
+    sbpl!(
+        sb,
+        "(allow file-write* (regex #\"^{home_re}/Library/Caches/com\\.apple\\.dt\\.\"))"
+    );
+}
+
+/// This user's `DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR`, spelled
+/// under `/private`. `None` off macOS or when confstr fails, which keeps the
+/// broad rule rather than producing a profile that breaks every tool.
+fn darwin_user_dirs() -> Option<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let get = |name| {
+            let mut buf = [0u8; 1024];
+            // SAFETY: buf is valid for buf.len() bytes; confstr NUL-terminates.
+            let n = unsafe { libc::confstr(name, buf.as_mut_ptr().cast(), buf.len()) };
+            if n == 0 || n > buf.len() {
+                return None;
+            }
+            let s = std::str::from_utf8(&buf[..n - 1])
+                .ok()?
+                .trim_end_matches('/');
+            let s = s
+                .strip_prefix("/var/")
+                .map_or(s.to_string(), |r| format!("/private/var/{r}"));
+            (s.starts_with("/private/var/folders/")
+                && crate::sandbox::validate_sbpl_path(Path::new(&s)).is_ok())
+            .then_some(s)
+        };
+        let dirs = get(libc::_CS_DARWIN_USER_TEMP_DIR)
+            .zip(get(libc::_CS_DARWIN_USER_CACHE_DIR))
+            .map(|(t, c)| vec![t, c]);
+        if dirs.is_none() {
+            crate::ui::warn(
+                "sandbox.strict_macos_reads: could not resolve this user's temp and cache \
+                 dirs, so all of /private/var/folders stays readable and writable.",
+            );
+        }
+        dirs
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 fn emit_cypress_app_data(
@@ -2653,6 +2716,7 @@ fn emit_system_files(sb: &mut String) {
     sbpl!(sb);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_temp_rules(
     sb: &mut String,
     allow_tmp_exec: bool,
@@ -2661,12 +2725,22 @@ fn emit_temp_rules(
     scratch_dir: Option<&Path>,
     allow_chromium_runtime: bool,
     playwright_socket_dir: Option<&Path>,
+    user_dirs: Option<&[String]>,
 ) {
     sbpl!(sb, ";; Temp directories");
     sbpl!(sb, "(allow file-read* (subpath \"/private/tmp\"))");
     sbpl!(sb, "(allow file-write* (subpath \"/private/tmp\"))");
-    sbpl!(sb, "(allow file-read* (subpath \"/private/var/folders\"))");
-    sbpl!(sb, "(allow file-write* (subpath \"/private/var/folders\"))");
+    // sandbox.strict_macos_reads: only this user's temp and cache dirs, not
+    // the per-user state dir (`0/`) or the rest of /private/var/folders.
+    if let Some(dirs) = user_dirs {
+        for dir in dirs {
+            sbpl!(sb, "(allow file-read* (subpath \"{dir}\"))");
+            sbpl!(sb, "(allow file-write* (subpath \"{dir}\"))");
+        }
+    } else {
+        sbpl!(sb, "(allow file-read* (subpath \"/private/var/folders\"))");
+        sbpl!(sb, "(allow file-write* (subpath \"/private/var/folders\"))");
+    }
     if let Some(socket_dir) = playwright_socket_dir {
         let socket_path = socket_dir.to_string_lossy();
         // SECURITY: this grants only AF_UNIX operations below the one random,
@@ -3096,6 +3170,14 @@ fn registry_config_overrides(
 }
 
 fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
+    if config.strict_macos_reads {
+        sbpl!(
+            sb,
+            ";; Non-dev cache dirs denied after user grants (strict_macos_reads)"
+        );
+        emit_cache_denies(sb, home);
+        sbpl!(sb);
+    }
     // Sensitive directories — DENY (after allows, so these override)
     //
     // Each deny names both spellings (`home_spellings`): SBPL checks the
@@ -5485,6 +5567,7 @@ mod tests {
             refuse_unenforced: false,
             proxy_enabled: false,
             deny_key_files_by_extension: false,
+            strict_macos_reads: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_copilot_host_persistence: false,
@@ -7774,6 +7857,160 @@ mod tests {
                     }
                 }
             });
+        }
+    }
+
+    /// The profile with `sandbox.strict_macos_reads` on, with the key's three
+    /// changes undone. Equal to the key-off profile only if the key changes
+    /// nothing else, and the key-off profile carries none of its rules.
+    fn undo_strict(on: &str) -> String {
+        let mut out = Vec::new();
+        let mut skip_block = false;
+        let mut pref_done = false;
+        let mut temp_done = false;
+        let mut pin_done = false;
+        for line in on.lines() {
+            if line.starts_with(";; Non-dev cache dirs denied after user grants") {
+                skip_block = true;
+                continue;
+            }
+            if skip_block {
+                skip_block = !line.is_empty();
+                continue;
+            }
+            if line.starts_with("(allow user-preference-read (preference-domain ") {
+                if !pref_done {
+                    out.push("(allow user-preference-read)".to_string());
+                    pref_done = true;
+                }
+                continue;
+            }
+            if line.starts_with("(allow file-read* (subpath \"/private/var/folders/")
+                || line.starts_with("(allow file-write* (subpath \"/private/var/folders/")
+            {
+                if !temp_done {
+                    out.push("(allow file-read* (subpath \"/private/var/folders\"))".into());
+                    out.push("(allow file-write* (subpath \"/private/var/folders\"))".into());
+                    temp_done = true;
+                }
+                continue;
+            }
+            if line.starts_with("(deny file-write-unlink (literal \"/private/var/folders/")
+                || line.starts_with("(deny file-write-create (literal \"/private/var/folders/")
+            {
+                if !pin_done {
+                    out.push("(deny file-write-unlink (literal \"/private/var/folders\"))".into());
+                    out.push("(deny file-write-create (literal \"/private/var/folders\"))".into());
+                    pin_done = true;
+                }
+                continue;
+            }
+            out.push(line.to_string());
+        }
+        out.join("\n") + if on.ends_with('\n') { "\n" } else { "" }
+    }
+
+    /// `sandbox.strict_macos_reads` unset leaves the profile as it was: for a
+    /// set of configs, the key-on profile minus the key's own rules is
+    /// byte-identical to the key-off profile, and the key-off profile has the
+    /// unscoped rules it always had.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_macos_reads_off_is_byte_identical() {
+        crate::with_env_lock_no_xdg(|| {
+            let project = Path::new("/Users/test/repo");
+            let home = Path::new("/Users/test");
+            let read_home = [home.to_path_buf()];
+            let write_cache = [home.join("Library/Caches")];
+            let scratch = home.join(".cache/cplt/scratch/x");
+            for i in 0..7 {
+                let profile = |on: bool| {
+                    let mut opts = test_options(project, home);
+                    match i {
+                        1 => opts.extra_read = &read_home,
+                        2 => opts.extra_write = &write_cache,
+                        3 => opts.allow_tmp_exec = true,
+                        4 => opts.scratch_dir = Some(&scratch),
+                        5 => opts.agent = crate::agent::Agent::Claude,
+                        6 => opts.agent = crate::agent::Agent::Copilot,
+                        _ => {}
+                    }
+                    opts.strict_macos_reads = on;
+                    generate_profile(&opts, &[])
+                };
+                let (off, on) = (profile(false), profile(true));
+                assert_ne!(off, on, "variant {i}: the key must change the profile");
+                assert!(
+                    off.contains("\n(allow user-preference-read)\n"),
+                    "variant {i}"
+                );
+                assert!(
+                    off.contains("(allow file-read* (subpath \"/private/var/folders\"))"),
+                    "variant {i}"
+                );
+                assert!(!off.contains("preference-domain"), "variant {i}");
+                assert!(!off.contains("after user grants"), "variant {i}");
+                assert_eq!(undo_strict(&on), off, "variant {i}");
+            }
+        });
+    }
+
+    /// With the key on: named preference domains only, this user's temp and
+    /// cache dirs only, and the cache denies after a broad user grant.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_macos_reads_scopes_the_profile() {
+        crate::with_env_lock_no_xdg(|| {
+            let project = Path::new("/Users/test/repo");
+            let home = Path::new("/Users/test");
+            let read_home = [home.to_path_buf()];
+            let mut opts = test_options(project, home);
+            opts.extra_read = &read_home;
+            opts.strict_macos_reads = true;
+            let p = generate_profile(&opts, &[]);
+            assert!(!p.contains("\n(allow user-preference-read)\n"));
+            assert!(p.contains(
+                "(allow user-preference-read (preference-domain \"kCFPreferencesAnyApplication\"))"
+            ));
+            assert!(!p.contains("(allow file-read* (subpath \"/private/var/folders\"))"));
+            assert!(!p.contains("(allow file-write* (subpath \"/private/var/folders\"))"));
+            let dirs = darwin_user_dirs().expect("confstr resolves on macOS");
+            for d in &dirs {
+                assert!(p.contains(&format!("(allow file-read* (subpath \"{d}\"))")));
+            }
+            let grant = p
+                .find("(allow file-read* (subpath \"/Users/test\"))")
+                .expect("user grant");
+            let deny = p
+                .rfind("(deny file-read* (regex #\"^/Users/test/Library/Caches/com\\.brave\\.\"))")
+                .expect("brave deny");
+            assert!(deny > grant, "cache deny must follow the user grant");
+        });
+    }
+
+    /// The personal-app caches added to the default list are denied without
+    /// the key.
+    #[test]
+    fn default_cache_denies_cover_more_personal_apps() {
+        let p = generate_profile(
+            &test_options(Path::new("/Users/test/repo"), Path::new("/Users/test")),
+            &[],
+        );
+        for pre in [
+            "com\\.microsoft\\.edgemac",
+            "com\\.brave\\.",
+            "com\\.tinyspeck\\.",
+            "company\\.thebrowser\\.",
+            "com\\.1password\\.",
+            "Microsoft Edge",
+            "BraveSoftware",
+        ] {
+            assert!(
+                p.contains(&format!(
+                    "(deny file-read* (regex #\"^/Users/test/Library/Caches/{pre}\"))"
+                )),
+                "{pre}"
+            );
         }
     }
 }

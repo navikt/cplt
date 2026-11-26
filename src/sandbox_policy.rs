@@ -1709,13 +1709,50 @@ pub(super) const DENIED_CACHE_PREFIXES: &[&str] = &[
     "org.whispersystems.", // Signal
     "us.zoom.",
     "at.obdev.", // Little Snitch
+    "com.microsoft.edgemac",
+    "com.brave.",
+    "com.tinyspeck.",      // Slack
+    "company.thebrowser.", // Arc
+    "com.1password.",
     // Non-prefixed personal apps
     "Firefox",
     "Google",
     "Mozilla",
     "Chrome",
     "Safari",
+    "Microsoft Edge",
+    "BraveSoftware",
 ];
+
+/// `sandbox.strict_macos_reads`: the preference domains `user-preference-read`
+/// stays open for. The global domain carries locale and keyboard settings every
+/// process reads; the Security and CFNetwork domains back keychain lookups and
+/// TLS/proxy settings. Any other application's domain is denied, so cfprefsd
+/// does not hand out another app's settings past the file denies.
+pub(super) const STRICT_PREFERENCE_DOMAINS: &[&str] = &[
+    "kCFPreferencesAnyApplication",
+    "com.apple.security",
+    "com.apple.CFNetwork",
+];
+
+/// The [`DENIED_CACHE_PREFIXES`] entry a path under `~/Library/Caches` falls
+/// in, if any. Compared case-insensitively, as Seatbelt matches the regex.
+pub fn denied_cache_prefix(home: &Path, p: &Path) -> Option<&'static str> {
+    let rest = p.strip_prefix(home.join("Library/Caches")).ok()?;
+    let first = rest
+        .components()
+        .next()?
+        .as_os_str()
+        .to_string_lossy()
+        .to_lowercase();
+    if first.starts_with("com.apple.dt.") {
+        return None;
+    }
+    DENIED_CACHE_PREFIXES
+        .iter()
+        .copied()
+        .find(|pre| first.starts_with(&pre.to_lowercase()))
+}
 
 /// System files that tools commonly need (SSL certs, resolv.conf, etc.)
 pub(super) const SYSTEM_READ_FILES: &[&str] = &[

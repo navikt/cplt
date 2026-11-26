@@ -506,6 +506,7 @@ mod macos_tests {
             refuse_unenforced: false,
             proxy_enabled: false,
             deny_key_files_by_extension: false,
+            strict_macos_reads: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_copilot_host_persistence: false,
@@ -4885,6 +4886,105 @@ int main(int argc, char **argv) {
             "config.yaml not overwritten"
         );
         assert_eq!(on_new, None, "nothing new written into the dir");
+    }
+
+    /// `sandbox.strict_macos_reads`: another application's preference domain
+    /// is not served, the global domain is; this user's temp dir stays
+    /// writable while the per-user state dir is closed; and a personal-app
+    /// cache stays denied under a broad `allow.read` on HOME.
+    #[test]
+    fn real_profile_strict_macos_reads() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(tmp.path()).unwrap();
+        let cache = home.join("Library/Caches/com.brave.Browser");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("x"), "CACHE\n").unwrap();
+        let grants = [home.clone()];
+        let profile = |on: bool| {
+            let mut opts = default_opts(&project, &home);
+            opts.extra_read = &grants;
+            opts.strict_macos_reads = on;
+            write_real_profile(&opts)
+        };
+        let (off, on) = (profile(false), profile(true));
+        let getconf = |name: &str| {
+            let out = Command::new("/usr/bin/getconf").arg(name).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let user_dir = getconf("DARWIN_USER_DIR");
+        let temp_dir = getconf("DARWIN_USER_TEMP_DIR");
+        let probe = format!("{temp_dir}cplt-strict-{}", std::process::id());
+        // Reading a domain outside the sandbox writes nothing.
+        let finder_exists = Command::new("/usr/bin/defaults")
+            .args(["read", "com.apple.finder"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+
+        let finder = |p: &PathBuf| run_sandboxed(p, "/usr/bin/defaults read com.apple.finder");
+        let global = |p: &PathBuf| {
+            run_sandboxed(p, "/usr/bin/defaults read -g >/dev/null && echo GLOBAL-OK")
+        };
+        let cat_cache =
+            |p: &PathBuf| run_sandboxed(p, &format!("cat '{}'", cache.join("x").display()));
+        let state = |p: &PathBuf| run_sandboxed(p, &format!("ls '{user_dir}'"));
+        let temp = |p: &PathBuf| {
+            run_sandboxed(
+                p,
+                &format!("touch '{probe}' && rm '{probe}' && echo TEMP-OK"),
+            )
+        };
+
+        let (off_finder, off_global, off_cache, off_state, off_temp) = (
+            finder(&off),
+            global(&off),
+            cat_cache(&off),
+            state(&off),
+            temp(&off),
+        );
+        let (on_finder, on_global, on_cache, on_state, on_temp) = (
+            finder(&on),
+            global(&on),
+            cat_cache(&on),
+            state(&on),
+            temp(&on),
+        );
+        fs::remove_file(&off).ok();
+        fs::remove_file(&on).ok();
+
+        if finder_exists {
+            assert!(off_finder.1, "unset: domain readable, got {off_finder:?}");
+        }
+        assert!(
+            !on_finder.1,
+            "on: app domain must not be served, got {on_finder:?}"
+        );
+        assert!(off_global.0.contains("GLOBAL-OK"), "{off_global:?}");
+        assert!(
+            on_global.0.contains("GLOBAL-OK"),
+            "on: global domain must work, {on_global:?}"
+        );
+        assert!(
+            off_cache.1 && off_cache.0.contains("CACHE"),
+            "{off_cache:?}"
+        );
+        assert!(
+            !on_cache.1 && !on_cache.0.contains("CACHE"),
+            "on: cache must stay denied, {on_cache:?}"
+        );
+        assert!(off_state.1, "{off_state:?}");
+        assert!(
+            !on_state.1,
+            "on: per-user state dir must be closed, {on_state:?}"
+        );
+        assert!(off_temp.0.contains("TEMP-OK"), "{off_temp:?}");
+        assert!(
+            on_temp.0.contains("TEMP-OK"),
+            "on: user temp dir must work, {on_temp:?}"
+        );
     }
 
     #[test]

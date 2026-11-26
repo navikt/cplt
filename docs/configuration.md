@@ -943,6 +943,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.readonly_host_tool_paths` | a staged hardening switch, see [Read-only tool downloads](#read-only-tool-downloads-sandboxreadonly_host_tool_paths) |
 | `sandbox.refuse_unenforced` | depends on what the machine can enforce, see [Refusing deny paths this host cannot enforce](#refusing-deny-paths-this-host-cannot-enforce-sandboxrefuse_unenforced) |
 | `sandbox.refuse_cache_exec_links` | a staged hardening switch, see [Symlinked cache-exec entries](#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links) |
+| `sandbox.strict_macos_reads` | a staged hardening switch, see [Stricter macOS read scope](#stricter-macos-read-scope-sandboxstrict_macos_reads) |
 | `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |
 | `sandbox.protect_pnpm_config` | a staged hardening switch, see [Protecting pnpm's global config](#protecting-pnpms-global-config-sandboxprotect_pnpm_config) |
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
@@ -1180,6 +1181,20 @@ To recover, set the key back to `false`. `--allow-env-files` also lifts it, but 
 It follows `--allow-env-files`: with that flag, none of these patterns are emitted. Like the default patterns, it is lifted for read inside the extracted dependency stores (`~/go/pkg/mod`, `~/.cargo/registry`) when a granted tree covers them, since a key file there is a library's test fixture. A `--deny-path` or `deny.paths` entry inside or above a store still wins, the same way it does for `.env` (#597): the read deny is repeated after the carve-out, narrowed to the part of the store you denied, so `server.pem` under your deny stays unreadable and the rest of the store keeps the carve-out.
 
 It has no effect on Linux, where the launch says so. Landlock cannot deny a file by name pattern, so on Linux the default patterns do not apply either.
+
+## Stricter macOS read scope (`sandbox.strict_macos_reads`)
+
+An optional stricter macOS read scope. With the key on, the macOS profile:
+
+- allows preference reads only for the global domain and the `com.apple.security` and `com.apple.CFNetwork` domains, instead of every application's preferences
+- grants read and write on your own temp and cache dirs under `/private/var/folders` (`getconf DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR`), instead of the whole tree
+- places the personal-app cache denies under `~/Library/Caches` after your `allow.read` and `allow.write` grants, so a broad grant such as `~` does not reopen them. A grant that names such a cache directly is refused at launch.
+
+```bash
+cplt config set sandbox.strict_macos_reads true
+```
+
+Off by default, because a tool that reads another application's preferences, or writes outside your temp and cache dirs in `/private/var/folders`, stops working. See [Known impacts](known-impacts.md#sandboxstrict_macos_reads-off-by-default). No effect on Linux, where the launch says so.
 
 ## Protecting pnpm's global config (`sandbox.protect_pnpm_config`)
 

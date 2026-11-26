@@ -895,6 +895,7 @@ fn landlock_policy_device_files_have_ioctl() {
         refuse_unenforced: false,
         proxy_enabled: false,
         deny_key_files_by_extension: false,
+        strict_macos_reads: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_copilot_host_persistence: false,
@@ -2293,6 +2294,7 @@ fn key_file_extension_denies_are_lifted_for_read_inside_dependency_stores() {
         &SandboxConfig {
             extra_read: &home,
             deny_key_files_by_extension: true,
+            strict_macos_reads: false,
             ..base_profile_options()
         },
         &[],
@@ -2325,6 +2327,7 @@ fn a_deny_path_inside_a_dependency_store_beats_the_key_file_carve_out() {
         &SandboxConfig {
             extra_deny: &deny,
             deny_key_files_by_extension: true,
+            strict_macos_reads: false,
             ..base_profile_options()
         },
         &[],
@@ -2867,6 +2870,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         refuse_unenforced: false,
         proxy_enabled: false,
         deny_key_files_by_extension: false,
+        strict_macos_reads: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_copilot_host_persistence: false,
@@ -3664,6 +3668,7 @@ fn profile_denies_key_files_by_extension_when_enabled() {
             extra_write: &write,
             extra_read: &read,
             deny_key_files_by_extension: true,
+            strict_macos_reads: false,
             ..base_profile_options()
         },
         &[],
@@ -3706,6 +3711,7 @@ fn profile_key_file_extension_denies_escape_the_root() {
         &SandboxConfig {
             extra_read: &read,
             deny_key_files_by_extension: true,
+            strict_macos_reads: false,
             ..base_profile_options()
         },
         &[],
@@ -3722,6 +3728,7 @@ fn profile_key_file_extension_denies_follow_allow_env_files() {
     let p = generate_profile(
         &SandboxConfig {
             deny_key_files_by_extension: true,
+            strict_macos_reads: false,
             allow_env_files: true,
             ..base_profile_options()
         },
@@ -4566,6 +4573,7 @@ fn allow_localhost_any_affects_both_backends() {
         refuse_unenforced: false,
         proxy_enabled: false,
         deny_key_files_by_extension: false,
+        strict_macos_reads: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_copilot_host_persistence: false,
@@ -4650,6 +4658,7 @@ fn config_options_parity_across_backends() {
         refuse_unenforced: false,
         proxy_enabled: false,
         deny_key_files_by_extension: false,
+        strict_macos_reads: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_copilot_host_persistence: false,
@@ -10378,6 +10387,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
             refuse_unenforced: false,
             proxy_enabled: false,
             deny_key_files_by_extension: false,
+            strict_macos_reads: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             ..base_profile_options()
@@ -11087,6 +11097,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         refuse_unenforced: false,
         proxy_enabled: false,
         deny_key_files_by_extension: false,
+        strict_macos_reads: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_copilot_host_persistence: false,
