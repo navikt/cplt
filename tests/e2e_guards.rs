@@ -3070,6 +3070,59 @@ fn real_push_feature_branch_deletion_allowed() {
 }
 
 #[test]
+fn real_push_bare_name_deletion_refused_when_it_names_a_tag() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(&work, &["tag", "v0"]));
+    assert!(git_ok(&work, &["push", "-q", "origin", "v0", "feat:feat"]));
+    for policy in [PROTECT, FORCE_ONLY] {
+        let (stderr, ok) = real_push_gate(
+            &work,
+            &facts,
+            policy,
+            &[],
+            &["push", "origin", "--delete", "v0"],
+        );
+        assert_refused(&stderr, ok, ":refs/heads/<branch>");
+        assert!(remote_ref(&origin, "refs/tags/v0").is_some());
+    }
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "-q", "origin", "--delete", "feat"],
+    );
+    assert!(ok, "{stderr}");
+    assert_eq!(remote_ref(&origin, "refs/heads/feat"), None);
+}
+
+#[test]
+fn real_push_deletion_refused_when_default_branch_unknown() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
+    let git_dir = work.join(".git");
+    for policy in [PROTECT, FORCE_ONLY] {
+        let (stderr, ok) = real_push_gate(
+            &work,
+            &facts,
+            policy,
+            &[],
+            &[
+                "--git-dir",
+                git_dir.to_str().unwrap(),
+                "push",
+                "origin",
+                ":refs/heads/victim",
+            ],
+        );
+        assert_refused(&stderr, ok, "not allowed");
+        assert!(remote_ref(&origin, "refs/heads/victim").is_some());
+    }
+}
+
+#[test]
 fn real_push_default_branch_deletion_and_mirror_refused() {
     let (_t, work, origin) = pushed_repo("main");
     let facts = launch_facts(&work);
