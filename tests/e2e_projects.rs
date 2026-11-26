@@ -2873,6 +2873,7 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
             ])
             .current_dir(&root)
             .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .env_remove("CPLT_TEST_NO_PLACEHOLDERS")
             .output()
             .expect("cplt should run");
         let stdout = String::from_utf8_lossy(&output.stdout);

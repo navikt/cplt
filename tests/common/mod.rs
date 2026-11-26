@@ -145,6 +145,9 @@ pub fn scratch_home() -> &'static Path {
 /// the developer's shell. A test that sets `HOME` itself afterwards wins.
 pub fn with_scratch_home(cmd: &mut Command) {
     cmd.env("HOME", scratch_home())
+        // Placeholder dirs stay after a launch; a test launching in the
+        // checkout would leave them there. Tests about them remove this.
+        .env("CPLT_TEST_NO_PLACEHOLDERS", "1")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_STATE_HOME")

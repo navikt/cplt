@@ -561,6 +561,12 @@ impl PreparedSandbox {
     /// in place afterwards: a process the session detached could still rely
     /// on them, and no exit check can rule that out.
     pub fn create_placeholder_dirs(&self) {
+        // Test-only seam, absent from release builds: suites that launch with
+        // the checkout as the project would otherwise leave these there.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CPLT_TEST_NO_PLACEHOLDERS").is_some_and(|v| !v.is_empty()) {
+            return;
+        }
         create_missing_dirs(&self.placeholder_dirs);
     }
 
