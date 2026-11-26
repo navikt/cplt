@@ -7854,6 +7854,10 @@ struct HostProbe {
     existing_home_tool_dirs: Vec<cplt::sandbox::ResolvedToolDir>,
     existing_app_dirs: Vec<String>,
     git_hooks_path: Option<PathBuf>,
+    /// See [`sandbox::SandboxConfig::repo_hooks_dirs`].
+    repo_hooks_dirs: Vec<PathBuf>,
+    /// See [`sandbox::SandboxConfig::repo_hooks_unreadable`].
+    repo_hooks_unreadable: Vec<String>,
     git_common_dir: Option<PathBuf>,
     /// Why `git_common_dir` is `None` for a worktree that has one. A launch
     /// warns with it, `cplt doctor` shows it as a finding.
@@ -7944,6 +7948,18 @@ impl HostProbe {
         // Git worktree common directory (shared .git for worktrees).
         let (git_common_dir, git_common_dir_problem) =
             discover::git_common_dir(home_dir, project_dir, &resolved.allow_write);
+        let hook_roots: Vec<PathBuf> = std::iter::once(project_dir.to_path_buf())
+            .chain(repo_dirs.iter().cloned())
+            .chain(resolved.allow_write.iter().cloned())
+            .collect();
+        let (repo_hooks_dirs, repo_hooks_unreadable, hooks_walk_truncated) =
+            discover::repo_hooks_dirs(&hook_roots);
+        if hooks_walk_truncated {
+            ui::warn(
+                "the search for nested repositories stopped at its directory limit; a \
+                 core.hooksPath set by a repository it did not reach is not protected this session",
+            );
+        }
         Self {
             home_dir: home_dir.to_path_buf(),
             project_dir: project_dir.to_path_buf(),
@@ -7951,6 +7967,8 @@ impl HostProbe {
             existing_app_dirs: tool_discovery.existing_app_dirs,
             // Global git hooks path from core.hooksPath.
             git_hooks_path: discover::git_hooks_path(home_dir),
+            repo_hooks_dirs,
+            repo_hooks_unreadable,
             git_common_dir,
             git_common_dir_problem,
             root_agents_md: resolved
@@ -9049,6 +9067,8 @@ fn build_sandbox_config<'a>(
         java_home: probe.java_home.as_deref(),
         dotnet_root: probe.dotnet_root.as_deref(),
         git_hooks_path: probe.git_hooks_path.as_deref(),
+        repo_hooks_dirs: &probe.repo_hooks_dirs,
+        repo_hooks_unreadable: &probe.repo_hooks_unreadable,
         git_common_dir: probe.git_common_dir.as_deref(),
         root_agents_md: probe.root_agents_md.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
@@ -9195,6 +9215,7 @@ fn run_audited_session(
         None
     };
     let mut proxy_handle = proxy_handle;
+    s.prepared.create_placeholder_dirs();
     let managed_guard = s.prepared.guard_managed();
     let audit_mode = audit::AuditMode::for_run(audit_enabled, cli.observe_domains);
     let (exit_code, snapshot, settled) = audit::run(
@@ -17339,6 +17360,8 @@ mod tests {
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
+            repo_hooks_dirs: &[],
+            repo_hooks_unreadable: &[],
             git_common_dir: None,
             root_agents_md: None,
             allow_gpg_signing: false,

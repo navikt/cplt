@@ -1584,6 +1584,109 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The hooks directory each root's repository configures with `core.hooksPath`
+/// (husky's `.husky/_`, a committed `.githooks`), resolved to an absolute path.
+///
+/// Git runs hooks from that directory instead of `<gitdir>/hooks`, so the
+/// `.git/hooks` write deny protects nothing while it is set: the directory
+/// gets the same deny. Every non-command scope counts (system, global, local,
+/// worktree, and their includes); the last one wins, as in git. The `-c
+/// core.hooksPath=/dev/null` the hardened invoker adds is the `command` scope
+/// and is skipped. A relative value is relative to the worktree top level.
+///
+/// The flag says the nested-repository walk stopped at its directory cap, so
+/// a repository below it may not have been probed; the caller warns.
+/// The second list names each root whose config could not be read in time;
+/// the caller warns with it rather than launching unannounced.
+pub fn repo_hooks_dirs(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>, bool) {
+    let mut dirs = Vec::new();
+    let mut problems = Vec::new();
+    let top: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    // Submodules and repositories below a root carry their own config.
+    let (nested, truncated) =
+        crate::sandbox::repo_walk(&top, 3, crate::sandbox::has_dot_git_or_is_bare, None);
+    let mut all: Vec<PathBuf> = roots.to_vec();
+    all.extend(nested.into_iter().filter(|n| !roots.contains(n)));
+    for root in all.iter().filter(|r| r.is_dir()) {
+        let shown = crate::audit::escape_path(&root.to_string_lossy());
+        let args = [
+            "config",
+            "-z",
+            "--show-scope",
+            "--includes",
+            "--path",
+            "--get-all",
+            "core.hooksPath",
+        ];
+        let out = match crate::git::try_output(root, &args) {
+            Ok(out) => out,
+            Err(crate::git::GitOutputError::Io(e)) => {
+                problems.push(format!("{shown}: {e}"));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        // `-z`: scope NUL value NUL, repeated. Not trimmed: the value is used
+        // exactly as git will use it, or refused.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let fields: Vec<&str> = text.split('\0').collect();
+        let Some(raw) = fields
+            .chunks_exact(2)
+            .filter(|kv| kv[0] != "command")
+            .map(|kv| kv[1])
+            .next_back()
+        else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.trim() != raw || raw.chars().any(char::is_control) {
+            problems.push(format!(
+                "{shown}: the value has surrounding whitespace or control characters"
+            ));
+            continue;
+        }
+        let raw = Path::new(raw);
+        let dir = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else if root.join(".git").symlink_metadata().is_ok() {
+            root.join(raw)
+        } else {
+            match crate::git::project_root(root) {
+                Ok(top) => top.join(raw),
+                Err(_) => root.join(raw),
+            }
+        };
+        // Both spellings: the configured path, so a symlink on it cannot be
+        // swapped, and the directory it resolves to.
+        let lexical = lexical_normalize(&dir);
+        let resolved = crate::config::canonicalize_deepest(&lexical);
+        for d in [lexical, resolved] {
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    (dirs, problems, truncated)
+}
+
+/// `a/./b/../c` to `a/c` without touching the filesystem.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Resolve the shared `.git` directory that governs `dir`, if any.
 ///
 /// This is the directory that actually holds `hooks/` and `config` — the two

@@ -306,6 +306,14 @@ pub struct SandboxConfig<'a> {
     pub dotnet_root: Option<&'a Path>,
     /// Global git hooks directory from `core.hooksPath`.
     pub git_hooks_path: Option<&'a Path>,
+    /// Hooks directories the repositories of the writable roots configure with
+    /// `core.hooksPath` (`discover::repo_hooks_dirs`). Write-denied like
+    /// `<gitdir>/hooks`: git runs hooks from here instead.
+    pub repo_hooks_dirs: &'a [PathBuf],
+    /// Roots whose `core.hooksPath` could not be read in time. A launch
+    /// refuses ([`refuse_unreadable_hooks_path`]): the directory git would run
+    /// hooks from is unknown, so it cannot be protected.
+    pub repo_hooks_unreadable: &'a [String],
     /// Shared .git directory for git worktrees.
     pub git_common_dir: Option<&'a Path>,
     /// `AGENTS.md` at the repository root when `--project-dir` is a
@@ -433,6 +441,9 @@ pub struct PreparedSandbox {
     /// Why the OpenCode handover must not read `auth.json` this session
     /// (#1057), judged against this session's policy.
     pub(crate) opencode_auth_refused: Option<String>,
+    /// Directories [`PreparedSandbox::create_placeholder_dirs`] creates at
+    /// launch where missing (see [`planned_protected_ancestors`]).
+    placeholder_dirs: Vec<PathBuf>,
     agent: Agent,
     /// Specific localhost ports the user has explicitly opened.
     allow_localhost: Vec<u16>,
@@ -544,6 +555,15 @@ impl PreparedSandbox {
 }
 
 impl PreparedSandbox {
+    /// Create the missing directories above the protected project paths
+    /// (see [`planned_protected_ancestors`]). Only the launcher calls this,
+    /// right before the agent starts; `prepare` writes nothing. They are left
+    /// in place afterwards: a process the session detached could still rely
+    /// on them, and no exit check can rule that out.
+    pub fn create_placeholder_dirs(&self) {
+        create_missing_dirs(&self.placeholder_dirs);
+    }
+
     /// On Linux, when a write grant reaches cplt's state dir, the snapshot of
     /// `managed.d` to check once the session is over. macOS denies the dir.
     #[must_use]
@@ -921,6 +941,19 @@ fn prepare_locked(
     for w in host_persistence_explicit_warnings(config) {
         crate::ui::warn(&w);
     }
+    if !inspect_only {
+        refuse_unreadable_hooks_path(config)?;
+        #[cfg(target_os = "linux")]
+        if let Some(link) = symlink_on_hooks_path(config) {
+            return Err(format!(
+                "core.hooksPath runs through the symlink {} inside a writable root. Linux \
+                 cannot pin a symlink, so it could be re-pointed at an unprotected \
+                 directory. Replace the link with the directory itself, or point \
+                 core.hooksPath at the real path.",
+                crate::audit::escape_path(&link.to_string_lossy())
+            ));
+        }
+    }
     #[cfg(target_os = "linux")]
     if config.restrict_oauth_bind && !inspect_only {
         warn_oauth_bind_gaps(config, landlock_mod::available_abi_version());
@@ -972,6 +1005,9 @@ fn prepare_locked(
         &base,
     )?;
     prepared.state_exposed = exposed.is_some();
+    if cfg!(target_os = "macos") && !inspect_only {
+        prepared.placeholder_dirs = planned_protected_ancestors(config);
+    }
     if config.agent == Agent::OpenCode && !inspect_only {
         let policy = base.get_or_init(|| landlock_mod::generate_policy(config));
         prepared.opencode_auth_refused =
@@ -995,6 +1031,120 @@ pub fn launch_grants(
     let mut grants = validate_cache_exec_dirs(config, &base)?;
     grants.extend(prepare_cypress_app_data(config, true, &base)?);
     Ok(grants)
+}
+
+/// The directories strictly between the writable root holding each hooks
+/// directory and that directory, outermost first. A hooks directory outside
+/// every root has none.
+pub(crate) fn repo_hooks_ancestors(hooks_dirs: &[PathBuf], roots: &[&Path]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in hooks_dirs {
+        let Some(root) = roots
+            .iter()
+            .filter(|r| dir.starts_with(r) && dir != *r)
+            .min_by_key(|r| r.components().count())
+        else {
+            continue;
+        };
+        let mut anc: Vec<PathBuf> = dir
+            .ancestors()
+            .skip(1)
+            .take_while(|a| a != root)
+            .map(Path::to_path_buf)
+            .collect();
+        anc.reverse();
+        out.extend(anc);
+    }
+    out
+}
+
+/// Fail closed when a root's `core.hooksPath` could not be read: launching
+/// would leave the hooks directory git uses writable.
+fn refuse_unreadable_hooks_path(config: &SandboxConfig) -> Result<(), String> {
+    match config.repo_hooks_unreadable.first() {
+        None => Ok(()),
+        Some(problem) => Err(format!(
+            "could not read core.hooksPath in {problem}, so the hooks directory that \
+             repository uses cannot be write-protected. Check that its git config is a \
+             regular file (`git config --show-origin --get-all core.hooksPath`), then \
+             launch again."
+        )),
+    }
+}
+
+/// The first symlink on a `core.hooksPath` spelling strictly below the
+/// writable root holding it. macOS pins the link's name; a bind mount cannot,
+/// so Linux refuses such a launch.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn symlink_on_hooks_path(config: &SandboxConfig) -> Option<PathBuf> {
+    let roots: Vec<&Path> = std::iter::once(config.project_dir)
+        .chain(config.named_roots.iter().map(PathBuf::as_path))
+        .chain(config.extra_write.iter().map(PathBuf::as_path))
+        .collect();
+    for dir in config.repo_hooks_dirs {
+        let Some(root) = roots.iter().find(|r| dir.starts_with(r)) else {
+            continue;
+        };
+        if let Some(link) = dir
+            .ancestors()
+            .take_while(|a| a != root)
+            .find(|a| a.symlink_metadata().is_ok_and(|m| m.is_symlink()))
+        {
+            return Some(link.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Create, empty, each missing directory above a protected project path, and
+/// return what was created.
+///
+/// macOS pins these directories against rename and rmdir
+/// (`file-write-unlink`), which only holds once they exist. A missing one can
+/// be created by renaming or cloning a tree built elsewhere onto its name,
+/// carrying `.opencode/plugins/` or `.claude/settings.json` with it, and
+/// Seatbelt has no rule that refuses that rename but allows a plain `mkdir`.
+/// An existing directory cannot be replaced that way. Git does not track empty
+/// directories, so they are left in place. Covers each writable root's
+/// `PROTECTED_IN_ROOT` ancestors and the directories between a root and a
+/// `core.hooksPath` directory inside it. A tree renamed in below a new
+/// subdirectory is not covered (SECURITY.md).
+fn placeholder_roots<'a>(config: &SandboxConfig<'a>) -> Vec<&'a Path> {
+    std::iter::once(config.project_dir)
+        .chain(config.named_roots.iter().map(PathBuf::as_path))
+        .chain(config.extra_write.iter().map(PathBuf::as_path))
+        .filter(|r| r.symlink_metadata().is_ok_and(|m| m.is_dir()))
+        .collect()
+}
+
+fn planned_protected_ancestors(config: &SandboxConfig) -> Vec<PathBuf> {
+    let roots = placeholder_roots(config);
+    let mut wanted: Vec<PathBuf> = Vec::new();
+    for root in &roots {
+        for p in policy::PROTECTED_IN_ROOT {
+            wanted.extend(policy::rel_ancestors(p.rel).iter().map(|a| root.join(a)));
+        }
+    }
+    wanted.extend(repo_hooks_ancestors(config.repo_hooks_dirs, &roots));
+    wanted
+}
+
+/// Create each directory of `wanted` that does not exist; return those created.
+fn create_missing_dirs(wanted: &[PathBuf]) -> Vec<PathBuf> {
+    let mut created: Vec<PathBuf> = Vec::new();
+    for dir in wanted {
+        if created.contains(dir) || dir.symlink_metadata().is_ok() {
+            continue;
+        }
+        match std::fs::create_dir(dir) {
+            Ok(()) => created.push(dir.clone()),
+            Err(e) => crate::ui::warn(&format!(
+                "could not create {}: {e}; the paths below it can be moved into place this session",
+                crate::audit::escape_path(&dir.to_string_lossy())
+            )),
+        }
+    }
+    created
 }
 
 /// The gitdirs a launch protects beyond the project's own.
@@ -3705,6 +3855,7 @@ fn prepare_impl(
         proxy_port: config.proxy_port,
         state_exposed: false,
         opencode_auth_refused: None,
+        placeholder_dirs: Vec::new(),
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
@@ -4255,6 +4406,9 @@ fn pin_paths(
     let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
     // The dirs between a broad grant and a protected login or autostart path.
     pins.extend(host_persistence_pin_dirs(config));
+    // The directories between a root and a `core.hooksPath` directory bound
+    // in `ro_protect_paths` (`.husky` above `.husky/_`).
+    pins.extend(repo_hooks_ancestors(config.repo_hooks_dirs, &write_roots));
     // #386: the ancestors of the `config.worktree` binds in `ro_protect_paths`.
     if !config.allow_git_config_write {
         pins.extend(linked_worktree_pin_paths(&write_roots, &git_dirs));
@@ -4378,6 +4532,15 @@ fn host_run_paths(
     // with an any-depth regex, and bubblewrap needs the paths named.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+    // A `core.hooksPath` directory replaces `.git/hooks`, so it is bound
+    // read-only like it. Only one that exists at launch can be bound.
+    ro_protect.extend(
+        config
+            .repo_hooks_dirs
+            .iter()
+            .filter(|d| d.is_dir())
+            .cloned(),
+    );
     // #386: `.git/config` read-only, as on macOS, unless the user opted in.
     // git writes `config.lock` beside it and renames it over; the rename onto
     // a bind fails with EBUSY and git removes the lock itself, so no stale
@@ -5730,6 +5893,7 @@ fn prepare_impl(
         proxy_port: config.proxy_port,
         state_exposed: false,
         opencode_auth_refused: None,
+        placeholder_dirs: Vec::new(),
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
@@ -5811,6 +5975,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
     if let Some(p) = config.git_hooks_path {
         policy::validate_sbpl_path(p).map_err(|e| format!("Git hooks path: {e}"))?;
+    }
+    for p in config.repo_hooks_dirs {
+        policy::validate_sbpl_path(p).map_err(|e| format!("core.hooksPath: {e}"))?;
     }
     if let Some(p) = config.git_common_dir {
         policy::validate_sbpl_path(p).map_err(|e| format!("Git common dir: {e}"))?;
@@ -6603,6 +6770,53 @@ mod tests {
         assert!(!is_zsh_sibling(Path::new("/h/other.zwc")));
     }
 
+    /// The missing directories above the protected paths and above a
+    /// `core.hooksPath` directory are planned, and creating them leaves an
+    /// existing one alone.
+    #[test]
+    fn protected_ancestors_are_planned_and_created_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p");
+        std::fs::create_dir_all(project.join(".github")).unwrap();
+        let hooks = [project.join("tools/hooks/_")];
+        let config = SandboxConfig {
+            project_dir: &project,
+            repo_hooks_dirs: &hooks,
+            ..test_config(tmp.path(), &[])
+        };
+        let created = create_missing_dirs(&planned_protected_ancestors(&config));
+        for d in [
+            ".opencode",
+            ".agents",
+            ".pi",
+            ".claude",
+            "tools",
+            "tools/hooks",
+        ] {
+            assert!(created.contains(&project.join(d)), "{d}: {created:?}");
+            assert!(project.join(d).is_dir());
+        }
+        assert!(!created.contains(&project.join(".github")));
+        assert!(!project.join("tools/hooks/_").exists());
+    }
+
+    /// An unreadable `core.hooksPath` refuses the launch, with what to do.
+    #[test]
+    fn unreadable_hooks_path_refuses_the_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let problem = ["/p: timed out".to_string()];
+        let config = SandboxConfig {
+            repo_hooks_unreadable: &problem,
+            ..test_config(tmp.path(), &[])
+        };
+        let err = refuse_unreadable_hooks_path(&config).unwrap_err();
+        assert!(
+            err.contains("/p: timed out") && err.contains("launch again"),
+            "{err}"
+        );
+        assert!(refuse_unreadable_hooks_path(&test_config(tmp.path(), &[])).is_ok());
+    }
+
     pub(super) fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
         SandboxConfig {
             project_dir: Path::new("/project"),
@@ -6636,6 +6850,8 @@ mod tests {
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
+            repo_hooks_dirs: &[],
+            repo_hooks_unreadable: &[],
             git_common_dir: None,
             root_agents_md: None,
             allow_gpg_signing: false,

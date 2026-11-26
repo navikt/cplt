@@ -492,6 +492,8 @@ mod macos_tests {
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
+            repo_hooks_dirs: &[],
+            repo_hooks_unreadable: &[],
             git_common_dir: None,
             root_agents_md: None,
             allow_gpg_signing: false,
@@ -3130,6 +3132,131 @@ int main(int argc, char **argv) {
             output.contains("Operation not permitted") || output.contains("EXIT:1"),
             "writing to .github/hooks should be blocked, got: {output}"
         );
+    }
+
+    /// A repository-local `core.hooksPath` directory is write-protected like
+    /// `.git/hooks`: no write inside, no rename of the directory above it,
+    /// and the hooks stay readable so they still run.
+    #[test]
+    fn real_profile_blocks_repo_hooks_dir_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".repo-hooks-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".husky/_")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        fs::write(tmp.join(".husky/_/pre-commit"), "#!/bin/sh\n").unwrap();
+        let home = home_dir();
+        let hooks = [tmp.join(".husky/_")];
+        let opts = SandboxConfig {
+            repo_hooks_dirs: &hooks,
+            ..default_opts(&tmp, &home)
+        };
+        let profile = write_real_profile(&opts);
+        let (output, _) = run_sandboxed(
+            &profile,
+            &format!(
+                "cd '{}'; echo x >> .husky/_/pre-commit 2>/dev/null && echo WRITE_OK; \
+                 touch .husky/_/post-checkout 2>/dev/null && echo CREATE_OK; \
+                 mv .husky h2 2>/dev/null && echo MOVE_OK; \
+                 cat .husky/_/pre-commit >/dev/null && echo READ_OK",
+                tmp.display()
+            ),
+        );
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(!output.contains("WRITE_OK"), "{output}");
+        assert!(!output.contains("CREATE_OK"), "{output}");
+        assert!(!output.contains("MOVE_OK"), "{output}");
+        assert!(output.contains("READ_OK"), "{output}");
+    }
+
+    /// A `core.hooksPath` that runs through a symlink (`.husky -> tools/husky`)
+    /// is protected under both spellings: the link cannot be replaced or
+    /// moved, and the real directory cannot be written.
+    #[test]
+    fn real_profile_pins_a_symlinked_repo_hooks_path() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".repo-hooks-link-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("tools/husky/_")).unwrap();
+        fs::create_dir_all(tmp.join("other/_")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        std::os::unix::fs::symlink("tools/husky", tmp.join(".husky")).unwrap();
+        let home = home_dir();
+        let hooks = [tmp.join(".husky/_"), tmp.join("tools/husky/_")];
+        let opts = SandboxConfig {
+            repo_hooks_dirs: &hooks,
+            ..default_opts(&tmp, &home)
+        };
+        let profile = write_real_profile(&opts);
+        let (output, _) = run_sandboxed(
+            &profile,
+            &format!(
+                "cd '{}'; rm .husky 2>/dev/null && echo UNLINK_OK; \
+                 mv .husky h2 2>/dev/null && echo MOVE_OK; \
+                 ln -sfn other .husky 2>/dev/null && echo RELINK_OK; \
+                 touch tools/husky/_/pre-commit 2>/dev/null && echo WRITE_OK; \
+                 mv tools t2 2>/dev/null && echo TOOLS_MOVE_OK",
+                tmp.display()
+            ),
+        );
+        let link = fs::read_link(tmp.join(".husky")).ok();
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        for bad in [
+            "UNLINK_OK",
+            "MOVE_OK",
+            "RELINK_OK",
+            "WRITE_OK",
+            "TOOLS_MOVE_OK",
+        ] {
+            assert!(!output.contains(bad), "{bad}: {output}");
+        }
+        assert_eq!(link.as_deref(), Some(Path::new("tools/husky")));
+    }
+
+    /// In-process `prepare` only plans the placeholder directories; the
+    /// launcher creates them.
+    #[test]
+    fn prepare_creates_no_placeholders() {
+        require_sandbox!();
+        let fixture = crate::common::home_temp_dir("prepare-placeholders");
+        let project = fs::canonicalize(fixture.path()).unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        cplt::sandbox::prepare(&opts).expect("prepare");
+        assert!(
+            !project.join(".opencode").exists(),
+            "prepare must not create placeholders"
+        );
+    }
+
+    /// A protected project path cannot be renamed into place once the
+    /// directory above it exists: the launch creates `.opencode` empty for
+    /// exactly this. Without it the same rename succeeds.
+    #[test]
+    fn real_profile_blocks_rename_over_existing_protected_ancestor() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".protected-anc-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("stage/plugins")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        fs::write(tmp.join("stage/plugins/p.js"), "x").unwrap();
+        fs::create_dir(tmp.join(".opencode")).unwrap();
+        let home = home_dir();
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+        let (output, _) = run_sandboxed(
+            &profile,
+            &format!(
+                "cd '{}'; perl -e 'rename(q(stage), q(.opencode)) or exit 1' && echo RENAME_OK",
+                tmp.display()
+            ),
+        );
+        let planted = tmp.join(".opencode/plugins/p.js").exists();
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(!output.contains("RENAME_OK") && !planted, "{output}");
     }
 
     /// H-11: `.claude/settings.json` carries Claude Code hooks (`SessionStart`
