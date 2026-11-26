@@ -7711,8 +7711,15 @@ except Exception as e:
         let (_tmp, home, project, _) = firmlink_fixture();
         std::os::unix::fs::symlink("/", project.join("rootlink")).unwrap();
         let link = project.join("rootlink").to_string_lossy().into_owned();
-        for key in ["allow.read", "allow.write"] {
-            for val in [link.as_str(), "/.nofollow", "/.nofollow/.nofollow"] {
+        // deny.paths too, and the firmlink root in two spellings (#1156).
+        for key in ["allow.read", "allow.write", "deny.paths"] {
+            for (val, want) in [
+                (link.as_str(), "filesystem root"),
+                ("/.nofollow", "filesystem root"),
+                ("/.nofollow/.nofollow", "filesystem root"),
+                ("/System/Volumes/Data", "firmlink"),
+                ("/System/Volumes/Data/.", "firmlink"),
+            ] {
                 let out = firmlink_cmd(&home)
                     .current_dir(&project)
                     .args(["config", "set", key, val])
@@ -7720,10 +7727,25 @@ except Exception as e:
                     .expect("cplt config set");
                 let err = String::from_utf8_lossy(&out.stderr);
                 assert!(
-                    !out.status.success() && err.contains("filesystem root"),
+                    !out.status.success() && err.contains(want),
                     "{key} {val}: {err}"
                 );
             }
+        }
+    }
+
+    /// `--allow-read`, `--allow-write` and `--deny-path` refuse the firmlink
+    /// root at launch instead of emitting a rule that matches nothing (#1156).
+    #[test]
+    fn binary_cli_refuses_firmlink_root() {
+        let (_tmp, home, project, _) = firmlink_fixture();
+        for flag in ["--allow-read", "--allow-write", "--deny-path"] {
+            let (out, err) =
+                firmlink_profile(&home, &project, None, &[flag, "/System/Volumes/Data"]);
+            assert!(
+                !out.contains("\"/System/Volumes/Data\"") && err.contains("firmlink"),
+                "{flag}:\n{err}\n{out}"
+            );
         }
     }
 

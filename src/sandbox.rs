@@ -1465,11 +1465,21 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
 /// (CLI, user config, `.cplt.toml`) feeds into. String checks upstream miss
 /// spellings such as `/.nofollow/.nofollow` or a symlink to `/`; a deny on
 /// `/` kills the launch and an allow on it is no sandbox at all.
-fn refuse_filesystem_root(key: &str, p: &Path) -> Result<(), String> {
+pub fn refuse_filesystem_root(key: &str, p: &Path) -> Result<(), String> {
     if p == Path::new("/") {
         return Err(format!(
             "{key} {} resolves to the filesystem root, which cplt refuses. \
              Name a specific path instead.",
+            p.display()
+        ));
+    }
+    // The data-volume root has no short spelling to map to, and Seatbelt
+    // matches the canonical `/...` paths, so a rule on it matches nothing (#1156).
+    if cfg!(target_os = "macos") && p == Path::new("/System/Volumes/Data") {
+        return Err(format!(
+            "{key} {} resolves to /System/Volumes/Data, the macOS data-volume firmlink root. \
+             A rule there matches nothing, because macOS matches paths under `/`. \
+             Name the path without the prefix, such as /Users/<you>/<dir>.",
             p.display()
         ));
     }
@@ -9484,6 +9494,31 @@ mod account_tests {
         let p = std::fs::canonicalize(&real).unwrap().join("new/hosts.yml");
         assert!(hosts_agent_writable(&p, &p, &writable));
         assert_eq!(resolve_unwritable(&p, &writable), Err(()));
+    }
+
+    /// #1156: the macOS data-volume root and spellings of it match nothing,
+    /// so grants and denies on it are refused, not emitted.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn firmlink_root_is_refused_for_grants_and_denies() {
+        let home = std::path::Path::new("/Users/nobody-cplt");
+        for spelled in [
+            "/System/Volumes/Data",
+            "/System/Volumes/Data/.",
+            "/System/Volumes/Data/",
+        ] {
+            let p = crate::config::canonicalize_strict(std::path::Path::new(spelled)).unwrap();
+            for key in ["allow.read", "allow.write"] {
+                let e = super::validate_grant_path(key, &p, home).unwrap_err();
+                assert!(e.contains("firmlink"), "{spelled} {key}: {e}");
+            }
+            let e = super::refuse_filesystem_root("deny path", &p).unwrap_err();
+            assert!(e.contains("firmlink"), "{spelled}: {e}");
+        }
+        assert!(
+            super::refuse_filesystem_root("deny path", std::path::Path::new("/System/Volumes"))
+                .is_ok()
+        );
     }
 
     #[test]

@@ -354,6 +354,9 @@ session-only token rather than plaintext storage. See [Linux keyring access](kno
 the device-code URL fails too. Sign in on the host with `gh auth login`, then
 run `cplt config set gh_guard.inject_token true --force`. The token is then
 visible to every process in the sandbox.
+If Copilot's Secret Service login is handed over through the keychain
+substitute, Copilot already has a token and `inject_token` sets no `GH_TOKEN`.
+To put the token in the environment anyway, pass `--pass-env GH_TOKEN`.
 
 cplt prints this fix once at launch when `gh_guard` is on, the scratch dir is
 on, `quiet` is off, `sandbox.keychain_substitute` is not `false`, and no token
@@ -379,7 +382,7 @@ sandbox — and readable from any of them, through `/proc/<pid>/environ` on Linu
 or `ps -E` on macOS:
 ```toml
 [gh_guard]
-inject_token = true   # injects GH_TOKEN env var (visible to all subprocesses)
+inject_token = true   # injects GH_TOKEN (visible to all subprocesses), unless the agent already has a token
 ```
 
 A token in the environment, exported or injected, is readable: `block_auth_token`

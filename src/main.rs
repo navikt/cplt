@@ -12709,6 +12709,22 @@ fn run_config_set_via(
     } else {
         None
     };
+    // A deny on the root or the firmlink root is refused at launch; refuse it
+    // here first (#1156).
+    if key == "deny.paths" && !unset {
+        for val in values {
+            let path = match config::canonicalize_strict(&config::expand_tilde(val)) {
+                Ok(c) => c,
+                // `/.nofollow`: the root in disguise.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => PathBuf::from("/"),
+                Err(_) => continue,
+            };
+            if let Err(e) = sandbox::refuse_filesystem_root(key, &path) {
+                ui::error(&e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     // A grant no launch can honour is refused here, with the same words the
     // launch would have used (#306). Accepting it at write time and refusing it
     // at read time is the same question answered twice, differently — and the
