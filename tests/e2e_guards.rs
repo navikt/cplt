@@ -2949,25 +2949,37 @@ fn git_gate_refuses_a_push_redirected_by_git_dir_in_the_environment() {
 }
 
 #[test]
-fn git_gate_refuses_transport_programs_set_in_the_environment() {
+fn git_gate_refuses_a_push_when_a_transport_env_var_changed_since_launch() {
     let launch = temp_repo_live("navikt/cplt", "main", &["feature/x"]);
-    let facts = launch_facts(launch.path());
+    let plain = launch_facts(launch.path());
     let push = ["push", "origin", "feature/x"];
-    let (_, stderr, ok) = git_gate_protect_default_with_env(launch.path(), &facts, &[], &push);
-    assert!(ok, "a feature push must stay allowed.\n{stderr}");
+    let x = std::path::Path::new("/x/ssh");
+    let y = std::path::Path::new("/y/ssh");
     for name in [
         "GIT_SSH_COMMAND",
         "GIT_SSH",
         "GIT_SSH_VARIANT",
         "GIT_PROXY_COMMAND",
     ] {
-        let (_, stderr, ok) = git_gate_protect_default_with_env(
-            launch.path(),
-            &facts,
-            &[(name, std::path::Path::new("/x/ssh"))],
-            &push,
-        );
+        // Set at launch: the same value pushes, another value is refused.
+        let mut facts: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        facts["transport_env"] = serde_json::json!({ name: "/x/ssh" });
+        let facts = facts.to_string();
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &facts, &[(name, x)], &push);
+        assert!(ok, "{name} unchanged must push.\n{stderr}");
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &facts, &[(name, y)], &push);
         assert_refused(&stderr, ok, name);
+        let (_, stderr, ok) = git_gate_protect_default_with_env(launch.path(), &facts, &[], &push);
+        assert_refused(&stderr, ok, name);
+        // Unset at launch: setting it refuses the push, nothing else.
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &plain, &[(name, x)], &push);
+        assert_refused(&stderr, ok, name);
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &plain, &[(name, x)], &["status"]);
+        assert!(ok, "{name} must not refuse a non-push.\n{stderr}");
     }
 }
 

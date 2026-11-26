@@ -5195,7 +5195,8 @@ const SENSITIVE_CONFIG_PREFIXES: &[&str] = &[
 
 /// Environment variables that choose the transport program for a push, the
 /// environment form of `core.sshCommand`, `ssh.variant` and `core.gitProxy`.
-const TRANSPORT_ENV_VARS: &[&str] = &[
+/// Their values are recorded at launch; a push under a changed value is refused.
+pub const TRANSPORT_ENV_VARS: &[&str] = &[
     "GIT_SSH_COMMAND",
     "GIT_SSH",
     "GIT_SSH_VARIANT",
@@ -5707,21 +5708,6 @@ pub fn gate_git(
         });
     }
 
-    if prevent_push
-        && let Some(name) = TRANSPORT_ENV_VARS
-            .iter()
-            .find(|n| std::env::var_os(n).is_some_and(|v| !v.is_empty()))
-    {
-        return Err(Refusal {
-            headline: format!("{name} is not allowed while push prevention is active."),
-            guidance: format!(
-                "{name} picks the program that connects to the remote, so the guard could not tell which\n\
-                 repository a push writes to. Unset it, or start cplt without it."
-            ),
-            agent_note: &[NOTE],
-        });
-    }
-
     if (prevent_push || prevent_force_push)
         && let Some((flag, key)) = injected_sensitive_config_key(&args[..i])
     {
@@ -5941,6 +5927,19 @@ pub fn gate_git(
     // The transport settings recorded at launch still apply. `core.sshCommand`
     // and friends decide where an ssh:// or git:// push connects without
     // changing its URL, so a push URL check alone says nothing once they move.
+    if prevent_push
+        && sub == "push"
+        && let Some(name) = repo_facts.changed_transport_env(std::env::vars())
+    {
+        return Err(Refusal {
+            headline: format!("{name} differs from its value when this session started."),
+            guidance: format!(
+                "{name} picks the program that connects to the remote, so it is recorded at launch.\n\
+                 Restore it, or start a new session with the value you need."
+            ),
+            agent_note: &[NOTE],
+        });
+    }
     if prevent_push
         && sub == "push"
         && (protect_default_branch_only || !allow_push_rules.is_empty())
@@ -6974,6 +6973,15 @@ fn unsafe_push_config(real_git: &Path, repo_args: &[&str]) -> Option<String> {
         })
 }
 
+/// The non-empty [`TRANSPORT_ENV_VARS`] in `vars`. An empty value counts as
+/// unset, as git treats it.
+pub fn transport_env(
+    vars: impl Iterator<Item = (String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    vars.filter(|(k, v)| !v.is_empty() && TRANSPORT_ENV_VARS.contains(&k.as_str()))
+        .collect()
+}
+
 /// The transport settings (`core.sshCommand`, `core.gitProxy`, `ssh.*`) git
 /// sees in the repository `repo_args` targets, as raw `config -z` output.
 /// `None` when git cannot answer.
@@ -7125,6 +7133,10 @@ pub struct RepoFacts {
     /// is refused when they differ at gate time.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub transport_config: String,
+    /// [`TRANSPORT_ENV_VARS`] the agent started with. Set by the launch from
+    /// the child's environment.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub transport_env: std::collections::BTreeMap<String, String>,
     /// The session's managed worktree root (`$CPLT_WORKTREE_ROOT`), the only
     /// place `git worktree add` may target (#962). Baked into the wrapper:
     /// the agent can set the env var to anything.
@@ -7257,6 +7269,19 @@ impl RepoFacts {
         };
         let member = self.target(repo_args, Some(git)).unwrap_or(self);
         transport_config(git, repo_args).is_some_and(|now| now == member.transport_config)
+    }
+
+    /// The first [`TRANSPORT_ENV_VARS`] entry whose value in `vars` differs
+    /// from the one recorded at launch.
+    fn changed_transport_env(
+        &self,
+        vars: impl Iterator<Item = (String, String)>,
+    ) -> Option<&'static str> {
+        let now = transport_env(vars);
+        TRANSPORT_ENV_VARS
+            .iter()
+            .copied()
+            .find(|name| now.get(*name) != self.transport_env.get(*name))
     }
 
     /// Whether `remote` still pushes to the URLs captured for it at launch.

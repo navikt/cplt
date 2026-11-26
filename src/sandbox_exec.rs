@@ -258,6 +258,15 @@ fn configure_command(
         for (key, val) in &sandbox_env.vars {
             cmd.env(key, val);
         }
+        // Spell out the inherited transport vars, so the git guard can record
+        // the child's value from `cmd` alone.
+        for name in crate::gh_proxy::TRANSPORT_ENV_VARS {
+            if let Some(v) = std::env::var_os(name)
+                && !cmd.get_envs().any(|(k, _)| k == *name)
+            {
+                cmd.env(name, v);
+            }
+        }
     }
 
     // After the filtered env, so a parent `YARN_IGNORE_SCRIPTS=false` that the
@@ -1181,6 +1190,10 @@ fn install_command_wrappers(
         let ask_remote = git_guard.enabled && git_guard.protect_default_branch_only;
         let (mut repo_facts, has_remotes) =
             crate::gh_proxy::session_repo_facts(project_dir, repo_dirs, ask_remote);
+        repo_facts.transport_env = crate::gh_proxy::transport_env(
+            cmd.get_envs()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string()))),
+        );
         // Baked, not read from the agent's env, which it can rewrite (#962).
         if let Some(root) = worktree_root {
             repo_facts.worktree_root = root.to_string_lossy().into_owned();
