@@ -10596,6 +10596,7 @@ deny_nested_git = false
 readonly_host_tool_paths = false
 refuse_cache_exec_links = false
 refuse_unenforced = false
+strict_macos_reads = false
 deny_key_files_by_extension = false
 protect_pnpm_config = false
 refuse_invalid_repo_config = false
