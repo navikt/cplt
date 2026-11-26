@@ -3207,6 +3207,48 @@ mod gh_config_dir_pin_tests {
 }
 
 #[cfg(test)]
+mod git_transport_env_record_tests {
+    /// The git wrapper records the transport env vars the agent starts with,
+    /// so the gate can compare them at push time.
+    #[test]
+    fn installed_git_wrapper_records_the_child_transport_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let gh_guard = crate::config::GhGuardPolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        let git_guard = crate::config::GitGuardPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        #[allow(clippy::disallowed_methods)] // absolute path, never run: only carries env
+        let mut cmd = std::process::Command::new("/usr/bin/true");
+        cmd.env("GIT_SSH_COMMAND", "ssh -i key");
+        super::install_command_wrappers(
+            &mut cmd,
+            &scratch,
+            tmp.path(),
+            &[],
+            &gh_guard,
+            &git_guard,
+            true,
+            None,
+            None,
+            None,
+        );
+        let Ok(script) = std::fs::read_to_string(scratch.join("bin/git")) else {
+            return; // no git available
+        };
+        assert!(
+            script.contains(r#""transport_env":{"GIT_SSH_COMMAND":"ssh -i key"}"#),
+            "{script}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod gh_token_extraction_tests {
     use super::*;
     use std::time::{Duration, Instant};

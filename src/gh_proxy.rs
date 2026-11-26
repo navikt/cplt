@@ -7920,6 +7920,7 @@ pub fn generate_git_wrapper_script(
         && repo_facts.named.is_empty()
         && repo_facts.worktree_root.is_empty()
         && repo_facts.git_common_dir.is_empty()
+        && repo_facts.transport_env.is_empty()
     {
         String::new()
     } else {
