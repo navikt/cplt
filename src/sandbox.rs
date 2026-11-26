@@ -4360,12 +4360,10 @@ fn ro_protect_paths(
 
     // Host login and autostart files: Landlock cannot subtract them from a
     // user `allow.write` on `~` or `~/.config`, so the bind is the control.
-    // Missing paths cannot be bound, and without bwrap nothing applies.
-    ro_protect.extend(
-        host_persistence_protect_paths(config)
-            .into_iter()
-            .filter(|p| p.symlink_metadata().is_ok()),
-    );
+    // Without bwrap nothing applies.
+    // Missing ones too: `build_bwrap_args` binds what exists when it runs,
+    // and the probe launch can create a masked path's mountpoint first.
+    ro_protect.extend(host_persistence_protect_paths(config));
 
     ro_protect.sort();
     ro_protect.dedup();

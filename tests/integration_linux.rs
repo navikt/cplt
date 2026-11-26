@@ -3463,6 +3463,7 @@ print('BIND_OK')
         let h = &home.path().canonicalize().unwrap();
         let project = h.join("project");
         fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(h.join(".config")).unwrap();
         let mut cmd = cplt_cmd();
         crate::common::with_scratch_home(&mut cmd);
         let out = cmd
