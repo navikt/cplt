@@ -418,14 +418,15 @@ pub(crate) fn test_functionality(
         return Err("bwrap test failed: forced by test".to_string());
     }
     let mut args = build_bwrap_args(fs_rules, overlays, deny_masks);
-    // Inspect names the placeholder without creating it (#1198). Probe the
+    // Inspect names the placeholder without creating it (#1198), and whatever
+    // sits at that path is not cplt's (it may be a planted link). Probe the
     // same plan with `/dev/null`, which always exists, as the file-mask source
     // and without the placeholder's self-mask, so availability is judged as a
     // launch judges it and the printed plan keeps the launch's shape.
     if let Some(ph) = deny_masks
         .placeholder
         .as_deref()
-        .filter(|p| p.symlink_metadata().is_err())
+        .filter(|_| !deny_masks.placeholder_created)
     {
         let ph = ph.to_string_lossy();
         if let Some(i) = args
@@ -932,6 +933,10 @@ pub(crate) struct DenyMasks {
     /// Mode-000 empty source file bound over each entry in `files`; lives in
     /// the per-session scratch dir. `None` when `files` is empty.
     placeholder: Option<PathBuf>,
+    /// Whether this plan created `placeholder`. When it only named it
+    /// (inspect-only), the path is never trusted: it may be anything the agent
+    /// left in the cache, so the probe swaps it out.
+    placeholder_created: bool,
     /// Deny targets that could not be mount-masked (under a bwrap-managed
     /// mount or `/tmp`, no longer resolvable, or file masks with no usable
     /// placeholder). The caller warns about these when the wrapper is active.
@@ -1036,15 +1041,18 @@ impl DenyMasks {
 /// One that cannot be masked is not put in `skipped`, which reports the
 /// user's deny paths; the caller asks [`DenyMasks::covers`] and warns itself.
 ///
-/// With `inspect_only` the placeholder is only named, never created: inspect
-/// writes nothing to the host (#1198), and [`test_functionality`] probes
-/// without it.
+/// Without `create` the placeholder is only named, never created or touched:
+/// inspect-only runs write nothing to the host (#1198), and
+/// [`test_functionality`] probes without it. The caller decides, because only
+/// it knows whether `scratch_dir` is a real session dir (a launch, or `cplt
+/// check`'s live probes) or the would-be path under the agent-writable cache,
+/// where whatever already sits there must not be followed.
 pub(crate) fn plan_deny_masks(
     extra_deny: &[PathBuf],
     socket_masks: &[PathBuf],
     credentials: &[CredentialLink],
     scratch_dir: Option<&Path>,
-    inspect_only: bool,
+    create: bool,
 ) -> DenyMasks {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1129,13 +1137,10 @@ pub(crate) fn plan_deny_masks(
         None
     } else {
         match scratch_dir.map(|s| {
-            // `cplt check` inspects with a real scratch dir and runs probes under
-            // bwrap, which binds the placeholder: create it there. A planned
-            // (not yet existing) scratch dir stays untouched (#1198).
-            if inspect_only && !s.is_dir() {
-                Ok(s.join(MASK_PLACEHOLDER))
-            } else {
+            if create {
                 create_mask_placeholder(s)
+            } else {
+                Ok(s.join(MASK_PLACEHOLDER))
             }
         }) {
             Some(Ok(path)) => Some(path),
@@ -1194,6 +1199,7 @@ pub(crate) fn plan_deny_masks(
     DenyMasks {
         dirs: kept_dirs,
         files,
+        placeholder_created: create && placeholder.is_some(),
         placeholder,
         skipped,
         socket_masks,
@@ -1213,7 +1219,7 @@ pub(crate) fn build_deny_masks(
     credentials: &[CredentialLink],
     scratch_dir: Option<&Path>,
 ) -> DenyMasks {
-    plan_deny_masks(extra_deny, socket_masks, credentials, scratch_dir, false)
+    plan_deny_masks(extra_deny, socket_masks, credentials, scratch_dir, true)
 }
 
 const MASK_PLACEHOLDER: &str = "deny-mask";
@@ -3384,6 +3390,92 @@ mod tests {
             tmpfs_pos > last_bind_pos,
             "dir masks must come after every bind so they shadow them"
         );
+    }
+
+    /// Inspect-only plans name the placeholder in the would-be scratch dir but
+    /// create nothing there, even when that dir already exists, and print the
+    /// same arguments a launch would.
+    #[test]
+    fn deny_mask_plan_without_create_writes_nothing() {
+        let base = non_tmp_tempdir();
+        let secret = base.path().join("token.txt");
+        std::fs::write(&secret, "s").expect("write");
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch");
+
+        let planned = plan_deny_masks(
+            std::slice::from_ref(&secret),
+            &[],
+            &[],
+            Some(&scratch),
+            false,
+        );
+        assert_eq!(planned.mask_count(), 1);
+        assert_eq!(planned.placeholder, Some(scratch.join(MASK_PLACEHOLDER)));
+        assert!(!planned.placeholder_created);
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "an inspect-only plan must create nothing"
+        );
+
+        let launched = build_deny_masks(std::slice::from_ref(&secret), &[], &[], Some(&scratch));
+        assert_eq!(
+            build_bwrap_args(&[], Overlays::default(), &planned),
+            build_bwrap_args(&[], Overlays::default(), &launched),
+            "the plan must print what a launch builds"
+        );
+    }
+
+    /// Whatever sits at the would-be scratch path is agent-controlled: a link
+    /// there, or at the placeholder name, must not be written through.
+    #[test]
+    fn deny_mask_plan_without_create_ignores_planted_links() {
+        use std::os::unix::fs::symlink;
+        let base = non_tmp_tempdir();
+        let secret = base.path().join("token.txt");
+        std::fs::write(&secret, "s").expect("write");
+        let target = base.path().join("elsewhere");
+        std::fs::create_dir(&target).expect("target");
+
+        let scratch = base.path().join("scratch");
+        symlink(&target, &scratch).expect("planted dir link");
+        let masks = plan_deny_masks(
+            std::slice::from_ref(&secret),
+            &[],
+            &[],
+            Some(&scratch),
+            false,
+        );
+        assert!(masks.placeholder.is_some());
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing may be created through a planted scratch link"
+        );
+
+        let scratch2 = base.path().join("scratch2");
+        std::fs::create_dir(&scratch2).expect("scratch2");
+        let victim = base.path().join("victim");
+        std::fs::write(&victim, "keep").expect("victim");
+        symlink(&victim, scratch2.join(MASK_PLACEHOLDER)).expect("planted file link");
+        plan_deny_masks(
+            std::slice::from_ref(&secret),
+            &[],
+            &[],
+            Some(&scratch2),
+            false,
+        );
+        assert!(
+            scratch2
+                .join(MASK_PLACEHOLDER)
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link must be left alone"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
     }
 
     #[test]

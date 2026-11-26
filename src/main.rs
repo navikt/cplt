@@ -8150,6 +8150,9 @@ fn assemble_sandbox(
     };
     // Inspect-only runs create nothing (#1198): they plan with the path a
     // session dir would get, so the printed policy matches a launch's.
+    // The deny-mask placeholder goes only into a real session dir: the
+    // would-be path sits in the agent-writable cache.
+    let create_mask_placeholder = !opts.inspect_only || opts.live_probes;
     let would_be_scratch = (resolved.scratch_dir && opts.inspect_only)
         .then(|| scratch::ScratchDir::would_be(home_dir));
     let scratch_path = scratch_guard
@@ -8643,7 +8646,7 @@ fn assemble_sandbox(
             })
             .ok();
         }
-        let mut refused = sandbox::mcp_broker_refusal(&sandbox_config, opts.inspect_only);
+        let mut refused = sandbox::mcp_broker_refusal(&sandbox_config, create_mask_placeholder);
         // A launch, not `--print-profile`: offer the host fix, then judge again.
         if refused.is_some()
             && !opts.inspect_only
@@ -8652,7 +8655,7 @@ fn assemble_sandbox(
             ui::warn(refused.as_deref().unwrap_or_default());
             let fixed = || sandbox::mcp_wrapper_error(&sandbox_config).is_none();
             if cplt::host_fix::offer(p, resolved.yes, false, Some(home_dir), &fixed) {
-                refused = sandbox::mcp_broker_refusal(&sandbox_config, opts.inspect_only);
+                refused = sandbox::mcp_broker_refusal(&sandbox_config, create_mask_placeholder);
             }
         }
         if let Some(why) = refused {
@@ -8705,7 +8708,7 @@ fn assemble_sandbox(
     }
     let mcp_refusal = opts
         .mcp_probe
-        .then(|| sandbox::mcp_broker_refusal(&sandbox_config, opts.inspect_only))
+        .then(|| sandbox::mcp_broker_refusal(&sandbox_config, create_mask_placeholder))
         .flatten();
     let read_denies = sandbox::ReadDenies::from_config_for_current_os(&sandbox_config);
     // Here, not at each caller: the launch, `exec` and `check` all build their
@@ -8746,9 +8749,13 @@ fn assemble_sandbox(
     }
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
-    let mut prepared =
-        sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut prepared = sandbox::prepare_with_pnpm_shadow(
+        &sandbox_config,
+        pnpm_shadow_path,
+        opts.inspect_only,
+        create_mask_placeholder,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     #[cfg(target_os = "linux")]
     if resolved.netns {
         prepared.check_netns().map_err(|e| anyhow::anyhow!("{e}"))?;

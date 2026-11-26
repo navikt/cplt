@@ -6562,4 +6562,52 @@ PY"#;
         assert!(stdout.contains("SOCK=[]"), "{ctx}");
         assert!(stderr.contains("deny path"), "{ctx}");
     }
+
+    /// Inspect-only paths create nothing on the host: `--print-profile` with a
+    /// file deny mask names the placeholder in the would-be scratch dir, but
+    /// leaves that dir, which lives in the agent-writable cache, untouched,
+    /// including a link already sitting at the placeholder name.
+    #[test]
+    fn print_profile_leaves_would_be_scratch_untouched() {
+        let fixture = tempdir_outside_tmp();
+        let home = fixture.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let secret = fixture.path().join("secret.txt");
+        fs::write(&secret, "s").unwrap();
+        let victim = fixture.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let would_be = cplt::scratch::ScratchDir::would_be(&home);
+        fs::create_dir_all(&would_be).unwrap();
+        let planted = would_be.join("deny-mask");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let project = create_test_project();
+
+        let out = cplt_cmd()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .args(["--print-profile", "--no-proxy", "--project-dir"])
+            .arg(project.path())
+            .arg("--deny-path")
+            .arg(&secret)
+            .output()
+            .unwrap();
+        let ctx = format!(
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{ctx}");
+        assert!(
+            fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link was replaced: {ctx}"
+        );
+        assert_eq!(fs::read_dir(&would_be).unwrap().count(), 1, "{ctx}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep", "{ctx}");
+    }
 }
