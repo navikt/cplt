@@ -3492,6 +3492,17 @@ mod tests {
             config.agent = crate::agent::Agent::OpenCode;
             config.agent_dirs = &dirs;
             let policy = generate_policy(&config);
+            // The fixture must sit outside every tree the policy grants by
+            // itself (a checkout under a temp dir puts `target/` in one).
+            let bare = generate_policy(&test_config(&project, &home));
+            if let Some((_, tree)) = crate::check::writable_tree_on_path(&bare, &home, &oc) {
+                eprintln!(
+                    "skipped: fixture home {} is inside always-writable {}; move the checkout",
+                    home.display(),
+                    tree.display()
+                );
+                return;
+            }
             assert!(
                 policy
                     .fs_rules
@@ -3505,6 +3516,29 @@ mod tests {
             );
             // The plain helper still sees the rule: the exemption is scoped.
             assert!(crate::check::writable_on_or_under(&policy, &home, &oc).is_some());
+            // Only for the dir the agent dir names: asked through another
+            // spelling of it, the same rule counts.
+            let alias = t.join("alias");
+            std::os::unix::fs::symlink(&oc, &alias).unwrap();
+            assert_eq!(
+                crate::opencode_v2::config_dir_writable(&policy, &home, &alias),
+                Some(oc.join("auth.json"))
+            );
+            // Planted at the exempt path: a live or dangling symlink, or a
+            // FIFO, is not cplt's plain file and refuses.
+            let auth = oc.join("auth.json");
+            let check = || crate::opencode_v2::config_dir_writable(&policy, &home, &oc);
+            std::fs::remove_file(&auth).unwrap();
+            std::os::unix::fs::symlink(oc.join("opencode.json"), &auth).unwrap();
+            assert_eq!(check(), Some(auth.clone()), "live symlink");
+            std::fs::remove_file(&auth).unwrap();
+            std::os::unix::fs::symlink(oc.join("missing"), &auth).unwrap();
+            assert_eq!(check(), Some(auth.clone()), "dangling symlink");
+            std::fs::remove_file(&auth).unwrap();
+            crate::untrusted::tests::mkfifo(&auth);
+            assert_eq!(check(), Some(auth.clone()), "fifo");
+            std::fs::remove_file(&auth).unwrap();
+            std::fs::write(&auth, "{}").unwrap();
 
             let extra = [oc.join("opencode.json")];
             let mut config = test_config(&project, &home);
