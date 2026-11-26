@@ -3053,22 +3053,40 @@ fn real_push_git_dir_redirect_is_not_the_launch_repository() {
 }
 
 #[test]
-fn real_push_deletion_counts_as_force() {
+fn real_push_feature_branch_deletion_allowed() {
     let (_t, work, origin) = pushed_repo("main");
     let facts = launch_facts(&work);
-    assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
     for (policy, args) in [
-        (PROTECT, &["push", "origin", ":victim"][..]),
-        (FORCE_ONLY, &["push", "origin", ":victim"]),
-        (FORCE_ONLY, &["push", "origin", "--delete", "victim"]),
+        (PROTECT, &["push", "-q", "origin", ":victim"][..]),
+        (PROTECT, &["push", "-q", "origin", "--delete", "victim"]),
+        (FORCE_ONLY, &["push", "-q", "origin", ":victim"]),
+        (FORCE_ONLY, &["push", "-q", "-d", "origin", "victim"]),
+    ] {
+        assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
+        let (stderr, ok) = real_push_gate(&work, &facts, policy, &[], args);
+        assert!(ok, "{args:?}: {stderr}");
+        assert_eq!(remote_ref(&origin, "refs/heads/victim"), None, "{args:?}");
+    }
+}
+
+#[test]
+fn real_push_default_branch_deletion_and_mirror_refused() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let before = remote_ref(&origin, "refs/heads/main");
+    assert!(before.is_some());
+    for (policy, args) in [
+        (PROTECT, &["push", "origin", ":main"][..]),
+        (PROTECT, &["push", "origin", "--delete", "main"]),
+        (FORCE_ONLY, &["push", "origin", ":main"]),
+        (FORCE_ONLY, &["push", "origin", "--delete", "main"]),
+        (FORCE_ONLY, &["push", "origin", ":refs/heads/main"]),
         (FORCE_ONLY, &["push", "--mirror", "origin"]),
+        (FORCE_ONLY, &["push", "--prune", "origin", "feat"]),
     ] {
         let (stderr, ok) = real_push_gate(&work, &facts, policy, &[], args);
         assert_refused(&stderr, ok, "not allowed");
-        assert!(
-            remote_ref(&origin, "refs/heads/victim").is_some(),
-            "{args:?}"
-        );
+        assert_eq!(remote_ref(&origin, "refs/heads/main"), before, "{args:?}");
     }
 }
 

@@ -4817,18 +4817,54 @@ fn push_positionals<'a>(push_args: &[&'a str]) -> Vec<&'a str> {
 /// flag at all. The refspec form is checked only against positionals so a `+` in a
 /// flag value can't produce a false positive.
 fn push_is_force(push_args: &[&str]) -> bool {
-    // Deleting or mirroring discards remote history the same way a force does.
+    // Mirroring and pruning discard remote refs the way a force does. Deleting
+    // one named branch is judged separately, by [`push_deletes_protected`].
     if push_args
         .iter()
-        .any(|a| is_force_push_flag(a) || matches!(*a, "--delete" | "-d" | "--mirror" | "--prune"))
+        .any(|a| is_force_push_flag(a) || matches!(*a, "--mirror" | "--prune"))
     {
         return true;
     }
-    // `+src:dst` forces; `:dst` (an empty source) deletes `dst`. A lone `:` is
-    // the matching push, not a deletion.
     push_positionals(push_args)
         .iter()
-        .any(|a| a.starts_with('+') || (a.starts_with(':') && a.len() > 1))
+        .any(|a| a.starts_with('+'))
+}
+
+fn push_is_delete(push_args: &[&str]) -> bool {
+    push_args.iter().any(|a| matches!(*a, "--delete" | "-d"))
+}
+
+/// Whether a push deletes anything other than an ordinary, unprotected
+/// branch: the default branch, a `main`/`master` floor name, a tag or other
+/// non-branch ref, or a name git could expand on the remote (`heads/x`).
+/// Deleting a feature branch stays allowed under force-push prevention.
+fn push_deletes_protected(push_args: &[&str], default_branch: Option<&str>) -> bool {
+    let positionals = push_positionals(push_args);
+    let refspecs = if positionals.len() == 1 && positionals[0].contains(':') {
+        &positionals[..]
+    } else {
+        positionals.get(1..).unwrap_or(&[])
+    };
+    let deleting = push_is_delete(push_args);
+    refspecs
+        .iter()
+        .filter_map(|spec| {
+            let bare = spec.strip_prefix('+').unwrap_or(spec);
+            if deleting {
+                Some(bare)
+            } else {
+                bare.strip_prefix(':').filter(|d| !d.is_empty())
+            }
+        })
+        .any(|name| {
+            let b = name.strip_prefix("refs/heads/").unwrap_or(name);
+            b.is_empty()
+                || b.contains('*')
+                || ["refs/", "heads/", "tags/"]
+                    .iter()
+                    .any(|p| b.starts_with(p))
+                || is_protected_branch(b, default_branch)
+        })
 }
 
 /// Config key prefixes that can redirect where a push lands (`remote.*`, `url.*`,
@@ -5769,7 +5805,13 @@ pub fn gate_git(
 
     if !prevent_push && prevent_force_push && sub == "push" {
         let push_args = &args[i + 1..];
-        let has_force = push_forces(push_args, real_git, &repo_args);
+        let default_branch = repo_facts.default_branch(
+            &push_dest_remote(push_args, real_git, &repo_args),
+            &repo_args,
+            real_git,
+        );
+        let has_force = push_forces(push_args, real_git, &repo_args)
+            || push_deletes_protected(push_args, default_branch);
         if has_force {
             return Err(Refusal {
                 headline: "'git push --force' is not allowed in this environment.".to_string(),
@@ -6095,9 +6137,11 @@ fn push_target_branches(
         // destination through `remote.<dest>.push`, or to the upstream under
         // `push.default=upstream`/`tracking`, so its own name is not
         // necessarily where it lands. Those configurations cannot be bound.
-        if refspecs
-            .iter()
-            .any(|s| !s.strip_prefix('+').unwrap_or(s).contains(':'))
+        let deleting = push_is_delete(push_args);
+        if !deleting
+            && refspecs
+                .iter()
+                .any(|s| !s.strip_prefix('+').unwrap_or(s).contains(':'))
         {
             let Some(git) = real_git else {
                 return PushTargets::Unconstrainable;
@@ -6115,9 +6159,14 @@ fn push_target_branches(
         let mut branches = Vec::new();
         for spec in refspecs {
             let bare = spec.strip_prefix('+').unwrap_or(spec);
-            if bare.contains(':') {
+            if bare.contains(':') || deleting {
                 // Explicit destination: a remote-side ref NAME, taken literally.
-                let dst = refspec_target_branch(bare);
+                // With `--delete` every refspec is such a name.
+                let dst = if deleting {
+                    bare.strip_prefix("refs/heads/").unwrap_or(bare)
+                } else {
+                    refspec_target_branch(bare)
+                };
                 // `:` and `src:` push the matching set; a `*` destination is a
                 // multi-ref pattern. Neither can be enumerated against a glob.
                 if dst.is_empty() || dst.contains('*') {
@@ -10574,19 +10623,30 @@ mod tests {
     }
 
     #[test]
-    fn push_is_force_counts_deletion_and_mirror() {
-        for args in [
-            &["origin", "--delete", "x"][..],
-            &["-d", "origin", "x"],
-            &["origin", ":x"],
-            &["origin", "+:x"],
-            &["--mirror", "origin"],
-            &["--prune", "origin", "feat"],
-        ] {
-            assert!(push_is_force(args), "{args:?}");
-        }
+    fn push_is_force_counts_mirror_and_judges_deletion_by_branch() {
+        assert!(push_is_force(&["--mirror", "origin"]));
+        assert!(push_is_force(&["--prune", "origin", "feat"]));
         assert!(!push_is_force(&["origin", ":"]));
-        assert!(!push_is_force(&["origin", "feat:feat"]));
+        assert!(!push_is_force(&["origin", ":feat"]));
+        assert!(!push_is_force(&["origin", "--delete", "feat"]));
+        for args in [
+            &["origin", "--delete", "main"][..],
+            &["-d", "origin", "trunk"],
+            &["origin", ":main"],
+            &[":refs/heads/trunk"],
+            &["origin", ":refs/tags/v1"],
+            &["origin", "--delete", "tags/v1"],
+        ] {
+            assert!(push_deletes_protected(args, Some("trunk")), "{args:?}");
+        }
+        for args in [
+            &["origin", "--delete", "feat"][..],
+            &["origin", ":feat"],
+            &["origin", "feat:feat", ":old"],
+            &["origin", "main:main"],
+        ] {
+            assert!(!push_deletes_protected(args, Some("trunk")), "{args:?}");
+        }
     }
 
     #[test]
