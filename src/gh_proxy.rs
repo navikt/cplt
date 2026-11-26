@@ -5043,12 +5043,102 @@ fn push_positionals<'a>(push_args: &[&'a str]) -> Vec<&'a str> {
 /// flag at all. The refspec form is checked only against positionals so a `+` in a
 /// flag value can't produce a false positive.
 fn push_is_force(push_args: &[&str]) -> bool {
-    if push_args.iter().any(|a| is_force_push_flag(a)) {
+    // Mirroring and pruning discard remote refs the way a force does. Deleting
+    // one named branch is judged separately, by [`push_deletion_refused`].
+    if push_args
+        .iter()
+        .any(|a| is_force_push_flag(a) || matches!(*a, "--mirror" | "--prune"))
+    {
         return true;
     }
     push_positionals(push_args)
         .iter()
         .any(|a| a.starts_with('+'))
+}
+
+fn push_is_delete(push_args: &[&str]) -> bool {
+    push_args.iter().any(|a| matches!(*a, "--delete" | "-d"))
+}
+
+/// The remote refs a push deletes: every refspec under `--delete`/`-d`, and
+/// each `:dst` refspec otherwise. A lone `:` is the matching push, not a
+/// deletion.
+fn push_deleted_refs<'a>(push_args: &[&'a str]) -> Vec<&'a str> {
+    let positionals = push_positionals(push_args);
+    let refspecs = if positionals.len() == 1 && positionals[0].contains(':') {
+        &positionals[..]
+    } else {
+        positionals.get(1..).unwrap_or(&[])
+    };
+    let deleting = push_is_delete(push_args);
+    refspecs
+        .iter()
+        .filter_map(|spec| {
+            let bare = spec.strip_prefix('+').unwrap_or(spec);
+            if deleting {
+                Some(bare)
+            } else {
+                bare.strip_prefix(':').filter(|d| !d.is_empty())
+            }
+        })
+        .collect()
+}
+
+/// The first deleted ref that is not provably an ordinary, unprotected branch.
+///
+/// Deleting a feature branch stays allowed under force-push prevention. Not
+/// allowed: an unknown default branch (fail closed), the default branch or a
+/// `main`/`master` floor name, a non-branch ref, a name git could expand on the
+/// remote (`heads/x`), and a bare name that `is_plain_remote_branch` does not
+/// confirm — git resolves a bare `v0` to the tag when one exists.
+fn push_deletion_refused<'a>(
+    push_args: &[&'a str],
+    default_branch: Option<&str>,
+    is_plain_remote_branch: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    push_deleted_refs(push_args).into_iter().find(|name| {
+        let qualified = name.strip_prefix("refs/heads/");
+        let b = qualified.unwrap_or(name);
+        default_branch.is_none()
+            || b.is_empty()
+            || b.contains('*')
+            || ["refs/", "heads/", "tags/"]
+                .iter()
+                .any(|p| b.starts_with(p))
+            || is_protected_branch(b, default_branch)
+            || (qualified.is_none() && !is_plain_remote_branch(b))
+    })
+}
+
+/// Whether every URL a push to `remote` writes to has `refs/heads/<name>` and
+/// no `refs/tags/<name>`. Probes the push URLs (`pushurl`, `pushInsteadOf`
+/// applied), not the fetch URL. No resolvable push URL means no.
+/// `ls-remote` patterns match on a path tail, so the refs are compared whole.
+fn remote_has_only_branch(real_git: &Path, repo_args: &[&str], remote: &str, name: &str) -> bool {
+    let urls = push_urls(real_git, repo_args, remote);
+    !urls.is_empty()
+        && urls.iter().all(|url| {
+            // `ls-remote` applies `url.*.insteadOf` to the URL again; `push`
+            // does not. Probe only a URL that ls-remote leaves unchanged.
+            let unchanged = run_git(real_git, repo_args, &["ls-remote", "--get-url", "--", url])
+                .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == url);
+            if !unchanged {
+                return false;
+            }
+            let Some(out) = run_git(
+                real_git,
+                repo_args,
+                &["ls-remote", "--heads", "--tags", "--", url, name],
+            ) else {
+                return false;
+            };
+            let refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split('\t').nth(1).map(ToString::to_string))
+                .collect();
+            refs.iter().any(|r| *r == format!("refs/heads/{name}"))
+                && !refs.iter().any(|r| *r == format!("refs/tags/{name}"))
+        })
 }
 
 /// Config key prefixes that can redirect where a push lands (`remote.*`, `url.*`,
@@ -5642,12 +5732,14 @@ pub fn gate_git(
 
     // `git subtree push` is a remote write — block it like a bare push while
     // leaving the local subtree forms (add/pull/split/merge) allowed.
-    if prevent_push && sub == "subtree" && is_subtree_push(sub_args) {
+    // `git lfs push` uploads objects to the remote the same way.
+    if prevent_push && matches!(sub, "subtree" | "lfs") && is_subtree_push(sub_args) {
         return Err(Refusal {
-            headline: "'git subtree push' is not allowed in this environment.".to_string(),
-            guidance: "Push prevention is enabled — 'subtree push' performs a remote write.\n\
-                       Local subtree operations (add/pull/split/merge) are still allowed."
-                .to_string(),
+            headline: format!("'git {sub} push' is not allowed in this environment."),
+            guidance: format!(
+                "Push prevention is enabled — '{sub} push' performs a remote write.\n\
+                 Local {sub} operations are still allowed."
+            ),
             agent_note: &[NOTE],
         });
     }
@@ -5674,6 +5766,38 @@ pub fn gate_git(
             ),
             agent_note: &[NOTE],
         });
+    }
+
+    // A deletion is not a force push, but it has to be provably an ordinary
+    // branch: see `push_deletion_refused`.
+    // Skipped when every push is refused below anyway. A namespace
+    // (`--namespace`, GIT_NAMESPACE) moves the remote refs out of what the probe
+    // sees, so a deletion under one is refused.
+    let push_refused_anyway =
+        prevent_push && !protect_default_branch_only && allow_push_rules.is_empty();
+    if sub == "push" && !push_refused_anyway && !push_deleted_refs(sub_args).is_empty() {
+        let remote = push_dest_remote(sub_args, real_git, &repo_args);
+        let namespaced = args[..i].iter().any(|a| a.starts_with("--namespace"))
+            || std::env::var_os("GIT_NAMESPACE").is_some();
+        let default_branch = repo_facts
+            .default_branch(&remote, &repo_args, real_git)
+            .filter(|_| !namespaced);
+        if let Some(name) = push_deletion_refused(sub_args, default_branch, |b| {
+            real_git.is_some_and(|git| remote_has_only_branch(git, &repo_args, &remote, b))
+        }) {
+            return Err(Refusal {
+                headline: format!(
+                    "Deleting '{name}' on '{remote}' is not allowed in this environment."
+                ),
+                guidance: format!(
+                    "Only an ordinary branch of the repository this session was launched in can be deleted:\n\
+                     not the default branch, main or master, and not a tag or other ref. A bare name is\n\
+                     allowed only when the remote has that branch and no tag of the same name.\n\
+                     To delete a feature branch, spell it out: `git push {remote} :refs/heads/<branch>`."
+                ),
+                agent_note: &[NOTE],
+            });
+        }
     }
 
     // Recursive submodule pushes run through git's own child git, not this
@@ -5802,12 +5926,14 @@ pub fn gate_git(
             if is_feature_branch {
                 // Feature branch push allowed, but still enforce force-push prevention
                 if prevent_force_push {
-                    let has_force = push_is_force(push_args);
+                    let has_force = push_forces(push_args, real_git, &repo_args);
                     if has_force {
                         return Err(Refusal {
-                            headline: "'git push --force' is not allowed in this environment."
+                            headline: "Force push is not allowed in this environment."
                                 .to_string(),
-                            guidance: "Force push prevention is enabled — regular push to feature branches is allowed but force push is blocked."
+                            guidance: "Force push prevention is enabled — regular push to feature branches is allowed but force push is blocked.\n\
+                                       This includes --force, --mirror, --prune, a `+` refspec, and a `+` refspec or\n\
+                                       `mirror = true` in the remote's git config."
                                 .to_string(),
                             agent_note: &[NOTE],
                         });
@@ -5851,7 +5977,7 @@ pub fn gate_git(
         // Check allow_push exception rules before blocking
         if sub == "push" && !allow_push_rules.is_empty() {
             let push_args = &args[i + 1..];
-            let has_force = push_is_force(push_args);
+            let has_force = push_forces(push_args, real_git, &repo_args);
             // Resolve where the push actually lands, then authorize against
             // EVERY push URL of that destination. A bare `git push` follows
             // git's own remote resolution (`branch.<b>.pushRemote` →
@@ -5975,13 +6101,25 @@ pub fn gate_git(
 
     // If only force push prevention is active (prevent_push=false, prevent_force_push=true),
     // check for force push flags on push commands
+    // `send-pack` is push's plumbing with its own force and mirror spellings;
+    // rather than parse those too, it is refused while force push is.
+    if !prevent_push && prevent_force_push && sub == "send-pack" {
+        return Err(Refusal {
+            headline: "'git send-pack' is not allowed in this environment.".to_string(),
+            guidance: "Force push prevention is enabled — use 'git push' instead.".to_string(),
+            agent_note: &[NOTE],
+        });
+    }
+
     if !prevent_push && prevent_force_push && sub == "push" {
         let push_args = &args[i + 1..];
-        let has_force = push_is_force(push_args);
+        let has_force = push_forces(push_args, real_git, &repo_args);
         if has_force {
             return Err(Refusal {
-                headline: "'git push --force' is not allowed in this environment.".to_string(),
-                guidance: "Force push prevention is enabled — regular push is allowed but force push is blocked."
+                headline: "Force push is not allowed in this environment.".to_string(),
+                guidance: "Force push prevention is enabled — regular push is allowed but force push is blocked.\n\
+                           This includes --force, --mirror, --prune, a `+` refspec, and a `+` refspec or\n\
+                           `mirror = true` in the remote's git config."
                     .to_string(),
                 agent_note: &[NOTE],
             });
@@ -6299,6 +6437,23 @@ fn push_target_branches(
     };
 
     if !refspecs.is_empty() {
+        // A colon-less refspec names only the source. Git maps it to a
+        // destination through `remote.<dest>.push`, or to the upstream under
+        // `push.default=upstream`/`tracking`, so its own name is not
+        // necessarily where it lands. Those configurations cannot be bound.
+        let deleting = push_is_delete(push_args);
+        if !deleting
+            && refspecs
+                .iter()
+                .any(|s| !s.strip_prefix('+').unwrap_or(s).contains(':'))
+        {
+            let Some(git) = real_git else {
+                return PushTargets::Unconstrainable;
+            };
+            if config_redirects_push(git, repo_args, remote_positional) {
+                return PushTargets::Unconstrainable;
+            }
+        }
         // Explicit refspecs override push.default and any configured push
         // refspec, so the destinations are exactly their target refs — but only
         // once the *shape* of each refspec is accounted for. Comparing a token
@@ -6308,12 +6463,26 @@ fn push_target_branches(
         let mut branches = Vec::new();
         for spec in refspecs {
             let bare = spec.strip_prefix('+').unwrap_or(spec);
-            if bare.contains(':') {
+            if bare.contains(':') || deleting {
                 // Explicit destination: a remote-side ref NAME, taken literally.
-                let dst = refspec_target_branch(bare);
+                // With `--delete` every refspec is such a name.
+                let dst = if deleting {
+                    bare.strip_prefix("refs/heads/").unwrap_or(bare)
+                } else {
+                    refspec_target_branch(bare)
+                };
                 // `:` and `src:` push the matching set; a `*` destination is a
                 // multi-ref pattern. Neither can be enumerated against a glob.
                 if dst.is_empty() || dst.contains('*') {
+                    return PushTargets::Unconstrainable;
+                }
+                // A destination outside `refs/heads/` (`refs/tags/x`), or one
+                // git expands on the remote through `refs/<dst>` (`heads/x`,
+                // `tags/x`), is not a plain branch name this check can judge.
+                if ["refs/", "heads/", "tags/"]
+                    .iter()
+                    .any(|p| dst.starts_with(p))
+                {
                     return PushTargets::Unconstrainable;
                 }
                 branches.push(dst.to_string());
@@ -6344,22 +6513,71 @@ fn push_target_branches(
     let Some(git) = real_git else {
         return PushTargets::Unconstrainable; // cannot probe config → fail closed
     };
-    if let Some(mode) = git_config_value(git, repo_args, "push.default")
-        && matches!(mode.as_str(), "matching" | "upstream" | "tracking")
+    if git_config_value(git, repo_args, "push.default").as_deref() == Some("matching")
+        || config_redirects_push(git, repo_args, remote_positional)
     {
-        return PushTargets::Unconstrainable;
-    }
-    let dest_remote = match remote_positional {
-        Some(r) => r.to_string(),
-        None => resolve_push_dest_remote(git, repo_args),
-    };
-    if git_config_value(git, repo_args, &format!("remote.{dest_remote}.push")).is_some() {
         return PushTargets::Unconstrainable;
     }
     match resolve_current_branch(git, repo_args) {
         Some(b) => PushTargets::Branches(vec![b]),
         None => PushTargets::Unconstrainable, // undeterminable branch → fail closed
     }
+}
+
+/// Whether config sends a push somewhere other than the named source branch:
+/// `push.default` `upstream`/`tracking`, a `remote.<dest>.push` refspec, or
+/// `remote.<dest>.mirror`. Read through the real git, so the agent-writable
+/// global and repository config files are both seen.
+fn config_redirects_push(real_git: &Path, repo_args: &[&str], remote: Option<&str>) -> bool {
+    if let Some(mode) = git_config_value(real_git, repo_args, "push.default")
+        && matches!(mode.as_str(), "upstream" | "tracking")
+    {
+        return true;
+    }
+    let remote = remote.map_or_else(
+        || resolve_push_dest_remote(real_git, repo_args),
+        ToString::to_string,
+    );
+    git_config_value(real_git, repo_args, &format!("remote.{remote}.push")).is_some()
+        || remote_mirrors(real_git, repo_args, &remote)
+}
+
+fn remote_mirrors(real_git: &Path, repo_args: &[&str], remote: &str) -> bool {
+    run_git(
+        real_git,
+        repo_args,
+        &[
+            "config",
+            "--bool",
+            "--get",
+            &format!("remote.{remote}.mirror"),
+        ],
+    )
+    .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+}
+
+/// Whether a push forces or deletes, from argv or from the destination's config
+/// (`remote.<dest>.mirror`, a `+` in any `remote.<dest>.push`). Config is only
+/// consulted when git can be queried.
+fn push_forces(push_args: &[&str], real_git: Option<&Path>, repo_args: &[&str]) -> bool {
+    if push_is_force(push_args) {
+        return true;
+    }
+    let Some(git) = real_git else {
+        return false;
+    };
+    let remote = push_dest_remote(push_args, real_git, repo_args);
+    remote_mirrors(git, repo_args, &remote)
+        || run_git(
+            git,
+            repo_args,
+            &["config", "--get-all", &format!("remote.{remote}.push")],
+        )
+        .is_some_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim().starts_with('+'))
+        })
 }
 
 /// Git global flags that redirect which repository a command operates on.
@@ -6750,13 +6968,20 @@ impl RepoFacts {
         let (Some(dir), false) = (dir, self.project_dir.is_empty()) else {
             return false;
         };
-        match (
+        let same_dir = match (
             std::fs::canonicalize(dir),
             std::fs::canonicalize(&self.project_dir),
         ) {
             (Ok(a), Ok(b)) => a == b,
             _ => false,
-        }
+        };
+        // `-C` only moves the working directory; `GIT_DIR` in the environment
+        // still picks the repository. So the common dir must match as well.
+        same_dir
+            && (self.git_common_dir.is_empty()
+                || real_git
+                    .and_then(|git| git_common_dir(git, repo_args))
+                    .is_some_and(|d| d == self.git_common_dir))
     }
 
     /// The baked default branch of `remote`, or `None` when there is no baked
@@ -10861,6 +11086,138 @@ mod tests {
         assert!(branches(&["origin", "HEAD"]).is_none());
         assert!(branches(&["origin"]).is_none()); // bare remote, no git to probe
         assert!(branches(&[]).is_none());
+    }
+
+    #[test]
+    fn push_target_branches_refuses_non_branch_destinations() {
+        let branches = |args: &[&str]| match push_target_branches(args, None, &[]) {
+            PushTargets::Branches(b) => Some(b),
+            PushTargets::Unconstrainable => None,
+        };
+        for dst in [
+            "feat:refs/tags/v1",
+            "feat:refs/notes/x",
+            "feat:heads/release/2026",
+            "feat:tags/v1",
+        ] {
+            assert!(branches(&["origin", dst]).is_none(), "{dst}");
+        }
+        assert_eq!(
+            branches(&["origin", "feat:refs/heads/feat"]),
+            Some(vec!["feat".to_string()])
+        );
+    }
+
+    #[test]
+    fn push_is_force_counts_mirror_and_judges_deletion_by_branch() {
+        assert!(push_is_force(&["--mirror", "origin"]));
+        assert!(push_is_force(&["--prune", "origin", "feat"]));
+        assert!(!push_is_force(&["origin", ":"]));
+        assert!(!push_is_force(&["origin", ":feat"]));
+        assert!(!push_is_force(&["origin", "--delete", "feat"]));
+        let yes = |_: &str| true;
+        for args in [
+            &["origin", "--delete", "main"][..],
+            &["-d", "origin", "trunk"],
+            &["origin", ":main"],
+            &[":refs/heads/trunk"],
+            &["origin", ":refs/tags/v1"],
+            &["origin", "--delete", "tags/v1"],
+        ] {
+            assert!(
+                push_deletion_refused(args, Some("trunk"), yes).is_some(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["origin", "--delete", "feat"][..],
+            &["origin", ":feat"],
+            &["origin", "feat:feat", ":old"],
+            &["origin", "main:main"],
+        ] {
+            assert!(
+                push_deletion_refused(args, Some("trunk"), yes).is_none(),
+                "{args:?}"
+            );
+        }
+        // Unknown default: fail closed.
+        assert!(push_deletion_refused(&["origin", ":refs/heads/feat"], None, yes).is_some());
+        // A bare name the remote does not confirm as a branch only (e.g. a tag).
+        assert!(
+            push_deletion_refused(&["origin", "--delete", "v0"], Some("main"), |_| false).is_some()
+        );
+        assert!(
+            push_deletion_refused(&["origin", ":refs/heads/v0"], Some("main"), |_| false).is_none()
+        );
+    }
+
+    #[test]
+    fn push_target_branches_fails_closed_when_config_redirects_a_named_source() {
+        let Some(git) = git_or_skip() else { return };
+        let (_tmp, repo) = scratch_repo("feat", "https://github.com/o/o.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        let repo_args = ["-C", dir.as_str()];
+        let set = |k: &str, v: Option<&str>| {
+            let mut cmd = std::process::Command::new(&git);
+            cmd.args(["-C", &dir, "config"]);
+            match v {
+                Some(v) => cmd.args([k, v]),
+                None => cmd.args(["--unset", k]),
+            };
+            assert!(cmd.status().unwrap().success());
+        };
+        let enumerated = |args: &[&str]| {
+            matches!(
+                push_target_branches(args, Some(&git), &repo_args),
+                PushTargets::Branches(_)
+            )
+        };
+        assert!(enumerated(&["origin", "feat"]));
+        for (k, v) in [
+            ("push.default", "upstream"),
+            ("push.default", "tracking"),
+            ("remote.origin.push", "refs/heads/feat:refs/heads/main"),
+            ("remote.origin.mirror", "true"),
+        ] {
+            set(k, Some(v));
+            assert!(!enumerated(&["origin", "feat"]), "{k}={v}");
+            assert!(!enumerated(&["origin"]), "{k}={v}");
+            set(k, None);
+        }
+        // An explicit destination is not remapped by config.
+        set("push.default", Some("upstream"));
+        assert!(enumerated(&["origin", "feat:feat"]));
+        set("push.default", None);
+
+        assert!(!push_forces(&["origin", "feat"], Some(&git), &repo_args));
+        set(
+            "remote.origin.push",
+            Some("+refs/heads/feat:refs/heads/feat"),
+        );
+        assert!(push_forces(&["origin", "feat"], Some(&git), &repo_args));
+        set("remote.origin.push", None);
+        set("remote.origin.mirror", Some("true"));
+        assert!(push_forces(&["origin"], Some(&git), &repo_args));
+    }
+
+    #[test]
+    fn send_pack_refused_under_force_push_prevention_and_lfs_push_under_push_prevention() {
+        let send = ["send-pack", "--force", "origin", "HEAD:refs/heads/x"];
+        assert!(gate_git_t(&send, false, true, false, &[], None).is_err());
+        assert!(gate_git_t(&send, false, false, false, &[], None).is_ok());
+        assert!(
+            gate_git_t(
+                &["lfs", "push", "origin", "x"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(gate_git_t(&["lfs", "ls-files"], true, true, false, &[], None).is_ok());
     }
 
     #[test]

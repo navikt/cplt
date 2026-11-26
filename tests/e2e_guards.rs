@@ -2997,6 +2997,514 @@ fn git_gate_allows_a_push_from_a_worktree_of_the_launch_repository() {
 }
 
 // ============================================================
+// Push destination resolution, against a real bare remote
+// ============================================================
+//
+// These run the real git for the push itself, so an allowed push lands in the
+// bare origin. Each test asserts the refusal AND that the protected ref did
+// not move.
+
+/// A work repo with a pushed `main`, `origin` a local bare repo whose default
+/// branch is `default`, checked out on a new branch `feat` one commit ahead.
+fn pushed_repo(default: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (tmp, work, origin) = common::bare_origin_repo(&std::env::temp_dir());
+    for args in [
+        &["branch", "-M", default][..],
+        &["push", "-q", "origin", default],
+        &["remote", "set-head", "origin", default],
+        &["checkout", "-q", "-b", "feat"],
+        &["commit", "-q", "--allow-empty", "-m", "feat"],
+    ] {
+        assert!(git_ok(&work, args), "git {args:?}");
+    }
+    (tmp, work, origin)
+}
+
+fn remote_ref(origin: &std::path::Path, name: &str) -> Option<String> {
+    let out = common::git_cmd(origin)
+        .args(["rev-parse", "--verify", "-q", name])
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `git-gate` with the real git and the given push policy, in `dir`.
+fn real_push_gate(
+    dir: &std::path::Path,
+    facts: &str,
+    policy: [bool; 3],
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> (String, bool) {
+    let [prevent_push, prevent_force_push, protect] = policy;
+    let mut cmd = cplt_cmd();
+    cmd.arg("git-gate")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg(format!("--repo-facts={facts}"))
+        .arg("--mode=block")
+        .arg(format!("--prevent-push={prevent_push}"))
+        .arg(format!("--prevent-force-push={prevent_force_push}"))
+        .arg(format!("--protect-default-branch-only={protect}"))
+        .arg("--")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(envs.iter().copied())
+        .current_dir(dir);
+    let out = cmd.output().expect("cplt git-gate should run");
+    (
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.success(),
+    )
+}
+
+const PROTECT: [bool; 3] = [true, true, true];
+const FORCE_ONLY: [bool; 3] = [false, true, false];
+
+#[test]
+fn real_push_feature_branch_still_allowed() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[],
+        &["push", "-q", "origin", "feat"],
+    );
+    assert!(ok, "{stderr}");
+    assert!(remote_ref(&origin, "refs/heads/feat").is_some());
+}
+
+#[test]
+fn real_push_upstream_mode_cannot_reach_default_branch() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(
+        &work,
+        &["branch", "-q", "--set-upstream-to=origin/main"]
+    ));
+    assert!(git_ok(&work, &["config", "push.default", "upstream"]));
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(&work, &facts, PROTECT, &[], &["push", "origin", "feat"]);
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+#[test]
+fn real_push_remote_push_mapping_cannot_reach_default_branch() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(
+        &work,
+        &[
+            "config",
+            "remote.origin.push",
+            "refs/heads/feat:refs/heads/main"
+        ]
+    ));
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(&work, &facts, PROTECT, &[], &["push", "origin", "feat"]);
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+#[test]
+fn real_push_heads_prefixed_destination_is_resolved() {
+    let (_t, work, origin) = pushed_repo("release/2026");
+    let facts = launch_facts(&work);
+    let before = remote_ref(&origin, "refs/heads/release/2026");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[],
+        &["push", "origin", "feat:heads/release/2026"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "refs/heads/release/2026"), before);
+}
+
+#[test]
+fn real_push_tag_destination_is_not_a_feature_branch() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[],
+        &["push", "origin", "feat:refs/tags/v1"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "refs/tags/v1"), None);
+}
+
+#[test]
+fn real_push_git_dir_redirect_is_not_the_launch_repository() {
+    // `-C <launch repo>` with GIT_DIR naming another clone, whose default
+    // branch the launch facts know nothing about.
+    let (_t, work, _origin) = pushed_repo("main");
+    let (_t2, other, other_origin) = pushed_repo("trunk");
+    assert!(git_ok(&other, &["checkout", "-q", "trunk"]));
+    assert!(git_ok(
+        &other,
+        &["commit", "-q", "--allow-empty", "-m", "x"]
+    ));
+    let facts = launch_facts(&work);
+    let before = remote_ref(&other_origin, "trunk");
+    let git_dir = other.join(".git");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[("GIT_DIR", git_dir.to_str().unwrap())],
+        &["-C", work.to_str().unwrap(), "push", "origin", "trunk"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&other_origin, "trunk"), before);
+}
+
+#[test]
+fn real_push_feature_branch_deletion_allowed() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    for (policy, args) in [
+        (PROTECT, &["push", "-q", "origin", ":victim"][..]),
+        (PROTECT, &["push", "-q", "origin", "--delete", "victim"]),
+        (FORCE_ONLY, &["push", "-q", "origin", ":victim"]),
+        (FORCE_ONLY, &["push", "-q", "-d", "origin", "victim"]),
+    ] {
+        assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
+        let (stderr, ok) = real_push_gate(&work, &facts, policy, &[], args);
+        assert!(ok, "{args:?}: {stderr}");
+        assert_eq!(remote_ref(&origin, "refs/heads/victim"), None, "{args:?}");
+    }
+}
+
+#[test]
+fn real_push_bare_name_deletion_refused_when_it_names_a_tag() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(&work, &["tag", "v0"]));
+    assert!(git_ok(&work, &["push", "-q", "origin", "v0", "feat:feat"]));
+    for policy in [PROTECT, FORCE_ONLY] {
+        let (stderr, ok) = real_push_gate(
+            &work,
+            &facts,
+            policy,
+            &[],
+            &["push", "origin", "--delete", "v0"],
+        );
+        assert_refused(&stderr, ok, ":refs/heads/<branch>");
+        assert!(remote_ref(&origin, "refs/tags/v0").is_some());
+    }
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "-q", "origin", "--delete", "feat"],
+    );
+    assert!(ok, "{stderr}");
+    assert_eq!(remote_ref(&origin, "refs/heads/feat"), None);
+}
+
+#[test]
+fn real_push_bare_name_deletion_needs_branch_and_no_tag() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    // `both` is a branch AND a tag; `tag`/`notes/commits` are not branches.
+    assert!(git_ok(&work, &["tag", "v0"]));
+    assert!(git_ok(&work, &["tag", "both"]));
+    assert!(git_ok(&work, &["notes", "add", "-m", "n"]));
+    assert!(git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "v0",
+            "both",
+            "feat:refs/heads/both",
+            "refs/notes/commits"
+        ]
+    ));
+    for args in [
+        &["push", "origin", "--delete", "tag", "v0"][..],
+        &["push", "origin", "--delete", "notes/commits"],
+        &["push", "origin", "--delete", "both"],
+        &["push", "origin", ":both"],
+    ] {
+        let (stderr, ok) = real_push_gate(&work, &facts, FORCE_ONLY, &[], args);
+        assert_refused(&stderr, ok, "not allowed");
+        for r in [
+            "refs/tags/v0",
+            "refs/tags/both",
+            "refs/heads/both",
+            "refs/notes/commits",
+        ] {
+            assert!(remote_ref(&origin, r).is_some(), "{args:?}: {r}");
+        }
+    }
+}
+
+#[test]
+fn real_push_deletion_probe_uses_the_push_url() {
+    let (_t, work, fetch) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let push = fetch.with_file_name("push.git");
+    assert!(git_ok(
+        &work,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            fetch.to_str().unwrap(),
+            push.to_str().unwrap()
+        ]
+    ));
+    assert!(git_ok(
+        &work,
+        &["config", "remote.origin.pushurl", push.to_str().unwrap()]
+    ));
+    // Fetch URL has branch `x`, push URL has tag `x`: refused, tag stays.
+    assert!(git_ok(&fetch, &["branch", "x", "main"]));
+    assert!(git_ok(&push, &["tag", "x", "main"]));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "origin", "--delete", "x"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert!(remote_ref(&push, "refs/tags/x").is_some());
+    // Fetch URL has tag `y`, push URL has branch `y`: allowed, branch deleted.
+    assert!(git_ok(&fetch, &["tag", "y", "main"]));
+    assert!(git_ok(&push, &["branch", "y", "main"]));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "-q", "origin", "--delete", "y"],
+    );
+    assert!(ok, "{stderr}");
+    assert_eq!(remote_ref(&push, "refs/heads/y"), None);
+}
+
+/// A bare clone of `src` beside it, named `name`, with tag `t` on main.
+fn bare_with_tag(src: &std::path::Path, name: &str, tag: Option<&str>) -> std::path::PathBuf {
+    let dst = src.with_file_name(name);
+    assert!(git_ok(
+        src,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap()
+        ]
+    ));
+    if let Some(t) = tag {
+        assert!(git_ok(&dst, &["tag", t, "main"]));
+    }
+    dst
+}
+
+#[test]
+fn real_push_deletion_probe_refuses_a_url_insteadof_would_move() {
+    // Push lands on `real` (tag x). A second insteadOf rule would move only
+    // ls-remote's view to `decoy` (branch x). Both config shapes.
+    for shape in ["pushinsteadof", "pushurl-alias"] {
+        let (_t, work, origin) = pushed_repo("main");
+        let facts = launch_facts(&work);
+        let real = bare_with_tag(&origin, "real.git", Some("x"));
+        let decoy = bare_with_tag(&origin, "decoy.git", None);
+        assert!(git_ok(&decoy, &["branch", "x", "main"]));
+        let cfg: Vec<(String, String)> = if shape == "pushinsteadof" {
+            vec![
+                (
+                    format!("url.{}.pushInsteadOf", real.display()),
+                    origin.display().to_string(),
+                ),
+                (
+                    format!("url.{}.insteadOf", decoy.display()),
+                    real.display().to_string(),
+                ),
+            ]
+        } else {
+            vec![
+                ("remote.origin.pushurl".into(), "alias:repo".into()),
+                (
+                    format!("url.{}.insteadOf", real.display()),
+                    "alias:repo".into(),
+                ),
+                (
+                    format!("url.{}.insteadOf", decoy.display()),
+                    real.display().to_string(),
+                ),
+            ]
+        };
+        for (k, v) in &cfg {
+            assert!(git_ok(&work, &["config", k, v]), "{k}");
+        }
+        let (stderr, ok) = real_push_gate(
+            &work,
+            &facts,
+            FORCE_ONLY,
+            &[],
+            &["push", "origin", "--delete", "x"],
+        );
+        assert_refused(&stderr, ok, "not allowed");
+        assert!(remote_ref(&real, "refs/tags/x").is_some(), "{shape}");
+    }
+}
+
+#[test]
+fn real_push_deletion_probe_requires_every_push_url() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let a = bare_with_tag(&origin, "a.git", None);
+    let b = bare_with_tag(&origin, "b.git", Some("x"));
+    assert!(git_ok(&a, &["branch", "x", "main"]));
+    assert!(git_ok(&b, &["branch", "x", "main"]));
+    for url in [&a, &b] {
+        assert!(git_ok(
+            &work,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                url.to_str().unwrap()
+            ]
+        ));
+    }
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "origin", "--delete", "x"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert!(remote_ref(&b, "refs/tags/x").is_some());
+}
+
+#[test]
+fn real_push_deletion_refused_under_a_namespace() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["--namespace=n", "push", "origin", ":refs/heads/victim"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[("GIT_NAMESPACE", "n")],
+        &["push", "origin", ":refs/heads/victim"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert!(remote_ref(&origin, "refs/heads/victim").is_some());
+}
+
+#[test]
+fn real_push_deletion_refused_when_default_branch_unknown() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
+    let git_dir = work.join(".git");
+    for policy in [PROTECT, FORCE_ONLY] {
+        let (stderr, ok) = real_push_gate(
+            &work,
+            &facts,
+            policy,
+            &[],
+            &[
+                "--git-dir",
+                git_dir.to_str().unwrap(),
+                "push",
+                "origin",
+                ":refs/heads/victim",
+            ],
+        );
+        assert_refused(&stderr, ok, "not allowed");
+        assert!(remote_ref(&origin, "refs/heads/victim").is_some());
+    }
+}
+
+#[test]
+fn real_push_default_branch_deletion_and_mirror_refused() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let before = remote_ref(&origin, "refs/heads/main");
+    assert!(before.is_some());
+    for (policy, args) in [
+        (PROTECT, &["push", "origin", ":main"][..]),
+        (PROTECT, &["push", "origin", "--delete", "main"]),
+        (FORCE_ONLY, &["push", "origin", ":main"]),
+        (FORCE_ONLY, &["push", "origin", "--delete", "main"]),
+        (FORCE_ONLY, &["push", "origin", ":refs/heads/main"]),
+        (FORCE_ONLY, &["push", "--mirror", "origin"]),
+        (FORCE_ONLY, &["push", "--prune", "origin", "feat"]),
+    ] {
+        let (stderr, ok) = real_push_gate(&work, &facts, policy, &[], args);
+        assert_refused(&stderr, ok, "not allowed");
+        assert_eq!(remote_ref(&origin, "refs/heads/main"), before, "{args:?}");
+    }
+}
+
+#[test]
+fn real_push_configured_force_refspec_counts_as_force() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(
+        &work,
+        &[
+            "config",
+            "remote.origin.push",
+            "+refs/heads/feat:refs/heads/main"
+        ]
+    ));
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(&work, &facts, FORCE_ONLY, &[], &["push", "origin"]);
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+#[test]
+fn real_send_pack_refused_under_force_push_prevention() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &[
+            "send-pack",
+            "--force",
+            origin.to_str().unwrap(),
+            "+feat:refs/heads/main",
+        ],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+// ============================================================
 // Full wrapper script integration (sandbox → wrapper → gate)
 // ============================================================
 
