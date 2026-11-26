@@ -1207,7 +1207,7 @@ Or set the key back to `false`. A token in `config.yaml` (pnpm 11 accepts an `_a
 
 ## Dropping the Keychain grant (`sandbox.keychain_substitute`)
 
-On by default for Copilot and Claude Code, off for the other agents. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it. An explicit value applies to every agent:
+On by default for Copilot and Claude Code, off for the other agents. On macOS it drops the Keychain grant. On Linux, for Copilot, it reads Copilot's Secret Service login with `secret-tool` and passes it as `COPILOT_GITHUB_TOKEN` (inert for other agents on Linux). `.cplt.toml` cannot set it. An explicit value applies to every agent:
 
 ```bash
 cplt config set sandbox.keychain_substitute false   # keep the Keychain grant
@@ -1286,7 +1286,7 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 | `gh_guard.mode` | `block` | `block` refuses, `warn` prints a warning and runs the command, `audit` runs it and logs the decision. See [gh guard](gh-guard.md). |
 | `gh_guard.scope_check` | `true` | Refuses write commands aimed at another repository, for example with `-R`. |
 | `gh_guard.block_auth_token` | `true` | Intercepts `gh auth token` through the wrapper. Copilot can receive a cached token once when eligible; otherwise it refuses. With `false`, real gh answers from whatever credential source it can reach. Does not prevent reading environment tokens, guard caches or allowed credential-helper output. |
-| `gh_guard.inject_token` ⚠️ | `false` | **Deprecated, and no effect on macOS.** `gh` gets its token from the gh guard exec token, and Copilot signs in with `sandbox.keychain_substitute = true` (macOS only). On macOS the key does nothing: cplt accepts it, prints one line at launch while it is `true`, and never refuses a launch over it. Remove it. On Linux it remains a recommended credential handover when native Secret Service authentication fails; native access depends on the backend and agent version, and the keyring is not guaranteed closed. See [Linux keyring access](known-impacts.md#linux-keyring-access-depends-on-the-backend-and-agent-version). On Linux, for Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Not needed for `gh` itself: the gh guard hands the real `gh` the exec token (see [gh guard](gh-guard.md#how-gh-itself-authenticates)). Skipped when the agent already has a token. |
+| `gh_guard.inject_token` ⚠️ | `false` | **Deprecated, and no effect on macOS.** `gh` gets its token from the gh guard exec token, and Copilot signs in with `sandbox.keychain_substitute = true` (on macOS it drops the Keychain grant; on Linux it reads Copilot's Secret Service login with `secret-tool` and passes it as `COPILOT_GITHUB_TOKEN`). On macOS the key does nothing: cplt accepts it, prints one line at launch while it is `true`, and never refuses a launch over it. Remove it. On Linux it remains a recommended credential handover when the Secret Service lookup does not run or finds nothing; native access depends on the backend and agent version, and the keyring is not guaranteed closed. See [Linux keyring access](known-impacts.md#linux-keyring-access-depends-on-the-backend-and-agent-version). On Linux, for Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Not needed for `gh` itself: the gh guard hands the real `gh` the exec token (see [gh guard](gh-guard.md#how-gh-itself-authenticates)). Skipped when the agent already has a token. |
 | `gh_guard.unknown_command` | `block` | What to do with a `gh` command the guard does not classify: `block` or `allow`. |
 | `gh_guard.allow_api_write` ⚠️ | `false` | Allows `gh api` writes (POST, PATCH, PUT and input flags), scope-checked to the current repository. |
 | `git_guard.enabled` | `true` | Intercepts `git push`, `request-pull` and `send-pack`. See [git guard](git-guard.md). |
@@ -1374,7 +1374,7 @@ Some local MCP servers need a host login the sandbox does not grant. `nais
 alpha mcp serve`, for one, reads the macOS login keychain. For each such
 server, nav-pilot writes a broker spec to `~/.config/cplt/mcp/` (or
 `$XDG_CONFIG_HOME/cplt/mcp/`): the server's `server.json` plus a
-`_meta["io.github.navikt/broker"]` block. On macOS cplt then runs the server
+`_meta["io.github.navikt/broker"]` block. On macOS, and on Linux under Bubblewrap, cplt then runs the server
 on the host, outside the sandbox, and points your client's entry at
 `cplt mcp-stdio <id>`, which connects to it over a per-session socket.
 
