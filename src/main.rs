@@ -1569,6 +1569,46 @@ struct RepoRoot {
 /// Every refusal here is a launch-time refusal on purpose. The set decides what
 /// `gh` may target and what `GH_REPO` is pinned to, so a root that is not the
 /// repository the user thinks it is would misdirect writes — the #213 shape.
+/// The first symlink met while resolving `path` hop by hop whose own location
+/// lies in `tree`, following every link's target, so `/a -> <tree>/b -> /c`
+/// is caught too. A chain over 40 links counts as a hit (fail closed).
+fn symlink_hop_inside(path: &Path, tree: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut todo: std::collections::VecDeque<std::ffi::OsString> =
+        path.iter().map(ToOwned::to_owned).collect();
+    let mut cur = PathBuf::new();
+    let mut hops = 0;
+    while let Some(part) = todo.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir | Component::Prefix(_)) => cur = PathBuf::from(&part),
+            Some(Component::ParentDir) => {
+                cur.pop();
+            }
+            Some(Component::Normal(_)) => {
+                let next = cur.join(&part);
+                if next
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    hops += 1;
+                    let real_parent = std::fs::canonicalize(&cur).unwrap_or_else(|_| cur.clone());
+                    if hops > 40 || real_parent.starts_with(tree) {
+                        return Some(next);
+                    }
+                    let target = std::fs::read_link(&next).ok()?;
+                    for c in target.iter().rev() {
+                        todo.push_front(c.to_owned());
+                    }
+                    continue;
+                }
+                cur = next;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn validate_repo_dirs(
     cli_dirs: &[PathBuf],
     local_dirs: &[String],
@@ -1663,13 +1703,7 @@ fn validate_repo_dirs(
 
         // The same holds for a symlinked directory on the way, when it sits
         // inside the project: the agent can repoint it between sessions.
-        if let Some(link) = absolute.ancestors().skip(1).find(|a| {
-            a.symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink())
-                && a.parent()
-                    .and_then(|p| std::fs::canonicalize(p).ok())
-                    .is_some_and(|p| p.starts_with(project_dir))
-        }) {
+        if let Some(link) = symlink_hop_inside(&absolute, project_dir) {
             bail!(
                 "{named_as} passes through a symlink inside the project directory,\n  {}\n  \
                  which is agent-writable, so the repository it names could be changed \
@@ -19747,6 +19781,13 @@ mod tests {
         std::os::unix::fs::symlink(&outside, elsewhere.join("b")).unwrap();
         let roots = validate_flags(&[elsewhere.join("b/api")], &project).unwrap();
         assert_eq!(dirs_of(&roots), vec![api]);
+
+        // A link outside the project that hops through one inside it.
+        std::os::unix::fs::symlink(project.join("a"), elsewhere.join("c")).unwrap();
+        let err = validate_flags(&[elsewhere.join("c/api")], &project)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("passes through a symlink"), "{err}");
     }
 
     #[test]

@@ -877,11 +877,20 @@ fn child_temp_base(home: &Path) -> std::io::Result<PathBuf> {
         .recursive(true)
         .mode(0o700)
         .create(&state)?;
+    // A linked state dir (dotfile managers) is fine when its target is a
+    // directory of ours no one else can write; launch validation has already
+    // refused one inside a tree the agent can write.
     if std::fs::symlink_metadata(&state)?.file_type().is_symlink() {
-        return Err(std::io::Error::other(format!(
-            "{} is a symlink; cplt keeps its state in a real directory",
-            state.display()
-        )));
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(&state)?;
+        // SAFETY: getuid(2) cannot fail.
+        if !m.is_dir() || m.uid() != unsafe { libc::getuid() } || m.mode() & 0o022 != 0 {
+            return Err(std::io::Error::other(format!(
+                "{} links to a directory that is not yours or that others can write; \
+                 point it at a directory you own with mode 0700, or replace the link",
+                state.display()
+            )));
+        }
     }
     // Canonical: Seatbelt matches resolved paths (a symlinked HOME).
     let base = state.canonicalize()?.join("mcp-tmp");
@@ -2695,7 +2704,18 @@ mod tests {
             home2.path().join(crate::sandbox::CPLT_STATE_DIR),
         )
         .unwrap();
-        assert!(child_temp_dir(home2.path()).is_err(), "symlinked state dir");
+        // A linked state dir to a private dir of ours is supported.
+        assert!(
+            child_temp_dir(home2.path()).is_ok(),
+            "linked private state dir"
+        );
+        // One others can write is refused, and nothing is created through it.
+        std::fs::remove_dir_all(target.path().join("mcp-tmp")).unwrap();
+        std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            child_temp_dir(home2.path()).is_err(),
+            "world-writable target"
+        );
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
     }
 
