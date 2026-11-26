@@ -3377,8 +3377,11 @@ mod tests {
             check_links(&rules, std::slice::from_ref(&hooks), &[]),
             Ok(vec![])
         );
-        // Without the deeper root the link sits below a writable root and refuses.
-        assert!(check_links(&rules[..1], std::slice::from_ref(&hooks), &[]).is_err());
+        // Without the deeper root the link sits below a writable root and is reported.
+        assert_eq!(
+            check_links(&rules[..1], std::slice::from_ref(&hooks), &[]).map(|w| w.len()),
+            Ok(1)
+        );
     }
 
     /// 221b672e: `/tmp` is a private tmpfs in the namespace, never a root here.
