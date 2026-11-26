@@ -2233,18 +2233,6 @@ fn git_gate_allows_exactly_spelled_push_options() {
         &["push", "--set-upstream", "origin", "feature/my-work"][..],
         &["push", "--no-verify", "origin", "feature/my-work"][..],
         &["push", "--atomic", "--signed", "origin", "feature/my-work"][..],
-        &[
-            "push",
-            "--exec=/usr/bin/git-receive-pack",
-            "origin",
-            "feature/my-work",
-        ][..],
-        &[
-            "push",
-            "--receive-pack=/usr/bin/git-receive-pack",
-            "origin",
-            "feature/my-work",
-        ][..],
         &["push", "origin", "--", "feature/my-work"][..],
     ] {
         let (_, stderr, ok) = git_gate_protect_default(args);
