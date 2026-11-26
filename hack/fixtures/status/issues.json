@@ -1,5 +1,5 @@
 {"data":{"repository":{"issues":{"nodes":[
 {"number":10,"title":"untriaged follow-up","createdAt":"2026-01-01T00:00:00Z","author":{"login":"Starefossen","__typename":"User"},"labels":{"nodes":[{"name":"follow-up"}]},"comments":{"nodes":[]}},
 {"number":11,"title":"triaged follow-up","createdAt":"2026-01-01T00:00:00Z","author":{"login":"Starefossen","__typename":"User"},"labels":{"nodes":[{"name":"follow-up"},{"name":"p2"}]},"comments":{"nodes":[]}},
-{"number":12,"title":"external bug","createdAt":"2026-01-02T00:00:00Z","author":{"login":"ext","__typename":"User"},"labels":{"nodes":[]},"comments":{"nodes":[{"createdAt":"2026-01-03T00:00:00Z","authorAssociation":"OWNER","author":{"login":"Starefossen"}}]}},
+{"number":12,"title":"external bug","createdAt":"2026-01-02T00:00:00Z","author":{"login":"ext","__typename":"User"},"labels":{"nodes":[]},"comments":{"nodes":[{"createdAt":"2026-01-03T00:00:00Z","authorAssociation":"OWNER","author":{"login":"Starefossen","__typename":"User"}}]}},
 {"number":13,"title":"bot issue","createdAt":"2026-01-01T00:00:00Z","author":{"login":"dependabot","__typename":"Bot"},"labels":{"nodes":[]},"comments":{"nodes":[]}}]}}}}

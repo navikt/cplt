@@ -25,25 +25,26 @@ number title createdAt headRefOid mergeStateStatus isInMergeQueue autoMergeReque
 author{login __typename} authorAssociation
 commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
  ... on CheckRun{name conclusion} ... on StatusContext{context state}}}}}}}
-comments(last:50){nodes{body createdAt authorAssociation author{login}}}
+comments(last:50){nodes{body createdAt authorAssociation author{login __typename}}}
+reviews(last:50){nodes{createdAt authorAssociation author{login __typename}}}
 reviewThreads(first:100){nodes{isResolved}}}}}}'
 ISQ='query($o:String!,$r:String!){repository(owner:$o,name:$r){issues(states:OPEN,first:100){nodes{
 number title createdAt author{login __typename}
 labels(first:30){nodes{name}}
-comments(last:30){nodes{createdAt authorAssociation author{login}}}}}}}'
+comments(last:30){nodes{createdAt authorAssociation author{login __typename}}}}}}}'
 
 # Shared jq helpers. shortcut: first 50 PRs / 100 issues only, paginate if the repo outgrows that.
 LIB='def maint: select(.authorAssociation=="OWNER" or .authorAssociation=="MEMBER" or .authorAssociation=="COLLABORATOR")
-  | select((.author.login // "") | endswith("[bot]") | not);
+  | select((.author.__typename // "") != "Bot");
 def days: ((now - (. | fromdateiso8601)) / 86400 | floor);
 def ext: (.author.__typename != "Bot") and (.author.login != "Starefossen");
-def lastmaint: ([.comments.nodes[] | maint | .createdAt] | max) // null;
+def lastmaint: ([(.comments.nodes[], (.reviews.nodes[]?)) | maint | .createdAt] | max) // null;
 def sinceReply: (lastmaint // .createdAt) | days;
 def flag: if . > 1 then "!" else "" end;'
 
 PRJQ="$LIB"'.data.repository.pullRequests.nodes[] | . as $p
   | ([.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | select(.name=="ci-ok") | .conclusion] | first // "none") as $ci
-  | ([.comments.nodes[] | select(.body | startswith("Fable review:"))] | last) as $f
+  | ([.comments.nodes[] | maint | select(.body | startswith("Fable review:"))] | last) as $f
   | (if $f == null then "" else $f.body end) as $b
   | (($b | split("\n") + [""] | .[0]) | sub("^Fable review: *";"")) as $verdict
   | (([$b | scan("Head reviewed: `?([0-9a-f]{7,40})")[0]] | first) // "") as $sha
@@ -53,8 +54,8 @@ PRJQ="$LIB"'.data.repository.pullRequests.nodes[] | . as $p
      ([.reviewThreads.nodes[] | select(.isResolved | not)] | length),
      (if .isInMergeQueue then "yes" else "no" end),
      (if .autoMergeRequest then "yes" else "no" end), .mergeStateStatus] | @tsv'
-EXTQ="$LIB"'[($pr.data.repository.pullRequests.nodes[] | select(ext) | {k:"PR", n:.number, a:.author.login, t:.title, c:.createdAt, d:sinceReply}),
-  ($is.data.repository.issues.nodes[] | select(ext) | {k:"issue", n:.number, a:.author.login, t:.title, c:.createdAt, d:sinceReply})]
+EXTQ="$LIB"'[($pr[0].data.repository.pullRequests.nodes[] | select(ext) | {k:"PR", n:.number, a:.author.login, t:.title, c:.createdAt, d:sinceReply}),
+  ($is[0].data.repository.issues.nodes[] | select(ext) | {k:"issue", n:.number, a:.author.login, t:.title, c:.createdAt, d:sinceReply})]
   | sort_by(.c)[] | [.k, "#\(.n)", .a, "age \(.c | days)d", "reply \(.d)d \(.d | flag)", .t[0:60]] | @tsv'
 FUQ="$LIB"'.data.repository.issues.nodes[] | select([.labels.nodes[].name] as $l | ($l | index("follow-up")) and ([$l[] | select(test("^p[123]$"))] | length == 0))
   | select((.createdAt | days) > 7) | ["#\(.number)", "\(.createdAt | days)d", .title[0:70]] | @tsv'
@@ -66,10 +67,12 @@ else
   IS=$(gh api graphql -f query="$ISQ" -f o="$1" -f r="$2")
 fi
 
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+printf %s "$PR" > "$T/pr"; printf %s "$IS" > "$T/is"
 echo "== Open PRs"
 { printf 'PR\tauthor\thead\tci-ok\tfable\tfable-sha\tthreads\tqueue\tauto\tmerge-state\n'
   jq -r "$PRJQ" <<<"$PR"; } | column -t -s $'\t'
 echo; echo "== External items (oldest first)"
-jq -nr --argjson pr "$PR" --argjson is "$IS" "$EXTQ" | column -t -s $'\t'
+jq -nr --slurpfile pr "$T/pr" --slurpfile is "$T/is" "$EXTQ" | column -t -s $'\t'
 echo; echo "== follow-up without p1/p2/p3, older than 7 days"
 jq -r "$FUQ" <<<"$IS" | column -t -s $'\t'
