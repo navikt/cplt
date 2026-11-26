@@ -1318,8 +1318,13 @@ impl SettleProbe {
             let flags = libc::fcntl(fds[0], libc::F_GETFL);
             libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        // Exempt the write end from the exec-time seal, or nothing in the
-        // session inherits it and the probe reports every session settled.
+        // The write end is CLOEXEC too, so other parent-side helpers (git,
+        // curl, security) never hold it open. `seal_inherited_fds` clears the
+        // flag in the session child alone, via the exemption below; without
+        // it nothing in the session inherits the end and every session
+        // reports settled.
+        // SAFETY: `fds[1]` is a descriptor `pipe` just returned.
+        unsafe { libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) };
         SETTLE_PROBE_FD.store(fds[1], Ordering::Relaxed);
         Some(Self {
             read: fds[0],
@@ -2867,6 +2872,19 @@ mod tests {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    #[test]
+    fn settle_probe_write_end_is_cloexec_until_handed_over() {
+        let probe = SettleProbe::arm().expect("pipe");
+        // SAFETY: F_GETFD on a descriptor the probe owns.
+        let flags = unsafe { libc::fcntl(probe.write, libc::F_GETFD) };
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "write end leaks to every child"
+        );
+        let _ = probe.outcome_within(Duration::from_millis(1));
     }
 
     fn sh_holding_the_probe(probe: &SettleProbe, script: &str) -> Command {

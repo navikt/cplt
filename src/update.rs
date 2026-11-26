@@ -504,10 +504,18 @@ pub fn parse_sha256sums(content: &str, asset_name: &str) -> Result<String, Updat
 
 // --- Internal helpers ---
 
-/// HTTP GET returning body as string (for JSON/text).
+/// `/usr/bin/curl` that ignores `~/.curlrc` and `CURL_HOME`: `-q` only works
+/// as the first argument. Proxy and CA settings come from the environment.
 #[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
+fn curl() -> Command {
+    let mut cmd = Command::new("/usr/bin/curl");
+    cmd.arg("-q").env_remove("CURL_HOME");
+    cmd
+}
+
+/// HTTP GET returning body as string (for JSON/text).
 fn curl_get(url: &str, version: &str) -> Result<String, UpdateError> {
-    let output = Command::new("/usr/bin/curl")
+    let output = curl()
         .args([
             "--fail",
             "--silent",
@@ -555,9 +563,8 @@ fn classify_curl_failure(code: Option<i32>, stderr: &str) -> UpdateError {
 }
 
 /// HTTP GET expecting JSON, with Accept header.
-#[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_get_json(url: &str, version: &str) -> Result<String, UpdateError> {
-    let output = Command::new("/usr/bin/curl")
+    let output = curl()
         .args([
             "--fail",
             "--silent",
@@ -587,9 +594,8 @@ fn curl_get_json(url: &str, version: &str) -> Result<String, UpdateError> {
 }
 
 /// Download a file to disk.
-#[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), UpdateError> {
-    let output = Command::new("/usr/bin/curl")
+    let output = curl()
         .args([
             "--fail",
             "--silent",
@@ -1013,6 +1019,13 @@ fn find_sudo() -> Result<PathBuf, UpdateError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn curl_skips_curlrc() {
+        let cmd = curl();
+        assert_eq!(cmd.get_args().next(), Some(std::ffi::OsStr::new("-q")));
+        assert!(cmd.get_envs().any(|(k, v)| k == "CURL_HOME" && v.is_none()));
+    }
 
     #[test]
     fn curl_failure_classification() {

@@ -3080,7 +3080,8 @@ impl Agent {
         let wsl = cfg!(target_os = "linux") && is_wsl();
 
         for binary_name in binary_names {
-            for dir in path_var.split(':') {
+            // Relative or empty segments resolve against the cwd, which the agent writes.
+            for dir in path_var.split(':').filter(|d| Path::new(d).is_absolute()) {
                 let candidate = PathBuf::from(dir).join(binary_name);
 
                 if !candidate.is_file() {
@@ -3228,7 +3229,7 @@ impl Agent {
         let mut found_opencode = false;
         let mut found_antigravity = false;
 
-        for dir in path_var.split(':') {
+        for dir in path_var.split(':').filter(|d| Path::new(d).is_absolute()) {
             if !found_copilot {
                 let candidate = PathBuf::from(dir).join("copilot");
                 if candidate.is_file() {
@@ -6999,6 +7000,34 @@ mod tests {
             [
                 ("HOME", Some(home.as_os_str())),
                 ("PATH", Some(shims.as_os_str())),
+            ],
+            || {
+                assert!(Agent::OpenCode.resolve_binary().is_err());
+                assert_eq!(Agent::auto_detect(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_binary_skips_relative_path_segments() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical home");
+        let f = home.join("opencode");
+        std::fs::write(&f, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // The same directory, reached relative to the cwd.
+        let depth = std::env::current_dir().unwrap().components().count();
+        let rel = format!(
+            "{}{}",
+            "../".repeat(depth),
+            home.strip_prefix("/").unwrap().display()
+        );
+        assert!(Path::new(&rel).join("opencode").is_file());
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                ("PATH", Some(std::ffi::OsStr::new(&rel))),
             ],
             || {
                 assert!(Agent::OpenCode.resolve_binary().is_err());
