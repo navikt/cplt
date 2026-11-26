@@ -2645,16 +2645,19 @@ fn build_seccomp_filter(proxy_forced: bool) -> Vec<BpfInstruction> {
         // Reload the syscall number into A. The blocklist loop leaves it in A,
         // but the ioctl block above reloads A with arg1 on its benign-ioctl
         // fall-through, so reload here rather than depend on which path we came
-        // from. jf = 10 skips the whole block below and lands on the
+        // from. jf = 11 skips the whole block below and lands on the
         // default-allow return appended after it.
         filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, NR_OFFSET));
         filter.push(jump(
             BPF_JMP | BPF_JEQ | BPF_K,
             libc::SYS_socket as u32,
             0,
-            10,
+            11,
         ));
         filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, ARG0_LO_OFFSET));
+        // AF_VSOCK reaches the hypervisor host from a VM guest and is not a
+        // path to the proxy, so it is denied outright (jt = 8 lands on the deny).
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, libc::AF_VSOCK as u32, 8, 0));
         // AF_INET / AF_INET6 → fall through to the type check; anything else
         // (AF_UNIX, AF_NETLINK, …) → skip the whole block to the allow.
         filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0));
@@ -5086,6 +5089,24 @@ mod tests {
                     "high bits in the family argument must not bypass the check"
                 );
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_forced_seccomp_denies_vsock() {
+        let nr = libc::SYS_socket as u32;
+        let vsock = libc::AF_VSOCK as u64;
+        for ty in [libc::SOCK_STREAM as u64, libc::SOCK_DGRAM as u64] {
+            assert_eq!(
+                run_filter(&build_seccomp_filter(true), nr, ARCH, sock(vsock, ty)),
+                EPERM
+            );
+            assert_eq!(
+                run_filter(&build_seccomp_filter(false), nr, ARCH, sock(vsock, ty)),
+                ALLOW,
+                "only proxy.forced restricts socket families"
+            );
         }
     }
 

@@ -1512,6 +1512,7 @@ pub(crate) fn resolve(
         for rule in policy.fs_rules.iter().filter(|r| r.nofollow) {
             landlock_mod::nofollow_host_id(&rule.path)?;
         }
+        refuse_symlinked_overlays(&policy.fs_rules, overlays)?;
     }
     match use_bubblewrap {
         Some(false) => Ok(None),
@@ -1537,6 +1538,50 @@ pub(crate) fn resolve(
             }
         },
     }
+}
+
+/// Refuses a read-only overlay or rename pin that is, or sits below, a
+/// symlink inside a writable root.
+///
+/// bwrap resolves a bind destination through links. A relative link moves the
+/// read-only bind onto its target and leaves the link itself replaceable; an
+/// absolute one makes bwrap abort, which auto-detect would turn into a
+/// Landlock-only session without any of the overlays. Both are refused here,
+/// before either arm of [`resolve`], the way [`nested_repo_roots`] refuses to
+/// follow links. Only components below a writable root are checked: the agent
+/// cannot plant a link above one, and hosts legitimately link `/home` and the like.
+pub(crate) fn refuse_symlinked_overlays(
+    fs_rules: &[FsRule],
+    overlays: Overlays<'_>,
+) -> Result<(), String> {
+    let roots: Vec<PathBuf> = fs_rules
+        .iter()
+        .filter(|r| r.access.write || r.access.create_dirs)
+        .flat_map(|r| [Some(r.path.clone()), r.path.canonicalize().ok()])
+        .flatten()
+        .collect();
+    for path in overlays.read_only.iter().chain(overlays.pins) {
+        for root in roots.iter().filter(|r| path.starts_with(r)) {
+            let mut cur = root.clone();
+            for part in path
+                .strip_prefix(root)
+                .unwrap_or(Path::new(""))
+                .components()
+            {
+                cur.push(part);
+                if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(format!(
+                        "{} is a symbolic link, and cplt keeps {} read-only. \
+                         Remove the link (`rm {}`) and launch again.",
+                        cur.display(),
+                        path.display(),
+                        cur.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether this bwrap accepts `--disable-userns` (bubblewrap 0.8+).
@@ -3199,6 +3244,48 @@ mod tests {
             !args.iter().any(|a| a.ends_with("/.gitmodules")),
             ".gitmodules must NOT be re-bound read-only (would break git submodule add)"
         );
+    }
+
+    #[test]
+    fn symlinked_protected_paths_are_refused() {
+        let proj = tempfile::tempdir().expect("tempdir");
+        let root = proj.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let rules = [FsRule {
+            path: root.clone(),
+            access: FsAccess {
+                write: true,
+                ..FsAccess::default()
+            },
+            nofollow: false,
+        }];
+        let hooks = root.join(".github/hooks");
+        let check = |read_only: &[PathBuf], pins: &[PathBuf]| {
+            refuse_symlinked_overlays(
+                &rules,
+                Overlays {
+                    read_only,
+                    pins,
+                    mask_missing: &[],
+                },
+            )
+        };
+        std::fs::create_dir(&hooks).unwrap();
+        assert!(check(std::slice::from_ref(&hooks), &[]).is_ok());
+        std::fs::remove_dir(&hooks).unwrap();
+        for target in [PathBuf::from("../elsewhere"), root.join("elsewhere")] {
+            std::os::unix::fs::symlink(&target, &hooks).unwrap();
+            let err = check(std::slice::from_ref(&hooks), &[]).unwrap_err();
+            assert!(err.contains(".github/hooks"), "{err}");
+            assert!(check(&[], std::slice::from_ref(&hooks)).is_err());
+            std::fs::remove_file(&hooks).unwrap();
+        }
+        // A linked ancestor redirects the bind just the same.
+        std::fs::remove_dir(root.join(".github")).unwrap();
+        std::fs::create_dir(root.join("elsewhere/hooks")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.join(".github")).unwrap();
+        assert!(check(std::slice::from_ref(&hooks), &[]).is_err());
     }
 
     #[test]

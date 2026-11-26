@@ -3424,6 +3424,32 @@ except PermissionError:
     print('sti=EPERM')
 ""#;
 
+    /// A link at a protected path must refuse the launch, both kinds: a
+    /// relative link would move the read-only bind onto its target, an absolute
+    /// one would make bwrap abort and auto-detect fall back to Landlock-only.
+    #[test]
+    fn bwrap_refuses_symlinked_protected_path() {
+        require_bwrap!();
+        let project = create_test_project();
+        let root = project.path();
+        fs::create_dir_all(root.join(".github")).unwrap();
+        fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let hooks = root.join(".github/hooks");
+        for target in [PathBuf::from("../elsewhere"), root.join("elsewhere")] {
+            std::os::unix::fs::symlink(&target, &hooks).unwrap();
+            for flags in [&["--use-bubblewrap"][..], &[][..]] {
+                let (code, out, err) = run_sandboxed_with_flags(root, flags, "echo RAN");
+                assert_ne!(
+                    code, 0,
+                    "{target:?} {flags:?}\nstdout: {out}\nstderr: {err}"
+                );
+                assert!(!out.contains("RAN"), "{target:?} {flags:?}: {out}");
+                assert!(err.contains("symbolic link"), "{target:?} {flags:?}: {err}");
+            }
+            fs::remove_file(&hooks).unwrap();
+        }
+    }
+
     #[test]
     fn bwrap_grants_only_its_private_devpts() {
         require_bwrap!();
