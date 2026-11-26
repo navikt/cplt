@@ -1283,16 +1283,6 @@ fn gh_gate_allows_explicit_api_repo_from_unverifiable_cwd() {
 }
 
 #[test]
-fn gh_gate_allows_relative_api_endpoint() {
-    // Relative paths (no leading /repos/) are resolved by gh to current repo
-    let (_, _, ok) = gh_gate(&["api", "pulls/67/comments"]);
-    assert!(
-        ok,
-        "relative API paths should be allowed (resolved to current repo)"
-    );
-}
-
-#[test]
 fn gh_gate_allows_global_command_from_unverifiable_cwd() {
     let temp = tempfile::tempdir().unwrap();
     let output = cplt_cmd()
@@ -4594,4 +4584,159 @@ fn gh_gate_pins_auth_hostname_when_token_rides_along() {
         "auth status -h github.com|set"
     );
     assert_eq!(run(&["auth", "status"], false), "auth status|");
+}
+
+#[test]
+fn gh_gate_refuses_top_level_api_reads_from_an_in_scope_checkout() {
+    for ep in [
+        "repositories/123/hooks",
+        "organizations/9919/audit-log",
+        "enterprises/acme/audit-log",
+        "teams/1/members",
+        "gists",
+        "/issues",
+        "pulls/1/comments",
+    ] {
+        let (_, stderr, ok) = gh_gate(&["api", ep]);
+        assert_refused(&stderr, ok, "");
+    }
+    for args in [
+        &["api", "rate_limit"][..],
+        &["api", "repos/navikt/cplt/pulls"],
+    ] {
+        let (_, stderr, ok) = gh_gate(args);
+        assert!(ok, "{args:?} must stay allowed: {stderr}");
+    }
+}
+
+#[test]
+fn gh_gate_keeps_delete_under_a_method_override_header() {
+    let (_, stderr, ok) = gh_gate_with_opts(
+        &[
+            "api",
+            "-X",
+            "DELETE",
+            "-H",
+            "X-HTTP-Method: GET",
+            "repos/navikt/cplt/issues/comments/1",
+        ],
+        &["--allow-api-write"],
+    );
+    assert_refused(&stderr, ok, "DELETE");
+}
+
+#[test]
+fn gh_gate_refuses_config_aliases() {
+    let cfg = tempfile::tempdir().unwrap();
+    let dir = cfg.path().to_str().unwrap();
+    std::fs::write(
+        cfg.path().join("config.yml"),
+        "aliases:\n    attestation: api -X DELETE repos/o/r\n",
+    )
+    .unwrap();
+    let (_, stderr, ok) = gh_gate_with_opts(&["attestation", "xx"], &["--gh-config-dir", dir]);
+    assert_refused(&stderr, ok, "alias");
+    // The same command without the alias is still allowed.
+    std::fs::write(
+        cfg.path().join("config.yml"),
+        "aliases:\n    co: pr checkout\n",
+    )
+    .unwrap();
+    let (_, stderr, ok) = gh_gate_with_opts(&["attestation", "xx"], &["--gh-config-dir", dir]);
+    assert!(ok, "{stderr}");
+}
+
+#[test]
+fn gh_gate_pins_gh_config_dir_for_real_gh() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s\\n' \"${GH_CONFIG_DIR-}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pinned = temp.path().join("launch-gh");
+    std::fs::create_dir_all(&pinned).unwrap();
+    let repo = temp_repo("navikt/cplt");
+    let out = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--gh-config-dir")
+        .arg(&pinned)
+        .arg("--")
+        .args(["pr", "list"])
+        .env("GH_CONFIG_DIR", temp.path().join("agent-gh"))
+        .current_dir(repo.path())
+        .output()
+        .expect("cplt gh-gate should run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        pinned.to_str().unwrap()
+    );
+}
+
+/// The gate's own lookups (`run_gh_lookup` for a gated merge,
+/// `verify_targets` for a review-thread mutation) read the pinned config too.
+#[test]
+fn gh_gate_pins_gh_config_dir_for_gate_lookups() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("log");
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"${{GH_CONFIG_DIR-}}\" >> '{}'\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pinned = temp.path().join("launch-gh");
+    std::fs::create_dir_all(&pinned).unwrap();
+    let repo = temp_repo("navikt/cplt");
+    let mutation = "query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}";
+    for (args, opts) in [
+        (&["pr", "merge", "1"][..], &["--allow-pr-merge"][..]),
+        (&["api", "graphql", "-f", mutation, "-f", "id=PRRT_x"], &[]),
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let out = cplt_cmd()
+            .arg("gh-gate")
+            .arg("--real-gh")
+            .arg(&fake_gh)
+            .arg("--real-git")
+            .arg(binary_in_path("git"))
+            .arg("--repo-scope")
+            .arg("navikt/cplt")
+            .arg("--gh-config-dir")
+            .arg(&pinned)
+            .args(opts)
+            .arg("--")
+            .args(args)
+            .env("GH_CONFIG_DIR", temp.path().join("agent-gh"))
+            .current_dir(repo.path())
+            .output()
+            .expect("cplt gh-gate should run");
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !seen.is_empty() && seen.lines().all(|l| l == pinned.to_str().unwrap()),
+            "{args:?}: lookups saw {seen:?}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

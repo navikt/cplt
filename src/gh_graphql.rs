@@ -971,6 +971,7 @@ pub fn verify_targets(
 ) -> Result<(), String> {
     for t in targets {
         let mut cmd = std::process::Command::new(real_gh);
+        crate::gh_proxy::pin_gh_config(&mut cmd);
         if let Some(token) = token {
             cmd.env("GH_TOKEN", token);
         }

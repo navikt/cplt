@@ -1116,6 +1116,10 @@ fn install_command_wrappers(
                 real_git_str.as_deref(),
                 &cplt_str,
                 gh_guard,
+                std::env::var_os("HOME")
+                    .and_then(|home| crate::sandbox::policy::gh_config_dir(Path::new(&home)))
+                    .as_deref()
+                    .and_then(Path::to_str),
             )
         };
         let wrapper_path = bin_dir.join("gh");
