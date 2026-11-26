@@ -879,10 +879,18 @@ fn child_temp_base(home: &Path) -> std::io::Result<PathBuf> {
         .create(&state)?;
     // A linked state dir (dotfile managers) is fine when its target is a
     // directory of ours no one else can write; launch validation has already
-    // refused one inside a tree the agent can write.
+    // refused one inside a tree the agent can write. Canonical: Seatbelt
+    // matches resolved paths (a symlinked HOME). The resolved dir is opened
+    // once without following links and both checks read that one handle, so
+    // a link swapped between them cannot pass.
+    let real = state.canonicalize()?;
     if std::fs::symlink_metadata(&state)?.file_type().is_symlink() {
-        use std::os::unix::fs::MetadataExt;
-        let m = std::fs::metadata(&state)?;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let m = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&real)?
+            .metadata()?;
         // SAFETY: getuid(2) cannot fail.
         if !m.is_dir() || m.uid() != unsafe { libc::getuid() } || m.mode() & 0o022 != 0 {
             return Err(std::io::Error::other(format!(
@@ -892,8 +900,7 @@ fn child_temp_base(home: &Path) -> std::io::Result<PathBuf> {
             )));
         }
     }
-    // Canonical: Seatbelt matches resolved paths (a symlinked HOME).
-    let base = state.canonicalize()?.join("mcp-tmp");
+    let base = real.join("mcp-tmp");
     match std::fs::DirBuilder::new().mode(0o700).create(&base) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
         _ => {}

@@ -225,6 +225,43 @@ mod e2e_tests {
         );
     }
 
+    /// gh's config dir moved into the project is refused at launch, also
+    /// through a link from outside the project; the default location is not.
+    #[test]
+    fn e2e_gh_config_dir_in_writable_tree_is_refused() {
+        let project = project_dir().join("target/e2e-ghcfg");
+        let gh = project.join("gh");
+        std::fs::create_dir_all(&gh).unwrap();
+        let link = scratch_home().join("linked-gh");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&gh, &link).unwrap();
+        for (var, val) in [
+            ("GH_CONFIG_DIR", gh.clone()),
+            ("GH_CONFIG_DIR", link.clone()),
+            ("XDG_DATA_HOME", project.clone()),
+        ] {
+            let out = cplt_cmd()
+                .args(["--print-profile"])
+                .env(var, &val)
+                .current_dir(&project)
+                .output()
+                .expect("binary should run");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{var}={}", val.display());
+            assert!(stderr.contains("writable inside the sandbox"), "{stderr}");
+        }
+        let out = cplt_cmd()
+            .args(["--print-profile"])
+            .current_dir(&project)
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn e2e_print_profile_blocks_sensitive_dirs() {
         let output = cplt_cmd()
@@ -384,7 +421,8 @@ mod e2e_tests {
             .expect("tempdir");
         let xdg = tmp.path().join("xdg");
         let output = cplt_cmd()
-            .args(["--print-profile", "--agent", "opencode"])
+            // gh guard off: XDG_CONFIG_HOME sits in the project on purpose.
+            .args(["--print-profile", "--agent", "opencode", "--no-gh-guard"])
             .env("XDG_CONFIG_HOME", &xdg)
             .current_dir(project_dir())
             .output()
@@ -2983,7 +3021,15 @@ mod e2e_tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
             let out = cplt_cmd()
-                .args(["--agent", "copilot", "mcp", "status", "--json"])
+                // gh guard off: XDG_CONFIG_HOME sits in a writable tree on purpose.
+                .args([
+                    "--agent",
+                    "copilot",
+                    "--no-gh-guard",
+                    "mcp",
+                    "status",
+                    "--json",
+                ])
                 .env("HOME", &home_path)
                 .env("XDG_CONFIG_HOME", xdg)
                 .current_dir(project_dir())

@@ -440,6 +440,19 @@ pub fn gh_config_dir(home: &Path) -> Option<PathBuf> {
     dir.is_absolute().then_some(dir)
 }
 
+/// gh's data dir, where extensions live: `GH_DATA_DIR`, then
+/// `$XDG_DATA_HOME/gh`, then `~/.local/share/gh`. `None` for a relative value.
+#[must_use]
+pub fn gh_data_dir(home: &Path) -> Option<PathBuf> {
+    let env = |k| std::env::var_os(k).filter(|v| !v.is_empty());
+    let dir = match (env("GH_DATA_DIR"), env("XDG_DATA_HOME")) {
+        (Some(d), _) => PathBuf::from(d),
+        (None, Some(x)) => PathBuf::from(x).join("gh"),
+        (None, None) => home.join(".local/share/gh"),
+    };
+    dir.is_absolute().then_some(dir)
+}
+
 /// gh's `hosts.yml` and `config.yml` when gh reads them from somewhere other
 /// than the `~/.config/gh` that [`HOME_CONFIG_FILES`] already grants.
 #[must_use]

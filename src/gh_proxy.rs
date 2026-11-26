@@ -2252,6 +2252,12 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 if override_method.as_deref() == Some("DELETE") {
                     return;
                 }
+                // Repeated: which one the server honours is not ours to
+                // guess, so it is blocked the way DELETE is.
+                if override_method.is_some() {
+                    override_method = Some("DELETE".to_string());
+                    return;
+                }
                 override_method = Some(if matches!(v.as_str(), "" | "GET" | "HEAD") {
                     "POST".to_string()
                 } else {
@@ -4171,7 +4177,8 @@ fn graphql_approval(
     let graphql_targets = crate::gh_graphql::check(args, &scope).map_err(refuse)?;
     Ok(GateApproval {
         repo_scope: None,
-        host_pin: None,
+        // The check names repositories without a host: hold gh to github.com.
+        host_pin: Some(DEFAULT_GH_HOST.to_string()),
         check_merge_protection: false,
         graphql_targets,
     })
@@ -8331,6 +8338,14 @@ mod tests {
                 "DELETE",
                 "repos/navikt/cplt/x",
             ],
+            &[
+                "api",
+                "-H",
+                "X-HTTP-Method-Override: PATCH",
+                "-H",
+                "x-method-override: POST",
+                "repos/navikt/cplt/x",
+            ],
         ] {
             let cmd = parse_command(args).unwrap();
             assert_eq!(cmd.method.as_deref(), Some("DELETE"), "{args:?}");
@@ -9827,6 +9842,17 @@ mod tests {
                 .unwrap();
         assert_eq!(approval.graphql_targets.len(), 1);
         assert_eq!(approval.repo_scope, None);
+        assert_eq!(approval.host_pin.as_deref(), Some("github.com"));
+        let read = [
+            "api",
+            "graphql",
+            "-f",
+            "query={ repository(owner: \"navikt\", name: \"cplt\") { pullRequests(first: 1) { nodes { number } } } }",
+        ];
+        let approval =
+            gate_with_repo_scope(&read, &GatePolicy::default(), &["navikt/cplt".into()], None)
+                .unwrap();
+        assert_eq!(approval.host_pin.as_deref(), Some("github.com"));
     }
 
     // Only exact `graphql` reaches the GraphQL checker; every other spelling of
