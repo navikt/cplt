@@ -327,6 +327,9 @@ pub(crate) struct BubblewrapWrapper {
     /// The `/proc` read grant (#790) is in `fs_rules` but not in the direct
     /// policy, so a fallback must say processes lose their `/proc/self`.
     pub proc_limited_on_fallback: bool,
+    /// Keyed read-only overlays bound by this wrapper; a spawn-time
+    /// fallback must name them as writable (#1184).
+    pub ro_overlays_on_fallback: Vec<PathBuf>,
     /// Whether egress is locked to the proxy port (`proxy.forced`). Needed
     /// in-namespace so the helper builds the same seccomp filter as the
     /// fork-based path (the UDP/raw-socket denial is gated on it).
@@ -1597,6 +1600,7 @@ pub(crate) fn build_wrapper(
         deny_mask_count: deny_masks.mask_count(),
         socket_mask_count: deny_masks.socket_mask_count(),
         proc_limited_on_fallback: false,
+        ro_overlays_on_fallback: Vec::new(),
         proxy_forced: policy.proxy_forced,
         plain_file: policy.plain_file,
     })
@@ -2154,6 +2158,7 @@ mod tests {
             deny_mask_count: 0,
             socket_mask_count: 0,
             proc_limited_on_fallback: false,
+            ro_overlays_on_fallback: Vec::new(),
             proxy_forced: false,
             plain_file: policy.plain_file,
         };
@@ -2196,6 +2201,7 @@ mod tests {
             deny_mask_count: 0,
             socket_mask_count: 0,
             proc_limited_on_fallback: false,
+            ro_overlays_on_fallback: Vec::new(),
             proxy_forced: false,
             plain_file: None,
         }
