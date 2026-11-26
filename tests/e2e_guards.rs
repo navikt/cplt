@@ -3126,7 +3126,7 @@ fn real_push_does_not_run_an_ssh_planted_first_on_path() {
         &work,
         &facts,
         PROTECT,
-        &[("PATH", path.as_str()), ("GIT_SSH_COMMAND", "")],
+        &[("PATH", path.as_str())],
         &["push", "-q", "origin", "feat"],
     );
     assert!(!marker.exists(), "the planted ssh ran");
