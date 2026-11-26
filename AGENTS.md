@@ -30,6 +30,7 @@ Always run `mise run check` at the end of a coding session.
 | `mise run test:probe` | offline probe checks | ✅ | ✅ | ✅ | Python 3 + Node.js; PTY case macOS-only |
 | `mise run test:integration` | integration | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
 | `mise run test:integration-linux` | integration_linux | ❌ | ✅ | ❌ | Linux with Landlock (5.13+) |
+| `mise run linux:test-integration` | integration_linux in a Debian container | ❌ | ❌ | ❌ | docker on the host (colima works); `linux:test-all` runs every suite; see CONTRIBUTING.md |
 | `mise run test:network-audit` | network_audit | ✅ | ❌ | ✅ | macOS or Linux; binds localhost TCP |
 | `mise run test:e2e` | e2e, message_commands | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |

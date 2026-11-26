@@ -75,6 +75,22 @@ run = "sh hack/quiet-test.sh --test integration"
 description = "Run Linux Landlock integration tests — Linux only (kernel 5.13+)"
 run = "sh hack/quiet-test.sh --test integration_linux"
 
+[tasks."linux:shell"]
+description = "Shell in a Debian container with bubblewrap, for Linux sandbox work from a Mac (docker or colima)"
+run = "sh hack/linux-dev.sh shell"
+
+[tasks."linux:check"]
+description = "Build and clippy the Linux target in the Debian dev container"
+run = "sh hack/linux-dev.sh check"
+
+[tasks."linux:test-integration"]
+description = "Run tests/integration_linux.rs in the Debian dev container"
+run = "sh hack/linux-dev.sh test-integration"
+
+[tasks."linux:test-all"]
+description = "Run every suite with cargo test --no-fail-fast in the Debian dev container, as the CI Linux job does"
+run = "sh hack/linux-dev.sh test-all"
+
 [tasks."test:network-audit"]
 description = "Run network audit command-path tests on macOS or Linux"
 run = "sh hack/quiet-test.sh --test network_audit"
