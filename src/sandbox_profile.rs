@@ -2982,6 +2982,22 @@ fn emit_host_login_write_denies(sb: &mut String, config: &SandboxConfig) {
         let p = p.display();
         sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
     }
+    for dir in super::host_persistence_zsh_dirs(config) {
+        let d = escape_regex(&dir.to_string_lossy());
+        sbpl!(
+            sb,
+            "(deny file-write* (regex #\"^{d}/\\.(zshrc|zprofile|zshenv|zlogin|zlogout)\\.zwc$\"))"
+        );
+        sbpl!(sb, "(deny file-write* (regex #\"^{d}/\\.zcompdump\"))");
+    }
+    // Rename pins (#923 pattern): moving an ancestor aside would leave the
+    // entry recreatable under a fresh tree the denies do not name.
+    for dir in super::host_persistence_pin_dirs(config) {
+        if validate_sbpl_path(&dir).is_ok() {
+            let d = dir.display();
+            sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
+        }
+    }
     sbpl!(sb);
 }
 

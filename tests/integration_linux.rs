@@ -3410,10 +3410,12 @@ print('BIND_OK')
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(h.join(".config/fish")).unwrap();
         fs::create_dir_all(h.join(".config/other")).unwrap();
+        fs::create_dir_all(h.join(".config/systemd/user")).unwrap();
         fs::write(h.join(".config/fish/config.fish"), "orig\n").unwrap();
         let script = format!(
             "echo x >> '{c}/fish/config.fish' && echo FISH_WRITTEN; \
              mkdir -p '{c}/autostart' && touch '{c}/autostart/a.desktop' && echo AUTOSTART_CREATED; \
+             mv '{c}/systemd' '{c}/s2' && echo SYSTEMD_MOVED; \
              touch '{c}/other/ok' && echo OTHER_OK",
             c = h.join(".config").display()
         );
@@ -3445,6 +3447,7 @@ print('BIND_OK')
         assert!(o.contains("OTHER_OK"), "stdout: {o}\nstderr: {e}");
         assert!(!o.contains("FISH_WRITTEN"), "stdout: {o}\nstderr: {e}");
         assert!(!o.contains("AUTOSTART_CREATED"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("SYSTEMD_MOVED"), "stdout: {o}\nstderr: {e}");
         assert!(
             !h.join(".config/autostart/a.desktop").exists(),
             "a missing autostart dir must be masked"
@@ -3453,6 +3456,49 @@ print('BIND_OK')
             fs::read_to_string(h.join(".config/fish/config.fish")).unwrap(),
             "orig\n"
         );
+    }
+
+    /// An explicit grant on a login path is honoured, with a launch warning.
+    #[test]
+    fn bwrap_honours_an_explicit_grant_on_a_login_path() {
+        require_bwrap!();
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = &home.path().canonicalize().unwrap();
+        let project = h.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(h.join(".config/autostart")).unwrap();
+        let script = format!(
+            "touch '{a}/x.desktop' && echo AUTOSTART_OK",
+            a = h.join(".config/autostart").display()
+        );
+        let mut cmd = cplt_cmd();
+        crate::common::with_scratch_home(&mut cmd);
+        let out = cmd
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join("xdg-config"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("XDG_CACHE_HOME", h.join(".cache"))
+            .args([
+                "--yes",
+                "--no-validate",
+                "--use-bubblewrap",
+                "--project-dir",
+            ])
+            .arg(&project)
+            .arg("--allow-write")
+            .arg(h.join(".config"))
+            .arg("--allow-write")
+            .arg(h.join(".config/autostart"))
+            .args(["--agent", "shell", "--", "-c", &script])
+            .output()
+            .expect("run cplt");
+        let (o, e) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(o.contains("AUTOSTART_OK"), "stdout: {o}\nstderr: {e}");
+        assert!(e.contains("known login or autostart path"), "stderr: {e}");
     }
 
     /// Without bubblewrap the login and autostart paths under a broad grant

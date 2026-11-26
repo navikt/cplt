@@ -24,9 +24,9 @@ pub use display::{
     localhost_any_ignored_suffix,
 };
 pub use editing::{
-    ConfigSetOp, HOME_SCOPE_WRITE_REASON, append_value_in_doc, array_entries_in_doc,
-    get_value_from_doc, home_scope_write, remove_array_element_in_doc, security_confirmation,
-    set_value_in_doc, unset_value_in_doc, validate_global_document, write_document_atomically,
+    ConfigSetOp, append_value_in_doc, array_entries_in_doc, get_value_from_doc,
+    home_scope_write_reason, remove_array_element_in_doc, security_confirmation, set_value_in_doc,
+    unset_value_in_doc, validate_global_document, write_document_atomically,
     write_repo_document_atomically,
 };
 pub use error::{ConfigError, IN_SANDBOX_HINT, is_absent};

@@ -13305,12 +13305,13 @@ fn run_config_set_repo(
         && key_info.key == "write"
         && !unset
         && !force
-        && let Some(val) = values.iter().find(|v| config::home_scope_write(v))
+        && let Some((val, reason)) = values
+            .iter()
+            .find_map(|v| config::home_scope_write_reason(v).map(|r| (v, r)))
     {
         ui::error(&format!(
-            "allow.write = {val} {}.\n  \
+            "allow.write = {val} {reason}.\n  \
              Add --force to confirm: cplt config set --repo allow.write {} --force",
-            config::HOME_SCOPE_WRITE_REASON,
             values.join(" ")
         ));
         return ExitCode::FAILURE;

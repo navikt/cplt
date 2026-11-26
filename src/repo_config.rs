@@ -973,13 +973,13 @@ pub fn propose_key_detail(
         "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
         "allow.write" if !propose.allow.write.is_empty() => {
             let mut d = format!("{:?}", propose.allow.write);
-            if propose
+            if let Some(r) = propose
                 .allow
                 .write
                 .iter()
-                .any(|w| crate::config::home_scope_write(w))
+                .find_map(|w| crate::config::home_scope_write_reason(w))
             {
-                d.push_str(" (dangerous: reaches home login and autostart files; cplt keeps those read-only)");
+                d = format!("{d} ({r})");
             }
             Some(d)
         }

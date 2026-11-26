@@ -4660,6 +4660,41 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A home-scope `allow.write` in a repo proposal needs `--force`.
+    #[test]
+    fn e2e_config_set_repo_home_scope_write_needs_force() {
+        let repo = make_repo_dir("set-repo-home-write");
+        let home = std::env::var("HOME").unwrap();
+        let run = |extra: &[&str]| {
+            cplt_cmd()
+                .args(["config", "set", "--repo", "allow.write", &home])
+                .args(extra)
+                .current_dir(&repo)
+                .output()
+                .expect("should run")
+        };
+        let out = run(&[]);
+        assert!(!out.status.success(), "must need --force");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--force"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !repo.join(".cplt.toml").exists()
+                || !std::fs::read_to_string(repo.join(".cplt.toml"))
+                    .unwrap()
+                    .contains(&home)
+        );
+        let out = run(&["--force"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // ── config set --local e2e tests (#340) ──────────────────────
 
     /// The single local file under a fake HOME, or `None` if none was written.

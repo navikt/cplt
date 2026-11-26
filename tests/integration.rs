@@ -2758,6 +2758,9 @@ int main(int argc, char **argv) {
              touch '{h}/Library/LaunchAgents/a.plist' && echo AGENT_WRITTEN; \
              touch '{h}/.config/fish/config.fish' && echo FISH_WRITTEN; \
              touch '{h}/.bash_profile' && echo PROFILE_WRITTEN; \
+             touch '{h}/.zshrc.zwc' && echo ZWC_WRITTEN; \
+             mv '{h}/Library' '{h}/Lib2' && echo LIBRARY_MOVED; \
+             mv '{h}/.config' '{h}/cfg2' && echo CONFIG_MOVED; \
              touch '{h}/notes.txt' && echo OTHER_OK"
         );
         let (output, _) = run_sandboxed(&profile, &script);
@@ -2768,10 +2771,36 @@ int main(int argc, char **argv) {
             "AGENT_WRITTEN",
             "FISH_WRITTEN",
             "PROFILE_WRITTEN",
+            "ZWC_WRITTEN",
+            "LIBRARY_MOVED",
+            "CONFIG_MOVED",
         ] {
             assert!(!output.contains(leak), "{leak}: {output}");
         }
         assert_eq!(fs::read_to_string(home.join(".zshrc")).unwrap(), "orig\n");
+    }
+
+    /// An explicit grant on a login path is the user's choice: it is
+    /// honoured, while a broader grant alone leaves the path read-only.
+    #[test]
+    fn real_profile_explicit_grant_on_login_path_is_honoured() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        let writes = [home.clone(), home.join(".local/bin")];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        let profile = write_real_profile(&opts);
+        let h = home.display();
+        let script = format!(
+            "touch '{h}/.local/bin/tool' && echo BIN_OK; touch '{h}/.zshrc' && echo RC_WRITTEN"
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(output.contains("BIN_OK"), "{output}");
+        assert!(!output.contains("RC_WRITTEN"), "{output}");
     }
 
     /// A directory clone must not carry a read-denied file out with it, while
