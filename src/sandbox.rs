@@ -3142,6 +3142,7 @@ fn copilot_keychain_acct() -> Result<Option<String>, String> {
     }
     #[allow(clippy::disallowed_methods)] // absolute system path
     let mut cmd = std::process::Command::new("/usr/bin/security");
+    crate::clean_env::helper_env(&mut cmd);
     cmd.arg("dump-keychain");
     let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))
         .ok_or("`security dump-keychain` failed or did not answer within 1 s")?;

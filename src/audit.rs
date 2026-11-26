@@ -2185,6 +2185,7 @@ fn template_dirs() -> Vec<PathBuf> {
     };
     let ask = |args: &[&str]| -> Option<PathBuf> {
         let mut cmd = Command::new(git);
+        crate::clean_env::helper_env(&mut cmd);
         cmd.args(args).current_dir("/");
         let out = crate::git::output_bounded(cmd, GIT_TIMEOUT).ok()?;
         let s = String::from_utf8(out.stdout).ok()?;

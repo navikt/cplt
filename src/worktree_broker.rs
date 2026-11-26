@@ -1679,6 +1679,7 @@ fn sandbox_git(ctx: &Context, cmd: Command, staging: Option<&Path>) -> Result<Co
             .map_err(|e| format!("cannot build broker checkout profile: {e}"))?;
     }
     let mut wrapped = Command::new("/usr/bin/sandbox-exec");
+    crate::clean_env::helper_env(&mut wrapped);
     wrapped
         .args(["-p", &profile])
         .arg(cmd.get_program())

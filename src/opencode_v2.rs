@@ -962,8 +962,9 @@ fn sandboxed(pid: i32) -> bool {
 #[cfg(target_os = "macos")]
 fn listens_on(pid: i32, port: u16) -> bool {
     #[allow(clippy::disallowed_methods)] // absolute path
-    std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-a", "-t", "-sTCP:LISTEN"])
+    let mut cmd = std::process::Command::new("/usr/sbin/lsof");
+    crate::clean_env::helper_env(&mut cmd);
+    cmd.args(["-nP", "-a", "-t", "-sTCP:LISTEN"])
         .arg(format!("-p{pid}"))
         .arg(format!("-iTCP@127.0.0.1:{port}"))
         .stdin(std::process::Stdio::null())

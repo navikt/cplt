@@ -46,10 +46,61 @@ pub unsafe fn launch() -> Vec<OsString> {
         }
         return args;
     }
-    // Returns only on failure (no temp dir, exe gone): availability over
-    // hardening, the launch runs on as before.
-    let _ = reexec(&args);
+    // Returns only on failure (no temp dir, exe gone). Availability over
+    // hardening: say so, then run on as before.
+    let Err(e) = reexec(&args);
+    crate::ui::warn(&format!(
+        "the launcher kept the full environment, so other processes of your user \
+         (including the sandboxed agent) can read it: re-exec with a clean \
+         environment failed: {e}"
+    ));
     args
+}
+
+/// What a parent-side helper (git, security, lsof, the worktree broker's
+/// git) receives: the variables those tools need to find their config,
+/// locale, agent socket and network proxy. Never a token: a helper that needs
+/// a secret gets it on stdin or a descriptor.
+pub const HELPER_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TMPDIR",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "SSH_AUTH_SOCK",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+/// Give `cmd` only [`HELPER_ENV`] from the restored environment. Call it right
+/// after `Command::new`: `env_clear` also drops variables set before it.
+pub fn helper_env(cmd: &mut std::process::Command) {
+    cmd.env_clear();
+    for k in HELPER_ENV {
+        if let Some(v) = std::env::var_os(k) {
+            cmd.env(k, v);
+        }
+    }
 }
 
 fn reexec(args: &[OsString]) -> std::io::Result<std::convert::Infallible> {
@@ -146,6 +197,20 @@ mod tests {
         assert_eq!(decode(b"A=B\0v\0"), None);
         assert_eq!(decode(b"\0v\0"), None);
         assert_eq!(decode(b"A\0v"), None);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned
+    fn helper_env_drops_everything_outside_the_list() {
+        let mut cmd = std::process::Command::new("/usr/bin/true");
+        cmd.env("CPLT_TEST_SECRET", "x");
+        helper_env(&mut cmd);
+        let keys: Vec<_> = cmd.get_envs().map(|(k, _)| k.to_owned()).collect();
+        assert!(
+            keys.iter().all(|k| HELPER_ENV.iter().any(|h| k == h)),
+            "{keys:?}"
+        );
+        assert!(!keys.iter().any(|k| k == "CPLT_TEST_SECRET"));
     }
 
     #[test]

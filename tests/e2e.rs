@@ -799,6 +799,22 @@ print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
         );
     }
 
+    /// A re-exec that cannot happen is reported, and the launch goes on.
+    #[test]
+    fn e2e_failed_clean_env_reexec_warns_and_continues() {
+        let out = cplt_cmd()
+            .arg("--version")
+            .env("TMPDIR", "/nonexistent-cplt-test-dir")
+            .output()
+            .expect("cplt should run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("the launcher kept the full environment"),
+            "{stderr}"
+        );
+    }
+
     /// #1121: an HTTPS GitHub remote with the gh guard off and no helper gets
     /// one launch line with the command; running that command clears it. SSH
     /// gets nothing, and doctor's `push:` line says which case it is.

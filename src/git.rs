@@ -623,8 +623,9 @@ fn harden(cmd: &mut Command) {
     #[cfg(test)]
     HARDENED_COMMANDS.with(|n| n.set(n.get() + 1));
 
-    // Same reasoning as `gh_proxy::detect_current_repo`, which also sweeps.
-    clear_git_env(cmd);
+    // Only the helper allowlist: no inherited GIT_* (same reasoning as
+    // `gh_proxy::detect_current_repo`) and no token from the user's shell.
+    crate::clean_env::helper_env(cmd);
     cmd
         // Skip /etc/gitconfig. Matches the sandboxed child's hardening
         // (`sandbox_policy::HARDENING_ENV_VARS`). Cost: a site-wide
@@ -1694,6 +1695,25 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--no-textconv"), "{args:?}");
     }
 
+    /// cargo exports CARGO_* to the test process: a hardened spawn must not
+    /// inherit them, or anything else outside the helper list.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // trusted_git path
+    fn hardened_spawn_does_not_inherit_the_parent_env() {
+        assert!(std::env::var_os("CARGO_PKG_NAME").is_some());
+        let mut cmd = Command::new(trusted_git().expect("trusted git"));
+        harden(&mut cmd);
+        // A shell alias prints the environment git hands its children.
+        let out = cmd
+            .args(["-c", "alias.e=!env", "e"])
+            .current_dir("/")
+            .output()
+            .expect("git runs");
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert!(out.contains("GIT_CONFIG_NOSYSTEM=1"), "{out}");
+        assert!(!out.contains("CARGO_"), "{out}");
+    }
+
     #[test]
     fn hardening_env_is_applied() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1712,13 +1732,13 @@ mod tests {
                 .find(|(k, _)| k == name)
                 .and_then(|(_, v)| v.clone())
         };
-        // Every named GIT_* is recorded as CLEARED (value None), so an
-        // inherited GIT_EXTERNAL_DIFF or GIT_CONFIG_GLOBAL cannot re-open what
-        // CONFIG_OVERRIDES closes.
+        // No named GIT_* is passed (the env is cleared to the helper list),
+        // so an inherited GIT_EXTERNAL_DIFF or GIT_CONFIG_GLOBAL cannot
+        // re-open what CONFIG_OVERRIDES closes.
         for name in GIT_ENV_CLEARED {
             let entry = envs.iter().find(|(k, _)| k == name);
             assert!(
-                matches!(entry, Some((_, None))),
+                !matches!(entry, Some((_, Some(_)))),
                 "{name} must be cleared, got {entry:?}"
             );
         }
