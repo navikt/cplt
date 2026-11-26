@@ -2881,6 +2881,237 @@ fn git_gate_allows_a_push_from_a_worktree_of_the_launch_repository() {
 }
 
 // ============================================================
+// Push destination resolution, against a real bare remote
+// ============================================================
+//
+// These run the real git for the push itself, so an allowed push lands in the
+// bare origin. Each test asserts the refusal AND that the protected ref did
+// not move.
+
+/// A work repo with a pushed `main`, `origin` a local bare repo whose default
+/// branch is `default`, checked out on a new branch `feat` one commit ahead.
+fn pushed_repo(default: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (tmp, work, origin) = common::bare_origin_repo(&std::env::temp_dir());
+    for args in [
+        &["branch", "-M", default][..],
+        &["push", "-q", "origin", default],
+        &["remote", "set-head", "origin", default],
+        &["checkout", "-q", "-b", "feat"],
+        &["commit", "-q", "--allow-empty", "-m", "feat"],
+    ] {
+        assert!(git_ok(&work, args), "git {args:?}");
+    }
+    (tmp, work, origin)
+}
+
+fn remote_ref(origin: &std::path::Path, name: &str) -> Option<String> {
+    let out = common::git_cmd(origin)
+        .args(["rev-parse", "--verify", "-q", name])
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `git-gate` with the real git and the given push policy, in `dir`.
+fn real_push_gate(
+    dir: &std::path::Path,
+    facts: &str,
+    policy: [bool; 3],
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> (String, bool) {
+    let [prevent_push, prevent_force_push, protect] = policy;
+    let mut cmd = cplt_cmd();
+    cmd.arg("git-gate")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg(format!("--repo-facts={facts}"))
+        .arg("--mode=block")
+        .arg(format!("--prevent-push={prevent_push}"))
+        .arg(format!("--prevent-force-push={prevent_force_push}"))
+        .arg(format!("--protect-default-branch-only={protect}"))
+        .arg("--")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(envs.iter().copied())
+        .current_dir(dir);
+    let out = cmd.output().expect("cplt git-gate should run");
+    (
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.success(),
+    )
+}
+
+const PROTECT: [bool; 3] = [true, true, true];
+const FORCE_ONLY: [bool; 3] = [false, true, false];
+
+#[test]
+fn real_push_feature_branch_still_allowed() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[],
+        &["push", "-q", "origin", "feat"],
+    );
+    assert!(ok, "{stderr}");
+    assert!(remote_ref(&origin, "refs/heads/feat").is_some());
+}
+
+#[test]
+fn real_push_upstream_mode_cannot_reach_default_branch() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(
+        &work,
+        &["branch", "-q", "--set-upstream-to=origin/main"]
+    ));
+    assert!(git_ok(&work, &["config", "push.default", "upstream"]));
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(&work, &facts, PROTECT, &[], &["push", "origin", "feat"]);
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+#[test]
+fn real_push_remote_push_mapping_cannot_reach_default_branch() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(
+        &work,
+        &[
+            "config",
+            "remote.origin.push",
+            "refs/heads/feat:refs/heads/main"
+        ]
+    ));
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(&work, &facts, PROTECT, &[], &["push", "origin", "feat"]);
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+#[test]
+fn real_push_heads_prefixed_destination_is_resolved() {
+    let (_t, work, origin) = pushed_repo("release/2026");
+    let facts = launch_facts(&work);
+    let before = remote_ref(&origin, "refs/heads/release/2026");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[],
+        &["push", "origin", "feat:heads/release/2026"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "refs/heads/release/2026"), before);
+}
+
+#[test]
+fn real_push_tag_destination_is_not_a_feature_branch() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[],
+        &["push", "origin", "feat:refs/tags/v1"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "refs/tags/v1"), None);
+}
+
+#[test]
+fn real_push_git_dir_redirect_is_not_the_launch_repository() {
+    // `-C <launch repo>` with GIT_DIR naming another clone, whose default
+    // branch the launch facts know nothing about.
+    let (_t, work, _origin) = pushed_repo("main");
+    let (_t2, other, other_origin) = pushed_repo("trunk");
+    assert!(git_ok(&other, &["checkout", "-q", "trunk"]));
+    assert!(git_ok(
+        &other,
+        &["commit", "-q", "--allow-empty", "-m", "x"]
+    ));
+    let facts = launch_facts(&work);
+    let before = remote_ref(&other_origin, "trunk");
+    let git_dir = other.join(".git");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        PROTECT,
+        &[("GIT_DIR", git_dir.to_str().unwrap())],
+        &["-C", work.to_str().unwrap(), "push", "origin", "trunk"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&other_origin, "trunk"), before);
+}
+
+#[test]
+fn real_push_deletion_counts_as_force() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(&work, &["push", "-q", "origin", "feat:victim"]));
+    for (policy, args) in [
+        (PROTECT, &["push", "origin", ":victim"][..]),
+        (FORCE_ONLY, &["push", "origin", ":victim"]),
+        (FORCE_ONLY, &["push", "origin", "--delete", "victim"]),
+        (FORCE_ONLY, &["push", "--mirror", "origin"]),
+    ] {
+        let (stderr, ok) = real_push_gate(&work, &facts, policy, &[], args);
+        assert_refused(&stderr, ok, "not allowed");
+        assert!(
+            remote_ref(&origin, "refs/heads/victim").is_some(),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn real_push_configured_force_refspec_counts_as_force() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    assert!(git_ok(
+        &work,
+        &[
+            "config",
+            "remote.origin.push",
+            "+refs/heads/feat:refs/heads/main"
+        ]
+    ));
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(&work, &facts, FORCE_ONLY, &[], &["push", "origin"]);
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+#[test]
+fn real_send_pack_refused_under_force_push_prevention() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let before = remote_ref(&origin, "main");
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &[
+            "send-pack",
+            "--force",
+            origin.to_str().unwrap(),
+            "+feat:refs/heads/main",
+        ],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert_eq!(remote_ref(&origin, "main"), before);
+}
+
+// ============================================================
 // Full wrapper script integration (sandbox → wrapper → gate)
 // ============================================================
 
