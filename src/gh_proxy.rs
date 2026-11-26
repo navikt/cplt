@@ -5191,7 +5191,20 @@ const SENSITIVE_CONFIG_PREFIXES: &[&str] = &[
     "core.sshcommand",
     "core.gitproxy",
     "ssh.",
+    // `http.proxy` and `http.<url>.proxy`; see [`config_key_matches`].
+    "http.*proxy",
 ];
+
+/// Whether lowercased `key` matches `pattern`: a prefix, or with one `*` a
+/// prefix and a suffix.
+fn config_key_matches(key: &str, pattern: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((head, tail)) => {
+            key.len() >= head.len() + tail.len() && key.starts_with(head) && key.ends_with(tail)
+        }
+        None => key.starts_with(pattern),
+    }
+}
 
 /// Environment variables that choose the transport program for a push, the
 /// environment form of `core.sshCommand`, `ssh.variant` and `core.gitProxy`.
@@ -5224,7 +5237,7 @@ fn injected_config_key(args: &[&str], prefixes: &[&str]) -> Option<(&'static str
         let lower = key.to_ascii_lowercase();
         prefixes
             .iter()
-            .any(|p| lower.starts_with(p))
+            .any(|p| config_key_matches(&lower, p))
             .then(|| key.to_string())
     };
     let mut i = 0;
@@ -5289,7 +5302,7 @@ fn env_injected_config_key(vars: &[(String, String)], prefixes: &[&str]) -> Opti
         let lower = key.trim_matches(['\'', '"', ' ']).to_ascii_lowercase();
         prefixes
             .iter()
-            .any(|p| lower.starts_with(p))
+            .any(|p| config_key_matches(&lower, p))
             .then_some(lower)
     };
 
@@ -5962,6 +5975,29 @@ pub fn gate_git(
             headline: "Git transport settings changed since this session started.".to_string(),
             guidance: "core.sshCommand, core.gitProxy, ssh.* and the http/remote proxy keys are recorded at launch, because they decide\n\
                        where a push connects. Restore them, or change them outside the sandbox and start a new session."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
+    }
+
+    if prevent_push
+        && protect_default_branch_only
+        && sub == "push"
+        && repo_facts.trusted_ssh.is_empty()
+        && let Some(git) = real_git
+        && !repo_facts.ssh_recorded(&repo_args, real_git)
+        && push_urls(
+            git,
+            &repo_args,
+            &push_dest_remote(sub_args, real_git, &repo_args),
+        )
+        .iter()
+        .any(|u| is_ssh_url(u))
+    {
+        return Err(Refusal {
+            headline: "No trusted ssh was found when this session started.".to_string(),
+            guidance: "An ssh push runs the ssh found at launch in the system bin directories, and there was none.\n\
+                       Install ssh there, set core.sshCommand or GIT_SSH_COMMAND before starting cplt, or push over https."
                 .to_string(),
             agent_note: &[NOTE],
         });
@@ -6986,28 +7022,30 @@ fn unsafe_push_config(real_git: &Path, repo_args: &[&str]) -> Option<String> {
         })
 }
 
-/// PATH for an approved `git push`: [`crate::git::TRUSTED_BIN_DIRS`] first,
-/// then the agent's PATH. git finds `ssh` and `git-remote-<scheme>` through
-/// PATH, so without this a directory the agent put first would pick the
-/// program that connects, with no setting changed. The agent's PATH stays
-/// after them, so hooks still find their tools. `None` for anything else.
-pub fn push_path(
-    args: &[&str],
-    agent_path: Option<&std::ffi::OsStr>,
-) -> Option<std::ffi::OsString> {
-    if args.get(git_subcommand_index(args)?) != Some(&"push") {
+/// `GIT_SSH_COMMAND` for an approved `git push`: the trusted `ssh` recorded
+/// at launch, when no ssh program was recorded. git finds `ssh` through PATH,
+/// so without this a directory the agent put first on PATH would pick the
+/// program that connects, with no setting changed. PATH itself is left alone
+/// so hooks keep the caller's tools. `None` for anything else.
+pub fn push_ssh_command(args: &[&str], facts: &RepoFacts, real_git: &Path) -> Option<String> {
+    let i = git_subcommand_index(args)?;
+    if args[i] != "push" || facts.trusted_ssh.is_empty() {
         return None;
     }
-    let mut dirs: Vec<std::path::PathBuf> = crate::git::TRUSTED_BIN_DIRS
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
-    dirs.extend(
-        agent_path
-            .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
-            .unwrap_or_default(),
-    );
-    std::env::join_paths(dirs).ok()
+    let repo_args = repo_target_args(&args[..i]);
+    (!facts.ssh_recorded(&repo_args, Some(real_git)))
+        .then(|| format!("'{}'", facts.trusted_ssh.replace('\'', "'\\''")))
+}
+
+/// Whether `url` is one git reaches over ssh: an `ssh://` URL or the
+/// scp-like `host:path` form (a colon before any slash).
+fn is_ssh_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if let Some((scheme, _)) = lower.split_once("://") {
+        return matches!(scheme, "ssh" | "git+ssh" | "ssh+git");
+    }
+    url.split_once(':')
+        .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'))
 }
 
 /// The non-empty [`TRANSPORT_ENV_VARS`] in `vars`. An empty value is dropped:
@@ -7171,6 +7209,10 @@ pub struct RepoFacts {
     /// is refused when they differ at gate time.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub transport_config: String,
+    /// Absolute path of the `ssh` found in the trusted bin directories at
+    /// launch. An approved push runs it unless an ssh program was recorded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trusted_ssh: String,
     /// [`TRANSPORT_ENV_VARS`] the agent started with. Set by the launch from
     /// the child's environment.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -7320,6 +7362,18 @@ impl RepoFacts {
             .iter()
             .copied()
             .find(|name| now.get(*name) != self.transport_env.get(*name))
+    }
+
+    /// Whether the session recorded its own ssh program for the targeted
+    /// repository: `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`.
+    fn ssh_recorded(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {
+        let member = self.target(repo_args, real_git).unwrap_or(self);
+        self.transport_env.contains_key("GIT_SSH")
+            || self.transport_env.contains_key("GIT_SSH_COMMAND")
+            || member
+                .transport_config
+                .split('\0')
+                .any(|r| r.split('\n').next() == Some("core.sshcommand"))
     }
 
     /// Whether `remote` still pushes to the URLs captured for it at launch.
@@ -7960,6 +8014,7 @@ pub fn generate_git_wrapper_script(
         && repo_facts.git_common_dir.is_empty()
         && repo_facts.transport_env.is_empty()
         && repo_facts.transport_config.is_empty()
+        && repo_facts.trusted_ssh.is_empty()
     {
         String::new()
     } else {
@@ -14431,6 +14486,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn is_ssh_url_matches_git_ssh_forms() {
+        for u in [
+            "ssh://h/x.git",
+            "git+ssh://h/x",
+            "git@github.com:o/r.git",
+            "h:x",
+        ] {
+            assert!(is_ssh_url(u), "{u}");
+        }
+        for u in [
+            "https://h/x",
+            "/srv/x.git",
+            "./a:b",
+            "file:///x",
+            "../x.git",
+        ] {
+            assert!(!is_ssh_url(u), "{u}");
+        }
+    }
+
     /// Transport settings pick where an ssh:// push connects with its URL
     /// unchanged, so a push is refused once they differ from launch.
     #[test]
@@ -14442,7 +14518,8 @@ mod tests {
         };
         let git = which_git().unwrap();
         make_branches(&git, &repo, &["feature"]);
-        let facts = capture_repo_facts(&git, &repo);
+        let mut facts = capture_repo_facts(&git, &repo);
+        facts.trusted_ssh = "/usr/bin/ssh".to_string();
         let dir = repo.to_string_lossy().into_owned();
         let push = |facts: &RepoFacts| {
             gate_git(
@@ -14460,6 +14537,9 @@ mod tests {
             ("core.sshCommand", "/x/ssh"),
             ("core.gitProxy", "/x/proxy"),
             ("ssh.variant", "simple"),
+            ("http.proxy", "http://127.0.0.1:1"),
+            ("http.https://github.com/.proxy", "http://127.0.0.1:1"),
+            ("remote.origin.proxy", "http://127.0.0.1:1"),
         ] {
             assert!(run_in(&git, &repo, &["config", key, value]));
             let err = push(&facts).expect_err(key);
@@ -14482,6 +14562,29 @@ mod tests {
                 None
             )
             .is_err()
+        );
+        for args in [
+            &["-c", "http.proxy=http://x", "status"][..],
+            &["-c", "http.https://github.com/.proxy=http://x", "status"],
+            &["--config-env=http.proxy=VAR", "status"],
+            &["--config-env", "HTTP.Proxy=VAR", "status"],
+        ] {
+            assert!(
+                gate_git_t(args, true, true, true, &[], None).is_err(),
+                "{args:?}"
+            );
+        }
+        // Other http settings stay allowed.
+        assert!(
+            gate_git_t(
+                &["-c", "http.sslVerify=true", "status"],
+                true,
+                true,
+                true,
+                &[],
+                None
+            )
+            .is_ok()
         );
         assert!(
             gate_git_t(
@@ -15613,6 +15716,21 @@ mod tests {
             &RepoFacts::default(),
         );
         assert!(!empty.contains("--repo-facts"), "got: {empty}");
+        // Each launch record alone is enough to bake the facts.
+        for set in [
+            |f: &mut RepoFacts| f.transport_config = "core.sshcommand\nx\0".to_string(),
+            |f: &mut RepoFacts| f.trusted_ssh = "/usr/bin/ssh".to_string(),
+            |f: &mut RepoFacts| {
+                f.transport_env
+                    .insert("GIT_SSH".to_string(), "x".to_string());
+            },
+        ] {
+            let mut facts = RepoFacts::default();
+            set(&mut facts);
+            let script =
+                generate_git_wrapper_script("/usr/bin/git", "/usr/local/bin/cplt", &policy, &facts);
+            assert!(script.contains("--repo-facts='"), "got: {script}");
+        }
     }
 
     #[test]

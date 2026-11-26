@@ -3088,10 +3088,28 @@ fn real_push_gate(
 const PROTECT: [bool; 3] = [true, true, true];
 const FORCE_ONLY: [bool; 3] = [false, true, false];
 
-/// An approved push finds `ssh` in the trusted system directories before a
-/// directory the agent put first on PATH.
+/// A fake `ssh` in `dir` that touches `marker` and completes the push into
+/// `origin`, so a run is visible.
+fn fake_ssh(dir: &std::path::Path, marker: &std::path::Path, origin: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let ssh = dir.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexec git-receive-pack '{}'\n",
+            marker.display(),
+            origin.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An approved ssh push runs the ssh recorded at launch, not one the agent
+/// put first on PATH; with none recorded it is refused.
 #[test]
-fn real_push_does_not_run_an_ssh_planted_first_on_path() {
+fn real_push_runs_the_launch_ssh_not_one_planted_on_path() {
     let (t, work, origin) = pushed_repo("main");
     assert!(git_ok(
         &work,
@@ -3102,35 +3120,35 @@ fn real_push_does_not_run_an_ssh_planted_first_on_path() {
             "ssh://cplt-test.invalid/x.git"
         ]
     ));
-    let facts = launch_facts(&work);
-    let planted = t.path().join("planted");
-    std::fs::create_dir_all(&planted).unwrap();
-    let marker = t.path().join("planted-ran");
-    let ssh = planted.join("ssh");
-    // Would complete the push into the local origin, so a run is visible.
-    std::fs::write(
-        &ssh,
-        format!(
-            "#!/bin/sh\ntouch '{}'\nexec git-receive-pack '{}'\n",
-            marker.display(),
-            origin.display()
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let path = format!("{}:{}", planted.display(), std::env::var("PATH").unwrap());
-    let _ = real_push_gate(
+    let planted_marker = t.path().join("planted-ran");
+    let trusted_marker = t.path().join("trusted-ran");
+    fake_ssh(&t.path().join("planted"), &planted_marker, &origin);
+    fake_ssh(&t.path().join("trusted"), &trusted_marker, &origin);
+    let path = format!(
+        "{}:{}",
+        t.path().join("planted").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let plain = launch_facts(&work);
+    let push = ["push", "-q", "origin", "feat"];
+
+    let (stderr, ok) = real_push_gate(&work, &plain, PROTECT, &[("PATH", path.as_str())], &push);
+    assert_refused(&stderr, ok, "No trusted ssh");
+    assert!(!planted_marker.exists());
+
+    let mut facts: serde_json::Value = serde_json::from_str(&plain).unwrap();
+    facts["trusted_ssh"] = serde_json::json!(t.path().join("trusted/ssh"));
+    let (stderr, ok) = real_push_gate(
         &work,
-        &facts,
+        &facts.to_string(),
         PROTECT,
         &[("PATH", path.as_str())],
-        &["push", "-q", "origin", "feat"],
+        &push,
     );
-    assert!(!marker.exists(), "the planted ssh ran");
-    assert_eq!(remote_ref(&origin, "refs/heads/feat"), None);
+    assert!(ok, "{stderr}");
+    assert!(!planted_marker.exists(), "the planted ssh ran");
+    assert!(trusted_marker.exists(), "the launch ssh did not run");
+    assert!(remote_ref(&origin, "refs/heads/feat").is_some());
 }
 
 #[test]

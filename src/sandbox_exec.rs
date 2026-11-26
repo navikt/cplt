@@ -1199,6 +1199,9 @@ fn install_command_wrappers(
             cmd.get_envs()
                 .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string()))),
         );
+        repo_facts.trusted_ssh = crate::git::trusted_binary("ssh")
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_default();
         // Baked, not read from the agent's env, which it can rewrite (#962).
         if let Some(root) = worktree_root {
             repo_facts.worktree_root = root.to_string_lossy().into_owned();

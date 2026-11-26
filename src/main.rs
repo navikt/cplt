@@ -6698,7 +6698,13 @@ fn run_gh_gate(
         }
         effect => effect,
     };
-    perform_gate_effect(real_gh, "gh", pinned.as_deref().unwrap_or(args), effect)
+    perform_gate_effect(
+        real_gh,
+        "gh",
+        pinned.as_deref().unwrap_or(args),
+        effect,
+        None,
+    )
 }
 
 /// Run the real `gh` for a read the gate needs, with `GH_REPO` pinned to `repo`
@@ -6735,6 +6741,7 @@ fn perform_gate_effect(
     name: &str,
     args: &[String],
     effect: GateEffect,
+    ssh_command: Option<&str>,
 ) -> ExitCode {
     match effect {
         GateEffect::ServeCachedToken => serve_cached_gh_token(),
@@ -6745,22 +6752,26 @@ fn perform_gate_effect(
             eprintln!("{refusal}\n{}", escape_hatch(name));
             ExitCode::FAILURE
         }
-        GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo), None),
-        GateEffect::ExecHost(host) => exec_real(real_binary, name, args, None, Some(&host)),
+        GateEffect::ExecScoped(repo) => {
+            exec_real(real_binary, name, args, Some(&repo), None, ssh_command)
+        }
+        GateEffect::ExecHost(host) => {
+            exec_real(real_binary, name, args, None, Some(&host), ssh_command)
+        }
         GateEffect::ExecRewritten { repo, args } => {
-            exec_real(real_binary, name, &args, Some(&repo), None)
+            exec_real(real_binary, name, &args, Some(&repo), None, ssh_command)
         }
         GateEffect::ExecPlain { notice } => {
             if let Some(notice) = notice {
                 eprintln!("{notice}");
             }
-            exec_real(real_binary, name, args, None, None)
+            exec_real(real_binary, name, args, None, None, ssh_command)
         }
         GateEffect::ExecWithout { notice, args } => {
             eprintln!("{notice}");
-            exec_real(real_binary, name, &args, None, None)
+            exec_real(real_binary, name, &args, None, None, ssh_command)
         }
-        GateEffect::ExecArgs(args) => exec_real(real_binary, name, &args, None, None),
+        GateEffect::ExecArgs(args) => exec_real(real_binary, name, &args, None, None, ssh_command),
     }
 }
 
@@ -6782,6 +6793,8 @@ fn exec_real(
     args: &[String],
     repo_scope: Option<&str>,
     host_pin: Option<&str>,
+    // The git guard's pinned ssh for an approved push; `None` leaves the env alone.
+    ssh_command: Option<&str>,
 ) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
@@ -6791,12 +6804,10 @@ fn exec_real(
     if name == "gh" {
         gh_proxy::pin_gh_config(&mut command);
     }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    if name == "git"
-        && let Some(path) = gh_proxy::push_path(&arg_refs, std::env::var_os("PATH").as_deref())
-    {
-        command.env("PATH", path);
+    if let Some(ssh) = ssh_command {
+        command.env("GIT_SSH_COMMAND", ssh);
     }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut host_pinned = false;
     if let Some(repo) = repo_scope {
         command.env("GH_REPO", repo);
@@ -7421,7 +7432,11 @@ fn run_git_gate(
             );
         }
     }
-    perform_gate_effect(real_git, "git", args, effect)
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let ssh = prevent_push
+        .then(|| gh_proxy::push_ssh_command(&arg_refs, repo_facts, real_git))
+        .flatten();
+    perform_gate_effect(real_git, "git", args, effect, ssh.as_deref())
 }
 
 // ── cplt exec ──────────────────────────────────────────────────────────────
