@@ -1560,6 +1560,8 @@ pub(crate) fn refuse_symlinked_overlays(
         .filter(|r| r.access.write || r.access.create_dirs)
         .flat_map(|r| [Some(r.path.clone()), r.path.canonicalize().ok()])
         .flatten()
+        // A private tmpfs in the namespace: host links there cannot be replaced.
+        .filter(|p| p != Path::new("/tmp"))
         .collect();
     for path in overlays.read_only.iter().chain(overlays.pins) {
         // The deepest root only: a linked agent config dir (`~/.copilot` into a
