@@ -424,6 +424,17 @@ pub fn key_value_hash(propose: &crate::repo_config::ProposeSection, key: &str) -
     // (null, e.g. a lost name-to-path mapping) has no hash, and a key with no
     // hash is never approved. Hashing null instead would let any later value
     // match.
+    let v = key_value_json(propose, key)?;
+    Some(sha256_hex(&format!("cplt-key-v1\0{key}\0{v}")))
+}
+
+/// The normalized value of one proposed key, exactly as [`key_value_hash`]
+/// hashes it. `None` when absent or null.
+#[must_use]
+pub fn key_value_json(
+    propose: &crate::repo_config::ProposeSection,
+    key: &str,
+) -> Option<serde_json::Value> {
     let value = serde_json::to_value(normalized(propose)).ok()?;
     // `sandbox.pass_env` is the one key not spelled as its `[propose]` path.
     let field = if key == "sandbox.pass_env" {
@@ -432,8 +443,7 @@ pub fn key_value_hash(propose: &crate::repo_config::ProposeSection, key: &str) -
         key
     };
     let pointer = format!("/{}", field.replace('.', "/"));
-    let v = value.pointer(&pointer).filter(|v| !v.is_null())?;
-    Some(sha256_hex(&format!("cplt-key-v1\0{key}\0{v}")))
+    value.pointer(&pointer).filter(|v| !v.is_null()).cloned()
 }
 
 /// The keys of `entry` that apply to `propose` as it stands now.

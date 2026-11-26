@@ -498,8 +498,10 @@ pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
         // Byte-comparing the raw blob against the file on disk would call every
         // .gitattributes filter (eol=crlf, LFS, git-crypt, ident) permanent
         // drift and make a correctly committed config ungrantable.
-        if !in_working_tree
-            || git_succeeds(
+        // A missing or symlinked working-tree file is not "the committed
+        // file": what the user's editor shows is not what is approved.
+        if in_working_tree
+            && git_succeeds(
                 project_dir,
                 &["diff", "--quiet", "HEAD", "--", REPO_CONFIG_FILE],
             )
