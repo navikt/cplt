@@ -3505,6 +3505,138 @@ fn real_send_pack_refused_under_force_push_prevention() {
 }
 
 // ============================================================
+// Pushes are judged by the repository git will write to (real git, local bare repos)
+// ============================================================
+
+/// A work repo whose `origin` is a local bare repo with `main` as its recorded
+/// default branch, plus a second bare repo `other`. Returns (tmp, work, origin, other).
+fn real_push_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let (tmp, work, origin) = common::bare_origin_repo(&std::env::temp_dir());
+    let other = tmp.path().join("other.git");
+    assert!(git_ok(
+        tmp.path(),
+        &["init", "--bare", "-q", other.to_str().unwrap()]
+    ));
+    assert!(git_ok(&work, &["push", "-q", "origin", "main"]));
+    assert!(git_ok(&work, &["fetch", "-q", "origin"]));
+    assert!(git_ok(&work, &["remote", "set-head", "origin", "main"]));
+    (tmp, work, origin, other)
+}
+
+/// Run the gate with the real git in `work`, protect_default_branch_only on,
+/// facts captured before `plant` changes the repository.
+fn planted_push_gate(work: &std::path::Path, plant: &[&[&str]], args: &[&str]) -> (String, bool) {
+    let facts = launch_facts(work);
+    for cfg in plant {
+        assert!(git_ok(work, cfg), "plant {cfg:?}");
+    }
+    let home = tempfile::tempdir().unwrap();
+    let output = cplt_cmd()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("git-gate")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg(format!("--repo-facts={facts}"))
+        .arg("--mode=block")
+        .arg("--prevent-push=true")
+        .arg("--prevent-force-push=true")
+        .arg("--protect-default-branch-only=true")
+        .arg("--")
+        .args(args)
+        .current_dir(work)
+        .output()
+        .expect("cplt git-gate should run");
+    (
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+fn has_branch(bare: &std::path::Path, branch: &str) -> bool {
+    git_ok(
+        bare,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+}
+
+const FEAT_PUSH: &[&str] = &["push", "-q", "origin", "HEAD:refs/heads/feat"];
+
+#[test]
+fn real_feature_push_lands_on_origin() {
+    let (_tmp, work, origin, _) = real_push_fixture();
+    let (stderr, ok) = planted_push_gate(&work, &[], FEAT_PUSH);
+    assert!(ok, "an ordinary feature push must work.\nstderr: {stderr}");
+    assert!(has_branch(&origin, "feat"));
+}
+
+#[test]
+fn real_push_refused_when_push_url_moved_after_launch() {
+    for how in ["pushurl", "pushinsteadof", "insteadof"] {
+        let (_tmp, work, origin, other) = real_push_fixture();
+        let (o, x) = (origin.to_str().unwrap(), other.to_str().unwrap());
+        let key = format!("url.{x}.{how}");
+        let plant: [&str; 3] = match how {
+            "pushurl" => ["config", "remote.origin.pushurl", x],
+            _ => ["config", &key, o],
+        };
+        let (stderr, ok) = planted_push_gate(&work, &[&plant], FEAT_PUSH);
+        assert_refused(&stderr, ok, "no longer pushes");
+        assert!(!has_branch(&other, "feat"), "{how}: ref did not move");
+    }
+}
+
+#[test]
+fn real_push_refused_with_receive_pack_override() {
+    let (_tmp, work, _, other) = real_push_fixture();
+    let rp = format!("--receive-pack=git-receive-pack {} #", other.display());
+    let (stderr, ok) = planted_push_gate(
+        &work,
+        &[],
+        &["push", "-q", &rp, "origin", "HEAD:refs/heads/feat"],
+    );
+    assert_refused(&stderr, ok, "'git push --receive-pack' is not allowed");
+    assert!(!has_branch(&other, "feat"), "ref did not move");
+
+    let cfg = format!("git-receive-pack {} #", other.display());
+    let (stderr, ok) = planted_push_gate(
+        &work,
+        &[&["config", "remote.origin.receivepack", &cfg]],
+        FEAT_PUSH,
+    );
+    assert_refused(&stderr, ok, "remote.origin.receivepack");
+    assert!(!has_branch(&other, "feat"), "ref did not move");
+}
+
+#[test]
+fn real_push_refused_when_push_url_has_surrounding_whitespace() {
+    let (tmp, work, _, _) = real_push_fixture();
+    // A separate repository whose path differs from origin's only by a space.
+    let spaced = format!("{} ", tmp.path().join("origin.git").display());
+    assert!(git_ok(tmp.path(), &["init", "--bare", "-q", &spaced]));
+    // Captured at launch with the spaced URL already set: the launch-time
+    // comparison alone does not catch this one.
+    assert!(git_ok(&work, &["config", "remote.origin.pushurl", &spaced]));
+    let (stderr, ok) = planted_push_gate(&work, &[], FEAT_PUSH);
+    assert_refused(&stderr, ok, "remote.origin.pushurl");
+    assert!(
+        !has_branch(std::path::Path::new(&spaced), "feat"),
+        "ref did not move"
+    );
+}
+
+// ============================================================
 // Full wrapper script integration (sandbox → wrapper → gate)
 // ============================================================
 
