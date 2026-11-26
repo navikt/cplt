@@ -468,7 +468,7 @@ pub fn may_inject(host: &str, method: &str, target: &str) -> bool {
         .next()
         .unwrap_or("")
         .split('/')
-        .any(|seg| seg.starts_with('.') || seg.contains(['%', ';']));
+        .any(|seg| seg.starts_with('.') || seg.contains('%'));
     !(first.starts_with("mcp") || first.contains(['%', '.']) || dotted)
 }
 
