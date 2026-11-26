@@ -1661,7 +1661,7 @@ fn check_link_target(
     {
         return Err("is a system mount");
     }
-    let others = fs_rules
+    let mut others = fs_rules
         .iter()
         .map(|r| &r.path)
         .chain(overlays.read_only)
