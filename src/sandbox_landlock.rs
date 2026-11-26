@@ -2518,6 +2518,46 @@ fn build_seccomp_filter(proxy_forced: bool) -> Vec<BpfInstruction> {
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
     }
 
+    // Step 2a': deny nested user and mount namespaces created through
+    // `clone`/`clone3` (#1191). `unshare`/`setns` are already in the blocklist,
+    // but `clone(CLONE_NEWUSER)` reaches the same place. A nested namespace
+    // created mid-session would not see binds the session adds later, and a
+    // new user namespace hands its creator a full capability set inside it.
+    //
+    // `clone3` passes its flags behind a pointer (`struct clone_args`), which
+    // BPF cannot read, so it is refused with ENOSYS. That is what kernels
+    // before 5.3 return and what Docker's default seccomp profile does, so
+    // glibc, musl, Go and Rust std all fall back to `clone`, where the flags
+    // are a plain integer (arg0 on both x86_64 and aarch64). The kernel takes
+    // clone flags as `unsigned long`, but every CLONE_NEW* bit sits in the low
+    // word, so comparing the low 32 bits is enough.
+    //
+    // A still holds the syscall number. The non-clone path leaves A untouched
+    // for the ioctl block; the allowed-clone path returns ALLOW directly, so A
+    // holding the masked flags never reaches a later compare.
+    {
+        const ENOSYS_VAL: u32 = libc::ENOSYS as u32;
+        const NS_FLAGS: u32 = (libc::CLONE_NEWUSER | libc::CLONE_NEWNS) as u32;
+        filter.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_clone3 as u32,
+            0,
+            1,
+        ));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS_VAL));
+        filter.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_clone as u32,
+            0,
+            5,
+        ));
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, ARG0_LO_OFFSET));
+        filter.push(stmt(BPF_ALU | BPF_AND | BPF_K, NS_FLAGS));
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    }
+
     // Step 2b: deny the terminal-injection ioctls (GHSA-q3p2-6x2x-8w8w,
     // CVE-2017-5226). Always applied, in every mode.
     //
@@ -5111,6 +5151,56 @@ mod tests {
                 run_filter(&filter, libc::SYS_read as u32, 0x4000_0003, [0; 6]),
                 EPERM,
                 "arch guard must reject the compat ABI (proxy_forced={proxy_forced})"
+            );
+        }
+    }
+
+    /// Filter-semantics test for the nested-namespace clone deny (#1191).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_denies_nested_namespace_clone() {
+        let clone = libc::SYS_clone as u32;
+        let flags = |f: i32| -> [u64; 6] { [f as u64, 0, 0, 0, 0, 0] };
+        let enosys = 0x0005_0000 | libc::ENOSYS as u32;
+        for proxy_forced in [false, true] {
+            let filter = build_seccomp_filter(proxy_forced);
+            for f in [
+                libc::CLONE_NEWUSER,
+                libc::CLONE_NEWNS,
+                libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::SIGCHLD,
+            ] {
+                assert_eq!(run_filter(&filter, clone, ARCH, flags(f)), EPERM, "{f:#x}");
+            }
+            // fork-style and thread-style clones stay allowed.
+            for f in [
+                libc::SIGCHLD,
+                libc::CLONE_VM
+                    | libc::CLONE_FS
+                    | libc::CLONE_FILES
+                    | libc::CLONE_SIGHAND
+                    | libc::CLONE_THREAD
+                    | libc::CLONE_SYSVSEM
+                    | libc::CLONE_SETTLS
+                    | libc::CLONE_PARENT_SETTID
+                    | libc::CLONE_CHILD_CLEARTID,
+            ] {
+                assert_eq!(run_filter(&filter, clone, ARCH, flags(f)), ALLOW, "{f:#x}");
+            }
+            // clone3 hides its flags behind a pointer: ENOSYS so libc falls back.
+            assert_eq!(
+                run_filter(&filter, libc::SYS_clone3 as u32, ARCH, [0; 6]),
+                enosys
+            );
+            // The clone block must not swallow later rules.
+            let tiocsti = u64::from(libc::TIOCSTI as u32);
+            assert_eq!(
+                run_filter(
+                    &filter,
+                    libc::SYS_ioctl as u32,
+                    ARCH,
+                    [0, tiocsti, 0, 0, 0, 0]
+                ),
+                EPERM
             );
         }
     }

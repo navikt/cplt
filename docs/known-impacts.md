@@ -1114,6 +1114,18 @@ So neither port rules nor proxy-forced mode stop SSH to `ssh.github.com:443`. Wh
 
 **To allow it deliberately,** grant the key file as above. Port 22 is not needed if you point the remote at `ssh://git@ssh.github.com:443/org/repo.git`. Under proxy-forced mode you also need a `ProxyCommand` that tunnels through cplt's proxy.
 
+## Linux: nested user and mount namespaces are blocked
+
+Inside a Linux session, a process cannot create a new user or mount namespace. cplt's seccomp filter refuses `unshare` and `setns`, and refuses `clone` with `CLONE_NEWUSER` or `CLONE_NEWNS`. `clone3` returns `ENOSYS`, so glibc, musl, Go and Rust fall back to `clone`, the same way they do on kernels older than 5.3 and under Docker's default seccomp profile. With Bubblewrap 0.8 or newer, cplt also passes `--disable-userns`.
+
+What this breaks, inside the session only:
+
+- Chromium's own sandbox. Run it with `--no-sandbox` (see [Cache exec](#cache-exec-playwright-pnpm-dlx-etc)).
+- `unshare`, `bwrap`, `firejail` and other tools that build their own sandbox. Copilot CLI's and DSH's inner sandboxes are already switched off for this reason.
+- Rootless Podman and Buildah. Run containers outside cplt, or use `sandbox.allow_docker` (see [Docker and Testcontainers](#docker-and-testcontainers)).
+
+All of these already failed on `unshare` before this change. A namespace created mid-session would not see the mounts cplt adds later, so cplt refuses it rather than leave a gap.
+
 ## D-Bus and systemd (Linux) — the session manager is reachable
 
 `XDG_RUNTIME_DIR` is on the environment allowlist, and Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1), so below that ABI `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox unless bubblewrap masks it. Private Secret Service reads were demonstrated on ABI 4 as [described above](#linux-keyring-access-depends-on-the-backend-and-agent-version); the session-manager escape remains a code-reading conclusion. `systemd-run --user <cmd>` hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
