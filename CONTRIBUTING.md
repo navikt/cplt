@@ -31,16 +31,19 @@ The hooks run formatting and Clippy checks before commits. `mise run check` runs
 
 ## Linux sandbox from a Mac
 
-The Landlock, seccomp and bubblewrap code only runs on Linux. To build and test it from a Mac, use the Debian container in `hack/linux-dev.sh`. It needs docker or podman; [colima](https://github.com/abiosoft/colima) works.
+The Landlock, seccomp and bubblewrap code only runs on Linux. To build and test it from a Mac, use the Debian container in `hack/linux-dev.sh`. It needs docker; [colima](https://github.com/abiosoft/colima) works. Podman is not supported.
 
 ```bash
 mise run linux:check             # cargo build + clippy for Linux
-mise run linux:test-integration  # tests/integration_linux.rs, as in CI
+mise run linux:test-integration  # tests/integration_linux.rs with the CI job's listener and session bus
+mise run linux:test-all          # cargo test --no-fail-fast, as the CI Linux job runs it
 mise run linux:shell             # shell in the container
 sh hack/linux-dev.sh run cargo test --lib seccomp   # any other command
 ```
 
-The checkout is mounted at `/work/cplt`. `target/` and the cargo registry live in the volumes `cplt-linuxdev-target` and `cplt-linuxdev-cargo`, so builds are cached and kept apart from the macOS build. Tests run as a non-root user with your uid. The container drops the default seccomp and AppArmor profiles and the `/proc` masks, because bubblewrap needs user namespaces, `mount` and a fresh `/proc`. It adds no capabilities and does not run privileged. To force an engine, set `CPLT_CONTAINER_ENGINE=podman`.
+The checkout is mounted at `/work/cplt`. `target/` is the volume `cplt-linuxdev-target`, laid over the checkout's own `target/`, and the cargo home is the volume `cplt-linuxdev-cargo`. Builds are cached and kept apart from the macOS build. Tests run as a non-root user with your uid. The container drops the default seccomp and AppArmor profiles and the `/proc` masks, because bubblewrap needs user namespaces, `mount` and a fresh `/proc`. It adds no capabilities and does not run privileged. It raises the open-file limit to 65536, because colima's default of 1024 is too low for the full suite.
+
+`linux:test-all` fails 3 lib tests on a colima Mac. CI passes them. Two make a FIFO or clean up a scratch dir inside the checkout, and the macOS file share does not support that. These are `linked_overlay_with_unsafe_target_is_refused` and `doctor_bubblewrap_state_probes_file_deny_masks`. The third is `nested_git_unreadable_dir_changed_behind_chmod_is_an_error`, which also fails in the container; the cause is not known.
 
 ## Output policy
 
