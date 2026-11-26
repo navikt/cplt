@@ -1311,6 +1311,13 @@ impl SettleProbe {
         // alone, so nothing in the sandbox can consume what it observes.
         // SAFETY: `fds[0]` is a descriptor `pipe` just returned.
         unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) };
+        // Non-blocking, so a `read` after `poll` cannot wait past the deadline
+        // if the data it saw is gone by then.
+        // SAFETY: `fds[0]` is a descriptor `pipe` just returned.
+        unsafe {
+            let flags = libc::fcntl(fds[0], libc::F_GETFL);
+            libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
         // Exempt the write end from the exec-time seal, or nothing in the
         // session inherits it and the probe reports every session settled.
         SETTLE_PROBE_FD.store(fds[1], Ordering::Relaxed);
@@ -3022,6 +3029,71 @@ mod tests {
         // SAFETY: `fd` is ours and closed exactly once.
         unsafe { libc::close(fd) };
         assert_eq!(outcome, Settle::TimedOut { wrote: 0 });
+    }
+
+    #[test]
+    fn settle_probe_stops_at_deadline_under_a_steady_writer() {
+        let outcome = settle_probe_against_endless_writer(
+            Duration::from_millis(200),
+            1,
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+        );
+        assert!(
+            matches!(outcome, Settle::TimedOut { wrote } if wrote > 0 && wrote < SETTLE_MAX_BYTES),
+            "{outcome:?}"
+        );
+    }
+
+    /// The race below is timing-dependent; this pins the property that closes it.
+    #[test]
+    fn settle_probe_read_end_is_nonblocking() {
+        let probe = SettleProbe::arm().expect("pipe");
+        // SAFETY: `probe.read` is a descriptor this probe owns.
+        let flags = unsafe { libc::fcntl(probe.read, libc::F_GETFL) };
+        let _ = probe.outcome_within(Duration::ZERO);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    /// Another reader can drain the pipe between `poll` and `read`. The read
+    /// must not then wait for data that never comes.
+    #[test]
+    fn settle_probe_stops_at_deadline_when_another_reader_drains() {
+        let probe = SettleProbe::arm().expect("pipe");
+        // SAFETY: duplicating descriptors this probe owns.
+        let (wfd, rfd) = unsafe { (libc::dup(probe.write), libc::dup(probe.read)) };
+        assert!(wfd >= 0 && rfd >= 0, "dup");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(probe.outcome_within(Duration::from_millis(300))));
+        // A drainer races the probe for every byte, then the writer goes
+        // quiet with its end still open.
+        // The dup shares the probe's O_NONBLOCK, so it polls until EOF.
+        std::thread::spawn(move || {
+            let mut b = [0u8; 1];
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd: rfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid `pollfd`; `b` is valid for 1 byte; `rfd` is ours.
+                unsafe { libc::poll(&raw mut pfd, 1, -1) };
+                if unsafe { libc::read(rfd, b.as_mut_ptr().cast(), 1) } == 0 {
+                    break;
+                }
+            }
+        });
+        for _ in 0..200 {
+            // SAFETY: one valid byte; `wfd` is ours.
+            unsafe { libc::write(wfd, b"x".as_ptr().cast(), 1) };
+            std::thread::sleep(Duration::from_micros(500));
+        }
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("settle probe blocked in read past its deadline");
+        // SAFETY: `wfd` is ours and closed exactly once; the drainer then sees EOF.
+        unsafe { libc::close(wfd) };
+        assert!(matches!(outcome, Settle::TimedOut { .. }), "{outcome:?}");
     }
 
     #[test]
