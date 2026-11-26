@@ -1737,6 +1737,7 @@ pub(super) const STRICT_PREFERENCE_DOMAINS: &[&str] = &[
 
 /// The [`DENIED_CACHE_PREFIXES`] entry a path under `~/Library/Caches` falls
 /// in, if any. Compared case-insensitively, as Seatbelt matches the regex.
+#[cfg(target_os = "macos")]
 pub fn denied_cache_prefix(home: &Path, p: &Path) -> Option<&'static str> {
     let rest = p.strip_prefix(home.join("Library/Caches")).ok()?;
     let first = rest

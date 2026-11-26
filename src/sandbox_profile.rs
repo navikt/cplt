@@ -7863,6 +7863,7 @@ mod tests {
     /// The profile with `sandbox.strict_macos_reads` on, with the key's three
     /// changes undone. Equal to the key-off profile only if the key changes
     /// nothing else, and the key-off profile carries none of its rules.
+    #[cfg(target_os = "macos")]
     fn undo_strict(on: &str) -> String {
         let mut out = Vec::new();
         let mut skip_block = false;
