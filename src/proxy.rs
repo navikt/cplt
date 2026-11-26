@@ -3033,11 +3033,15 @@ pub fn classify_resolved(
 /// A name whose last label starts with a digit (`10.1`, `0x0a.1.2.3`, `012.1`,
 /// `167772161`). The resolver's inet_aton fallback reads it as an IPv4 address,
 /// so it is an IP literal in disguise, never a DNS name. Trailing dot ignored.
+/// Any `:` marks an IPv6 literal (`fd00::1`, `[::1]`, `fe80::1%lo0`): no DNS
+/// name contains one, and the proxy blocks IP targets before DNS (#1113).
 pub fn is_ip_alias(host: &str) -> bool {
-    host.trim_end_matches('.')
-        .rsplit('.')
-        .next()
-        .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+    host.contains(':')
+        || host
+            .trim_end_matches('.')
+            .rsplit('.')
+            .next()
+            .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// The one line every `allow_private_domains` entry point prints when it drops

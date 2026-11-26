@@ -1865,6 +1865,9 @@ impl Resolved {
     ) {
         for path_str in &repo_config.deny.paths {
             let path = resolve_repo_path(path_str, config_dir);
+            if let Some(m) = repo_deny_root_source(path_str, &path, config_dir) {
+                ui::error(&m);
+            }
             if !self.deny_paths.contains(&path) {
                 self.deny_paths.push(path);
             }
@@ -2092,6 +2095,21 @@ impl Resolved {
 ///
 /// Deny paths deliberately get no such check — `[deny]` needs no approval and
 /// can only tighten, so a repointed deny symlink cannot escalate.
+/// Name `.cplt.toml` as the source when a repo `[deny] paths` entry resolves
+/// to a path the launch refuses (a committed symlink to `/`): the launch
+/// refusal alone cannot say where the path came from (#1156). The entry is
+/// still kept, so the launch refuses rather than dropping a deny.
+fn repo_deny_root_source(path_str: &str, path: &Path, config_dir: &Path) -> Option<String> {
+    crate::sandbox::refuse_filesystem_root("deny path", path)
+        .err()
+        .map(|e| {
+            format!(
+                "{} [deny] paths entry {path_str:?}: {e}",
+                config_dir.join(".cplt.toml").display()
+            )
+        })
+}
+
 fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Option<PathBuf> {
     repo_allow_path(path_str, config_dir, key)
         .map_err(|e| ui::warn(&e))
@@ -3904,12 +3922,29 @@ validate = false
         assert!(resolved.allow_ports.contains(&5432));
     }
 
+    /// #1156: a repo deny that resolves to `/` names `.cplt.toml` as its source.
+    #[test]
+    fn repo_deny_root_names_cplt_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/", tmp.path().join("root")).unwrap();
+        let path = resolve_repo_path("root", tmp.path());
+        let msg = repo_deny_root_source("root", &path, tmp.path()).expect("refused");
+        assert!(
+            msg.contains(".cplt.toml") && msg.contains("filesystem root"),
+            "{msg}"
+        );
+        assert_eq!(
+            repo_deny_root_source("x", &tmp.path().join("x"), tmp.path()),
+            None
+        );
+    }
+
     /// #1102: an IP-alias entry would do nothing, so it is dropped (with a
     /// warning) rather than kept as an apparent grant.
     #[test]
     fn allow_private_domains_drops_ip_aliases_at_load() {
         let config = Config::parse(
-            "[proxy]\nallow_private_domains = [\"intern.nav.no\", \"10.1\", \"0x0a.1.2.3\"]\n",
+            "[proxy]\nallow_private_domains = [\"intern.nav.no\", \"10.1\", \"0x0a.1.2.3\", \"fd00::1\", \"[::1]\", \"fe80::1%lo0\"]\n",
         )
         .expect("config parses");
         let resolved = config.merge(CliFlags::default()).unwrap();

@@ -126,10 +126,21 @@ fn apply_session_env(
     opencode_v2: bool,
     extra_env: &[(String, String)],
     deny_env: &[String],
-) {
+    inherit_env: bool,
+) -> Option<&'static str> {
     // v2 ignores the #695 handover: a credential there, even a user-passed
-    // one, is only exposure (#716/#729).
+    // one, is only exposure (#716/#729). Say so, so the drop is not silent (#1077).
+    let mut notice = None;
     if opencode_v2 {
+        let explicit = cmd
+            .get_envs()
+            .any(|(k, v)| k == "OPENCODE_AUTH_CONTENT" && v.is_some());
+        let inherited = inherit_env
+            && !cmd.get_envs().any(|(k, _)| k == "OPENCODE_AUTH_CONTENT")
+            && std::env::var_os("OPENCODE_AUTH_CONTENT").is_some();
+        if explicit || inherited {
+            notice = Some(OPENCODE_V2_AUTH_CONTENT_NOTICE);
+        }
         cmd.env_remove("OPENCODE_AUTH_CONTENT");
     }
     cmd.envs(
@@ -138,7 +149,10 @@ fn apply_session_env(
             .filter(|(k, _)| !deny_env.contains(k))
             .map(|(k, v)| (k, v)),
     );
+    notice
 }
+
+const OPENCODE_V2_AUTH_CONTENT_NOTICE: &str = "OPENCODE_AUTH_CONTENT not passed: OpenCode 2 never reads it, so it would only expose the credential. Sign in with `opencode auth login` on the host and drop it from --pass-env.";
 
 /// Point the agent's own instruction channel at the session brief (#967),
 /// after the session env so it extends whatever value the child would get.
@@ -1989,7 +2003,15 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    if let Some(n) = apply_session_env(
+        &mut cmd,
+        sandbox.opencode_v2,
+        &sandbox.extra_env,
+        deny_env,
+        inherit_env,
+    ) {
+        ui::warn(n);
+    }
     install_open_url_shims(&mut cmd, sandbox, inherit_env);
     install_push_hint_helper(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
@@ -2159,7 +2181,15 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    if let Some(n) = apply_session_env(
+        &mut cmd,
+        sandbox.opencode_v2,
+        &sandbox.extra_env,
+        deny_env,
+        inherit_env,
+    ) {
+        ui::warn(n);
+    }
     install_open_url_shims(&mut cmd, sandbox, inherit_env);
     install_push_hint_helper(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
@@ -2427,7 +2457,15 @@ fn exec_bwrap(
         sandbox.opencode_auth_refused.as_deref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    if let Some(n) = apply_session_env(
+        &mut cmd,
+        sandbox.opencode_v2,
+        &sandbox.extra_env,
+        deny_env,
+        inherit_env,
+    ) {
+        ui::warn(n);
+    }
     install_open_url_shims(&mut cmd, sandbox, inherit_env);
     install_push_hint_helper(&mut cmd, sandbox, inherit_env);
     apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
@@ -3513,7 +3551,7 @@ echo "failed to read keyring" >&2; exit 1"#,
                 ("COPILOT_GITHUB_TOKEN", None),
             ],
             || {
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = Some("ghp_fake".into()));
+                let _fake = FakeGhToken::set("ghp_fake");
                 for wrapper in [false, true] {
                     let scratch = tempfile::tempdir().unwrap();
                     let mut cmd = Command::new("true");
@@ -3538,7 +3576,6 @@ echo "failed to read keyring" >&2; exit 1"#,
                         assert!(!scratch.path().join(".gh-exec-token").exists());
                     }
                 }
-                FAKE_GH_TOKEN.with(|t| *t.borrow_mut() = None);
             },
         );
     }
@@ -3952,7 +3989,7 @@ mod keychain_substitute_tests {
     fn session_env_keeps_user_opencode_auth_content_on_v1_only() {
         let mut v1 = Command::new("true");
         v1.env("OPENCODE_AUTH_CONTENT", "{}");
-        apply_session_env(&mut v1, false, &[], &[]);
+        assert_eq!(apply_session_env(&mut v1, false, &[], &[], false), None);
         let set: Vec<_> = v1.get_envs().collect();
         assert_eq!(
             set,
@@ -3961,9 +3998,22 @@ mod keychain_substitute_tests {
 
         let mut v2 = Command::new("true");
         v2.env("OPENCODE_AUTH_CONTENT", "{}");
-        apply_session_env(&mut v2, true, &[], &[]);
+        assert_eq!(
+            apply_session_env(&mut v2, true, &[], &[], false),
+            Some(OPENCODE_V2_AUTH_CONTENT_NOTICE),
+            "#1077: the v2 drop must be announced"
+        );
         let set: Vec<_> = v2.get_envs().collect();
         assert_eq!(set, vec![("OPENCODE_AUTH_CONTENT".as_ref(), None)]);
+
+        let mut none = Command::new("true");
+        temp_env::with_var("OPENCODE_AUTH_CONTENT", None::<&str>, || {
+            assert_eq!(apply_session_env(&mut none, true, &[], &[], true), None);
+        });
+        temp_env::with_var("OPENCODE_AUTH_CONTENT", Some("{}"), || {
+            let mut inh = Command::new("true");
+            assert!(apply_session_env(&mut inh, true, &[], &[], true).is_some());
+        });
     }
 
     #[test]
@@ -3973,7 +4023,13 @@ mod keychain_substitute_tests {
             ("OPENAI_API_KEY".to_string(), "x".to_string()),
             ("KEEP".to_string(), "y".to_string()),
         ];
-        apply_session_env(&mut cmd, false, &extra, &["OPENAI_API_KEY".to_string()]);
+        apply_session_env(
+            &mut cmd,
+            false,
+            &extra,
+            &["OPENAI_API_KEY".to_string()],
+            false,
+        );
         let set: Vec<_> = cmd.get_envs().collect();
         assert_eq!(set, vec![("KEEP".as_ref(), Some("y".as_ref()))]);
     }

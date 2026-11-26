@@ -723,7 +723,17 @@ mod tests {
     #[test]
     fn allow_private_domains_refuses_ip_aliases_at_set() {
         let info = lookup_key("proxy.allow_private_domains").unwrap();
-        for bad in ["10.1", "0x0a.1.2.3", "012.0.0.1", "167772161", "10.0.0.5"] {
+        for bad in [
+            "10.1",
+            "0x0a.1.2.3",
+            "012.0.0.1",
+            "167772161",
+            "10.0.0.5",
+            // #1113: IPv6 literals in each form.
+            "fd00::1",
+            "[::1]",
+            "fe80::1%lo0",
+        ] {
             let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
             let err = set_value_in_doc(&mut doc, info, bad)
                 .unwrap_err()
