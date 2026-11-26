@@ -56,6 +56,22 @@ ignores the failed write of `_update-notifier-last-checked` in the root, so
 `~/.m2` and `~/.yarn` and their writable subdirectories before launch, since
 the sandbox cannot.
 
+## Subscriptions and self-update ignore `~/.curlrc` (behaviour change)
+
+cplt fetches blocklist subscriptions and self-updates with `/usr/bin/curl`.
+It now runs curl with `-q` and without `CURL_HOME`, so `~/.curlrc` is no
+longer read for these requests. A proxy or CA bundle set only in that file
+stops applying to them.
+
+Set them in the environment that starts cplt instead. curl reads
+`HTTPS_PROXY` (or `https_proxy`) and `NO_PROXY` for the proxy, and
+`CURL_CA_BUNDLE` or `SSL_CERT_FILE` for the CA bundle:
+
+```sh
+export HTTPS_PROXY=http://proxy.example:8080
+export CURL_CA_BUNDLE=/path/to/ca-bundle.pem
+```
+
 ## uv's data directory is read-only (behaviour change)
 
 Inside cplt, `~/.local/share/uv` is read-only. The host runs the `uv tool`
