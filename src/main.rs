@@ -13301,6 +13301,21 @@ fn run_config_set_repo(
         return ExitCode::FAILURE;
     }
 
+    if key_info.section == "allow"
+        && key_info.key == "write"
+        && !unset
+        && !force
+        && let Some(val) = values.iter().find(|v| config::home_scope_write(v))
+    {
+        ui::error(&format!(
+            "allow.write = {val} {}.\n  \
+             Add --force to confirm: cplt config set --repo allow.write {} --force",
+            config::HOME_SCOPE_WRITE_REASON,
+            values.join(" ")
+        ));
+        return ExitCode::FAILURE;
+    }
+
     // Load or create repo config document
     let mut doc = match untrusted::read_untrusted(
         &repo_config_path,

@@ -317,6 +317,12 @@ fn profile_locked(
     // project or an `allow.write` tree, and the deny at its target must beat
     // that grant (#524).
     emit_home_config_write_denies(&mut sb, config, &home);
+    // Same reason: a broad `allow.write` (`~`, `~/.config`, `~/Library`) is
+    // accepted, but the host's login and autostart files stay read-only.
+    // Unlike other explicit user grants, which go after the denies so the
+    // user wins, this deny follows them: it protects the host outside the
+    // sandbox, not data the agent works on.
+    emit_host_login_write_denies(&mut sb, config);
     // Same reason, in the other direction: `process-exec` is granted
     // profile-wide, so an `allow.write` tree is executable unless something
     // says otherwise, and only a rule after every allow can say it.
@@ -2953,6 +2959,28 @@ fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: 
     for dir in pins {
         let d = dir.display();
         sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
+    }
+    sbpl!(sb);
+}
+
+/// Write denies for the host login and autostart paths a user `allow.write`
+/// covers ([`super::host_persistence_protect_paths`]). `subpath` matches a file
+/// exactly and a directory with everything under it.
+fn emit_host_login_write_denies(sb: &mut String, config: &SandboxConfig) {
+    let paths: Vec<PathBuf> = super::host_persistence_protect_paths(config)
+        .into_iter()
+        .filter(|p| validate_sbpl_path(p).is_ok())
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    sbpl!(
+        sb,
+        ";; Host login and autostart files stay read-only under allow.write"
+    );
+    for p in paths {
+        let p = p.display();
+        sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
     }
     sbpl!(sb);
 }

@@ -2737,6 +2737,43 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A whole-home `allow.write` is honoured, except for the host's login and
+    /// autostart files, which stay read-only under it.
+    #[test]
+    fn real_profile_home_write_grant_keeps_login_files_read_only() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
+        fs::create_dir_all(home.join(".config/fish")).unwrap();
+        fs::write(home.join(".zshrc"), "orig\n").unwrap();
+        let writes = [home.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        let profile = write_real_profile(&opts);
+        let h = home.display();
+        let script = format!(
+            "echo x >> '{h}/.zshrc' && echo RC_WRITTEN; \
+             touch '{h}/Library/LaunchAgents/a.plist' && echo AGENT_WRITTEN; \
+             touch '{h}/.config/fish/config.fish' && echo FISH_WRITTEN; \
+             touch '{h}/.bash_profile' && echo PROFILE_WRITTEN; \
+             touch '{h}/notes.txt' && echo OTHER_OK"
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        assert!(output.contains("OTHER_OK"), "{output}");
+        for leak in [
+            "RC_WRITTEN",
+            "AGENT_WRITTEN",
+            "FISH_WRITTEN",
+            "PROFILE_WRITTEN",
+        ] {
+            assert!(!output.contains(leak), "{leak}: {output}");
+        }
+        assert_eq!(fs::read_to_string(home.join(".zshrc")).unwrap(), "orig\n");
+    }
+
     /// A directory clone must not carry a read-denied file out with it, while
     /// an ordinary file clone (APFS copy-on-write, used by build tools) works.
     #[test]

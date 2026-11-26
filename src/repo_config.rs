@@ -972,7 +972,16 @@ pub fn propose_key_detail(
     match key {
         "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
         "allow.write" if !propose.allow.write.is_empty() => {
-            Some(format!("{:?}", propose.allow.write))
+            let mut d = format!("{:?}", propose.allow.write);
+            if propose
+                .allow
+                .write
+                .iter()
+                .any(|w| crate::config::home_scope_write(w))
+            {
+                d.push_str(" (dangerous: reaches home login and autostart files; cplt keeps those read-only)");
+            }
+            Some(d)
         }
         "allow.ports" if !propose.allow.ports.is_empty() => {
             Some(format!("{:?}", propose.allow.ports))
@@ -1152,6 +1161,19 @@ preset = \"full-trust\"\n",
         assert!(toml::from_str::<RepoConfig>("this is = = not toml [[[\n").is_err());
     }
     use super::*;
+
+    #[test]
+    fn propose_detail_marks_home_scope_write() {
+        crate::with_env_lock_no_xdg(|| {
+            let mut p = ProposeSection::default();
+            p.allow.write = vec!["~".to_string()];
+            let d = propose_key_detail(&p, "allow.write", None).unwrap();
+            assert!(d.contains("dangerous"), "{d}");
+            p.allow.write = vec!["~/Repos/other".to_string()];
+            let d = propose_key_detail(&p, "allow.write", None).unwrap();
+            assert!(!d.contains("dangerous"), "{d}");
+        });
+    }
 
     #[test]
     fn every_token_inject_ca_var_is_reserved() {

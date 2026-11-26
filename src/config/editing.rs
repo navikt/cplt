@@ -410,6 +410,21 @@ pub fn unset_value_in_doc(doc: &mut toml_edit::DocumentMut, key_info: &ConfigKey
     }
 }
 
+/// Why a home-scope `allow.write` grant is marked dangerous.
+pub const HOME_SCOPE_WRITE_REASON: &str = "is dangerous: it reaches your home directory's login \
+     and autostart files (cplt keeps those read-only, but everything else under it is writable)";
+
+/// Whether an `allow.write` value is home-scope: `~`, a parent of it, or a
+/// path at, above or inside a host login or autostart path.
+pub fn home_scope_write(value: &str) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let path = super::expand_tilde(value);
+    path.is_absolute()
+        && crate::sandbox::reaches_host_persistence(std::path::Path::new(&home), &path)
+}
+
 /// Returns the security confirmation required to write `value`, if any.
 ///
 /// This is shared by the scriptable config command and interactive settings UI
@@ -429,6 +444,9 @@ pub fn security_confirmation(key_info: &ConfigKeyInfo, value: &str, unset: bool)
                 enabled.join(", ")
             ));
         }
+    }
+    if key_info.section == "allow" && key_info.key == "write" && home_scope_write(value) {
+        return Some(HOME_SCOPE_WRITE_REASON.to_string());
     }
     if key_info.dangerous
         && (value == "true"
@@ -955,6 +973,18 @@ mod tests {
         unset_value_in_doc(&mut doc, info);
         let result = doc.to_string();
         assert!(result.contains("validate = true"));
+    }
+
+    #[test]
+    fn security_confirmation_marks_home_scope_write_grants() {
+        crate::with_env_lock_no_xdg(|| {
+            let write = lookup_key("allow.write").unwrap();
+            for v in ["~", "~/Library", "~/.config", "~/Library/LaunchAgents", "/"] {
+                assert!(security_confirmation(write, v, false).is_some(), "{v}");
+            }
+            assert!(security_confirmation(write, "~/Repos/x", false).is_none());
+            assert!(security_confirmation(write, "~", true).is_none());
+        });
     }
 
     #[test]

@@ -143,31 +143,33 @@ pub use policy::{
     AppDir, AppDirKind, BUILD_CREDENTIAL_FILES, CLONE_CACHE_DIRS, CPLT_STATE_DIR, CacheEnv,
     DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, DockerAccess, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS,
-    HOST_EXEC_APP_DIRS, HOST_EXEC_TOOL_PATHS, HOST_TOOL_RO_OVERLAYS, HardeningCategory,
-    HardeningEnvVar, HomeToolDir, HostExec, HostExecPath, LinuxCoverage, OAUTH_CALLBACK_PORT,
-    PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
-    PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
-    PROTECTED_IN_ROOT, PathBinDir, Protected, READONLY_HOST_TOOL_TWINS, ResolvedToolDir,
-    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
-    TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, XDG_PINNED_MARKER,
-    active_tool_dirs, app_dirs, app_root_warning, apply_readonly_host_tool_paths,
-    build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
-    copilot_ro_protect_paths, cplt_exe_no_exec_dir, cplt_state_ancestor_grant, cplt_state_dir,
-    cplt_state_dir_grant, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
-    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
-    ensure_split_tool_dirs, env_dir_move_fix, env_tool_dir_allowed, env_tool_dir_hint_ok,
-    env_tool_path_protected, env_tool_path_readonly_host, env_tool_temp_roots,
-    exec_write_conflicts, first_party_read_target, gradle_loopback_hint, grant_is_refused,
-    home_config_link_targets, home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays,
+    HOST_EXEC_APP_DIRS, HOST_EXEC_TOOL_PATHS, HOST_PERSISTENCE_PATHS, HOST_TOOL_RO_OVERLAYS,
+    HardeningCategory, HardeningEnvVar, HomeToolDir, HostExec, HostExecPath, LinuxCoverage,
+    OAUTH_CALLBACK_PORT, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
+    PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
+    PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, READONLY_HOST_TOOL_TWINS,
+    ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
+    TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
+    XDG_PINNED_MARKER, active_tool_dirs, app_dirs, app_root_warning,
+    apply_readonly_host_tool_paths, build_credential_grants, copilot_default_pkg_dir,
+    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, cplt_exe_no_exec_dir,
+    cplt_state_ancestor_grant, cplt_state_dir, cplt_state_dir_grant, cplt_state_file,
+    credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
+    cypress_runtime_intent, dir_overlaps_credentials, ensure_split_tool_dirs, env_dir_move_fix,
+    env_tool_dir_allowed, env_tool_dir_hint_ok, env_tool_path_protected,
+    env_tool_path_readonly_host, env_tool_temp_roots, exec_write_conflicts,
+    first_party_read_target, gradle_loopback_hint, grant_is_refused, home_config_link_targets,
+    home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays,
     host_tool_ro_overlays_unenforced_warning, linux_docker_socket_paths,
     linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
     missing_split_tool_dirs, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
     no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
-    readonly_wrapper_lock_files, refused_writable_app_root, relocatable_tool_prefix,
-    report_state_pinned, shim_ro_protect_paths, socket_mask_paths, state_pinned_message,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
-    validate_sbpl_path, wrapper_lock_files, xdg_runtime_dir_env, xdg_state_dir,
+    reaches_host_persistence, readonly_wrapper_lock_files, refused_writable_app_root,
+    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
+    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, wrapper_lock_files, xdg_runtime_dir_env,
+    xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -1988,6 +1990,32 @@ fn maintain_cplt_state(config: &SandboxConfig) -> Result<(), String> {
     policy::flush_state_pinned(config.home_dir, config.project_dir)?;
     crate::launch_state::prune(config.home_dir);
     Ok(())
+}
+
+/// The [`HOST_PERSISTENCE_PATHS`] entries a user `allow.write` grant covers,
+/// at their `$HOME` spelling and, for a link, at its target. Both backends
+/// protect exactly these, so a launch without such a grant is unchanged.
+///
+/// A path at or under a project or named root is left out, as is one that
+/// contains one: those trees are writable by design (a dotfiles repo opened as
+/// the project keeps working).
+pub(crate) fn host_persistence_protect_paths(config: &SandboxConfig) -> Vec<PathBuf> {
+    let roots: Vec<&Path> = std::iter::once(config.project_dir)
+        .chain(config.named_roots.iter().map(PathBuf::as_path))
+        .collect();
+    let mut out: Vec<PathBuf> = HOST_PERSISTENCE_PATHS
+        .iter()
+        .flat_map(|e| {
+            let named = config.home_dir.join(e);
+            let target = crate::config::canonicalize_deepest(&named);
+            [named, target]
+        })
+        .filter(|p| config.extra_write.iter().any(|w| p.starts_with(w)))
+        .filter(|p| !roots.iter().any(|r| p.starts_with(r) || r.starts_with(p)))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// [`writable_trees`] canonicalized, for matching against the canonical paths
@@ -4330,6 +4358,15 @@ fn ro_protect_paths(
     // and without bwrap nothing does (`prepare_impl` warns at launch).
     ro_protect.extend(home_config_link_targets(config.home_dir));
 
+    // Host login and autostart files: Landlock cannot subtract them from a
+    // user `allow.write` on `~` or `~/.config`, so the bind is the control.
+    // Missing paths cannot be bound, and without bwrap nothing applies.
+    ro_protect.extend(
+        host_persistence_protect_paths(config)
+            .into_iter()
+            .filter(|p| p.symlink_metadata().is_ok()),
+    );
+
     ro_protect.sort();
     ro_protect.dedup();
     ro_protect
@@ -6105,6 +6142,67 @@ mod tests {
             let err = validate_hard_denied_grants(&config).unwrap_err();
             assert!(err.contains("uv(real)"), "{err}");
         });
+    }
+
+    #[test]
+    fn host_persistence_paths_protected_only_under_a_write_grant() {
+        let home = Path::new("/h");
+        let mut config = test_config(home, &[]);
+        assert!(host_persistence_protect_paths(&config).is_empty());
+        let profile = generate_profile(&config, &[]);
+        assert!(!profile.contains("Host login and autostart"), "{profile}");
+
+        let grant = [PathBuf::from("/h")];
+        config.extra_write = &grant;
+        let paths = host_persistence_protect_paths(&config);
+        for p in [
+            "/h/.zshrc",
+            "/h/Library/LaunchAgents",
+            "/h/.config/systemd/user",
+        ] {
+            assert!(paths.contains(&PathBuf::from(p)), "{p}: {paths:?}");
+        }
+        let profile = generate_profile(&config, &[]);
+        let deny = "(deny file-write* (subpath \"/h/.zshrc\"))";
+        let allow = "(allow file-write* (subpath \"/h\"))";
+        assert!(
+            profile.find(allow).unwrap() < profile.find(deny).unwrap(),
+            "deny must follow the user allow: {profile}"
+        );
+
+        // A narrower grant protects only what it covers.
+        let grant = [PathBuf::from("/h/.config")];
+        config.extra_write = &grant;
+        let paths = host_persistence_protect_paths(&config);
+        assert!(
+            paths.contains(&PathBuf::from("/h/.config/fish")),
+            "{paths:?}"
+        );
+        assert!(!paths.contains(&PathBuf::from("/h/.zshrc")), "{paths:?}");
+
+        // A project inside a persistence path stays writable.
+        let grant = [PathBuf::from("/h")];
+        config.extra_write = &grant;
+        config.project_dir = Path::new("/h/bin/tool");
+        assert!(!host_persistence_protect_paths(&config).contains(&PathBuf::from("/h/bin")));
+    }
+
+    #[test]
+    fn reaches_host_persistence_marks_home_scope_grants() {
+        let home = Path::new("/h");
+        for p in [
+            "/",
+            "/h",
+            "/h/Library",
+            "/h/.config",
+            "/h/Library/LaunchAgents",
+            "/h/.config/fish/conf.d",
+        ] {
+            assert!(reaches_host_persistence(home, Path::new(p)), "{p}");
+        }
+        for p in ["/h/Repos", "/h/.cache", "/opt"] {
+            assert!(!reaches_host_persistence(home, Path::new(p)), "{p}");
+        }
     }
 
     pub(super) fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {

@@ -245,6 +245,61 @@ pub const DENIED_FILES: &[&str] = &[
     ".vault-token",
 ];
 
+/// Host login and autostart paths, relative to `$HOME`: files and directories
+/// the user's own shell, session manager or tools run from outside the sandbox.
+/// One list for macOS and Linux, like [`HOME_TOOL_DIRS`]; a missing path costs
+/// nothing.
+///
+/// A user `allow.write` on `~`, `~/.config`, `~/Library` or a parent of `$HOME`
+/// is accepted, but these stay read-only under it: macOS emits a write deny
+/// after every user allow, and Linux binds the existing ones read-only through
+/// bubblewrap. Not listed: `~/.npmrc` and `~/.ssh` are already denied as
+/// credentials; `~/.gitconfig` is read-only through [`HOME_CONFIG_FILES`];
+/// `~/Library/LaunchDaemons` and the crontab spool are root-owned.
+pub const HOST_PERSISTENCE_PATHS: &[&str] = &[
+    // Shell startup files, run by every new interactive or login shell.
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".config/fish",
+    ".config/nushell",
+    // macOS per-user launchd jobs, loaded at login.
+    "Library/LaunchAgents",
+    // XDG autostart entries and systemd user units, started with the session.
+    ".config/autostart",
+    ".config/systemd/user",
+    // Commonly first on PATH: a binary dropped here shadows a system command.
+    ".local/bin",
+    "bin",
+    // sshd runs `~/.ssh/rc` at login and trusts `authorized_keys`. `~/.ssh` is
+    // denied already; these stay closed even if a grant reopens it.
+    ".ssh/rc",
+    ".ssh/authorized_keys",
+    // Global git hooks (`core.hooksPath`) and included config live here.
+    ".config/git",
+];
+
+/// Whether a write grant on `path` reaches the host login and autostart files:
+/// it is `$HOME` or an ancestor of it, or it is, contains or sits inside a
+/// [`HOST_PERSISTENCE_PATHS`] entry. Used to mark such grants as dangerous.
+///
+/// shortcut: compares spelled paths, not canonical ones; a symlinked spelling
+/// goes unmarked. The profile deny holds either way.
+pub fn reaches_host_persistence(home: &Path, path: &Path) -> bool {
+    home.starts_with(path)
+        || HOST_PERSISTENCE_PATHS.iter().any(|e| {
+            let e = home.join(e);
+            e.starts_with(path) || path.starts_with(&e)
+        })
+}
+
 /// Home config files granted read-only on both backends, relative to `$HOME`.
 ///
 /// One list so the backends cannot drift apart (#522): a config that works on

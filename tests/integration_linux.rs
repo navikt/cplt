@@ -3399,6 +3399,55 @@ print('BIND_OK')
         );
     }
 
+    /// A broad `allow.write` stays writable, except for the host's login and
+    /// autostart files, which bubblewrap binds read-only under it.
+    #[test]
+    fn bwrap_keeps_login_files_read_only_under_a_broad_write_grant() {
+        require_bwrap!();
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = &home.path().canonicalize().unwrap();
+        let project = h.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(h.join(".config/fish")).unwrap();
+        fs::create_dir_all(h.join(".config/other")).unwrap();
+        fs::write(h.join(".config/fish/config.fish"), "orig\n").unwrap();
+        let script = format!(
+            "echo x >> '{c}/fish/config.fish' && echo FISH_WRITTEN; \
+             touch '{c}/other/ok' && echo OTHER_OK",
+            c = h.join(".config").display()
+        );
+        let mut cmd = cplt_cmd();
+        crate::common::with_scratch_home(&mut cmd);
+        let out = cmd
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("XDG_CACHE_HOME", h.join(".cache"))
+            .args([
+                "--yes",
+                "--no-validate",
+                "--use-bubblewrap",
+                "--project-dir",
+            ])
+            .arg(&project)
+            .arg("--allow-write")
+            .arg(h.join(".config"))
+            .args(["--agent", "shell", "--", "-c", &script])
+            .output()
+            .expect("run cplt");
+        let (o, e) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(o.contains("OTHER_OK"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("FISH_WRITTEN"), "stdout: {o}\nstderr: {e}");
+        assert_eq!(
+            fs::read_to_string(h.join(".config/fish/config.fish")).unwrap(),
+            "orig\n"
+        );
+    }
+
     // ── Private devpts under bubblewrap (#1016) ───────────────────
 
     /// Opens a PTY pair, reopens the slave by path (the Landlock rule), sets
