@@ -1626,12 +1626,21 @@ Step 5 is the critical one. We connect to the `SocketAddr` from step 3 rather th
 | `198.18.0.0/15` | RFC 2544 | Benchmarking |
 | `240.0.0.0/4` | RFC 1112 | Reserved/future |
 | `192.0.0.0/24` | RFC 6890 | IETF protocol assignments |
-| `0.0.0.0` | N/A | Unspecified |
+| `0.0.0.0/8` | RFC 791 | "This network", including unspecified `0.0.0.0` |
+| `224.0.0.0/4` | RFC 5771 | Multicast |
 | `255.255.255.255` | N/A | Broadcast |
 | `::1` | RFC 4291 | IPv6 loopback |
 | `fc00::/7` | RFC 4193 | IPv6 ULA (private) |
 | `fe80::/10` | RFC 4291 | IPv6 link-local |
+| `fec0::/10` | RFC 3879 | IPv6 site-local (deprecated) |
+| `ff00::/8` | RFC 4291 | IPv6 multicast |
 | `::ffff:A.B.C.D` (private v4) | RFC 4291 | IPv4-mapped IPv6 |
+| `::A.B.C.D` (private v4) | RFC 4291 | IPv4-compatible IPv6 |
+| `64:ff9b::/96`, `64:ff9b:1::/48` (private v4) | RFC 6052, RFC 8215 | NAT64 |
+| `2002::/16` (private v4) | RFC 3056 | 6to4 |
+| `2001::/32` (private server or client v4) | RFC 4380 | Teredo |
+
+IPv6 forms that carry an IPv4 address are classified by that address, so a transition form of a public address stays allowed.
 
 #### Proxy-forced mode (#53)
 
