@@ -179,6 +179,26 @@ pub fn gh_hosts() -> &'static [String] {
     GH_HOSTS.get_or_init(|| vec![DEFAULT_GH_HOST.to_string()])
 }
 
+static GH_CONFIG_DIR_PIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Set gh's config dir as located at launch. Once per process: `gh-gate` sets
+/// it from the flag baked into its wrapper. A later call is ignored.
+pub fn set_gh_config_dir(dir: &Path) {
+    let _ = GH_CONFIG_DIR_PIN.set(dir.to_path_buf());
+}
+
+/// Point a real `gh` the gate runs at the config dir captured at launch.
+///
+/// `GH_CONFIG_DIR` (then `XDG_CONFIG_HOME`, then `HOME`) picks the
+/// `config.yml` gh reads aliases and `http_unix_socket` from, and the agent
+/// sets all three. An agent-written config could define aliases, or route the gate's own lookups and the token it attaches
+/// to a socket the agent listens on. `GH_CONFIG_DIR` outranks the other two.
+pub fn pin_gh_config(cmd: &mut std::process::Command) {
+    if let Some(dir) = GH_CONFIG_DIR_PIN.get() {
+        cmd.env("GH_CONFIG_DIR", dir);
+    }
+}
+
 /// Whether the github.com token cplt cached may go to this approved `gh` exec.
 ///
 /// `gh` sends `GH_TOKEN` to github.com and to every `*.ghe.com` tenant, so it
@@ -2227,6 +2247,11 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 "x-http-method-override" | "x-http-method" | "x-method-override"
             ) {
                 let v = value.trim().to_uppercase();
+                // A DELETE named anywhere stays a DELETE: a later header must
+                // not turn it into a write `allow_api_write` would approve.
+                if override_method.as_deref() == Some("DELETE") {
+                    return;
+                }
                 override_method = Some(if matches!(v.as_str(), "" | "GET" | "HEAD") {
                     "POST".to_string()
                 } else {
@@ -2342,7 +2367,8 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             }
             i += 1;
         }
-        if override_method.is_some() {
+        // `-X DELETE` is what gh sends, whatever the header claims.
+        if override_method.is_some() && method.as_deref() != Some("DELETE") {
             method = override_method;
         }
 
@@ -2741,6 +2767,10 @@ fn api_destination_host(cmd: &ParsedCommand) -> &str {
     }
 }
 
+/// `gh api` reads that name no owner or repository: service metadata only.
+const GLOBAL_STATIC_API_READS: &[&str] =
+    &["rate_limit", "meta", "zen", "octocat", "emojis", "versions"];
+
 /// Check if a command targets the expected repository.
 ///
 /// `startup_repo` should be in "owner/name" format. Explicit repository targets
@@ -2751,7 +2781,7 @@ fn api_destination_host(cmd: &ParsedCommand) -> &str {
 /// explicit -R or a matching /repos/ path.
 ///
 /// Security: write operations (`has_input_flags` or non-GET method) never use the
-/// relative-path fallback — they require an explicit /repos/{owner}/{repo}/... match.
+/// static-read fallback — they require an explicit /repos/{owner}/{repo}/... match.
 /// This prevents scope-check bypass via top-level endpoints (e.g. `gists`, `app/...`)
 /// that don't start with a deny-listed prefix.
 pub fn is_repo_in_scope(
@@ -2783,18 +2813,14 @@ pub fn is_repo_in_scope(
             if is_api_write(cmd) {
                 return None;
             }
-            // For reads: check if this looks like a relative path (no leading absolute prefix)
-            // that gh CLI resolves to the current repo (e.g., `gh api pulls/67/comments`).
+            // gh does not prefix a bare path with the current repository: `gh api
+            // pulls/1` requests `https://api.github.com/pulls/1`. So a path without
+            // `repos/{owner}/{repo}` is a top-level endpoint (`organizations/{id}`,
+            // `repositories/{id}`, `teams/{id}`, `gists`, ...) that can name any
+            // owner's data. Only a fixed set of endpoints that carry no owner or
+            // repository data passes, and only from an in-scope checkout.
             let path = decoded.strip_prefix('/').unwrap_or(&decoded);
-            if !path.starts_with("repos/")
-                && !path.starts_with("orgs/")
-                && !path.starts_with("users/")
-                && !path.starts_with("user")
-                && !path.starts_with("notifications")
-                && !path.starts_with("graphql")
-            {
-                // Relative read endpoint — gh CLI resolves to the invocation cwd's
-                // repo, which must still be a member of the immutable startup scope.
+            if GLOBAL_STATIC_API_READS.contains(&path.trim_end_matches('/')) {
                 // The pin sets `GH_HOST` to a non-github.com member's host,
                 // which `--hostname` overrides: the two must agree.
                 return invocation_repo
@@ -2803,7 +2829,7 @@ pub fn is_repo_in_scope(
                         cmd.hostname.is_none() || split_member(member).0.eq_ignore_ascii_case(host)
                     });
             }
-            // Absolute non-repo endpoint (e.g., /orgs/..., /user/...) — not in scope.
+            // Any other top-level endpoint (orgs/, organizations/, user, ...) — not in scope.
             return None;
         }
         // No endpoint at all for gh api — shouldn't happen, but deny
@@ -2812,6 +2838,37 @@ pub fn is_repo_in_scope(
 
     // Non-api commands: no -R flag → implicitly targets the invocation cwd's repo.
     invocation_repo.and_then(|repo| scope_member(scope, repo))
+}
+
+/// For a `gh api` path without `repos/{owner}/{repo}`, the spelling that reads
+/// the same path in an in-scope repository: gh sends a bare path to the API
+/// root, so `pulls/1` never meant the current repository.
+fn bare_api_path_hint(
+    cmd: &ParsedCommand,
+    invocation_repo: Option<&str>,
+    scope: &[String],
+) -> String {
+    let Some(endpoint) = cmd.api_endpoint.as_deref().filter(|_| cmd.command == "api") else {
+        return String::new();
+    };
+    let Ok(path) = github_api_endpoint_path(endpoint) else {
+        return String::new();
+    };
+    if extract_repo_from_api_path(path).is_some() {
+        return String::new();
+    }
+    let member = invocation_repo
+        .and_then(|repo| scope_member(scope, repo))
+        .or_else(|| scope.first().cloned());
+    let Some(member) = member else {
+        return String::new();
+    };
+    format!(
+        "gh sends a path without repos/<owner>/<repo> to the API root, not to this repository. \
+         Use repos/{}/{}.\n",
+        split_member(&member).1,
+        path.trim_start_matches('/')
+    )
 }
 
 /// The scope member `target` names, in the spelling captured at launch.
@@ -3332,6 +3389,8 @@ pub fn cplt_unrunnable_body(cplt: &str, feature: &str) -> String {
 /// starts — the launch repository plus every `--repo-dir` root on GitHub.
 /// `real_git` is the trusted Git binary used to verify an implicit target's cwd.
 /// `cplt_bin` is the path to the cplt binary (for calling `gh-gate`).
+/// `gh_config_dir` is gh's config dir as located at launch, pinned for every
+/// real `gh` the gate runs.
 /// Policy flags are baked into the wrapper invocation so the gate doesn't
 /// re-read config at runtime (security: agent could edit config files).
 pub fn generate_wrapper_script(
@@ -3340,9 +3399,13 @@ pub fn generate_wrapper_script(
     real_git: Option<&str>,
     cplt_bin: &str,
     policy: &crate::config::GhGuardPolicy,
+    gh_config_dir: Option<&str>,
 ) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
+    let config_dir_flag = gh_config_dir
+        .map(|dir| format!(" --gh-config-dir {}", shell_escape(dir)))
+        .unwrap_or_default();
     let repo_scope_flag = repo_scope
         .iter()
         .map(|repo| format!("--repo-scope {}", shell_escape(repo)))
@@ -3401,7 +3464,7 @@ pub fn generate_wrapper_script(
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag}{ext_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag}{ext_flag}{config_dir_flag} -- "$@"
 "#
     )
 }
@@ -3991,7 +4054,7 @@ fn gate_decision(
                         scope_label(&scope),
                     ),
                     guidance: format!(
-                        "Reason: {}\n\
+                        "{}Reason: {}\n\
                          Ways forward: read-only commands take an explicit repository — \
                          `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
                          <number>`, `gh issue view -R <owner>/<repo> <number>` — and REST GET \
@@ -4004,6 +4067,7 @@ fn gate_decision(
                          machine, name it with `cplt config set --local sandbox.repo_dirs <DIR>` \
                          and it joins the scope set — beside this repository or inside it, \
                          either works. Otherwise relaunch cplt against that repository.",
+                        bare_api_path_hint(&cmd, invocation_repo.as_deref(), &scope),
                         result.reason,
                     ),
                     agent_note: &[RESTRICTED, NOTE],
@@ -8186,8 +8250,8 @@ mod tests {
     }
 
     #[test]
-    fn api_relative_path_in_scope() {
-        // Relative paths like `pulls/67/comments` are resolved by gh to current repo
+    fn api_relative_path_is_not_in_scope() {
+        // gh sends `pulls/67/comments` to the API root, not to the cwd's repo
         let cmd = ParsedCommand {
             command: "api".to_string(),
             subcommand: None,
@@ -8198,11 +8262,11 @@ mod tests {
             api_endpoint: Some("pulls/67/comments".to_string()),
             hostname: None,
         };
-        assert!(in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
+        assert!(!in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
     }
 
     #[test]
-    fn api_relative_path_with_query_string_in_scope() {
+    fn api_relative_path_with_query_string_is_not_in_scope() {
         let cmd = ParsedCommand {
             command: "api".to_string(),
             subcommand: None,
@@ -8213,7 +8277,84 @@ mod tests {
             api_endpoint: Some("pulls?state=open".to_string()),
             hostname: None,
         };
-        assert!(in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
+        assert!(!in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
+    }
+
+    #[test]
+    fn api_top_level_reads_are_not_in_scope() {
+        let cwd = Some("navikt/cplt");
+        for ep in [
+            "repositories/123/hooks",
+            "organizations/9919/audit-log",
+            "enterprises/acme/audit-log",
+            "teams/1/members",
+            "gists",
+            "/issues",
+            "installation/repositories",
+            "app/installations",
+            "search/code?q=x",
+        ] {
+            let cmd = parse_command(&["api", ep]).unwrap();
+            assert!(!in_scope(&cmd, "navikt/cplt", cwd), "{ep}");
+        }
+        for ep in ["rate_limit", "/meta", "zen"] {
+            let cmd = parse_command(&["api", ep]).unwrap();
+            assert!(in_scope(&cmd, "navikt/cplt", cwd), "{ep}");
+            assert!(!in_scope(&cmd, "navikt/cplt", Some("other/repo")), "{ep}");
+        }
+    }
+
+    #[test]
+    fn method_override_never_downgrades_delete() {
+        for args in [
+            &[
+                "api",
+                "-X",
+                "DELETE",
+                "-H",
+                "X-HTTP-Method: GET",
+                "repos/navikt/cplt/x",
+            ][..],
+            &[
+                "api",
+                "-H",
+                "X-HTTP-Method-Override: DELETE",
+                "-H",
+                "X-HTTP-Method-Override: GET",
+                "repos/navikt/cplt/x",
+            ],
+            &[
+                "api",
+                "-H",
+                "X-HTTP-Method-Override: GET",
+                "-X",
+                "DELETE",
+                "repos/navikt/cplt/x",
+            ],
+        ] {
+            let cmd = parse_command(args).unwrap();
+            assert_eq!(cmd.method.as_deref(), Some("DELETE"), "{args:?}");
+            assert_eq!(
+                evaluate_with_policy(&cmd, true).decision,
+                Decision::Block,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_script_bakes_in_gh_config_dir() {
+        let script = generate_wrapper_script(
+            "/usr/bin/gh",
+            &[],
+            None,
+            "/c",
+            &crate::config::GhGuardPolicy::default(),
+            Some("/Users/u/.config/gh"),
+        );
+        assert!(
+            script.contains("--no-allow-pr-merge --gh-config-dir '/Users/u/.config/gh' -- \"$@\"")
+        );
     }
 
     #[test]
@@ -8342,6 +8483,7 @@ mod tests {
             Some("/usr/bin/git"),
             "/usr/local/bin/cplt",
             &crate::config::GhGuardPolicy::default(),
+            None,
         );
         assert_eq!(
             script,
@@ -8361,7 +8503,7 @@ mod tests {
             hosts: ghe_hosts(),
             ..Default::default()
         };
-        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy);
+        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy, None);
         assert!(
             script.contains(
                 "--no-allow-pr-merge --gh-host 'github.com' --gh-host 'example.ghe.com' -- \"$@\""
@@ -8894,6 +9036,7 @@ mod tests {
             Some("/usr/bin/git"),
             "/usr/local/bin/cplt",
             &policy,
+            None,
         );
         assert!(script.contains("/usr/bin/gh"));
         assert!(script.contains("--repo-scope 'navikt/cplt'"));
@@ -8919,6 +9062,7 @@ mod tests {
             Some("/usr/bin/git"),
             "/usr/local/bin/cplt",
             &policy,
+            None,
         );
         assert!(
             script.contains("--allow-api-write"),
@@ -8932,7 +9076,7 @@ mod tests {
             allow_extensions: vec!["dash".to_string()],
             ..Default::default()
         };
-        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy);
+        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy, None);
         assert!(script.contains(" --allow-extension "), "{script}");
     }
 
@@ -8949,6 +9093,7 @@ mod tests {
                 None,
                 "/usr/local/bin/cplt",
                 &policy,
+                None,
             );
             assert!(script.contains(flag), "{flag} missing: {script}");
         }
@@ -10365,6 +10510,7 @@ mod tests {
             Some("/path/with'quote/git"),
             "/path/with\"dq/cplt",
             &policy,
+            None,
         );
         assert!(script.contains("gh-gate"));
         // Should use single-quote escaping, no unescaped double quotes in paths

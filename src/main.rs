@@ -1090,6 +1090,10 @@ NOTE:
         /// gh extension the guard lets run (`gh_guard.allow_extensions`). Repeatable.
         #[arg(long = "allow-extension")]
         allow_extension: Vec<String>,
+        /// gh's config dir as located at launch; every real `gh` the gate runs
+        /// reads its config from here, whatever the agent's environment says.
+        #[arg(long)]
+        gh_config_dir: Option<PathBuf>,
 
         /// Block `gh pr merge` (override for --allow-pr-merge).
         #[arg(long, conflicts_with = "allow_pr_merge")]
@@ -5501,12 +5505,16 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 no_allow_pr_merge,
                 gh_host,
                 allow_extension,
+                gh_config_dir,
                 args,
             } => {
                 if !gh_host.is_empty() {
                     gh_proxy::set_gh_hosts(&gh_host);
                 }
                 gh_proxy::set_gh_extensions(&allow_extension);
+                if let Some(dir) = &gh_config_dir {
+                    gh_proxy::set_gh_config_dir(dir);
+                }
                 let policy = gh_proxy::GatePolicy {
                     mode: match mode.as_str() {
                         "warn" => config::EnforcementMode::Warn,
@@ -6637,6 +6645,7 @@ fn run_gh_gate(
 #[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate, against the same real gh it would exec
 fn run_gh_lookup(real_gh: &Path, repo: &str, args: &[&str]) -> Result<String, String> {
     let mut cmd = std::process::Command::new(real_gh);
+    gh_proxy::pin_gh_config(&mut cmd);
     if let Some(token) = exec_gh_token() {
         cmd.env("GH_TOKEN", token);
     }
@@ -6717,6 +6726,9 @@ fn exec_real(
     let mut command = std::process::Command::new(real_binary);
     command.env_remove("GH_HOST");
     command.env_remove("GH_REPO");
+    if name == "gh" {
+        gh_proxy::pin_gh_config(&mut command);
+    }
     let mut host_pinned = false;
     if let Some(repo) = repo_scope {
         command.env("GH_REPO", repo);

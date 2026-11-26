@@ -645,6 +645,23 @@ pub(super) fn is_regular_file(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file())
 }
 
+/// gh's config dir as located at launch, baked into the gh wrapper so every
+/// real `gh` the gate runs reads it. Warns when it cannot be located: the
+/// gate then runs gh with whatever config dir the session's environment names.
+fn launch_gh_config_dir() -> Option<String> {
+    let dir = std::env::var_os("HOME")
+        .and_then(|home| crate::sandbox::policy::gh_config_dir(Path::new(&home)))
+        .and_then(|d| d.to_str().map(str::to_string));
+    if dir.is_none() {
+        crate::ui::warn(
+            "gh guard: could not locate gh's config dir (HOME unset, a relative \
+             GH_CONFIG_DIR or XDG_CONFIG_HOME, or a non-UTF-8 path). gh commands the \
+             guard runs read the config dir from the session's environment.",
+        );
+    }
+    dir
+}
+
 pub(super) fn gh_hosts_yml() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     crate::discover::gh_hosts_yml(&home)
@@ -1116,6 +1133,7 @@ fn install_command_wrappers(
                 real_git_str.as_deref(),
                 &cplt_str,
                 gh_guard,
+                launch_gh_config_dir().as_deref(),
             )
         };
         let wrapper_path = bin_dir.join("gh");
@@ -3094,6 +3112,72 @@ mod pnpm_path_tests {
         assert_eq!(path(&cmd), std::ffi::OsString::from(&want));
         append_pnpm_home_dirs(&mut cmd, &roots);
         assert_eq!(path(&cmd), std::ffi::OsString::from(&want));
+    }
+}
+
+#[cfg(test)]
+mod gh_config_dir_pin_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// The gh wrapper the launch writes carries the config dir located at
+    /// launch, so the gate can pin it.
+    #[test]
+    fn installed_gh_wrapper_bakes_in_the_launch_gh_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let bin = tmp.path().join("path");
+        let scratch = tmp.path().join("scratch");
+        for d in [&home, &bin, &scratch] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let gh = bin.join("gh");
+        std::fs::write(&gh, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gh_guard = crate::config::GhGuardPolicy {
+            enabled: true,
+            scope_check: false,
+            ..Default::default()
+        };
+        let git_guard = crate::config::GitGuardPolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        let h = home.to_str().unwrap();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(h)),
+                ("PATH", Some(bin.to_str().unwrap())),
+                ("GH_CONFIG_DIR", None),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || {
+                #[allow(clippy::disallowed_methods)] // absolute path, never run: only carries env
+                let mut cmd = std::process::Command::new("/usr/bin/true");
+                super::install_command_wrappers(
+                    &mut cmd,
+                    &scratch,
+                    tmp.path(),
+                    &[],
+                    &gh_guard,
+                    &git_guard,
+                    true,
+                    None,
+                    None,
+                    None,
+                );
+            },
+        );
+        let script = std::fs::read_to_string(scratch.join("bin/gh")).unwrap();
+        assert!(
+            script.contains(&format!(" --gh-config-dir '{h}/.config/gh' ")),
+            "{script}"
+        );
+        temp_env::with_vars(
+            [("HOME", Some("/h")), ("GH_CONFIG_DIR", Some("rel"))],
+            || {
+                assert_eq!(super::launch_gh_config_dir(), None);
+            },
+        );
     }
 }
 
