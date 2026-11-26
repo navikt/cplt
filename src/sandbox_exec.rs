@@ -3154,6 +3154,7 @@ mod gh_config_dir_pin_tests {
                 ("PATH", Some(bin.to_str().unwrap())),
                 ("GH_CONFIG_DIR", None),
                 ("XDG_CONFIG_HOME", None),
+                ("XDG_DATA_HOME", None),
             ],
             || {
                 #[allow(clippy::disallowed_methods)] // absolute path, never run: only carries env
@@ -3175,6 +3176,12 @@ mod gh_config_dir_pin_tests {
         let script = std::fs::read_to_string(scratch.join("bin/gh")).unwrap();
         assert!(
             script.contains(&format!(" --gh-config-dir '{h}/.config/gh' ")),
+            "{script}"
+        );
+        // gh appends `gh` to XDG_DATA_HOME itself, so the wrapper carries the
+        // data dir's parent.
+        assert!(
+            script.contains(&format!(" --gh-xdg-data-home '{h}/.local/share' ")),
             "{script}"
         );
         temp_env::with_vars(
