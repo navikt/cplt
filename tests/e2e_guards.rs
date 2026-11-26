@@ -3519,7 +3519,16 @@ fn real_push_fixture() -> (
 /// Run the gate with the real git in `work`, protect_default_branch_only on,
 /// facts captured before `plant` changes the repository.
 fn planted_push_gate(work: &std::path::Path, plant: &[&[&str]], args: &[&str]) -> (String, bool) {
-    let facts = launch_facts(work);
+    planted_push_gate_with(&binary_in_path("git"), work, plant, args)
+}
+
+fn planted_push_gate_with(
+    git: &std::path::Path,
+    work: &std::path::Path,
+    plant: &[&[&str]],
+    args: &[&str],
+) -> (String, bool) {
+    let facts = serde_json::to_string(&cplt::gh_proxy::capture_repo_facts(git, work)).unwrap();
     for cfg in plant {
         assert!(git_ok(work, cfg), "plant {cfg:?}");
     }
@@ -3530,7 +3539,7 @@ fn planted_push_gate(work: &std::path::Path, plant: &[&[&str]], args: &[&str]) -
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .arg("git-gate")
         .arg("--real-git")
-        .arg(binary_in_path("git"))
+        .arg(git)
         .arg(format!("--repo-facts={facts}"))
         .arg("--mode=block")
         .arg("--prevent-push=true")
@@ -3545,6 +3554,59 @@ fn planted_push_gate(work: &std::path::Path, plant: &[&[&str]], args: &[&str]) -
         String::from_utf8_lossy(&output.stderr).to_string(),
         output.status.success(),
     )
+}
+
+/// A push URL already set when the session starts (say, by an earlier
+/// session) has no default-branch fact of its own: the recorded
+/// `refs/remotes/origin/HEAD` was learned from the fetch URL.
+#[test]
+fn real_push_refused_when_launch_push_url_names_another_repository() {
+    let (_tmp, work, _, other) = real_push_fixture();
+    assert!(git_ok(
+        &work,
+        &["config", "remote.origin.pushurl", other.to_str().unwrap()]
+    ));
+    let (stderr, ok) = planted_push_gate(&work, &[], FEAT_PUSH);
+    assert_refused(
+        &stderr,
+        ok,
+        "could not be determined for the URL it pushes to",
+    );
+    assert!(stderr.contains("set-head origin --auto"), "{stderr}");
+    assert!(!has_branch(&other, "feat"), "ref did not move");
+}
+
+/// A system-level insteadOf is invisible inside the session
+/// (GIT_CONFIG_NOSYSTEM=1), so the launch record must not see it either, or
+/// every push in that layout is refused as "moved".
+#[test]
+fn real_push_works_with_system_level_insteadof() {
+    let (tmp, work, origin, other) = real_push_fixture();
+    let sys = tmp.path().join("system-gitconfig");
+    std::fs::write(
+        &sys,
+        format!(
+            "[url \"{}\"]\n\tpushInsteadOf = {}\n",
+            other.display(),
+            origin.display()
+        ),
+    )
+    .unwrap();
+    let git = tmp.path().join("git-with-system-config.sh");
+    std::fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\nGIT_CONFIG_SYSTEM='{}' exec '{}' \"$@\"\n",
+            sys.display(),
+            binary_in_path("git").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let (stderr, ok) = planted_push_gate_with(&git, &work, &[], FEAT_PUSH);
+    assert!(ok, "push must work.\nstderr: {stderr}");
+    assert!(has_branch(&origin, "feat"));
+    assert!(!has_branch(&other, "feat"));
 }
 
 fn has_branch(bare: &std::path::Path, branch: &str) -> bool {
@@ -3581,6 +3643,10 @@ fn real_push_refused_when_push_url_moved_after_launch() {
         };
         let (stderr, ok) = planted_push_gate(&work, &[&plant], FEAT_PUSH);
         assert_refused(&stderr, ok, "no longer pushes");
+        assert!(
+            !stderr.contains("set-head"),
+            "{how}: no set-head hint\n{stderr}"
+        );
         assert!(!has_branch(&other, "feat"), "{how}: ref did not move");
     }
 }
