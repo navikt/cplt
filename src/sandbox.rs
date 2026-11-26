@@ -4722,8 +4722,14 @@ fn missing_dir_masks_with(
     nested_repos: &[PathBuf],
     inspect_only: bool,
 ) -> Vec<PathBuf> {
-    if inspect_only || !config.mask_missing_deny_paths {
+    if inspect_only {
         return Vec::new();
+    }
+    // Not behind `mask_missing_deny_paths`: these masks exist only under a
+    // broad `allow.write`, which already changes this launch.
+    let persist = host_persistence_missing_masks(config);
+    if !config.mask_missing_deny_paths {
+        return persist;
     }
     // Resolved, because the writable binds `build_bwrap_args` compares
     // against are canonical: an agent root reached through `XDG_*`,
@@ -4745,7 +4751,71 @@ fn missing_dir_masks_with(
         write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
         masks.extend(missing_worktree_config_masks(&write_roots, &git_dirs));
     }
+    masks.extend(persist);
     masks
+}
+
+/// The missing host login and autostart paths under a broad `allow.write`
+/// that bubblewrap can mask: directories with an empty read-only tmpfs,
+/// [`policy::HOST_PERSISTENCE_MASKABLE_FILES`] with `/dev/null`. bwrap leaves
+/// the empty mountpoint on the host.
+#[cfg(any(target_os = "linux", test))]
+fn host_persistence_missing_masks(config: &SandboxConfig) -> Vec<PathBuf> {
+    let home = config.home_dir;
+    let covered = host_persistence_protect_paths(config);
+    HOST_PERSISTENCE_PATHS
+        .iter()
+        .filter(|e| {
+            policy::host_persistence_is_dir(e)
+                || policy::HOST_PERSISTENCE_MASKABLE_FILES.contains(e)
+        })
+        .map(|e| crate::config::canonicalize_deepest(&home.join(e)))
+        .filter(|p| p.symlink_metadata().is_err())
+        .filter(|p| covered.contains(p))
+        .collect()
+}
+
+/// What a broad `allow.write` leaves writable among the host login and
+/// autostart paths: all of them without bubblewrap (Landlock cannot subtract
+/// from a grant), and with it the missing ones no mask covers.
+#[cfg(any(target_os = "linux", test))]
+fn host_persistence_unprotected(
+    config: &SandboxConfig,
+    bwrap_args: Option<&[String]>,
+) -> Vec<PathBuf> {
+    let paths = host_persistence_protect_paths(config);
+    let Some(args) = bwrap_args else {
+        return paths;
+    };
+    let missing: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| p.symlink_metadata().is_err())
+        .collect();
+    unmasked_missing_dirs(&missing, args)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn host_persistence_warning(config: &SandboxConfig, unprotected: &[PathBuf]) -> Option<String> {
+    if unprotected.is_empty() {
+        return None;
+    }
+    let grants: Vec<String> = config
+        .extra_write
+        .iter()
+        .filter(|w| unprotected.iter().any(|p| p.starts_with(w)))
+        .map(|w| w.display().to_string())
+        .collect();
+    let paths: Vec<String> = unprotected
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    Some(format!(
+        "allow.write {} covers host login and autostart paths that stay writable on this \
+         host: {}. Landlock cannot subtract them from the grant; only Bubblewrap can, and \
+         only for paths that exist or can be masked. Narrow the grant, or install bubblewrap.",
+        grants.join(", "),
+        paths.join(", ")
+    ))
 }
 
 /// The masks [`missing_dir_masks`] asked for that the wrapper did not
@@ -5141,8 +5211,19 @@ fn prepare_impl(
     {
         ui::warn(&w);
     }
+    // No silent grants: say which login and autostart paths stay writable.
+    let unprotected = host_persistence_unprotected(
+        config,
+        bwrap_wrapper.as_ref().map(|w| w.bwrap_args.as_slice()),
+    );
+    if let Some(w) = host_persistence_warning(config, &unprotected) {
+        ui::warn(&w);
+    }
     if let Some(w) = &bwrap_wrapper {
-        for p in unmasked_missing_dirs(&mask_missing, &w.bwrap_args) {
+        for p in unmasked_missing_dirs(&mask_missing, &w.bwrap_args)
+            .into_iter()
+            .filter(|p| !unprotected.contains(p))
+        {
             ui::warn(&format!(
                 "sandbox.mask_missing_deny_paths: {} is missing and could not be masked \
                  (its parent is missing or outside the writable grant), so the agent may \
@@ -6188,6 +6269,48 @@ mod tests {
     }
 
     #[test]
+    fn host_persistence_missing_paths_are_masked_or_warned() {
+        let home = tempfile::tempdir().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::write(h.join(".zshrc"), "").unwrap();
+        let grant = [h.clone()];
+        let mut config = test_config(&h, &[]);
+        config.extra_write = &grant;
+        let masks = host_persistence_missing_masks(&config);
+        assert!(masks.contains(&h.join(".bashrc")), "{masks:?}");
+        assert!(masks.contains(&h.join("bin")), "{masks:?}");
+        assert!(!masks.contains(&h.join(".zshrc")), "exists: {masks:?}");
+        assert!(!masks.contains(&h.join(".bash_profile")), "{masks:?}");
+        assert!(!masks.contains(&h.join(".ssh/rc")), "{masks:?}");
+
+        // Without bubblewrap every covered path is named in the warning.
+        let all = host_persistence_unprotected(&config, None);
+        assert!(all.contains(&h.join(".zshrc")), "{all:?}");
+        let w = host_persistence_warning(&config, &all).unwrap();
+        assert!(
+            w.contains(&h.display().to_string()) && w.contains(".zshrc"),
+            "{w}"
+        );
+
+        // With it, only missing paths no mask covers remain.
+        let args: Vec<String> = ["--ro-bind", "/dev/null"]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .chain([h.join(".bashrc").display().to_string()])
+            .collect();
+        let left = host_persistence_unprotected(&config, Some(&args));
+        assert!(!left.contains(&h.join(".bashrc")), "{left:?}");
+        assert!(!left.contains(&h.join(".zshrc")), "{left:?}");
+        assert!(left.contains(&h.join(".bash_profile")), "{left:?}");
+
+        config.extra_write = &[];
+        assert!(
+            host_persistence_warning(&config, &host_persistence_unprotected(&config, None))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn reaches_host_persistence_marks_home_scope_grants() {
         let home = Path::new("/h");
         for p in [
@@ -6203,6 +6326,13 @@ mod tests {
         for p in ["/h/Repos", "/h/.cache", "/opt"] {
             assert!(!reaches_host_persistence(home, Path::new(p)), "{p}");
         }
+        // A symlinked spelling of home is marked too.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap().join("home");
+        std::fs::create_dir(&real).unwrap();
+        let link = real.with_file_name("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(reaches_host_persistence(&real, &link));
     }
 
     pub(super) fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {

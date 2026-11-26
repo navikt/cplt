@@ -858,7 +858,10 @@ pub(crate) fn build_bwrap_args(
 /// the host), or an empty read-only tmpfs for a missing directory.
 fn emit_missing_mask(args: &mut Vec<String>, path: &Path) {
     let p = path.to_string_lossy().into_owned();
-    if path.file_name() == Some(std::ffi::OsStr::new("config.worktree")) {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "config.worktree"
+        || crate::sandbox::policy::HOST_PERSISTENCE_MASKABLE_FILES.contains(&name)
+    {
         args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), p]);
     } else {
         args.extend([

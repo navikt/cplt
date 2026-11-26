@@ -290,9 +290,38 @@ pub const HOST_PERSISTENCE_PATHS: &[&str] = &[
 /// it is `$HOME` or an ancestor of it, or it is, contains or sits inside a
 /// [`HOST_PERSISTENCE_PATHS`] entry. Used to mark such grants as dangerous.
 ///
-/// shortcut: compares spelled paths, not canonical ones; a symlinked spelling
-/// goes unmarked. The profile deny holds either way.
+/// Compared as spelled and canonically, so a symlinked spelling of `~` counts.
+/// The [`HOST_PERSISTENCE_PATHS`] files that bubblewrap masks with an empty
+/// read-only file when they are missing. An empty file here changes nothing
+/// for the shell that reads it. `.bash_profile` and `.bash_login` are left
+/// out: an empty one would stop bash reading `~/.profile`. So is `~/.ssh`,
+/// which is masked as a credential directory already, and where an empty
+/// `rc` would stop sshd running xauth.
+#[cfg(any(target_os = "linux", test))]
+pub const HOST_PERSISTENCE_MASKABLE_FILES: &[&str] = &[
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".bashrc",
+    ".bash_logout",
+    ".profile",
+];
+
+/// The [`HOST_PERSISTENCE_PATHS`] entries that are directories.
+#[cfg(any(target_os = "linux", test))]
+pub fn host_persistence_is_dir(entry: &str) -> bool {
+    entry.starts_with(".config/") || matches!(entry, "Library/LaunchAgents" | ".local/bin" | "bin")
+}
+
 pub fn reaches_host_persistence(home: &Path, path: &Path) -> bool {
+    let canon = |p: &Path| crate::config::canonicalize_deepest(p);
+    reaches_host_persistence_spelled(home, path)
+        || reaches_host_persistence_spelled(&canon(home), &canon(path))
+}
+
+fn reaches_host_persistence_spelled(home: &Path, path: &Path) -> bool {
     home.starts_with(path)
         || HOST_PERSISTENCE_PATHS.iter().any(|e| {
             let e = home.join(e);

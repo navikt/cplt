@@ -3413,6 +3413,7 @@ print('BIND_OK')
         fs::write(h.join(".config/fish/config.fish"), "orig\n").unwrap();
         let script = format!(
             "echo x >> '{c}/fish/config.fish' && echo FISH_WRITTEN; \
+             mkdir -p '{c}/autostart' && touch '{c}/autostart/a.desktop' && echo AUTOSTART_CREATED; \
              touch '{c}/other/ok' && echo OTHER_OK",
             c = h.join(".config").display()
         );
@@ -3443,9 +3444,45 @@ print('BIND_OK')
         );
         assert!(o.contains("OTHER_OK"), "stdout: {o}\nstderr: {e}");
         assert!(!o.contains("FISH_WRITTEN"), "stdout: {o}\nstderr: {e}");
+        assert!(!o.contains("AUTOSTART_CREATED"), "stdout: {o}\nstderr: {e}");
+        assert!(
+            !h.join(".config/autostart/a.desktop").exists(),
+            "a missing autostart dir must be masked"
+        );
         assert_eq!(
             fs::read_to_string(h.join(".config/fish/config.fish")).unwrap(),
             "orig\n"
+        );
+    }
+
+    /// Without bubblewrap the login and autostart paths under a broad grant
+    /// stay writable, and the launch says so.
+    #[test]
+    fn no_bwrap_warns_about_login_files_under_a_broad_write_grant() {
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = &home.path().canonicalize().unwrap();
+        let project = h.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut cmd = cplt_cmd();
+        crate::common::with_scratch_home(&mut cmd);
+        let out = cmd
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join("xdg-config"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("XDG_CACHE_HOME", h.join(".cache"))
+            .args(["--yes", "--no-validate", "--no-bubblewrap", "--project-dir"])
+            .arg(&project)
+            .arg("--allow-write")
+            .arg(h.join(".config"))
+            .args(["--agent", "shell", "--", "-c", "true"])
+            .output()
+            .expect("run cplt");
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            e.contains("host login and autostart paths that stay writable")
+                && e.contains(".config/autostart"),
+            "stderr: {e}"
         );
     }
 
