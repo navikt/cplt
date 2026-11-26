@@ -1277,6 +1277,20 @@ fn gh_gate_allow_api_write_permits_post_in_scope() {
 }
 
 #[test]
+fn gh_gate_blocks_method_override_header_with_underscores() {
+    let (_, stderr, ok) = gh_gate(&[
+        "api",
+        "repos/navikt/cplt/issues/1",
+        "-H",
+        "X_HTTP_Method_Override: DELETE",
+    ]);
+    assert!(
+        !ok,
+        "an underscore override header must be refused.\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn gh_gate_allow_api_write_still_blocks_graphql() {
     // GraphQL must remain blocked even with --allow-api-write — arbitrary mutations
     // cannot be statically scope-checked.
@@ -1701,6 +1715,36 @@ fn gh_gate_refuses_resolve_thread_in_other_repo() {
     let (stderr, ok) =
         gh_gate_with_fake_gh(&gh, &["api", "graphql", "-f", RESOLVE, "-f", "id=PRRT_1"]);
     assert_refused(&stderr, ok, "belongs to 'other/repo'");
+}
+
+#[test]
+fn gh_gate_pins_graphql_lookup_and_mutation_to_github_com() {
+    // The stand-in answers the lookup and accepts the mutation only when both
+    // carry `--hostname github.com`, so an unpinned call fails the test.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake-gh.sh");
+    let body = r#"{"data":{"node":{"__typename":"PullRequestReviewThread","repository":{"url":"https://github.com/navikt/cplt"}}}}"#;
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *'--hostname github.com'*) ;; *) exit 1 ;; esac\n\
+             case \"$*\" in *'node(id: $id)'*) printf '%s' '{body}' ;; esac\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (stderr, ok) = gh_gate_with_fake_gh(
+        &script,
+        &["api", "graphql", "-f", RESOLVE, "-f", "id=PRRT_1"],
+    );
+    assert!(
+        ok,
+        "pinned lookup and mutation must succeed.\nstderr: {stderr}"
+    );
 }
 
 #[test]
