@@ -16224,7 +16224,10 @@ fn start_denial_stream() -> Option<std::process::Child> {
         // Absolute: a bare name is resolved from the parent's PATH at spawn
         // time, and the sandbox grants the agent write+exec on directories that
         // sit on it. /usr/bin/log is the only valid location.
-        match std::process::Command::new("/usr/bin/log")
+        let mut log = std::process::Command::new("/usr/bin/log");
+        // Lives as long as the session: no inherited secret in its env.
+        cplt::clean_env::helper_env(&mut log);
+        match log
             .args([
                 "stream",
                 "--predicate",

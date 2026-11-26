@@ -1678,10 +1678,18 @@ fn sandbox_git(ctx: &Context, cmd: Command, staging: Option<&Path>) -> Result<Co
         write!(profile, "\n(allow file-read* file-write* (subpath \"{}\"))\n(deny process-exec (subpath \"{}\"))\n", staging.display(), staging.display())
             .map_err(|e| format!("cannot build broker checkout profile: {e}"))?;
     }
+    Ok(wrap_in_sandbox_exec(&profile, &cmd))
+}
+
+/// `cmd` under `sandbox-exec -p profile`, with only the helper env plus what
+/// `cmd` set itself: never the user's full environment.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // absolute system path
+fn wrap_in_sandbox_exec(profile: &str, cmd: &Command) -> Command {
     let mut wrapped = Command::new("/usr/bin/sandbox-exec");
     crate::clean_env::helper_env(&mut wrapped);
     wrapped
-        .args(["-p", &profile])
+        .args(["-p", profile])
         .arg(cmd.get_program())
         .args(cmd.get_args());
     for (key, value) in cmd.get_envs() {
@@ -1695,7 +1703,7 @@ fn sandbox_git(ctx: &Context, cmd: Command, staging: Option<&Path>) -> Result<Co
         wrapped.current_dir(dir);
     }
     wrapped.stdin(Stdio::null());
-    Ok(wrapped)
+    wrapped
 }
 
 /// Linux: the same session rules the agent runs under, plus read and write
@@ -2451,6 +2459,22 @@ fn request(body: serde_json::Value, name: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned
+    fn the_sandbox_exec_wrapper_gets_only_the_helper_env() {
+        let mut inner = Command::new("/usr/bin/true");
+        inner.env("GIT_DIR", "/x");
+        let before = crate::clean_env::helper_env_calls();
+        let wrapped = wrap_in_sandbox_exec("(version 1)", &inner);
+        assert_eq!(crate::clean_env::helper_env_calls(), before + 1);
+        assert!(
+            wrapped
+                .get_envs()
+                .any(|(k, v)| k == "GIT_DIR" && v.is_some())
+        );
+    }
 
     #[test]
     fn protected_matching_tracks_the_declaration_and_component_boundaries() {

@@ -6649,16 +6649,14 @@ PY"#;
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep", "{ctx}");
     }
 
-    /// `/proc/<pid>/environ` is the exec-time environment. cplt re-execs
+    /// `/proc/<pid>/environ` is the exec-time environment. Read by the
+    /// harness, outside the sandbox, while the session runs: cplt re-execs
     /// itself with an empty one, so a value exported to it is not there.
     #[test]
     fn launcher_environ_holds_no_exported_value() {
         require_landlock!();
         let project = create_test_project();
-        let script = r#"n="canary-""7f3e"; p=$PPID
-if tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | grep -qx -- --__cplt-env-fd; then echo parent-is-cplt; fi
-if tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -q "$n"; then echo LEAK; else echo clean; fi"#;
-        let output = cplt_cmd()
+        let mut child = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -6668,19 +6666,32 @@ if tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -q "$n"; then echo LEAK; e
                 "--project-dir",
             ])
             .arg(project.path())
-            .args(["--", "-c", script])
+            .args(["--", "-c", "echo ready; read _"])
             .env("HOME", home_dir())
             .env("CPLT_TEST_CANARY", "canary-7f3e")
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
             .expect("Failed to execute cplt");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let ctx = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let pid = child.id();
+        let environ = fs::read(format!("/proc/{pid}/environ"));
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline"));
+        drop(child.stdin.take());
+        let _ = child.wait();
+        assert_eq!(line.trim(), "ready");
+        let environ = environ.expect("the harness can read the launcher's environ");
+        let cmdline = String::from_utf8_lossy(&cmdline.expect("cmdline")).into_owned();
         assert!(
-            stdout.contains("clean") && !stdout.contains("LEAK"),
-            "{ctx}"
+            cmdline.contains("--__cplt-env-fd"),
+            "not the launcher: {cmdline}"
         );
-        if !stdout.contains("parent-is-cplt") {
-            eprintln!("note: parent /proc entry not visible here (pid namespace): {ctx}");
-        }
+        let environ = String::from_utf8_lossy(&environ);
+        assert!(!environ.contains("canary-7f3e"), "{environ}");
     }
 }

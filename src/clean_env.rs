@@ -7,14 +7,14 @@
 //! after start changes nothing they report.
 //!
 //! So `cplt` re-execs itself once, first thing in `main`, with an empty
-//! environment and the original one in an unlinked temp file passed by
-//! descriptor. The new image loads it back with `set_var` before any thread
+//! environment and the original one on an inherited pipe (see `send`),
+//! read once. The new image loads it back with `set_var` before any thread
 //! exists, so every in-process lookup sees what the user exported, while the
 //! exec-time block that stays readable for the whole session holds nothing.
 
 use std::ffi::OsString;
-use std::io::{Read, Seek, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io::Read;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 /// argv[1] of the re-exec'd image; argv[2] is the descriptor number. An argv
@@ -95,6 +95,8 @@ pub const HELPER_ENV: &[&str] = &[
 /// Give `cmd` only [`HELPER_ENV`] from the restored environment. Call it right
 /// after `Command::new`: `env_clear` also drops variables set before it.
 pub fn helper_env(cmd: &mut std::process::Command) {
+    #[cfg(test)]
+    HELPER_ENV_CALLS.with(|n| n.set(n.get() + 1));
     cmd.env_clear();
     for k in HELPER_ENV {
         if let Some(v) = std::env::var_os(k) {
@@ -103,28 +105,92 @@ pub fn helper_env(cmd: &mut std::process::Command) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static HELPER_ENV_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How often this thread called [`helper_env`]: lets a test prove a spawn
+/// site goes through it.
+#[cfg(test)]
+pub fn helper_env_calls() -> usize {
+    HELPER_ENV_CALLS.with(std::cell::Cell::get)
+}
+
 fn reexec(args: &[OsString]) -> std::io::Result<std::convert::Infallible> {
     use std::os::unix::process::CommandExt;
+    if cfg!(debug_assertions) && std::env::var_os("CPLT_TEST_FAIL_REEXEC").is_some() {
+        return Err(std::io::Error::other(
+            "forced by CPLT_TEST_FAIL_REEXEC (debug build)",
+        ));
+    }
     // The binary that is running now, not a PATH lookup.
     let exe = std::env::current_exe()?.canonicalize()?;
-    let mut file = tempfile::tempfile()?;
-    file.write_all(&encode(std::env::vars_os()))?;
-    file.rewind()?;
-    let fd = file.as_raw_fd();
-    // Inherited by the new image only; it closes it after one read.
-    // SAFETY: fd is owned by `file` and open.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    let block = encode(std::env::vars_os());
+    if block.len() as u64 > LIMIT {
+        return Err(std::io::Error::other("environment larger than 4 MiB"));
     }
+    let fd = send(&block)?;
     #[allow(clippy::disallowed_methods)] // exe is the resolved running binary
-    let err = std::process::Command::new(exe)
-        .arg0(&args[0])
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg0(args.first().map_or(exe.as_os_str(), |a| a.as_os_str()))
         .arg(MARKER)
         .arg(fd.to_string())
-        .args(&args[1..])
-        .env_clear()
-        .exec();
+        .args(args.iter().skip(1))
+        .env_clear();
+    let err = cmd.exec();
+    // SAFETY: our read end; the exec did not happen.
+    unsafe { libc::close(fd) };
     Err(err)
+}
+
+/// The block on a pipe, so it never has a filesystem name another process
+/// could open (a temp file exists under `$TMPDIR` until it is unlinked). A
+/// pipe buffer holds only 16-64 KiB and no thread may exist yet, so a
+/// double-forked writer feeds it; the reader sees EOF when the writer exits.
+/// Returns the read end, inheritable across exec.
+fn send(block: &[u8]) -> std::io::Result<i32> {
+    let mut fds = [0; 2];
+    // SAFETY: plain syscalls on descriptors this function owns.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let [r, w] = fds;
+        libc::fcntl(w, libc::F_SETFD, libc::FD_CLOEXEC);
+        let middle = libc::fork();
+        if middle < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(r);
+            libc::close(w);
+            return Err(e);
+        }
+        if middle == 0 {
+            // Single-threaded child: only async-signal-safe calls from here.
+            libc::close(r);
+            if libc::fork() == 0 {
+                let mut rest = block;
+                while !rest.is_empty() {
+                    let n = libc::write(w, rest.as_ptr().cast(), rest.len());
+                    if n <= 0 {
+                        libc::_exit(1);
+                    }
+                    rest = &rest[n as usize..];
+                }
+                libc::_exit(0);
+            }
+            libc::_exit(0);
+        }
+        libc::close(w);
+        let mut status = 0;
+        libc::waitpid(middle, &raw mut status, 0);
+        if libc::fcntl(r, libc::F_SETFD, 0) != 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(r);
+            return Err(e);
+        }
+        Ok(r)
+    }
 }
 
 fn encode(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<u8> {
@@ -165,13 +231,16 @@ fn read_env(fd: i32) -> std::io::Result<Vec<(OsString, OsString)>> {
     if fd < 3 || unsafe { libc::fstat(fd, &raw mut st) } != 0 {
         return Err(bad());
     }
-    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
         return Err(bad());
     }
-    // SAFETY: open, a regular file, and ours from here on (closed on drop).
+    // SAFETY: open, a pipe, and ours from here on (closed on drop).
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut buf = Vec::new();
-    file.take(LIMIT).read_to_end(&mut buf)?;
+    file.take(LIMIT + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > LIMIT {
+        return Err(std::io::Error::other("environment block over the limit"));
+    }
     if buf.is_empty() {
         return Ok(Vec::new());
     }
@@ -214,9 +283,16 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_descriptor_that_is_not_a_regular_file() {
-        let (r, _w) = std::io::pipe().unwrap();
-        assert!(read_env(r.as_raw_fd()).is_err());
+    fn refuses_a_descriptor_that_is_not_a_pipe() {
+        let f = tempfile::tempfile().unwrap();
+        assert!(read_env(std::os::fd::AsRawFd::as_raw_fd(&f)).is_err());
         assert!(read_env(1).is_err());
+    }
+
+    #[test]
+    fn a_block_larger_than_a_pipe_buffer_arrives_whole() {
+        let vars = vec![(OsString::from("BIG"), OsString::from("x".repeat(300_000)))];
+        let fd = send(&encode(vars.clone().into_iter())).unwrap();
+        assert_eq!(read_env(fd).unwrap(), vars);
     }
 }

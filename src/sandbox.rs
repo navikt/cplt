@@ -5669,6 +5669,14 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_probe_gets_only_the_helper_env() {
+        let before = crate::clean_env::helper_env_calls();
+        let _ = copilot_keychain_acct();
+        assert_eq!(crate::clean_env::helper_env_calls(), before + 1);
+    }
+
     /// #1164: literal and data-only write grants count, not only subpaths.
     #[test]
     fn write_grant_paths_reads_literals_and_every_write_kind() {

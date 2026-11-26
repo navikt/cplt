@@ -1218,6 +1218,14 @@ fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listener_probe_gets_only_the_helper_env() {
+        let before = crate::clean_env::helper_env_calls();
+        let _ = listens_on(i32::try_from(std::process::id()).unwrap(), 1);
+        assert_eq!(crate::clean_env::helper_env_calls(), before + 1);
+    }
+
     #[test]
     fn run_starts_the_session_service_first() {
         let bin = Path::new("/x/opencode");

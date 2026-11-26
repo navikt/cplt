@@ -2675,6 +2675,15 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    #[test]
+    fn template_probe_gets_only_the_helper_env() {
+        let before = crate::clean_env::helper_env_calls();
+        let _ = template_dirs();
+        if crate::git::trusted_git().is_some() {
+            assert!(crate::clean_env::helper_env_calls() > before);
+        }
+    }
+
     use super::*;
     use std::process::Command;
 

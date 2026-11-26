@@ -765,7 +765,8 @@ mod e2e_tests {
         require_sandbox!();
         let home = crate::common::make_config_home("clean-env");
         let repo = crate::common::temp_repo("navikt/probe");
-        // The needle is assembled in the script so argv never carries it.
+        // Needle and marker are assembled in the script: the parent's argv
+        // carries the script text, so a literal would always match.
         let script = r#"/usr/bin/python3 -I -c '
 import ctypes, os
 mib = (ctypes.c_int * 3)(1, 49, os.getppid())
@@ -773,7 +774,7 @@ n = ctypes.c_size_t(1 << 20)
 b = ctypes.create_string_buffer(n.value)
 assert ctypes.CDLL(None).sysctl(mib, 3, b, ctypes.byref(n), None, 0) == 0
 raw = b.raw[: n.value]
-print("parent-is-cplt" if b"--__cplt-env-fd" in raw else "parent-unknown")
+print("parent-is-cplt" if b"--__cplt-" + b"env-fd" in raw else "parent-unknown")
 print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
 '"#;
         let out = crate::common::cplt_local(&home, repo.path())
@@ -804,7 +805,7 @@ print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
     fn e2e_failed_clean_env_reexec_warns_and_continues() {
         let out = cplt_cmd()
             .arg("--version")
-            .env("TMPDIR", "/nonexistent-cplt-test-dir")
+            .env("CPLT_TEST_FAIL_REEXEC", "1")
             .output()
             .expect("cplt should run");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -813,6 +814,66 @@ print("LEAK" if b"canary-" + b"7f3e" in raw else "clean")
             stderr.contains("the launcher kept the full environment"),
             "{stderr}"
         );
+    }
+
+    /// The environment travels on a pipe, never as a file: with a TMPDIR no
+    /// one can create files in, the re-exec still succeeds and leaves nothing.
+    #[test]
+    fn e2e_clean_env_reexec_creates_no_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir_in(crate::common::real_home()).expect("tempdir");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let out = cplt_cmd()
+            .arg("--version")
+            .env("TMPDIR", tmp.path())
+            .output()
+            .expect("cplt should run");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("kept the full environment"), "{stderr}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    /// Read from outside the sandbox: the launcher's exec-time environment,
+    /// by pid, while the session runs.
+    #[test]
+    fn e2e_launcher_procargs_read_by_the_harness_hold_no_exported_value() {
+        require_sandbox!();
+        let home = crate::common::make_config_home("clean-env-ps");
+        let repo = crate::common::temp_repo("navikt/probe");
+        let mut child = crate::common::cplt_local(&home, repo.path())
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--",
+                "-c",
+                "echo ready; read _",
+            ])
+            .env("CPLT_TEST_CANARY", "canary-7f3e")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cplt should run");
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let ps = Command::new("/bin/ps")
+            .args(["-E", "-ww", "-o", "command=", "-p", &child.id().to_string()])
+            .output()
+            .expect("ps runs");
+        drop(child.stdin.take());
+        let _ = child.wait();
+        let seen = String::from_utf8_lossy(&ps.stdout);
+        assert!(seen.contains("--__cplt-env-fd"), "not the launcher: {seen}");
+        assert!(!seen.contains("canary-7f3e"), "{seen}");
     }
 
     /// #1121: an HTTPS GitHub remote with the gh guard off and no helper gets
