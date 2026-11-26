@@ -111,7 +111,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox. This flag wins over the sandbox.agent
     /// config key, which wins over auto-detection from PATH.
-    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, shell
+    /// Supported: copilot, opencode, antigravity, pi, claude, goose, dsh, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 

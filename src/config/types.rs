@@ -439,7 +439,7 @@ pub struct GhGuardConfig {
     pub unknown_command: Option<UnknownCommandPolicy>,
     /// Allow `gh api` write operations (POST/PATCH/PUT/DELETE and input flags).
     /// When true, write requests are scope-checked to the current repo.
-    /// GraphQL is always blocked regardless of this setting (default: false).
+    /// `gh api graphql` is not affected by this setting (default: false).
     pub allow_api_write: Option<bool>,
     /// Allow `gh pr merge` of the authenticated account's own pull requests
     /// into a branch whose rulesets require an approving review that a new push dismisses
