@@ -401,6 +401,44 @@ echo AGENT_COMPLETED
         }
     }
 
+    /// #1184: with `sandbox.readonly_host_tool_paths` on and bubblewrap off,
+    /// Landlock cannot keep the overlays read-only, so the launch must warn
+    /// and name them instead of dropping the setting silently.
+    #[test]
+    fn readonly_host_tool_paths_without_bubblewrap_warns() {
+        require_landlock!();
+        let project = create_test_project();
+        let h = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(h.path()).unwrap();
+        let cfg = home.join("cplt.toml");
+        fs::write(&cfg, "[sandbox]\nreadonly_host_tool_paths = true\n").unwrap();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--no-bubblewrap",
+                "--agent",
+                "shell",
+            ])
+            .arg("--project-dir")
+            .arg(project.path())
+            .args(["--", "-c", "true"])
+            .env("HOME", &home)
+            .env("CPLT_CONFIG", &cfg)
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .expect("Failed to execute cplt");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("readonly_host_tool_paths is on, but Bubblewrap is not in use")
+                && stderr.contains(&*home.join(".cache/pre-commit").to_string_lossy()),
+            "launch must warn and name the writable overlays: {stderr}"
+        );
+    }
+
     fn run_sandboxed_home_with_flags_env(
         project_dir: &Path,
         home: &Path,

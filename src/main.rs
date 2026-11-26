@@ -11677,6 +11677,16 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             .as_ref()
             .map(|p| Finding::warning(p.message.clone(), Some(p.fix.clone()))),
     );
+    // The same stated gap the Linux launch warns about (#1184).
+    if cfg!(target_os = "linux") && !bubblewrap.active() {
+        findings.extend(
+            sandbox::host_tool_ro_overlays_unenforced_warning(&sandbox::host_tool_ro_overlays(
+                &home_dir,
+                resolved.readonly_host_tool_paths,
+            ))
+            .map(|w| Finding::warning(w, None)),
+        );
+    }
     findings.extend(doctor::pts_grant_finding(
         &policy,
         bubblewrap.active(),
