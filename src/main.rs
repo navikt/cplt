@@ -14349,7 +14349,12 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
     // The verdict describes `HEAD:.cplt.toml`; `drifted` says the working-tree
     // file is not those bytes. Only a committed file can drift: an untracked or
     // staged-only file has no HEAD copy, and is `uncommitted` instead.
-    let drifted = config_state == repo_config::RepoConfigState::Drifted;
+    let drifted = matches!(
+        config_state,
+        repo_config::RepoConfigState::Drifted
+            | repo_config::RepoConfigState::CommittedButMissing
+            | repo_config::RepoConfigState::CommittedButNotAFile
+    );
     let bare = |state: &str, message: String| {
         serde_json::json!({
             "version": 1,
@@ -21258,30 +21263,88 @@ mod tests {
         (guard, dir, loaded)
     }
 
-    /// Every proposable key is shown with its value wherever approval is
-    /// asked for: each string or number the approval hashes appears in the
-    /// lines printed under the key.
+    /// Every proposable value is shown wherever approval is asked for. The
+    /// fields come from the serialized `ProposeSection`, the data the approval
+    /// hashes, not a hand-written list: a new list field fails here until
+    /// `proposed_keys` names it and `proposal_value_lines` shows its value.
     #[test]
     fn every_proposed_value_is_shown_before_approval() {
-        let (_g, dir, loaded) = committed_repo_config(
-            "[propose]\nrepos = [\"acme/lib\"]\npass_env = [\"MY_SECRET\"]\n\
-             [propose.allow]\nread = [\"r\"]\nwrite = [\"w\"]\nsocket = [\"s.sock\"]\n\
-             ports = [5432]\nlocalhost = [3000]\ndomains = [\"a.example\"]\n\
-             [propose.proxy]\nallow_private_domains = [\"intern.example\"]\n",
-        );
-        let propose = &loaded.config.propose;
-        let keys = repo_config::proposed_keys(propose);
-        assert!(keys.len() >= 9, "{keys:?}");
-        for key in keys {
-            let shown = proposal_value_lines(&dir, &loaded, None, key).join("\n");
-            let v = trust::key_value_json(propose, key).expect(key);
-            let items = v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
-            for item in items {
-                let want = item
-                    .as_str()
-                    .map_or_else(|| item.to_string(), str::to_string);
-                assert!(shown.contains(&want), "{key}: {want} not in {shown:?}");
+        fn fill(v: &mut serde_json::Value, path: &str, n: &mut u16, leaves: &mut Vec<String>) {
+            let serde_json::Value::Object(map) = v else {
+                return;
+            };
+            for (k, child) in map.iter_mut() {
+                // Unknown keys are flattened in; a default has none.
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                match child {
+                    serde_json::Value::Object(_) => fill(child, &p, n, leaves),
+                    serde_json::Value::Array(_) => {
+                        *n += 1;
+                        *child = serde_json::json!([format!("o/v{n}")]);
+                        leaves.push(p);
+                    }
+                    // Booleans are proposed only as `true`: the key is the value.
+                    _ => {}
+                }
             }
+        }
+        let mut schema = serde_json::to_value(repo_config::ProposeSection::default()).unwrap();
+        let (mut n, mut leaves) = (1000, Vec::new());
+        fill(&mut schema, "", &mut n, &mut leaves);
+        // Number lists (ports) do not take a string: give those a number.
+        let mut propose: Option<repo_config::ProposeSection> = None;
+        for _ in 0..=leaves.len() {
+            match serde_json::from_value(schema.clone()) {
+                Ok(p) => {
+                    propose = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    // serde names the offending value, which is unique per leaf.
+                    let leaf = leaves
+                        .iter()
+                        .find(|l| {
+                            let ptr = format!("/{}", l.replace('.', "/"));
+                            schema.pointer(&ptr).unwrap()[0]
+                                .as_str()
+                                .is_some_and(|v| e.to_string().contains(&format!("\"{v}\"")))
+                        })
+                        .unwrap_or_else(|| panic!("cannot fill {e}"));
+                    let ptr = format!("/{}", leaf.replace('.', "/"));
+                    let num = schema.pointer(&ptr).unwrap()[0].as_str().unwrap()[3..]
+                        .parse::<u16>()
+                        .unwrap();
+                    *schema.pointer_mut(&ptr).unwrap() = serde_json::json!([num]);
+                }
+            }
+        }
+        let propose = propose.expect("every list field fillable");
+        assert!(leaves.len() >= 9, "{leaves:?}");
+
+        let (_g, dir, mut loaded) = committed_repo_config("");
+        loaded.config.propose = propose;
+        let keys = repo_config::proposed_keys(&loaded.config.propose);
+        for leaf in &leaves {
+            let key = if leaf == "pass_env" {
+                "sandbox.pass_env"
+            } else {
+                leaf.as_str()
+            };
+            assert!(
+                keys.contains(&key),
+                "{key} is proposable but not in proposed_keys"
+            );
+            let shown = proposal_value_lines(&dir, &loaded, None, key).join("\n");
+            let v = schema
+                .pointer(&format!("/{}", leaf.replace('.', "/")))
+                .unwrap()[0]
+                .clone();
+            let want = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            assert!(shown.contains(&want), "{key}: {want} not in {shown:?}");
         }
     }
 
@@ -21304,15 +21367,15 @@ mod tests {
             repo_config::RepoConfigState::Committed
         );
         std::fs::remove_file(&file).unwrap();
-        assert_eq!(
-            repo_config::repo_config_state(&dir),
-            repo_config::RepoConfigState::Drifted
-        );
+        let st = repo_config::repo_config_state(&dir);
+        assert_eq!(st, repo_config::RepoConfigState::CommittedButMissing);
+        assert!(st.explain().unwrap().contains("git restore"));
+        assert_eq!(trust_show_json(&dir)["command"], serde_json::Value::Null);
         std::os::unix::fs::symlink(&other, &file).unwrap();
-        assert_eq!(
-            repo_config::repo_config_state(&dir),
-            repo_config::RepoConfigState::Drifted
-        );
+        let st = repo_config::repo_config_state(&dir);
+        assert_eq!(st, repo_config::RepoConfigState::CommittedButNotAFile);
+        assert!(st.explain().unwrap().contains("symlink"));
+        assert_eq!(trust_show_json(&dir)["command"], serde_json::Value::Null);
     }
 
     fn approval(dir: &Path, keys: &[&str], hash: &str) -> trust::TrustEntry {
