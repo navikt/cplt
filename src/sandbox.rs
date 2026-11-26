@@ -70,6 +70,7 @@ pub(crate) mod bubblewrap_probe {
             super::bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
+                host_run: &plan.host_run,
                 mask_missing: &super::missing_dir_masks(config, true),
             },
             &plan.deny_masks,
@@ -3762,6 +3763,7 @@ fn mcp_wrapper(
             bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
+                host_run: &plan.host_run,
                 mask_missing: &missing_dir_masks(config, true),
             },
             &plan.deny_masks,
@@ -4211,6 +4213,23 @@ fn ro_protect_paths(
     extra_git_dirs: &[PathBuf],
     nested_repos: &[PathBuf],
 ) -> Vec<PathBuf> {
+    let mut ro_protect = host_run_paths(config, extra_git_dirs, nested_repos);
+    agent_and_tool_ro_paths(config, &mut ro_protect);
+    ro_protect.sort();
+    ro_protect.dedup();
+    ro_protect
+}
+
+/// The part of [`ro_protect_paths`] whose contents git or an agent runs on the
+/// host from a repository: git persistence paths and `.git/config`. A symlink
+/// at or above one of these refuses the launch
+/// (`bubblewrap::symlinked_overlays`).
+#[cfg(target_os = "linux")]
+fn host_run_paths(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+    nested_repos: &[PathBuf],
+) -> Vec<PathBuf> {
     // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
     // so the project's .git/hooks (and other git-persistence files) stay
     // writable — a persistence-escape vector. When Bubblewrap is active we
@@ -4256,7 +4275,12 @@ fn ro_protect_paths(
         ro_protect.sort();
         ro_protect.dedup();
     }
+    ro_protect
+}
 
+/// The agent-config and tool-dir part of [`ro_protect_paths`].
+#[cfg(target_os = "linux")]
+fn agent_and_tool_ro_paths(config: &SandboxConfig, ro_protect: &mut Vec<PathBuf>) {
     // #237: same class, different tree — the agent's own config dir is granted
     // writable, and some files in it auto-execute on the host the next time the
     // agent runs outside cplt (Claude hooks, Pi extensions). macOS
@@ -4360,14 +4384,10 @@ fn ro_protect_paths(
 
     // Host login and autostart files: Landlock cannot subtract them from a
     // user `allow.write` on `~` or `~/.config`, so the bind is the control.
-    // Without bwrap nothing applies.
-    // Missing ones too: `build_bwrap_args` binds what exists when it runs,
-    // and the probe launch can create a masked path's mountpoint first.
+    // Without bwrap nothing applies. Missing ones too: `build_bwrap_args`
+    // binds what exists when it runs, and the probe launch can create a
+    // masked path's mountpoint first.
     ro_protect.extend(host_persistence_protect_paths(config));
-
-    ro_protect.sort();
-    ro_protect.dedup();
-    ro_protect
 }
 
 /// Launch warnings for the credential entries a symlink moves into a grant
@@ -4467,6 +4487,7 @@ struct BwrapPlan {
     credential_targets: Vec<PathBuf>,
     ro_protect: Vec<PathBuf>,
     pins: Vec<PathBuf>,
+    host_run: Vec<PathBuf>,
     deny_masks: bubblewrap::DenyMasks,
 }
 
@@ -4526,7 +4547,7 @@ fn bwrap_plan(
     let credential_links = landlock_mod::credential_links(config.home_dir, &policy.fs_rules);
     let credential_targets: Vec<PathBuf> =
         credential_links.iter().map(|l| l.target.clone()).collect();
-    let (ro_protect, pins) =
+    let (ro_protect, pins, host_run) =
         overlay_paths(config, extra_git_dirs, &nested_repos, &credential_targets);
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
@@ -4574,6 +4595,7 @@ fn bwrap_plan(
         credential_targets,
         ro_protect,
         pins,
+        host_run,
         deny_masks,
     }
 }
@@ -4845,13 +4867,14 @@ fn overlay_paths(
     extra_git_dirs: &[PathBuf],
     nested_repos: &[PathBuf],
     credential_targets: &[PathBuf],
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let ro_protect = ro_protect_paths(config, extra_git_dirs, nested_repos);
+    let host_run = host_run_paths(config, extra_git_dirs, nested_repos);
     let mut pins = pin_paths(config, extra_git_dirs, nested_repos);
     pins.extend(home_config_target_pins(config, credential_targets));
     pins.sort();
     pins.dedup();
-    (ro_protect, pins)
+    (ro_protect, pins, host_run)
 }
 
 /// #705: remove the Claude hook-script grants (`claude_hook_script_grants`,
@@ -5136,6 +5159,7 @@ fn prepare_impl(
         credential_targets,
         mut ro_protect,
         mut pins,
+        mut host_run,
         deny_masks,
     } = {
         if !inspect_only {
@@ -5196,6 +5220,7 @@ fn prepare_impl(
         bubblewrap::Overlays {
             read_only: &ro_protect,
             pins: &pins,
+            host_run: &host_run,
             mask_missing: &mask_missing,
         },
         &deny_masks,
@@ -5292,11 +5317,12 @@ fn prepare_impl(
             }
             profile_text.push('\n');
         } else if !made.is_empty() {
-            (ro_protect, pins) =
+            (ro_protect, pins, host_run) =
                 overlay_paths(config, extra_git_dirs, &nested_repos, &credential_targets);
             let overlays = bubblewrap::Overlays {
                 read_only: &ro_protect,
                 pins: &pins,
+                host_run: &host_run,
                 mask_missing: &mask_missing,
             };
             let rebuilt =
