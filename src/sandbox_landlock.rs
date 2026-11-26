@@ -3466,6 +3466,59 @@ mod tests {
         }
     }
 
+    /// #1057 review: the default OpenCode layout, judged by the real
+    /// policy, keeps the v2 GitHub MCP config dir usable despite cplt's own
+    /// `auth.json` file rule there. A user file grant inside still refuses.
+    #[test]
+    fn opencode_config_dir_check_exempts_only_cplts_own_auth_json() {
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, project) = (t.join("home"), t.join("proj"));
+        let oc = home.join(".config/opencode");
+        std::fs::create_dir_all(&oc).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(oc.join("auth.json"), "{}").unwrap();
+        std::fs::write(oc.join("opencode.json"), "{}").unwrap();
+        let vars = [
+            ("XDG_CONFIG_HOME", None::<&str>),
+            ("XDG_DATA_HOME", None),
+            ("XDG_STATE_HOME", None),
+            ("XDG_CACHE_HOME", None),
+            ("OPENCODE_CONFIG_DIR", None),
+        ];
+        temp_env::with_vars(vars, || {
+            let dirs = crate::agent::Agent::OpenCode.config_dirs(&home);
+            let mut config = test_config(&project, &home);
+            config.agent = crate::agent::Agent::OpenCode;
+            config.agent_dirs = &dirs;
+            let policy = generate_policy(&config);
+            assert!(
+                policy
+                    .fs_rules
+                    .iter()
+                    .any(|r| r.access.write && r.path == oc.join("auth.json")),
+                "fixture: cplt's own auth.json rule is present"
+            );
+            assert_eq!(
+                crate::opencode_v2::config_dir_writable(&policy, &home, &oc),
+                None
+            );
+            // The plain helper still sees the rule: the exemption is scoped.
+            assert!(crate::check::writable_on_or_under(&policy, &home, &oc).is_some());
+
+            let extra = [oc.join("opencode.json")];
+            let mut config = test_config(&project, &home);
+            config.agent = crate::agent::Agent::OpenCode;
+            config.agent_dirs = &dirs;
+            config.extra_write = &extra;
+            let policy = generate_policy(&config);
+            assert_eq!(
+                crate::opencode_v2::config_dir_writable(&policy, &home, &oc),
+                Some(oc.join("opencode.json"))
+            );
+        });
+    }
+
     #[test]
     fn project_dir_gets_full_access() {
         let project = PathBuf::from("/fake/user/project");

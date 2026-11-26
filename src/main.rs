@@ -5921,7 +5921,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                         proxy_handle.as_ref().map(|h| h.port),
                         cplt::discover::stored_gh_secret,
                         spec,
-                        |p| cplt::check::writable_on_or_under(&policy, &home_dir, p),
+                        |p| cplt::opencode_v2::config_dir_writable(&policy, &home_dir, p),
                     )
                 },
                 ui::warn,

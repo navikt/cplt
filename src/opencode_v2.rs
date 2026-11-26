@@ -601,6 +601,30 @@ pub fn github_mcp(
 
 /// The user's OpenCode config dir: an absolute `OPENCODE_CONFIG_DIR`, which
 /// replaces `$XDG_CONFIG_HOME/opencode` as in OpenCode 2.3.2. Never a project dir.
+/// The writable test for the OpenCode config dir `dir` in
+/// [`github_mcp`]: [`crate::check::writable_on_or_under`], except the exact
+/// file-level write rules cplt's own OpenCode agent dirs put inside `dir`
+/// (legacy `auth.json`, #1057 review). Read from `Agent::config_dirs`, so the
+/// exemption cannot drift from the grant.
+pub fn config_dir_writable(
+    policy: &crate::sandbox::LandlockPolicy,
+    home: &Path,
+    dir: &Path,
+) -> Option<PathBuf> {
+    let own: Vec<PathBuf> = crate::agent::Agent::OpenCode
+        .config_dirs(home)
+        .into_iter()
+        .filter(|d| d.path == dir)
+        .flat_map(|d| {
+            d.write_files
+                .iter()
+                .map(|f| d.path.join(f))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    crate::check::writable_on_or_under_except(policy, home, dir, &own)
+}
+
 pub(crate) fn user_config_dirs(home: &Path) -> Vec<PathBuf> {
     vec![
         std::env::var_os("OPENCODE_CONFIG_DIR")

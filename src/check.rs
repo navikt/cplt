@@ -381,13 +381,35 @@ pub fn writable_tree_on_path(
 /// the dir. Unsure means inside: this only refuses a credential.
 #[must_use]
 pub fn writable_on_or_under(policy: &LandlockPolicy, home: &Path, path: &Path) -> Option<PathBuf> {
+    writable_on_or_under_except(policy, home, path, &[])
+}
+
+/// [`writable_on_or_under`], minus file rules cplt itself emits inside
+/// `path` (an agent's own `write_files`, such as OpenCode's legacy
+/// `auth.json` in its config dir). `exempt` holds exact paths; a rule is
+/// skipped only when its path is one of them verbatim and nothing but a
+/// plain file (or nothing) sits there. Any other rule inside still counts.
+#[must_use]
+pub fn writable_on_or_under_except(
+    policy: &LandlockPolicy,
+    home: &Path,
+    path: &Path,
+    exempt: &[PathBuf],
+) -> Option<PathBuf> {
     if let Some((_, tree)) = writable_tree_on_path(policy, home, path) {
         return Some(tree);
     }
+    let own_file = |p: &Path| {
+        exempt.iter().any(|e| e == p)
+            && match p.symlink_metadata() {
+                Ok(m) => m.is_file(),
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            }
+    };
     policy
         .fs_rules
         .iter()
-        .find(|r| r.access.write && rule_inside(&r.path, path))
+        .find(|r| r.access.write && rule_inside(&r.path, path) && !own_file(&r.path))
         .map(|r| r.path.clone())
 }
 
