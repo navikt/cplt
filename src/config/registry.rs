@@ -699,6 +699,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "[\"github.com\"]",
         description: "GitHub hostnames whose remotes the gh guard scopes, e.g. [\"github.com\", \"example.ghe.com\"]. Bare hostnames only. Global config only. The host must also be reachable through the proxy (allowed_domains under strict networking); cplt does not add it.",
     },
+    ConfigKeyInfo {
+        section: "gh_guard",
+        key: "allow_extensions",
+        value_type: ConfigValueType::StrArray,
+        dangerous: true,
+        default_display: "[]",
+        description: "gh extensions the gh guard lets run, by the word after 'gh' (e.g. [\"dash\"] for gh dash). Any other word that is not a gh built-in is refused, since it may be an alias. A listed extension runs with the gh token. Global config only.",
+    },
     // [git_guard]
     ConfigKeyInfo {
         section: "git_guard",

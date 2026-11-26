@@ -244,6 +244,13 @@ pub(super) fn parse_local(
              your global config instead:\n  cplt config set gh_guard.hosts <HOST>"
         ));
     }
+    // Same for `allow_extensions`: a per-checkout file must not let new code run with the token.
+    if config.gh_guard.allow_extensions.take().is_some() {
+        ui::warn(&format!(
+            "gh_guard.allow_extensions in {display} is ignored: it is global-only. Set it \
+             in your global config instead:\n  cplt config set --force gh_guard.allow_extensions <NAME>"
+        ));
+    }
 
     Ok(Some(config))
 }
@@ -374,12 +381,19 @@ pub fn validate_local_document(doc: &toml_edit::DocumentMut) -> Result<(), Confi
     super::editing::validate_global_document(doc)?;
     // Global-only: the loader drops it from a local file, so writing it there
     // would be a setting that silently does nothing.
-    if doc.get("gh_guard").and_then(|t| t.get("hosts")).is_some() {
-        return Err(ConfigError::Validation(
-            "gh_guard.hosts is global-only and cannot be set in local config. \
-             Set it globally: cplt config set gh_guard.hosts <HOST>"
-                .to_string(),
-        ));
+    for (key, hint) in [
+        ("hosts", "cplt config set gh_guard.hosts <HOST>"),
+        (
+            "allow_extensions",
+            "cplt config set --force gh_guard.allow_extensions <NAME>",
+        ),
+    ] {
+        if doc.get("gh_guard").and_then(|t| t.get(key)).is_some() {
+            return Err(ConfigError::Validation(format!(
+                "gh_guard.{key} is global-only and cannot be set in local config. \
+                 Set it globally: {hint}"
+            )));
+        }
     }
     reject_relative_paths(&Config::parse(&doc.to_string())?, "local config")
 }
@@ -676,6 +690,7 @@ impl Config {
                     allow_pr_merge: _,
                     // Global-only: never taken from the local layer.
                     hosts: _,
+                    allow_extensions: _,
                 },
             git_guard:
                 super::types::GitGuardConfig {

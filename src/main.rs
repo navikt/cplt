@@ -1087,6 +1087,10 @@ NOTE:
         #[arg(long = "gh-host")]
         gh_host: Vec<String>,
 
+        /// gh extension the guard lets run (`gh_guard.allow_extensions`). Repeatable.
+        #[arg(long = "allow-extension")]
+        allow_extension: Vec<String>,
+
         /// Block `gh pr merge` (override for --allow-pr-merge).
         #[arg(long, conflicts_with = "allow_pr_merge")]
         no_allow_pr_merge: bool,
@@ -5496,11 +5500,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 allow_pr_merge,
                 no_allow_pr_merge,
                 gh_host,
+                allow_extension,
                 args,
             } => {
                 if !gh_host.is_empty() {
                     gh_proxy::set_gh_hosts(&gh_host);
                 }
+                gh_proxy::set_gh_extensions(&allow_extension);
                 let policy = gh_proxy::GatePolicy {
                     mode: match mode.as_str() {
                         "warn" => config::EnforcementMode::Warn,
@@ -6475,6 +6481,9 @@ enum GateEffect {
     /// `-u` taken out, whose only effect was a `.git/config` write the sandbox
     /// denies (#402).
     ExecWithout { notice: String, args: Vec<String> },
+    /// Run `args` instead of the invocation, unpinned: a listed extension run
+    /// as `gh extension exec <name>`, so a same-named alias cannot stand in.
+    ExecArgs(Vec<String>),
     /// Serve the cached token from the scratch dir instead of running `gh`.
     ServeCachedToken,
     /// Refuse, printing this refusal and the guard's escape hatch.
@@ -6540,9 +6549,26 @@ fn decide_gh_gate(
             }
             Ok((a, pinned))
         });
+    let extension = gh_proxy::listed_extension_argv(&arg_refs);
     match verdict {
         Ok((approval, _)) if !approval.graphql_targets.is_empty() => {
             GateEffect::VerifyGraphql(approval.graphql_targets)
+        }
+        // Fail closed: a plain exec of `gh <flag> <name>` could run a same-named alias.
+        Ok(_) if matches!(extension, Some(Err(_))) => {
+            let Some(Err(flag)) = extension else {
+                unreachable!()
+            };
+            refusal_effect(policy.mode, gh_proxy::extension_flag_refusal(&flag))
+        }
+        Ok((approval, None)) if matches!(extension, Some(Ok(_))) => {
+            let Some(Ok((args, repo))) = extension else {
+                unreachable!()
+            };
+            match repo.or(approval.repo_scope) {
+                Some(repo) => GateEffect::ExecRewritten { repo, args },
+                None => GateEffect::ExecArgs(args),
+            }
         }
         Ok((approval, pinned)) => match (approval.repo_scope, approval.host_pin, pinned) {
             (Some(repo), _, Some(args)) => GateEffect::ExecRewritten { repo, args },
@@ -6663,6 +6689,7 @@ fn perform_gate_effect(
             eprintln!("{notice}");
             exec_real(real_binary, name, &args, None, None)
         }
+        GateEffect::ExecArgs(args) => exec_real(real_binary, name, &args, None, None),
     }
 }
 

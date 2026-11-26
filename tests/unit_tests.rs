@@ -10476,6 +10476,7 @@ unknown_command = "warn"
 allow_api_write = false
 allow_pr_merge = false
 hosts = ["github.com"]
+allow_extensions = []
 
 [git_guard]
 enabled = false
@@ -12656,6 +12657,7 @@ fn every_hinted_config_command_pastes_and_works() {
         "cplt config set <KEY> <VALUE>",
         "cplt config set allow.{kind} {}",
         "cplt config set gh_guard.hosts <HOST>",
+        "cplt config set --force gh_guard.allow_extensions <NAME>",
         "cplt config set shell.skip {name}",
         "cplt config set shell.skip <agent>",
         "cplt config set",

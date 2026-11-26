@@ -1157,6 +1157,15 @@ fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
                 .unwrap_or_else(|| vec![crate::gh_proxy::DEFAULT_GH_HOST.to_string()]),
             src("gh_guard", "hosts", c.gh_guard.hosts.is_some())
         ),
+        format!(
+            "    allow_extensions      = {:?}{}",
+            c.gh_guard.allow_extensions.clone().unwrap_or_default(),
+            src(
+                "gh_guard",
+                "allow_extensions",
+                c.gh_guard.allow_extensions.is_some()
+            )
+        ),
         String::new(),
         "  [git_guard]".to_string(),
         format!(
@@ -1318,6 +1327,7 @@ mod tests {
             "proxy.port",
             "sandbox.use_bubblewrap",
             "gh_guard.hosts",
+            "gh_guard.allow_extensions",
         ] {
             let info = crate::config::lookup_key(k).unwrap();
             assert!(
@@ -1356,6 +1366,7 @@ mod tests {
                 ("shell.skip", _) => "goose",
                 ("deny.env", _) => "MY_SECRET",
                 ("gh_guard.hosts", _) => "example.ghe.com",
+                ("gh_guard.allow_extensions", _) => "dash",
                 (_, ConfigValueType::Bool) => "false",
                 (_, ConfigValueType::U16 | ConfigValueType::U16Array) => "8080",
                 (_, ConfigValueType::U64) => "1",

@@ -73,6 +73,107 @@ pub fn set_gh_hosts(hosts: &[String]) {
     let _ = GH_HOSTS.set(hosts.iter().map(|h| h.to_ascii_lowercase()).collect());
 }
 
+static GH_EXTENSIONS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set the extensions the guard lets run (`gh_guard.allow_extensions`). Once
+/// per process, from the flags baked into the `gh-gate` wrapper.
+pub fn set_gh_extensions(names: &[String]) {
+    let _ = GH_EXTENSIONS.set(names.to_vec());
+}
+
+fn gh_extensions() -> &'static [String] {
+    GH_EXTENSIONS.get_or_init(Vec::new)
+}
+
+/// Whether `word` is a gh built-in top-level command, after alias mapping.
+/// `co` is not: it is gh's default user alias for `pr checkout`, and
+/// redefinable like any other.
+pub fn is_gh_builtin(word: &str) -> bool {
+    let word = canonical_command(word);
+    word != "co"
+        && (GH_COMMANDS.contains(&word) || ["accessibility", "help", "version"].contains(&word))
+}
+
+/// Decision for a top-level word that is not a gh built-in, or `None` for a
+/// built-in. Such a word is a user alias or an extension. Aliases live in gh
+/// config the agent can write, so the guard cannot know what one runs; only
+/// extensions the user named in `gh_guard.allow_extensions` run (#1099).
+fn non_builtin_decision(command: &str, allowed: &[String]) -> Option<PolicyResult> {
+    if is_gh_builtin(command) {
+        return None;
+    }
+    Some(if allowed.iter().any(|n| n == command) {
+        PolicyResult {
+            decision: Decision::Allow,
+            reason: "extension listed in gh_guard.allow_extensions",
+        }
+    } else {
+        PolicyResult {
+            decision: Decision::Block,
+            reason: "not a gh built-in command: a user alias or extension the guard cannot \
+                     resolve. Run the built-in command it stands for (`gh pr checkout`, not \
+                     `gh co`); to run an extension, name it with \
+                     `cplt config set --force gh_guard.allow_extensions <NAME>`",
+        }
+    })
+}
+
+/// For a listed extension, the argv that runs it as `gh extension exec <name>`.
+/// The plain `gh <name>` form runs a same-named user alias when no extension is
+/// installed, and aliases live in config the agent can write; `extension exec`
+/// ignores aliases and fails when the extension is absent.
+///
+/// gh reads the first word after `extension exec` as the name, so nothing may
+/// precede it: a `-R`/`--repo` before the name comes back as the repository to
+/// pin through `GH_REPO`, and any other word there is refused.
+pub fn listed_extension_argv(args: &[&str]) -> Option<Result<ExtensionRun, String>> {
+    listed_extension_argv_for(args, gh_extensions())
+}
+
+/// Refusal for a word before a listed extension's name that cannot be carried
+/// over to `gh extension exec <name>`.
+pub fn extension_flag_refusal(flag: &str) -> Refusal {
+    Refusal {
+        headline: format!("'{flag}' before a gh extension name is not allowed."),
+        guidance: "The guard runs a listed extension as 'gh extension exec <name>', where \
+            only -R/--repo can be carried over. Put other flags after the extension name."
+            .to_string(),
+        agent_note: &[RESTRICTED, NOTE],
+    }
+}
+
+/// A listed extension's argv (`extension exec <name> ...`) and the `-R` repo
+/// given before the name, if any.
+pub type ExtensionRun = (Vec<String>, Option<String>);
+
+fn listed_extension_argv_for(
+    args: &[&str],
+    listed: &[String],
+) -> Option<Result<ExtensionRun, String>> {
+    let root = root_command(args).0?;
+    let word = args[root];
+    if is_gh_builtin(word) || !listed.iter().any(|n| n == word) {
+        return None;
+    }
+    let mut repo = None;
+    let mut prefix = args[..root].iter();
+    while let Some(&a) = prefix.next() {
+        let value = match a {
+            "-R" | "--repo" => prefix.next().copied(),
+            _ => a
+                .strip_prefix("--repo=")
+                .or_else(|| a.strip_prefix("-R").filter(|v| !v.is_empty())),
+        };
+        match value {
+            Some(v) if !v.is_empty() => repo = Some(v.to_string()),
+            _ => return Some(Err(a.to_string())),
+        }
+    }
+    let mut out = vec!["extension".to_string(), "exec".to_string()];
+    out.extend(args[root..].iter().map(ToString::to_string));
+    Some(Ok((out, repo)))
+}
+
 /// The GitHub hosts the guard accepts; `["github.com"]` unless configured.
 pub fn gh_hosts() -> &'static [String] {
     GH_HOSTS.get_or_init(|| vec![DEFAULT_GH_HOST.to_string()])
@@ -2001,6 +2102,56 @@ fn subcommand_short_value_flags(command: &str, subcommand: Option<&str>) -> &'st
     }
 }
 
+/// gh's built-in top-level command aliases (gh 2.105, `ALIASES:` in `--help`).
+const GH_COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("a11y", "accessibility"),
+    ("agent", "agent-task"),
+    ("agent-tasks", "agent-task"),
+    ("agents", "agent-task"),
+    ("at", "attestation"),
+    ("cs", "codespace"),
+    ("ext", "extension"),
+    ("extensions", "extension"),
+    ("rs", "ruleset"),
+    ("skills", "skill"),
+];
+
+/// gh's built-in subcommand aliases, as (canonical command, alias, canonical
+/// subcommand). `ls` for `list` is handled for every group.
+const GH_SUBCOMMAND_ALIASES: &[(&str, &str, &str)] = &[
+    ("extension", "uninstall", "remove"),
+    ("gist", "new", "create"),
+    ("issue", "new", "create"),
+    ("pr", "co", "checkout"),
+    ("pr", "new", "create"),
+    ("release", "new", "create"),
+    ("repo", "new", "create"),
+    ("secret", "remove", "delete"),
+    ("skill", "add", "install"),
+    ("skill", "show", "preview"),
+    ("variable", "remove", "delete"),
+];
+
+/// Map a built-in alias to the command gh runs, so policy sees the real
+/// command: unresolved, `gh pr new` was an unknown subcommand and passed under
+/// `unknown_command = allow` (#1099).
+fn canonical_command(word: &str) -> &str {
+    GH_COMMAND_ALIASES
+        .iter()
+        .find(|(a, _)| *a == word)
+        .map_or(word, |&(_, c)| c)
+}
+
+fn canonical_subcommand<'a>(command: &str, word: &'a str) -> &'a str {
+    if word == "ls" {
+        return "list";
+    }
+    GH_SUBCOMMAND_ALIASES
+        .iter()
+        .find(|(c, a, _)| *c == command && *a == word)
+        .map_or(word, |&(_, _, s)| s)
+}
+
 /// Parse a `gh` command line into its structured components.
 ///
 /// Expects `args` to be the arguments *after* the `gh` binary name,
@@ -2055,7 +2206,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         return None;
     }
 
-    let command = args[idx].to_string();
+    let command = canonical_command(args[idx]).to_string();
     idx += 1;
 
     // Special case: `gh api` has no subcommand — the next positional is the endpoint
@@ -2262,7 +2413,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             }
             a => {
                 if subcommand.is_none() {
-                    subcommand = Some(a.to_string());
+                    subcommand = Some(canonical_subcommand(&command, a).to_string());
                 }
             }
         }
@@ -2291,6 +2442,10 @@ pub fn evaluate_with_policy(cmd: &ParsedCommand, allow_api_write: bool) -> Polic
     // Special handling for `gh api`
     if cmd.command == "api" {
         return evaluate_api(cmd, allow_api_write);
+    }
+
+    if let Some(result) = non_builtin_decision(&cmd.command, gh_extensions()) {
+        return result;
     }
 
     let sub = cmd.subcommand.as_deref().unwrap_or("");
@@ -3236,12 +3391,17 @@ pub fn generate_wrapper_script(
             .map(|host| format!(" --gh-host {}", shell_escape(host)))
             .collect()
     };
+    let ext_flag: String = policy
+        .allow_extensions
+        .iter()
+        .map(|name| format!(" --allow-extension {}", shell_escape(name)))
+        .collect();
     format!(
         r#"#!/bin/sh
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag}{ext_flag} -- "$@"
 "#
     )
 }
@@ -3549,6 +3709,9 @@ fn gate_decision(
                 .to_string(),
             agent_note: &[RESTRICTED, NOTE],
         });
+    }
+    if let Some(Err(flag)) = listed_extension_argv(args) {
+        return Err(extension_flag_refusal(&flag));
     }
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
@@ -4300,7 +4463,6 @@ const GH_COMMANDS: &[&str] = &[
     "secret",
     "skill",
     "ssh-key",
-    "stack",
     "status",
     "variable",
     "workflow",
@@ -7468,7 +7630,7 @@ mod tests {
     #[test]
     fn default_deny_unknown_commands() {
         let parsed = ParsedCommand {
-            command: "invented-future-cmd".to_string(),
+            command: "pr".to_string(),
             subcommand: Some("destroy".to_string()),
             repo_flag: None,
             method: None,
@@ -7674,6 +7836,96 @@ mod tests {
             assert_eq!(misplaced_flag(args), Some(""), "{args:?}");
             assert!(gate(args, Path::new("."), &policy).is_err(), "{args:?}");
         }
+    }
+
+    /// #1099: built-in aliases get the canonical command's decision, and words
+    /// that are not built-ins (user aliases, extensions) are refused, under
+    /// `unknown_command = allow` too.
+    #[test]
+    fn gh_aliases_resolve_before_policy() {
+        let allow = GatePolicy {
+            unknown_command: UnknownCommandDecision::Allow,
+            ..GatePolicy::default()
+        };
+        for (alias, canonical) in [
+            (&["gist", "new", "-"][..], &["gist", "create", "-"][..]),
+            (&["pr", "new"], &["pr", "create"]),
+            (&["cs", "delete"], &["codespace", "delete"]),
+            (&["ext", "uninstall", "x"], &["extension", "remove", "x"]),
+            (&["secret", "remove", "X"], &["secret", "delete", "X"]),
+            (&["pr", "ls"], &["pr", "list"]),
+        ] {
+            let a = parse_command(alias).unwrap();
+            let c = parse_command(canonical).unwrap();
+            assert_eq!(
+                (&a.command, &a.subcommand),
+                (&c.command, &c.subcommand),
+                "{alias:?}"
+            );
+            assert_eq!(evaluate(&a).decision, evaluate(&c).decision, "{alias:?}");
+        }
+        for args in [
+            &["gist", "new", "-"][..],
+            &["cs", "delete"],
+            &["ext", "exec", "x"],
+        ] {
+            assert!(gate(args, Path::new("."), &allow).is_err(), "{args:?}");
+        }
+        // An extension runs only when listed, by its exact name; a listed name
+        // does not open built-ins, `co`, or other words.
+        let listed = vec!["dash".to_string()];
+        assert_eq!(
+            non_builtin_decision("dash", &listed).unwrap().decision,
+            Decision::Allow
+        );
+        for word in ["dashx", "Dash", "co", "my-alias", "stack"] {
+            assert_eq!(
+                non_builtin_decision(word, &listed).unwrap().decision,
+                Decision::Block,
+                "{word}"
+            );
+        }
+        assert!(non_builtin_decision("pr", &listed).is_none());
+        for args in [
+            &["co", "1"][..],
+            &["my-alias"],
+            &["some-extension", "run"],
+            &["stack", "list"],
+        ] {
+            let p = parse_command(args).unwrap();
+            assert_eq!(evaluate(&p).decision, Decision::Block, "{args:?}");
+            assert!(gate(args, Path::new("."), &allow).is_err(), "{args:?}");
+        }
+        for args in [&["help"][..], &["version"], &["a11y"]] {
+            let p = parse_command(args).unwrap();
+            assert_ne!(evaluate(&p).decision, Decision::Block, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn listed_extension_argv_puts_the_name_first() {
+        let listed = vec!["dash".to_string()];
+        let run = |a: &[&str]| listed_extension_argv_for(a, &listed);
+        let ok = |a: &[&str], repo: Option<&str>| {
+            let (argv, r) = run(a).unwrap().unwrap();
+            assert_eq!(argv[..3], ["extension", "exec", "dash"], "{a:?}");
+            assert_eq!(r.as_deref(), repo, "{a:?}");
+        };
+        ok(&["dash", "-x"], None);
+        ok(&["-R", "o/r", "dash"], Some("o/r"));
+        ok(&["-Rfoo/bar", "dash"], Some("foo/bar"));
+        ok(&["--repo=o/r", "dash"], Some("o/r"));
+        ok(&["--repo", "o/r", "dash"], Some("o/r"));
+        for a in [
+            &["--", "dash"][..],
+            &["-h", "x", "dash"],
+            &["--hostname=x", "dash"],
+            &["--repo=", "dash"],
+        ] {
+            assert!(run(a).unwrap().is_err(), "{a:?}");
+        }
+        assert!(run(&["pr", "list"]).is_none());
+        assert!(run(&["other"]).is_none());
     }
 
     #[test]
@@ -8672,6 +8924,16 @@ mod tests {
             script.contains("--allow-api-write"),
             "wrapper must bake in --allow-api-write when policy has allow_api_write=true"
         );
+    }
+
+    #[test]
+    fn wrapper_script_bakes_in_allow_extensions() {
+        let policy = crate::config::GhGuardPolicy {
+            allow_extensions: vec!["dash".to_string()],
+            ..Default::default()
+        };
+        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy);
+        assert!(script.contains(" --allow-extension "), "{script}");
     }
 
     #[test]

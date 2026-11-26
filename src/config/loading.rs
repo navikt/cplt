@@ -600,6 +600,15 @@ impl Config {
                 }
                 None => vec![crate::gh_proxy::DEFAULT_GH_HOST.to_string()],
             },
+            allow_extensions: match &self.gh_guard.allow_extensions {
+                Some(names) => {
+                    names
+                        .iter()
+                        .try_for_each(|n| super::validation::validate_gh_extension(n))?;
+                    names.clone()
+                }
+                None => Vec::new(),
+            },
         };
 
         // An `allow_push` rule that names neither a remote nor any branch

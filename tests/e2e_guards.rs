@@ -315,6 +315,131 @@ fn gh_gate_blocks_repo_delete() {
     assert_refused(&stderr, ok, "deletes entire repository");
 }
 
+/// #1099: a built-in alias gets the canonical command's decision, and a word
+/// that is not a gh built-in (user alias, extension) is refused, also with
+/// `--unknown-command=allow`.
+#[test]
+fn gh_gate_resolves_aliases_under_unknown_allow() {
+    let allow = ["--unknown-command=allow"];
+    let (_, stderr, ok) = gh_gate_with_opts(&["cs", "delete"], &allow);
+    assert_refused(&stderr, ok, "out of scope");
+    let (_, stderr, ok) = gh_gate_with_opts(&["repo", "new", "x"], &allow);
+    assert!(!ok, "repo new must get repo create's decision: {stderr}");
+    let (_, stderr, ok) = gh_gate_with_opts(&["my-alias"], &allow);
+    assert_refused(&stderr, ok, "not a gh built-in command");
+    let (_, stderr, ok) = gh_gate_with_opts(&["pr", "ls"], &allow);
+    assert!(ok, "pr ls is pr list: {stderr}");
+}
+
+/// #1099: a listed name runs as `gh extension exec`, so a user alias of the
+/// same name (gh config the agent can write) never runs in its place. Needs a
+/// real gh; skipped without one.
+#[test]
+fn gh_gate_listed_extension_never_runs_same_named_alias() {
+    let Some(gh) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("gh"))
+        .find(|p| p.is_file() && !p.to_string_lossy().contains("shims"))
+        .or_else(|| {
+            ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .find(|p| p.is_file())
+        })
+    else {
+        eprintln!("skipping: no gh binary");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("gh-config");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.yml"),
+        "aliases:\n    dash: '!echo ALIAS-RAN'\n",
+    )
+    .unwrap();
+    let run = |gh_args: &[&str]| {
+        let repo = temp_repo("navikt/cplt");
+        let out = cplt_cmd()
+            .args(["gh-gate", "--real-gh"])
+            .arg(&gh)
+            .arg("--real-git")
+            .arg(binary_in_path("git"))
+            .args([
+                "--repo-scope",
+                "navikt/cplt",
+                "--allow-extension",
+                "dash",
+                "--",
+            ])
+            .args(gh_args)
+            .env("HOME", tmp.path())
+            .env("GH_CONFIG_DIR", &cfg)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .env("XDG_STATE_HOME", tmp.path())
+            .env("XDG_CACHE_HOME", tmp.path())
+            .env("GH_TOKEN", "dummy")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).to_string()
+                + &String::from_utf8_lossy(&out.stderr),
+            out.status.success(),
+        )
+    };
+    let (out, ok) = run(&["dash"]);
+    assert!(
+        !ok && !out.contains("ALIAS-RAN"),
+        "alias must not run: {out}"
+    );
+    assert!(out.contains("not found"), "{out}");
+    for args in [&["--help", "dash"][..], &["-h", "x", "dash"]] {
+        let (out, ok) = run(args);
+        assert!(!ok && !out.contains("RAN"), "{args:?} must refuse: {out}");
+    }
+
+    let ext = data.join("gh/extensions/gh-dash");
+    std::fs::create_dir_all(&ext).unwrap();
+    std::fs::write(
+        ext.join("gh-dash"),
+        "#!/bin/sh\necho EXT-RAN repo=$GH_REPO\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(ext.join("gh-dash"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (out, ok) = run(&["dash"]);
+    assert!(
+        ok && out.contains("EXT-RAN") && !out.contains("ALIAS-RAN"),
+        "{out}"
+    );
+    // `-R` before the name is carried over as the GH_REPO pin.
+    let (out, ok) = run(&["-R", "o/r", "dash"]);
+    assert!(ok && out.contains("EXT-RAN repo=o/r"), "{out}");
+    let (out, ok) = run(&["-Rfoo", "dash"]);
+    assert!(ok && out.contains("EXT-RAN repo=foo"), "{out}");
+    let (out, ok) = run(&["--hostname", "x", "dash"]);
+    assert!(!ok && !out.contains("RAN"), "{out}");
+}
+
+/// #1099: only extensions named in `gh_guard.allow_extensions` run, by exact
+/// name; `stack` is an extension in gh 2.105, not a built-in.
+#[test]
+fn gh_gate_runs_only_listed_extensions() {
+    for opts in [&["--unknown-command=allow"][..], &[]] {
+        let listed = [opts, &["--allow-extension", "dash"]].concat();
+        let (_, stderr, ok) = gh_gate_with_opts(&["dash"], &listed);
+        assert!(ok, "listed extension must run: {stderr}");
+        for args in [&["dashboard"][..], &["stack", "list"], &["co", "1"]] {
+            let (_, stderr, ok) = gh_gate_with_opts(args, &listed);
+            assert_refused(&stderr, ok, "gh_guard.allow_extensions");
+        }
+    }
+}
+
 #[test]
 fn gh_gate_blocks_repo_edit() {
     let (_, stderr, ok) = gh_gate(&["repo", "edit", "--visibility", "private"]);
@@ -420,13 +545,14 @@ fn gh_gate_auth_token_allowed_when_disabled() {
 
 #[test]
 fn gh_gate_blocks_unknown_command() {
-    let (_, stderr, ok) = gh_gate(&["totally-new-command", "arg1"]);
+    let (_, stderr, ok) = gh_gate(&["pr", "totally-new-command", "arg1"]);
     assert_refused(&stderr, ok, "not recognized by the policy table");
 }
 
 #[test]
 fn gh_gate_allows_unknown_when_policy_allows() {
-    let (_, _, ok) = gh_gate_with_opts(&["totally-new-command"], &["--unknown-command=allow"]);
+    let (_, _, ok) =
+        gh_gate_with_opts(&["pr", "totally-new-command"], &["--unknown-command=allow"]);
     assert!(ok, "unknown commands should pass when policy is 'allow'");
 }
 
