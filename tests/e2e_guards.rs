@@ -5491,6 +5491,16 @@ fn git_gate_refuses_a_push_whose_refs_are_redirected_by_the_environment() {
         ],
     ));
     let backend = std::path::PathBuf::from(format!("files://{}", other.join(".git").display()));
+    // Older git ignores the variable: nothing is redirected to test then.
+    let probe = common::git_cmd(launch.path())
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .env("GIT_REFERENCE_BACKEND", &backend)
+        .output()
+        .unwrap();
+    if String::from_utf8_lossy(&probe.stdout).trim() != "main" {
+        eprintln!("SKIPPED: this git does not honour GIT_REFERENCE_BACKEND");
+        return;
+    }
     let (_, stderr, ok) = git_gate_protect_default_with_env(
         launch.path(),
         &facts,
