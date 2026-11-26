@@ -429,6 +429,11 @@ pub enum RepoConfigState {
     Committed,
     /// Committed, but the working tree copy differs — local edits are not in effect.
     Drifted,
+    /// Committed, but deleted from the working tree.
+    CommittedButMissing,
+    /// Committed, but the working-tree entry is a symlink or another non-file,
+    /// so what an editor shows need not be what HEAD holds.
+    CommittedButNotAFile,
     /// In the working tree only: untracked (possibly gitignored), or staged but
     /// not committed. Read for its `[deny]` on every platform since #206; never
     /// a source of grants.
@@ -456,6 +461,16 @@ impl RepoConfigState {
             Self::Drifted => Some(format!(
                 "{REPO_CONFIG_FILE} differs from the version committed in git HEAD.\n  \
                  cplt reads it from HEAD, so your local edits are not in effect until committed."
+            )),
+            Self::CommittedButMissing => Some(format!(
+                "The committed {REPO_CONFIG_FILE} is missing from this checkout.\n  \
+                 Restore it with `git restore {REPO_CONFIG_FILE}`, so what you review is what you approve."
+            )),
+            Self::CommittedButNotAFile => Some(format!(
+                "{REPO_CONFIG_FILE} in this checkout is a symlink or not a regular file.\n  \
+                 cplt approves only the committed file, and a link can show different content \
+                 from what HEAD holds. Replace it with the committed file: \
+                 `rm {REPO_CONFIG_FILE} && git restore {REPO_CONFIG_FILE}`."
             )),
             Self::Uncommitted => Some(format!(
                 "{REPO_CONFIG_FILE} exists in the working tree but not in git HEAD.\n  \
@@ -486,10 +501,8 @@ impl RepoConfigState {
 /// [`load_repo_config`] decides what is applied.
 #[must_use]
 pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
-    let in_working_tree = project_dir
-        .join(REPO_CONFIG_FILE)
-        .symlink_metadata()
-        .is_ok_and(|m| m.is_file());
+    let entry = project_dir.join(REPO_CONFIG_FILE).symlink_metadata();
+    let in_working_tree = entry.as_ref().is_ok_and(std::fs::Metadata::is_file);
 
     // Existence in HEAD is what closes the gitignore hole: `git status` says
     // nothing at all about an ignored file, so it cannot answer this.
@@ -498,12 +511,18 @@ pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
         // Byte-comparing the raw blob against the file on disk would call every
         // .gitattributes filter (eol=crlf, LFS, git-crypt, ident) permanent
         // drift and make a correctly committed config ungrantable.
-        if !in_working_tree
-            || git_succeeds(
-                project_dir,
-                &["diff", "--quiet", "HEAD", "--", REPO_CONFIG_FILE],
-            )
-        {
+        // A missing or symlinked working-tree file is not "the committed
+        // file": what the user's editor shows is not what is approved.
+        if entry.is_err() {
+            return RepoConfigState::CommittedButMissing;
+        }
+        if !in_working_tree {
+            return RepoConfigState::CommittedButNotAFile;
+        }
+        if git_succeeds(
+            project_dir,
+            &["diff", "--quiet", "HEAD", "--", REPO_CONFIG_FILE],
+        ) {
             return RepoConfigState::Committed;
         }
         return RepoConfigState::Drifted;

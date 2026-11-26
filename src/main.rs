@@ -1428,6 +1428,11 @@ enum TrustAction {
         /// Approve all permissions without prompting.
         #[arg(long)]
         all: bool,
+
+        /// Approve only if the proposal still has this content hash, as
+        /// printed by `cplt trust` and `cplt trust show --json`.
+        #[arg(long, value_name = "CONTENT_HASH")]
+        hash: Option<String>,
     },
 
     /// Revoke trust for specific permissions.
@@ -2513,7 +2518,11 @@ fn warn_unknown_repo_config_keys(config: &repo_config::RepoConfig, label: &str) 
     if unknown.is_empty() {
         return;
     }
-    let keys = unknown.join(", ");
+    let keys = unknown
+        .iter()
+        .map(|k| k.escape_debug().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let tightening = if repo_config::has_unknown_tightening_keys(config) {
         " At least one is under [deny], so a restriction this repository asks \
          for is NOT being applied."
@@ -14163,7 +14172,9 @@ fn run_trust_command(action: Option<TrustAction>) -> ExitCode {
 
     match action {
         TrustAction::Show { .. } => trust_show(&project_dir, &loaded),
-        TrustAction::Accept { keys, all } => trust_accept(&project_dir, &loaded, &keys, all),
+        TrustAction::Accept { keys, all, hash } => {
+            trust_accept(&project_dir, &loaded, &keys, all, hash.as_deref())
+        }
         TrustAction::Revoke { keys, all } => trust_revoke(&project_dir, &loaded, &keys, all),
     }
 }
@@ -14338,7 +14349,12 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
     // The verdict describes `HEAD:.cplt.toml`; `drifted` says the working-tree
     // file is not those bytes. Only a committed file can drift: an untracked or
     // staged-only file has no HEAD copy, and is `uncommitted` instead.
-    let drifted = config_state == repo_config::RepoConfigState::Drifted;
+    let drifted = matches!(
+        config_state,
+        repo_config::RepoConfigState::Drifted
+            | repo_config::RepoConfigState::CommittedButMissing
+            | repo_config::RepoConfigState::CommittedButNotAFile
+    );
     let bare = |state: &str, message: String| {
         serde_json::json!({
             "version": 1,
@@ -14403,14 +14419,54 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
 fn spelled_with_canonical(raw: &str, dir: &Path) -> String {
     let spelled = dir.join(config::expand_tilde(raw));
     let canonical = config::canonicalize_deepest(&spelled);
+    // Repo-controlled text: never print bidi or control characters raw.
+    let shown = raw.escape_debug();
     if canonical == spelled {
-        raw.to_string()
+        shown.to_string()
     } else {
         format!(
-            "{raw}  (resolves to {})",
+            "{shown}  (resolves to {})",
             canonical.to_string_lossy().escape_debug()
         )
     }
+}
+
+/// The value lines shown under a proposed key, wherever approval is asked for
+/// or reported: `cplt trust`, the `trust accept` prompt and its summary. Paths
+/// show where they resolve; any other key falls back to the value the approval
+/// hashes ([`trust::key_value_json`]), so a key can never be listed without
+/// what approving it grants. A boolean key is its own value.
+fn proposal_value_lines(
+    project_dir: &Path,
+    loaded: &repo_config::LoadedRepoConfig,
+    trust_entry: Option<&trust::TrustEntry>,
+    key: &str,
+) -> Vec<String> {
+    let propose = &loaded.config.propose;
+    let paths = match key {
+        "allow.read" => &propose.allow.read,
+        "allow.write" => &propose.allow.write,
+        "allow.socket" => &propose.allow.socket,
+        "repos" => return proposed_repo_lines(project_dir, loaded, trust_entry),
+        _ if config::PROPOSE_BOOLS.iter().any(|r| r.key == key) => return Vec::new(),
+        _ => {
+            let detail = repo_config::propose_key_detail(propose, key, None).or_else(|| {
+                trust::key_value_json(propose, key)
+                    .map(|v| v.to_string().escape_debug().to_string())
+            });
+            return vec![detail.unwrap_or_else(|| "(value could not be read)".to_string())];
+        }
+    };
+    let mut lines: Vec<String> = paths
+        .iter()
+        .map(|p| spelled_with_canonical(p, &loaded.dir))
+        .collect();
+    if key == "allow.write" {
+        lines.extend(paths.iter().filter_map(|w| {
+            config::home_scope_write_reason(w).map(|r| format!("{} {r}", w.escape_debug()))
+        }));
+    }
+    lines
 }
 
 fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoConfig) -> ExitCode {
@@ -14514,22 +14570,8 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             if !approved && let Some(cost) = repo_config::propose_key_cost(key) {
                 println!("{blue}[cplt]{nc}      {dim}{cost}{nc}");
             }
-            let paths = match key {
-                "allow.read" => &loaded.config.propose.allow.read,
-                "allow.write" => &loaded.config.propose.allow.write,
-                "allow.socket" => &loaded.config.propose.allow.socket,
-                _ => &Vec::new(),
-            };
-            for p in paths {
-                println!(
-                    "{blue}[cplt]{nc}      {}",
-                    spelled_with_canonical(p, &loaded.dir)
-                );
-            }
-            if key == "repos" {
-                for line in proposed_repo_lines(project_dir, loaded, trust_entry.as_ref()) {
-                    println!("{blue}[cplt]{nc}      {line}");
-                }
+            for line in proposal_value_lines(project_dir, loaded, trust_entry.as_ref(), key) {
+                println!("{blue}[cplt]{nc}      {line}");
             }
         }
     }
@@ -14545,6 +14587,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 
     // Show actionable hint for unapproved permissions
     let has_pending = !proposed.is_empty() && !all_approved;
+    let shown_hash = trust::proposal_content_hash(&loaded.config.propose);
 
     if let Some(ref entry) = trust_entry
         && !entry.accepted.approved_at.is_empty()
@@ -14624,7 +14667,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         println!();
         if repo_proposal_refusals(loaded).is_empty() {
             println!("{blue}[cplt]{nc}  {yellow}To approve all pending permissions:{nc}");
-            println!("{blue}[cplt]{nc}    cplt trust accept --all");
+            println!("{blue}[cplt]{nc}    cplt trust accept --all --hash {shown_hash}");
         } else {
             println!(
                 "{blue}[cplt]{nc}  {red}Fix or remove the REFUSED entries in .cplt.toml and commit \
@@ -14646,7 +14689,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             .collect();
         if !pending_keys.is_empty() {
             println!(
-                "{blue}[cplt]{nc}    cplt trust accept {}",
+                "{blue}[cplt]{nc}    cplt trust accept --hash {shown_hash} {}",
                 pending_keys.join(" ")
             );
         }
@@ -15210,6 +15253,7 @@ fn trust_accept(
     loaded: &repo_config::LoadedRepoConfig,
     keys: &[String],
     all: bool,
+    expected_hash: Option<&str>,
 ) -> ExitCode {
     // Guard: approve ONLY the committed config, so every granted permission is
     // auditable in git history and no process can inject permissions and
@@ -15230,6 +15274,17 @@ fn trust_accept(
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
 
     let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+    // Pins a non-interactive approval to the proposal that was reviewed: if
+    // the committed file changed after `cplt trust` printed it, refuse.
+    if let Some(h) = expected_hash
+        && h != current_hash
+    {
+        ui::error(
+            "The proposal in .cplt.toml changed since that hash was printed, so nothing was \
+             approved.\n  Run `cplt trust` again and review what it shows now.",
+        );
+        return ExitCode::FAILURE;
+    }
     let stored = trust::load_trust(project_dir);
 
     if proposed.is_empty() {
@@ -15428,12 +15483,14 @@ fn trust_accept(
             pending.len()
         );
         println!();
+        let dim = ui::stdout_color(ui::DIM);
         for &key in &pending {
-            let detail = repo_config::propose_key_detail(&loaded.config.propose, key, None);
-            if let Some(d) = detail {
-                println!("  {yellow}•{nc} {key}: {d}");
-            } else {
-                println!("  {yellow}•{nc} {key}");
+            println!("  {yellow}•{nc} {key}");
+            if let Some(cost) = repo_config::propose_key_cost(key) {
+                println!("    {dim}{cost}{nc}");
+            }
+            for line in proposal_value_lines(project_dir, loaded, stored.as_ref(), key) {
+                println!("    {line}");
             }
             if key == "proxy.allow_private_domains" {
                 println!("    {}", repo_config::PRIVATE_DOMAINS_BROWSER_NOTE);
@@ -15604,6 +15661,9 @@ fn trust_accept(
     );
     for key in &keys_to_accept {
         println!("  • {key}");
+        for line in proposal_value_lines(project_dir, loaded, Some(&entry), key) {
+            println!("    {line}");
+        }
     }
     if keys_to_accept
         .iter()
@@ -21203,6 +21263,121 @@ mod tests {
         (guard, dir, loaded)
     }
 
+    /// Every proposable value is shown wherever approval is asked for. The
+    /// fields come from the serialized `ProposeSection`, the data the approval
+    /// hashes, not a hand-written list: a new list field fails here until
+    /// `proposed_keys` names it and `proposal_value_lines` shows its value.
+    #[test]
+    fn every_proposed_value_is_shown_before_approval() {
+        fn fill(v: &mut serde_json::Value, path: &str, n: &mut u16, leaves: &mut Vec<String>) {
+            let serde_json::Value::Object(map) = v else {
+                return;
+            };
+            for (k, child) in map.iter_mut() {
+                // Unknown keys are flattened in; a default has none.
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                match child {
+                    serde_json::Value::Object(_) => fill(child, &p, n, leaves),
+                    serde_json::Value::Array(_) => {
+                        *n += 1;
+                        *child = serde_json::json!([format!("o/v{n}")]);
+                        leaves.push(p);
+                    }
+                    // Booleans are proposed only as `true`: the key is the value.
+                    _ => {}
+                }
+            }
+        }
+        let mut schema = serde_json::to_value(repo_config::ProposeSection::default()).unwrap();
+        let (mut n, mut leaves) = (1000, Vec::new());
+        fill(&mut schema, "", &mut n, &mut leaves);
+        // Number lists (ports) do not take a string: give those a number.
+        let mut propose: Option<repo_config::ProposeSection> = None;
+        for _ in 0..=leaves.len() {
+            match serde_json::from_value(schema.clone()) {
+                Ok(p) => {
+                    propose = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    // serde names the offending value, which is unique per leaf.
+                    let leaf = leaves
+                        .iter()
+                        .find(|l| {
+                            let ptr = format!("/{}", l.replace('.', "/"));
+                            schema.pointer(&ptr).unwrap()[0]
+                                .as_str()
+                                .is_some_and(|v| e.to_string().contains(&format!("\"{v}\"")))
+                        })
+                        .unwrap_or_else(|| panic!("cannot fill {e}"));
+                    let ptr = format!("/{}", leaf.replace('.', "/"));
+                    let num = schema.pointer(&ptr).unwrap()[0].as_str().unwrap()[3..]
+                        .parse::<u16>()
+                        .unwrap();
+                    *schema.pointer_mut(&ptr).unwrap() = serde_json::json!([num]);
+                }
+            }
+        }
+        let propose = propose.expect("every list field fillable");
+        assert!(leaves.len() >= 9, "{leaves:?}");
+
+        let (_g, dir, mut loaded) = committed_repo_config("");
+        loaded.config.propose = propose;
+        let keys = repo_config::proposed_keys(&loaded.config.propose);
+        for leaf in &leaves {
+            let key = if leaf == "pass_env" {
+                "sandbox.pass_env"
+            } else {
+                leaf.as_str()
+            };
+            assert!(
+                keys.contains(&key),
+                "{key} is proposable but not in proposed_keys"
+            );
+            let shown = proposal_value_lines(&dir, &loaded, None, key).join("\n");
+            let v = schema
+                .pointer(&format!("/{}", leaf.replace('.', "/")))
+                .unwrap()[0]
+                .clone();
+            let want = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            assert!(shown.contains(&want), "{key}: {want} not in {shown:?}");
+        }
+    }
+
+    #[test]
+    fn displayed_paths_escape_bidi_and_control_characters() {
+        let dir = Path::new("/nonexistent-cplt-test");
+        let shown = spelled_with_canonical("a\u{202e}b\u{200b}c\n", dir);
+        assert!(!shown.chars().any(config::is_display_unsafe), "{shown:?}");
+    }
+
+    /// A deleted or symlinked working-tree file is not the committed file.
+    #[test]
+    fn missing_or_symlinked_working_file_is_not_committed() {
+        let (_g, dir, _) = committed_repo_config("[propose]\nallow_docker = true\n");
+        let file = dir.join(".cplt.toml");
+        let other = dir.join("other.toml");
+        std::fs::copy(&file, &other).unwrap();
+        assert_eq!(
+            repo_config::repo_config_state(&dir),
+            repo_config::RepoConfigState::Committed
+        );
+        std::fs::remove_file(&file).unwrap();
+        let st = repo_config::repo_config_state(&dir);
+        assert_eq!(st, repo_config::RepoConfigState::CommittedButMissing);
+        assert!(st.explain().unwrap().contains("git restore"));
+        assert_eq!(trust_show_json(&dir)["command"], serde_json::Value::Null);
+        std::os::unix::fs::symlink(&other, &file).unwrap();
+        let st = repo_config::repo_config_state(&dir);
+        assert_eq!(st, repo_config::RepoConfigState::CommittedButNotAFile);
+        assert!(st.explain().unwrap().contains("symlink"));
+        assert_eq!(trust_show_json(&dir)["command"], serde_json::Value::Null);
+    }
+
     fn approval(dir: &Path, keys: &[&str], hash: &str) -> trust::TrustEntry {
         trust::TrustEntry {
             repo: trust::approved_identity(dir, ""),
@@ -21319,10 +21494,10 @@ mod tests {
             "{v}"
         );
         assert_eq!(v["proposed"][0]["key"], "allow_docker", "{v}");
-        // Deleted from the working tree: cplt still reads HEAD, and nothing
-        // on disk disagrees with it.
+        // Deleted from the working tree: the checkout no longer shows what
+        // HEAD proposes, so it is drift, and accept refuses it.
         std::fs::remove_file(dir.join(".cplt.toml")).unwrap();
-        assert_eq!(trust_show_json(&dir)["drifted"], false);
+        assert_eq!(trust_show_json(&dir)["drifted"], true);
 
         // Untracked, then staged but never committed: no HEAD copy to drift from.
         let (_g2, dir) = canonical_tempdir();

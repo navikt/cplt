@@ -1370,6 +1370,103 @@ fn golden_untrusted_repo_config_is_announced_inert_then_applied() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A teammate reviews a proposal with `cplt trust` and approves it with the
+/// command it prints. Every proposed value must be on screen before approval,
+/// and an approval must refuse a proposal that changed after it was shown.
+#[test]
+fn golden_trust_shows_every_value_and_pins_accept_to_what_was_shown() {
+    let home = make_config_home("golden-trust-values");
+    let repo = temp_repo("navikt/spleis");
+    let commit = |toml: &str| {
+        std::fs::write(repo.path().join(".cplt.toml"), toml).expect("write .cplt.toml");
+        for args in [
+            &["add", ".cplt.toml"][..],
+            &["commit", "--quiet", "-m", "cplt config"][..],
+        ] {
+            let out = common::git_cmd(repo.path())
+                .args(args)
+                .output()
+                .expect("git should run");
+            assert!(out.status.success(), "git {args:?} should succeed");
+        }
+    };
+    commit(
+        "[propose]\npass_env = [\"MY_SECRET_TOKEN\"]\n\
+         [propose.allow]\ndomains = [\"proposed.example\"]\nports = [5439]\nlocalhost = [3999]\n\
+         [propose.proxy]\nallow_private_domains = [\"intern.example\"]\n",
+    );
+
+    let (stdout, stderr, status) = launch(&home, repo.path(), &["trust"]);
+    assert!(
+        status.success(),
+        "cplt trust should succeed:\n{stdout}{stderr}"
+    );
+    for value in [
+        "MY_SECRET_TOKEN",
+        "proposed.example",
+        "5439",
+        "3999",
+        "intern.example",
+    ] {
+        assert!(
+            stdout.contains(value),
+            "`cplt trust` must show {value}:\n{stdout}"
+        );
+    }
+    let cmd = stdout
+        .lines()
+        .find(|l| l.contains("cplt trust accept --all --hash "))
+        .unwrap_or_else(|| panic!("no pinned accept command:\n{stdout}"));
+    let hash = cmd.rsplit(' ').next().expect("hash").to_string();
+
+    // The proposal changes after it was shown: the printed command refuses.
+    commit(
+        "[propose]\npass_env = [\"OTHER_SECRET\"]\n\
+         [propose.allow]\ndomains = [\"proposed.example\"]\nports = [5439]\nlocalhost = [3999]\n\
+         [propose.proxy]\nallow_private_domains = [\"intern.example\"]\n",
+    );
+    let (so, se, st) = launch(
+        &home,
+        repo.path(),
+        &["trust", "accept", "--all", "--hash", &hash],
+    );
+    assert!(
+        !st.success(),
+        "a changed proposal must be refused:\n{so}{se}"
+    );
+    let (so, _, _) = launch(&home, repo.path(), &["trust"]);
+    assert!(so.contains("pending"), "nothing may be approved:\n{so}");
+
+    // Re-shown, the new hash approves, and the summary names the values.
+    let (stdout, _, _) = launch(&home, repo.path(), &["trust"]);
+    let hash = stdout
+        .lines()
+        .find(|l| l.contains("--hash "))
+        .and_then(|l| l.rsplit(' ').next())
+        .expect("hash")
+        .to_string();
+    let (so, se, st) = launch(
+        &home,
+        repo.path(),
+        &["trust", "accept", "--all", "--hash", &hash],
+    );
+    assert!(st.success(), "accept should succeed:\n{so}{se}");
+    for value in [
+        "OTHER_SECRET",
+        "proposed.example",
+        "5439",
+        "3999",
+        "intern.example",
+    ] {
+        assert!(
+            so.contains(value),
+            "`accept --all` must show {value}:\n{so}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Path 7 — the awkward repository states still launch, and say something true
 // ════════════════════════════════════════════════════════════════════
