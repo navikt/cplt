@@ -263,17 +263,28 @@ fn sanitized_stderr(stderr: &[u8]) -> String {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
+    // Filter first, so a dropped char cannot split a prefix past the check;
+    // check the uncapped line, so a token cut by the cap is caught too.
+    let filtered: String = line
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    let longest_run = |f: fn(&char) -> bool| {
+        filtered
+            .split(|c: char| !f(&c))
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+    };
     if ["gho_", "ghp_", "ghu_", "ghs_", "ghr_", "github_pat_"]
         .iter()
-        .any(|p| line.contains(p))
+        .any(|p| filtered.contains(p))
+        || longest_run(char::is_ascii_hexdigit) >= 40
+        || longest_run(char::is_ascii_alphanumeric) >= 30
     {
         return "(output withheld)".into();
     }
-    let clean: String = line
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(160)
-        .collect();
+    let clean: String = filtered.chars().take(160).collect();
     if clean.is_empty() {
         "(no output)".into()
     } else {
@@ -2249,6 +2260,24 @@ mod tests {
         let gh = gh_fixture(tmp.path(), "echo 'bad gho_secret123' >&2; exit 1");
         let err = super::gh_auth_token_in(&gh, T, None).unwrap_err();
         assert!(!err.contains("gho_"), "{err}");
+    }
+
+    #[test]
+    fn sanitizer_checks_prefixes_after_dropping_control_chars() {
+        assert_eq!(
+            super::sanitized_stderr(b"bad gh\x07o_abc"),
+            "(output withheld)"
+        );
+    }
+
+    #[test]
+    fn sanitizer_withholds_long_hex_and_base62_runs() {
+        let hex = format!("err {}", "a1".repeat(20));
+        assert_eq!(super::sanitized_stderr(hex.as_bytes()), "(output withheld)");
+        let b62 = format!("err {}", "Ab9".repeat(10));
+        assert_eq!(super::sanitized_stderr(b62.as_bytes()), "(output withheld)");
+        let short = format!("err {}", "Ab9".repeat(9));
+        assert_eq!(super::sanitized_stderr(short.as_bytes()), short);
     }
 
     /// Not logged in is not a failure: nothing to warn about.
