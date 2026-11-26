@@ -18,8 +18,8 @@ in PATH. Check the selected path with `cplt doctor --verbose`, then launch
 ## Gradle, Maven and Yarn homes are read-only outside their caches
 
 Inside cplt, `~/.gradle` and `~/.m2` are read-only except for the
-directories a build fills: `caches/`, `wrapper/`, `native/`, `daemon/` and
-`.tmp/` under `~/.gradle`, and `repository/` and `wrapper/` under `~/.m2`.
+directories a build fills: `caches/`, `wrapper/`, `native/`, `daemon/`,
+`.tmp/`, `notifications/` and `workers/` under `~/.gradle`, and `repository/` and `wrapper/` under `~/.m2`.
 `~/.yarn` is read-only except `berry/`. Host builds run or obey the other
 files there (`init.d/`, `init.gradle`, `gradle.properties`, `settings.xml`,
 `toolchains.xml`, Yarn classic's global `bin/`), so a sandboxed session must
@@ -1194,8 +1194,8 @@ This lifts TCC restrictions for all child processes, while the cplt sandbox keep
    ```
    Then add to config:
    ```toml
-   [sandbox]
-   allow_read = ["~/Screenshots"]
+   [allow]
+   read = ["~/Screenshots"]
    ```
 
 ## Git workflow (commit & push)
@@ -1220,11 +1220,11 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
    ```bash
    gh auth login   # one-time setup
    ```
-3. **Configure the git credential helper** (not needed for `github.com` with the gh guard on):
+3. **Configure the git credential helper** (not needed for the hosts in `gh_guard.hosts`, `github.com` by default, with the gh guard on):
    ```bash
    gh auth setup-git
    ```
-   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed. The same helper means the agent can get the token itself; see [the limit](../SECURITY.md#github-token-handling-per-agent).
+   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for each host in `gh_guard.hosts` (`https://github.com` by default) inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed. The same helper means the agent can get the token itself; see [the limit](../SECURITY.md#github-token-handling-per-agent).
 
 **Credentials per agent (macOS).** The helper only produces a token if `gh` can reach one from inside the sandbox:
 
@@ -1268,7 +1268,7 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git fetch/pull/push` (SSH)        | ❌ No key on macOS | SSH agent socket and `~/.ssh` denied, so authentication fails; use HTTPS. The network path is open on 443 (`ssh.github.com:443`), see [SSH over port 443](#ssh-over-port-443). On Linux only `SSH_AUTH_SOCK` is withheld |
 | `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every named repository (`--repo-dir`), to every `allow.write` grant, and to any repository nested under one. Blocked on Linux too with `sandbox.allow_git_config_write = false` (new configs, needs Bubblewrap) |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
-| `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`; on Linux blocked only with `sandbox.allow_git_config_write = false` |
+| `git remote set-url`               | ❌ Blocked | Refused by the git guard under `protect_default_branch_only` (the default) on both platforms. `.git/config` is also write-protected on macOS, and on Linux with `sandbox.allow_git_config_write = false` |
 | `git submodule add`                | ❌ Blocked on macOS | `.gitmodules` is write-protected on macOS. Writable on Linux, same Landlock limit (supply chain vector) |
 | Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project, in every named repository (`--repo-dir`), in every `allow.write` grant, and in any repository nested under one, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, and nested repositories are found by a bounded scan: three levels down, 20 000 directories in total, symlinks not followed. A repository deeper than that, past the cap, bare, or a nested worktree/submodule stays writable there. See [security.md](security.md) |
 | `git init` / `git clone`           | ❌ Blocked on macOS | Both write `.git/config` and `.git/hooks/`, which are protected anywhere under a writable root. Clone outside the sandbox, then point cplt at the result. They work on Linux, also with `sandbox.allow_git_config_write = false`: a bind covers only a `.git/config` that exists at launch, so a repository created in the session stays writable |
@@ -1446,7 +1446,7 @@ One more case worth knowing: a **Gradle daemon started outside cplt and then reu
 
 ## Gradle toolchain JDKs
 
-`~/.gradle` is a dependency store. The sandbox grants read, write, and `file-map-executable` there (for JNI libs) but **not** `process-exec`, so a rogue agent cannot drop a binary into the dependency cache and run it. Gradle's toolchain support auto-provisions JDKs into `~/.gradle/jdks`, inside that non-executable tree, so forking a toolchain `javac` or test JVM failed with `Operation not permitted` and no config key could grant exec.
+`~/.gradle` is a dependency store. The sandbox grants read and `file-map-executable` there (for JNI libs), and write only on its build subdirectories, but **not** `process-exec`, so a rogue agent cannot drop a binary into the dependency cache and run it. Gradle's toolchain support auto-provisions JDKs into `~/.gradle/jdks`, inside that non-executable tree, so forking a toolchain `javac` or test JVM failed with `Operation not permitted` and no config key could grant exec.
 
 cplt now carves `~/.gradle/jdks` back out as executable, and makes it **read-only** to keep the write-then-exec hole closed. Consequence: with `org.gradle.java.installations.auto-download=true`, a toolchain that is not already on disk fails at provisioning time with a write error instead of at exec time. Provision it once outside cplt, or use a JDK outside `~/.gradle`:
 
@@ -1489,7 +1489,7 @@ Or for a single run: `cplt --allow-jvm-attach`
 - Any test suite that gets `"Could not self-attach to current VM using external process"` errors
 - JMX monitoring tools that attach to running JVMs
 
-**How it works:** the JVM creates a socket at `/tmp/.java_pid<PID>`, a hardcoded path that `java.io.tmpdir` does not affect. A helper JVM process connects to that socket to load an instrumentation agent. The sandbox rule uses a regex that only allows sockets matching `.java_pid<PID>`, so on macOS every other Unix socket in `/tmp` (SSH agent, tmux, PostgreSQL) stays blocked. On Linux no unix socket is gated in the first place, so the flag grants nothing that was not already reachable, see [Linux limitations](../SECURITY.md#linux-specific-limitations).
+**How it works:** the JVM creates a socket at `/tmp/.java_pid<PID>`, a hardcoded path that `java.io.tmpdir` does not affect. A helper JVM process connects to that socket to load an instrumentation agent. The sandbox rule uses a regex that only allows sockets matching `.java_pid<PID>`, so on macOS every other Unix socket in `/tmp` (SSH agent, tmux, PostgreSQL) stays blocked. On Linux the flag does not change any unix socket rule. It grants execute on `/tmp` and read on `/proc` so the attach helper can inspect the target JVM, see [Linux limitations](../SECURITY.md#linux-specific-limitations).
 
 **Security note:** this opens a narrow IPC channel for `.java_pid*`-named sockets only. SSH agent access (`SSH_AUTH_SOCK`) is NOT exposed. On macOS it lives at `/private/tmp/com.apple.launchd.*/Listeners`, which does not match the pattern.
 
@@ -1538,7 +1538,7 @@ The proxy applies the same SSRF guard to the JVM that it has always applied to c
 ```
 Could not resolve com.example:internal-lib:1.0.
 > Could not get resource 'https://nexus.intern.example.com/repository/maven-public/...'
-  > Failed to CONNECT: 403 Forbidden — Private target blocked by cplt.
+  > Failed to CONNECT: 403 Forbidden — Resolved to a private IP, blocked by cplt.
 ```
 
 Two cases, and they do not have the same answer.
@@ -1546,10 +1546,12 @@ Two cases, and they do not have the same answer.
 **The repository has a DNS name** — add it to `proxy.allow_private_domains`. Suffix matching, so one entry covers subdomains:
 
 ```toml
-# ~/.config/cplt/config.toml, or .cplt.toml in the repo
+# ~/.config/cplt/config.toml
 [proxy]
 allow_private_domains = ["intern.example.com"]
 ```
+
+In a repository `.cplt.toml` the key goes under `[propose.proxy]` and needs `cplt trust accept`.
 
 Or for a single run: `cplt --allow-private-domain intern.example.com` (singular — there is no `--allow-private-domains` flag).
 
@@ -1599,7 +1601,7 @@ Or for a single run: `cplt --allow-read ~/.m2/settings.xml`
 
 A `deny.paths` or `--deny-path` entry that covers the same file, or a directory holding it, wins over the `allow.read` on both platforms ([#1222](https://github.com/navikt/cplt/issues/1222)), and so does one covering a grant inside `~/.aws`, `~/.kube` or another credential directory. Before #1222, macOS let the allow win. If such a file stopped being readable after an upgrade, remove the overlapping deny entry; the launch warning names it.
 
-If a Node or JVM build needs the usual three together, `sandbox.allow_build_credentials = true` grants `~/.npmrc`, `~/.gradle/gradle.properties` and `~/.m2/settings.xml` read-only in one opt-in. It is off by default and marked dangerous: **turning it on exposes every token in those files to the agent**, not only the one the project uses. It narrows nothing compared with the three `allow.read` lines. A link from one of them into a credential directory is refused, and a `--deny-path` on one keeps the key from granting it. On Linux the Maven and Gradle files stay readable and writable regardless, and a deny on them holds only under Bubblewrap. See [Build-host credentials](configuration.md#build-host-credentials-sandboxallow_build_credentials) ([#463](https://github.com/navikt/cplt/issues/463)).
+If a Node or JVM build needs the usual three together, `sandbox.allow_build_credentials = true` grants `~/.npmrc`, `~/.gradle/gradle.properties` and `~/.m2/settings.xml` read-only in one opt-in. It is off by default and marked dangerous: **turning it on exposes every token in those files to the agent**, not only the one the project uses. It narrows nothing compared with the three `allow.read` lines. A link from one of them into a credential directory is refused, and a `--deny-path` on one keeps the key from granting it. On Linux the Maven and Gradle files stay readable regardless (not writable, since `~/.m2` and `~/.gradle` are read-only roots), and a deny on them holds only under Bubblewrap. See [Build-host credentials](configuration.md#build-host-credentials-sandboxallow_build_credentials) ([#463](https://github.com/navikt/cplt/issues/463)).
 
 > **Note:** these are the *overridable* credential denials (`DENIED_HOME_SUBPATHS`). A second list — `~/.netrc`, `~/.pypirc`, `~/.gem/credentials` and `~/.vault-token` — is hard-denied and cannot be re-opened on either platform. macOS emits the generic `allow.read` grants before the literal deny rules, so the deny wins; Linux, where Landlock is grant-only and those files are withheld by omission, filters them back out of the ruleset. Naming one in `allow.read`, `allow.write` or `allow.socket` fails at startup with an error rather than being dropped quietly, so a grant that cannot take effect is never mistaken for one that did. One gap remains on Linux: a grant on a *parent* directory (`~/.gem`, or `$HOME` itself) still exposes the file, because Landlock cannot deny a subpath inside an allowed directory — the same limitation described below.
 
@@ -1638,9 +1640,9 @@ The audit reports `incomplete` instead of listing changes, and the one-time `cpl
 
 **A committed `.cplt.toml` still applies.** cplt reads it from the object store with `git cat-file`, which cannot reach a filter and is never refused. Permissions you have already approved keep working. It is the one-time accept that is blocked.
 
-**Why it works this way.** Git runs a content filter's program when it reads working-tree files, and cplt runs `git` in the parent process, *outside* the sandbox. `.git/config` is write-denied on macOS but stays writable to the agent on Linux (see [Git restrictions](#git-restrictions)), and on either platform the file may already carry a filter from before the session, so a repository could otherwise pick a program that cplt executes unsandboxed ([#210](https://github.com/navikt/cplt/issues/210)). Unlike the other executable config keys, filters are named by an arbitrary subsection, so no fixed `-c` override can neutralise them. That leaves two options. Run the filter, which is the escape. Or refuse, and say so. An `incomplete` audit is a loud "could not verify", not a clean session cplt never checked.
+**Why it works this way.** Git runs a content filter's program when it reads working-tree files, and cplt runs `git` in the parent process, *outside* the sandbox. `.git/config` is write-denied on macOS, and on Linux under Bubblewrap with `sandbox.allow_git_config_write = false`, but otherwise stays writable to the agent on Linux (see [Git restrictions](#git-restrictions)), and on either platform the file may already carry a filter from before the session, so a repository could otherwise pick a program that cplt executes unsandboxed ([#210](https://github.com/navikt/cplt/issues/210)). Unlike the other executable config keys, filters are named by an arbitrary subsection, so no fixed `-c` override can neutralise them. That leaves two options. Run the filter, which is the escape. Or refuse, and say so. An `incomplete` audit is a loud "could not verify", not a clean session cplt never checked.
 
-One consequence is worth knowing: on Linux, where `.git/config` is writable, an agent can deliberately force the audit to `incomplete` by writing a filter into it. That is inherent to failing closed.
+One consequence is worth knowing: on Linux without that setting (or without Bubblewrap), where `.git/config` is writable, an agent can deliberately force the audit to `incomplete` by writing a filter into it. That is inherent to failing closed.
 
 **Fix:** move the filter to your global config if it belongs there (`git config --global filter.lfs.clean …`), or accept the `incomplete` audit for that repository. If you need `cplt trust accept` to work, remove the repo-local filter for the one invocation.
 

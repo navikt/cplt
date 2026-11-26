@@ -213,7 +213,7 @@ used for an existing-state model request.
 
 On macOS, generated profiles start with `(deny default)` and omit
 `(allow lsopen)` unless `allow_browser` is enabled. See
-`src/sandbox_profile.rs:958-999`. `/usr/bin/open` itself can execute; the restricted
+the `allow_browser` block in `src/sandbox_profile.rs`. `/usr/bin/open` itself can execute; the restricted
 operation is Launch Services opening the target. Direct CoreServices callers use
 the same operation. This is a profile mechanism, not a measurement of the reported
 nav-pilot session's effective configuration. `--allow-browser` grants unscoped

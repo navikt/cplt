@@ -194,7 +194,7 @@ not. Entries that came from the command line, or from a trust-approved
 The third is the one people do not expect. cplt refuses any host that resolves
 to a **private IP**, whatever the lists say, because a public name pointing at
 `10.x` is how an agent reaches your internal network. An intranet service is
-therefore blocked with `403 ... Private target blocked by cplt` even with no
+therefore blocked with `403 ... Resolved to a private IP, blocked by cplt` even with no
 allowlist in force and nothing on the blocklist — the fix is to name it here,
 not to touch the other two:
 
@@ -219,8 +219,8 @@ matches nothing — and in an allowlist, where everything not listed is refused,
 does not merely fail to help: it leaves the hosts you meant to permit blocked,
 with an entry on screen that looks right. cplt warns at startup about a `*` in a domain **file**
 (`--allowed-domains`, `--blocked-domains`, a subscription cache) rather than
-letting the session fail closed silently. Lists set as config arrays, such as
-`proxy.allow_private_domains`, are not checked yet.
+letting the session fail closed silently. For the config arrays `allow.domains`, `proxy.allow_private_domains` and
+`proxy.upstream_no_proxy`, `cplt config set` refuses an entry containing `*`.
 
 The same matching applies to the blocklist, `proxy.allow_private_domains` and
 `proxy.upstream_no_proxy`.
@@ -278,10 +278,11 @@ RFC 1918 — see `is_private_ip` for the authority:
 
 - IPv4: loopback `127/8`, private `10/8` `172.16/12` `192.168/16`, link-local
   `169.254/16` (which covers the cloud metadata endpoint), CGNAT `100.64/10`
-  (Tailscale, VPN), benchmarking `198.18/15`, reserved `240/4`, protocol
-  assignment `192.0.0/24`, unspecified `0.0.0.0`, broadcast `255.255.255.255`
+  (Tailscale, VPN), benchmarking `198.18/15`, multicast `224/4`, reserved `240/4`, protocol
+  assignment `192.0.0/24`, this-network `0.0.0.0/8`, broadcast `255.255.255.255`
 - IPv6: loopback `::1`, unspecified `::`, ULA `fc00::/7`, link-local `fe80::/10`,
-  and v4-mapped forms of the above
+  site-local `fec0::/10`, multicast `ff00::/8`, and v4-mapped, v4-compatible,
+  NAT64, 6to4 and Teredo forms that carry a private IPv4 address
 
 `proxy.allow_private_domains` waives that check for names you trust. Suffix
 matching, like every other list: `nav.cloud.nais.io` covers every subdomain, but
@@ -617,7 +618,7 @@ upstream_no_proxy = ["internal.example.com", "corp.example"]
 ```
 
 > [!IMPORTANT]
-> **Internal hosts also need `allow_private_domains`.** A no-proxy host takes cplt's direct path, which applies the resolved-IP SSRF guard. An internal host that resolves to a private IP, the usual `NO_PROXY` target, is blocked with `403 Resolved to private IP` unless you also allow it to resolve private:
+> **Internal hosts also need `allow_private_domains`.** A no-proxy host takes cplt's direct path, which applies the resolved-IP SSRF guard. An internal host that resolves to a private IP, the usual `NO_PROXY` target, is blocked with `403 Resolved to a private IP` unless you also allow it to resolve private:
 > ```toml
 > [proxy]
 > upstream = "http://corporate-proxy.example.com:8080"
