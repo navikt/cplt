@@ -433,6 +433,7 @@ allow_git_config_write = false
 # unknown_command = "block"   # policy for commands not in classification table
 # allow_api_write = false     # allow gh api POST/PATCH/PUT to current repo (opt-in)
 # allow_pr_merge = false      # allow gh pr merge into ruleset-protected branches (opt-in)
+# allow_extensions = []       # gh extensions allowed to run, e.g. ["dash"] (global only)
 
 # ── git guard ───────────────────────────────────────────────────────────────
 # Intercepts `git` commands to prevent accidental pushes.

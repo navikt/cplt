@@ -449,6 +449,10 @@ pub struct GhGuardConfig {
     /// `["github.com"]`), e.g. a GHE.com or GHES host. Global config only: a
     /// per-checkout file must not widen which hosts the agent can reach.
     pub hosts: Option<Vec<String>>,
+    /// gh extensions (`gh <name>`) the guard lets run. A word that is not a gh
+    /// built-in is otherwise refused, since it may be a user alias the agent
+    /// defined. Global config only.
+    pub allow_extensions: Option<Vec<String>>,
 }
 
 /// `[git_guard]` — git command prevention for sandboxed agents.
@@ -863,6 +867,8 @@ pub struct GhGuardPolicy {
     /// GitHub hosts whose remotes the guard scopes (`gh_guard.hosts`),
     /// lowercased. Global config only.
     pub hosts: Vec<String>,
+    /// gh extensions the guard lets run (`gh_guard.allow_extensions`). Global config only.
+    pub allow_extensions: Vec<String>,
 }
 
 impl Default for GhGuardPolicy {
@@ -877,6 +883,7 @@ impl Default for GhGuardPolicy {
             allow_api_write: false,
             allow_pr_merge: false,
             hosts: vec![crate::gh_proxy::DEFAULT_GH_HOST.to_string()],
+            allow_extensions: Vec::new(),
         }
     }
 }

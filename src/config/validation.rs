@@ -39,6 +39,30 @@ pub fn validate_gh_host(host: &str) -> Result<(), super::error::ConfigError> {
     )))
 }
 
+/// Refuse a `gh_guard.allow_extensions` entry that is not an extension name.
+/// It is matched exactly against the word after `gh`, so a built-in or alias
+/// of one would never reach the extension, and `co` is a user alias.
+pub fn validate_gh_extension(name: &str) -> Result<(), super::error::ConfigError> {
+    let plain = !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if !plain {
+        return Err(super::error::ConfigError::Validation(format!(
+            "gh_guard.allow_extensions entry '{name}' is not an extension name. Give the \
+             word you type after `gh`, e.g. `dash` for `gh dash` (from gh-dash)"
+        )));
+    }
+    if name == "co" || crate::gh_proxy::is_gh_builtin(name) {
+        return Err(super::error::ConfigError::Validation(format!(
+            "gh_guard.allow_extensions entry '{name}' is a gh built-in command or alias, \
+             not an extension. Built-ins are decided by the guard's policy table"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a `gh_guard.hosts` list that names no host or an invalid one. An
 /// empty list would read as "unset" downstream and quietly mean github.com.
 pub fn validate_gh_hosts(hosts: &[String]) -> Result<(), super::error::ConfigError> {
@@ -383,6 +407,17 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
     }
 
     if let Some(gh_guard) = table.get("gh_guard").and_then(|v| v.as_table()) {
+        if gh_guard
+            .get("allow_extensions")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+        {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "gh_guard.allow_extensions lets the listed gh extensions run with the gh token, unchecked by the guard (DANGEROUS)"
+                    .to_string(),
+            });
+        }
         if gh_guard.get("inject_token").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
@@ -502,6 +537,20 @@ fn value_type_name(v: &toml::Value) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::path::default_config_contents;
+
+    #[test]
+    fn gh_extension_names_refuse_builtins_and_junk() {
+        for ok in ["dash", "copilot-x", "my_ext.v2", "stack"] {
+            assert!(validate_gh_extension(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "-x", "a b", "a/b", "pr", "cs", "co", "help", "ext"] {
+            assert!(validate_gh_extension(bad).is_err(), "{bad}");
+        }
+        let key = crate::config::lookup_key("gh_guard.allow_extensions").unwrap();
+        let mut doc = toml_edit::DocumentMut::new();
+        assert!(crate::config::append_value_in_doc(&mut doc, key, "pr").is_err());
+        assert!(crate::config::append_value_in_doc(&mut doc, key, "dash").is_ok());
+    }
 
     #[test]
     fn gh_hosts_accept_bare_hostnames_only() {
@@ -1017,6 +1066,9 @@ some_new_option = true
         {
             let toml = match (key.section, key.key) {
                 ("allow", "exec") => "[allow]\nexec = [\"/usr/local/bin\"]\n".to_string(),
+                ("gh_guard", "allow_extensions") => {
+                    "[gh_guard]\nallow_extensions = [\"dash\"]\n".to_string()
+                }
                 ("git_guard", "allow_push") => {
                     "[[git_guard.allow_push]]\nremote = \"origin\"\nbranches = [\"feat/*\"]\n"
                         .to_string()

@@ -81,9 +81,7 @@ fn parse_value_for_key(
                     item.trim().to_string()
                 };
                 refuse_private_domain_ip(key_info, &item)?;
-                if is_gh_hosts_key(key_info) {
-                    super::validation::validate_gh_host(&item)?;
-                }
+                validate_gh_element(key_info, &item)?;
                 arr.push(item);
             }
             Ok(toml_edit::Value::Array(arr))
@@ -117,8 +115,12 @@ fn is_private_domains_key(key_info: &ConfigKeyInfo) -> bool {
     (key_info.section, key_info.key) == ("proxy", "allow_private_domains")
 }
 
-fn is_gh_hosts_key(key_info: &ConfigKeyInfo) -> bool {
-    (key_info.section, key_info.key) == ("gh_guard", "hosts")
+fn validate_gh_element(key_info: &ConfigKeyInfo, item: &str) -> Result<(), ConfigError> {
+    match (key_info.section, key_info.key) {
+        ("gh_guard", "hosts") => super::validation::validate_gh_host(item),
+        ("gh_guard", "allow_extensions") => super::validation::validate_gh_extension(item),
+        _ => Ok(()),
+    }
 }
 
 /// Parse a single element value for appending to an array.
@@ -170,8 +172,8 @@ fn parse_element(
                     key_info.section, key_info.key
                 )));
             }
-            if !removing && is_gh_hosts_key(key_info) {
-                super::validation::validate_gh_host(value)?;
+            if !removing {
+                validate_gh_element(key_info, value)?;
             }
             // A `*` in a domain matches nothing: matching is exact host plus
             // subdomains, with no glob syntax (#481). For a file, cplt warns

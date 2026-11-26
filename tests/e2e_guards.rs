@@ -331,6 +331,21 @@ fn gh_gate_resolves_aliases_under_unknown_allow() {
     assert!(ok, "pr ls is pr list: {stderr}");
 }
 
+/// #1099: only extensions named in `gh_guard.allow_extensions` run, by exact
+/// name; `stack` is an extension in gh 2.105, not a built-in.
+#[test]
+fn gh_gate_runs_only_listed_extensions() {
+    for opts in [&["--unknown-command=allow"][..], &[]] {
+        let listed = [opts, &["--allow-extension", "dash"]].concat();
+        let (_, stderr, ok) = gh_gate_with_opts(&["dash"], &listed);
+        assert!(ok, "listed extension must run: {stderr}");
+        for args in [&["dashboard"][..], &["stack", "list"], &["co", "1"]] {
+            let (_, stderr, ok) = gh_gate_with_opts(args, &listed);
+            assert_refused(&stderr, ok, "gh_guard.allow_extensions");
+        }
+    }
+}
+
 #[test]
 fn gh_gate_blocks_repo_edit() {
     let (_, stderr, ok) = gh_gate(&["repo", "edit", "--visibility", "private"]);

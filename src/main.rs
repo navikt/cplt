@@ -1087,6 +1087,10 @@ NOTE:
         #[arg(long = "gh-host")]
         gh_host: Vec<String>,
 
+        /// gh extension the guard lets run (`gh_guard.allow_extensions`). Repeatable.
+        #[arg(long = "allow-extension")]
+        allow_extension: Vec<String>,
+
         /// Block `gh pr merge` (override for --allow-pr-merge).
         #[arg(long, conflicts_with = "allow_pr_merge")]
         no_allow_pr_merge: bool,
@@ -5496,11 +5500,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 allow_pr_merge,
                 no_allow_pr_merge,
                 gh_host,
+                allow_extension,
                 args,
             } => {
                 if !gh_host.is_empty() {
                     gh_proxy::set_gh_hosts(&gh_host);
                 }
+                gh_proxy::set_gh_extensions(&allow_extension);
                 let policy = gh_proxy::GatePolicy {
                     mode: match mode.as_str() {
                         "warn" => config::EnforcementMode::Warn,

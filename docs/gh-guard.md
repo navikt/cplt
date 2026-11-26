@@ -76,6 +76,7 @@ unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
 hosts = ["github.com"]      # GitHub hosts whose remotes are scoped; global config only
+allow_extensions = []       # gh extensions allowed to run, e.g. ["dash"]; global config only
 
 [git_guard]
 enabled = true              # intercept git push, request-pull, send-pack
@@ -122,6 +123,27 @@ hosts they are refused.
 The guard does not open the network. The host must also be reachable through
 the proxy: under strict networking, add it to `allowed_domains`. cplt does
 not add it for you.
+
+### Aliases and extensions
+
+gh's built-in aliases are resolved before the policy lookup, so `gh pr new` is
+decided as `gh pr create` and `gh cs delete` as `gh codespace delete`.
+
+Any other word after `gh` is refused, whatever `unknown_command` says. It is
+either a user alias, defined in gh config that the agent can write, so the
+guard cannot know what it runs, or an extension. `gh co` is gh's default alias
+for `gh pr checkout` and is refused too: run `gh pr checkout`.
+
+To let an extension run, name it in your global config:
+
+```bash
+cplt config set --force gh_guard.allow_extensions dash   # for gh dash (gh-dash)
+```
+
+Only the exact names in the list run, and they run unchecked with the gh
+token. Built-in command names are refused at `config set`. If a listed name is
+also a gh alias, gh decides which one runs, so list only names you have
+installed as extensions.
 
 ### Backward compatibility
 
@@ -391,7 +413,7 @@ blocks `gh auth token` and `--show-token`, not `echo $GH_TOKEN`. See the
 
 ### How `gh` itself authenticates
 
-Inside the sandbox `gh` usually cannot read its token: it is in the Keychain, which most agents do not get, and token variables are stripped for every agent except Copilot. So with the gh guard on and `gh` logged in on the host, cplt writes the token at launch to `$TMPDIR/.gh-exec-token` (mode `0600`), the exec token. Copilot on macOS is skipped when it has the Keychain or the substitute's `GH_TOKEN`. When the wrapper runs an approved command, it sets `GH_TOKEN` from that file on the real `gh` process only. The agent's environment never gets it, but whatever the real `gh` starts inherits it: `GH_PAGER`, `BROWSER` and `EDITOR` programs, extensions under `unknown_command = "allow"`, and git from `gh pr checkout`. That is the same trust level as the readable file.
+Inside the sandbox `gh` usually cannot read its token: it is in the Keychain, which most agents do not get, and token variables are stripped for every agent except Copilot. So with the gh guard on and `gh` logged in on the host, cplt writes the token at launch to `$TMPDIR/.gh-exec-token` (mode `0600`), the exec token. Copilot on macOS is skipped when it has the Keychain or the substitute's `GH_TOKEN`. When the wrapper runs an approved command, it sets `GH_TOKEN` from that file on the real `gh` process only. The agent's environment never gets it, but whatever the real `gh` starts inherits it: `GH_PAGER`, `BROWSER` and `EDITOR` programs, extensions listed in `allow_extensions`, and git from `gh pr checkout`. That is the same trust level as the readable file.
 
 HTTPS `git push` goes through the wrapper too. `gh auth setup-git` writes the credential helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`), which makes git run the real `gh` directly. So when the wrapper is installed, cplt appends `credential.https://<host>.helper = !gh auth git-credential` for every host in `gh_guard.hosts` (`github.com` by default) for the sandbox through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`. Git runs the helper through `sh`, so it resolves to the wrapper on `PATH`. Git tries helpers in order: your own (osxkeychain, Git Credential Manager, `store`, the absolute-path `gh`) run first, and when none returns a credential, for example because the absolute-path `gh` cannot reach the Keychain, git falls through to the wrapper. Existing `GIT_CONFIG_*` entries are kept and the new entries appended. Helpers for hosts outside `gh_guard.hosts` are unchanged. No file is written; your git config is untouched.
 

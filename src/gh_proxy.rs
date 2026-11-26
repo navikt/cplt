@@ -73,6 +73,51 @@ pub fn set_gh_hosts(hosts: &[String]) {
     let _ = GH_HOSTS.set(hosts.iter().map(|h| h.to_ascii_lowercase()).collect());
 }
 
+static GH_EXTENSIONS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set the extensions the guard lets run (`gh_guard.allow_extensions`). Once
+/// per process, from the flags baked into the `gh-gate` wrapper.
+pub fn set_gh_extensions(names: &[String]) {
+    let _ = GH_EXTENSIONS.set(names.to_vec());
+}
+
+fn gh_extensions() -> &'static [String] {
+    GH_EXTENSIONS.get_or_init(Vec::new)
+}
+
+/// Whether `word` is a gh built-in top-level command, after alias mapping.
+/// `co` is not: it is gh's default user alias for `pr checkout`, and
+/// redefinable like any other.
+pub fn is_gh_builtin(word: &str) -> bool {
+    let word = canonical_command(word);
+    word != "co"
+        && (GH_COMMANDS.contains(&word) || ["accessibility", "help", "version"].contains(&word))
+}
+
+/// Decision for a top-level word that is not a gh built-in, or `None` for a
+/// built-in. Such a word is a user alias or an extension. Aliases live in gh
+/// config the agent can write, so the guard cannot know what one runs; only
+/// extensions the user named in `gh_guard.allow_extensions` run (#1099).
+fn non_builtin_decision(command: &str, allowed: &[String]) -> Option<PolicyResult> {
+    if is_gh_builtin(command) {
+        return None;
+    }
+    Some(if allowed.iter().any(|n| n == command) {
+        PolicyResult {
+            decision: Decision::Allow,
+            reason: "extension listed in gh_guard.allow_extensions",
+        }
+    } else {
+        PolicyResult {
+            decision: Decision::Block,
+            reason: "not a gh built-in command: a user alias or extension the guard cannot \
+                     resolve. Run the built-in command it stands for (`gh pr checkout`, not \
+                     `gh co`); to run an extension, name it with \
+                     `cplt config set --force gh_guard.allow_extensions <NAME>`",
+        }
+    })
+}
+
 /// The GitHub hosts the guard accepts; `["github.com"]` unless configured.
 pub fn gh_hosts() -> &'static [String] {
     GH_HOSTS.get_or_init(|| vec![DEFAULT_GH_HOST.to_string()])
@@ -2260,8 +2305,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
     // short-option arity for that (command, subcommand) pair so boolean flags
     // (`pr review -aRother/repo`) do not mask `-R` and value-taking flags
     // (`pr create -rRiley`) do not misread an uppercase `R` in the value.
-    let sub_hint =
-        find_subcommand_hint(&command, &args[idx..]).map(|s| canonical_subcommand(&command, s));
+    let sub_hint = find_subcommand_hint(&command, &args[idx..]);
     let mut subcommand = None;
     let mut repo_flag = None;
     let mut i = idx;
@@ -2343,19 +2387,8 @@ pub fn evaluate_with_policy(cmd: &ParsedCommand, allow_api_write: bool) -> Polic
         return evaluate_api(cmd, allow_api_write);
     }
 
-    // A word that is not a gh built-in is a user alias or an extension. Aliases
-    // live in gh config the agent can write, so the guard cannot know what one
-    // runs, and an extension is `gh extension exec`, which is refused. `co` is
-    // gh's default alias for `pr checkout`, and redefinable like any other.
-    if cmd.command == "co"
-        || !(GH_COMMANDS.contains(&cmd.command.as_str())
-            || ["accessibility", "help", "version"].contains(&cmd.command.as_str()))
-    {
-        return PolicyResult {
-            decision: Decision::Block,
-            reason: "not a gh built-in command: a user alias or extension the guard cannot \
-                     resolve. Run the built-in command it stands for (`gh pr checkout`, not `gh co`)",
-        };
+    if let Some(result) = non_builtin_decision(&cmd.command, gh_extensions()) {
+        return result;
     }
 
     let sub = cmd.subcommand.as_deref().unwrap_or("");
@@ -3301,12 +3334,17 @@ pub fn generate_wrapper_script(
             .map(|host| format!(" --gh-host {}", shell_escape(host)))
             .collect()
     };
+    let ext_flag: String = policy
+        .allow_extensions
+        .iter()
+        .map(|name| format!(" --allow-extension {}", shell_escape(name)))
+        .collect();
     format!(
         r#"#!/bin/sh
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag}{ext_flag} -- "$@"
 "#
     )
 }
@@ -4365,7 +4403,6 @@ const GH_COMMANDS: &[&str] = &[
     "secret",
     "skill",
     "ssh-key",
-    "stack",
     "status",
     "variable",
     "workflow",
@@ -7774,7 +7811,27 @@ mod tests {
         ] {
             assert!(gate(args, Path::new("."), &allow).is_err(), "{args:?}");
         }
-        for args in [&["co", "1"][..], &["my-alias"], &["some-extension", "run"]] {
+        // An extension runs only when listed, by its exact name; a listed name
+        // does not open built-ins, `co`, or other words.
+        let listed = vec!["dash".to_string()];
+        assert_eq!(
+            non_builtin_decision("dash", &listed).unwrap().decision,
+            Decision::Allow
+        );
+        for word in ["dashx", "Dash", "co", "my-alias", "stack"] {
+            assert_eq!(
+                non_builtin_decision(word, &listed).unwrap().decision,
+                Decision::Block,
+                "{word}"
+            );
+        }
+        assert!(non_builtin_decision("pr", &listed).is_none());
+        for args in [
+            &["co", "1"][..],
+            &["my-alias"],
+            &["some-extension", "run"],
+            &["stack", "list"],
+        ] {
             let p = parse_command(args).unwrap();
             assert_eq!(evaluate(&p).decision, Decision::Block, "{args:?}");
             assert!(gate(args, Path::new("."), &allow).is_err(), "{args:?}");
@@ -8781,6 +8838,16 @@ mod tests {
             script.contains("--allow-api-write"),
             "wrapper must bake in --allow-api-write when policy has allow_api_write=true"
         );
+    }
+
+    #[test]
+    fn wrapper_script_bakes_in_allow_extensions() {
+        let policy = crate::config::GhGuardPolicy {
+            allow_extensions: vec!["dash".to_string()],
+            ..Default::default()
+        };
+        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy);
+        assert!(script.contains(" --allow-extension "), "{script}");
     }
 
     #[test]
