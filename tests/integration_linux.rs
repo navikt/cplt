@@ -3452,33 +3452,54 @@ except PermissionError:
 
     /// A link at a read-only overlay that is not host-run (mise's `shims/`,
     /// stow-style) is bound at its target. An absolute link must not make
-    /// bwrap abort: with `--use-bubblewrap` that would fail the launch.
+    /// bwrap abort: with `--use-bubblewrap` that would fail the launch. The
+    /// target sits outside every writable grant (a target inside one is
+    /// refused), so the write is denied whether Landlock or the mount says no.
     #[test]
     fn bwrap_binds_a_linked_tool_overlay_at_its_target() {
         require_bwrap!();
         let project = create_test_project();
-        let home = tempfile::tempdir().unwrap();
-        let mise = home.path().join(".local/share/mise");
-        let real = home.path().join("real-shims");
+        // Not under /tmp: a link into /tmp is refused.
+        let home = tempfile::tempdir_in(crate::common::scratch_home()).unwrap();
+        let h = home.path().canonicalize().unwrap();
+        let mise = h.join(".local/share/mise");
+        let real = h.join("real-shims");
         fs::create_dir_all(&mise).unwrap();
         fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, mise.join("shims")).unwrap();
         let script = format!(
-            "touch {}/x 2>/dev/null && echo WROTE; echo RAN",
-            real.display()
+            "test -d {r} && echo EXISTS; touch {r}/x 2>/dev/null && echo WROTE; echo RAN",
+            r = real.display()
         );
-        let (code, out, err) = run_sandboxed_home_with_flags(
-            project.path(),
-            home.path(),
-            &["--use-bubblewrap"],
-            &script,
-        );
+        let (code, out, err) =
+            run_sandboxed_home_with_flags(project.path(), &h, &["--use-bubblewrap"], &script);
         assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
-        assert!(out.contains("RAN"), "stdout: {out}\nstderr: {err}");
+        assert!(
+            out.contains("RAN") && out.contains("EXISTS"),
+            "stdout: {out}\nstderr: {err}"
+        );
         assert!(
             !out.contains("WROTE"),
-            "the target must be read-only: {out}\n{err}"
+            "the target must stay read-only: {out}\n{err}"
         );
+        assert!(!real.join("x").exists(), "nothing may land in the target");
+    }
+
+    /// A nested repository's `.github/hooks` behind a link refuses the launch
+    /// like the project's own.
+    #[test]
+    fn bwrap_refuses_a_nested_repos_linked_hooks() {
+        require_bwrap!();
+        let project = create_test_project();
+        let root = project.path();
+        let sub = root.join("sub");
+        fs::create_dir_all(sub.join(".git")).unwrap();
+        fs::create_dir_all(root.join("elsewhere/hooks")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", sub.join(".github")).unwrap();
+        let (code, out, err) = run_sandboxed_with_flags(root, &["--use-bubblewrap"], "echo RAN");
+        assert_ne!(code, 0, "stdout: {out}\nstderr: {err}");
+        assert!(!out.contains("RAN"), "{out}");
+        assert!(err.contains("symbolic link"), "{err}");
     }
 
     #[test]

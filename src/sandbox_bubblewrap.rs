@@ -1616,6 +1616,17 @@ pub(crate) fn symlinked_overlays(
                     warnings,
                 );
             }
+            if let Err(why) = check_link_target(path, fs_rules, overlays, &roots) {
+                return (
+                    Some(format!(
+                        "`{}` is a symbolic link at or above `{}`, which cplt mounts \
+                         read-only, and its target {why}. Replace the link with a copy.",
+                        cur.display(),
+                        path.display()
+                    )),
+                    warnings,
+                );
+            }
             warnings.push(format!(
                 "`{}` is a symbolic link, so the read-only mount for `{}` lands on its \
                  target and the link itself stays replaceable. Replace the link with a \
@@ -1627,6 +1638,50 @@ pub(crate) fn symlinked_overlays(
         }
     }
     (None, warnings)
+}
+
+/// Where a linked overlay may be bound ([`overlay_bind_path`]). The agent can
+/// retarget the link between sessions, so only a plain file or directory of
+/// the user's own, away from everything else the mount plan touches, is
+/// accepted: not `/`, `/proc`, `/dev`, `/sys` or `/tmp` (bwrap's own mounts),
+/// not an ancestor of another bind (it would cover it), and not inside a
+/// writable root (where the agent controls what sits there).
+fn check_link_target(
+    path: &Path,
+    fs_rules: &[FsRule],
+    overlays: Overlays<'_>,
+    roots: &[PathBuf],
+) -> Result<(), &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let target = path.canonicalize().map_err(|_| "does not resolve")?;
+    if ["/proc", "/dev", "/sys", "/tmp"]
+        .iter()
+        .any(|m| target.starts_with(m))
+        || target == Path::new("/")
+    {
+        return Err("is a system mount");
+    }
+    let others = fs_rules
+        .iter()
+        .map(|r| &r.path)
+        .chain(overlays.read_only)
+        .chain(overlays.pins)
+        .chain(overlays.mask_missing);
+    if others.any(|o| {
+        o.canonicalize()
+            .is_ok_and(|c| c != target && c.starts_with(&target))
+    }) {
+        return Err("holds another path in the mount plan");
+    }
+    if roots.iter().any(|r| target.starts_with(r)) {
+        return Err("is inside a writable grant");
+    }
+    let meta = std::fs::metadata(&target).map_err(|_| "cannot be read")?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    if !(meta.is_file() || meta.is_dir()) || meta.uid() != unsafe { libc::getuid() } {
+        return Err("is not a file or directory of your own");
+    }
+    Ok(())
 }
 
 /// Where an overlay or pin is bound: its resolved path, so a link (one
@@ -3354,7 +3409,8 @@ mod tests {
     /// A stow-style link to an agent config file keeps working: warned, not refused.
     #[test]
     fn symlinked_agent_config_file_warns() {
-        let t = tempfile::tempdir().expect("tempdir");
+        // Not under /tmp: a link into /tmp is refused.
+        let t = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
         let base = t.path().canonicalize().unwrap();
         let cfg = base.join(".claude");
         std::fs::create_dir(&cfg).unwrap();
@@ -3370,6 +3426,41 @@ mod tests {
         .expect("agent config links must not refuse the launch");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("settings.json"), "{warnings:?}");
+    }
+
+    /// A warn-class link the agent could retarget is refused when its target
+    /// would disturb the mount plan or is not the user's own plain file.
+    #[test]
+    fn linked_overlay_with_unsafe_target_is_refused() {
+        let t = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        let cfg = base.join("cfg");
+        std::fs::create_dir(&cfg).unwrap();
+        std::fs::write(cfg.join("inside.json"), "{}").unwrap();
+        let tmp = tempfile::NamedTempFile::new_in("/tmp").unwrap();
+        let link = cfg.join("settings.json");
+        let mut cases: Vec<(PathBuf, &str)> = vec![
+            (PathBuf::from("/"), "system mount"),
+            (PathBuf::from("/proc/self/status"), "system mount"),
+            (PathBuf::from("/dev/null"), "system mount"),
+            (tmp.path().to_path_buf(), "system mount"),
+            (base.clone(), "another path"),
+            (cfg.join("inside.json"), "writable grant"),
+        ];
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } != 0 {
+            cases.push((PathBuf::from("/etc/hostname"), "your own"));
+        }
+        for (target, why) in cases {
+            if !target.exists() {
+                continue;
+            }
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let err = check_links_with(&[write_rule(&cfg)], std::slice::from_ref(&link), &[], &[])
+                .expect_err(&format!("{target:?} must be refused"));
+            assert!(err.contains(why), "{target:?}: {err}");
+            std::fs::remove_file(&link).unwrap();
+        }
     }
 
     /// A warned link, absolute included, is bound at its resolved target: bwrap
