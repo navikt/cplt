@@ -378,6 +378,10 @@ pub(crate) struct Overlays<'a> {
     /// Bound read-WRITE onto themselves, so the path becomes a mountpoint and
     /// its *name* cannot be renamed or removed ([`rename_pin_paths`]).
     pub pins: &'a [PathBuf],
+    /// The subset of `read_only` whose contents run on the host from a
+    /// repository (git persistence, `.git/config`). A symlink at or above one
+    /// of these, or above a pin holding one, refuses the launch.
+    pub host_run: &'a [PathBuf],
     /// Directories in `read_only` that get an empty read-only tmpfs when they
     /// do not exist (`sandbox.mask_missing_deny_paths`), plus missing
     /// `config.worktree` files masked with `--ro-bind /dev/null <path>`, so the
@@ -1512,6 +1516,13 @@ pub(crate) fn resolve(
         for rule in policy.fs_rules.iter().filter(|r| r.nofollow) {
             landlock_mod::nofollow_host_id(&rule.path)?;
         }
+        let (refusal, warnings, _) = symlinked_overlays(&policy.fs_rules, overlays);
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
+        for w in warnings {
+            crate::ui::warn_id("warn.bubblewrap-overlay-link", &w);
+        }
     }
     match use_bubblewrap {
         Some(false) => Ok(None),
@@ -1537,6 +1548,203 @@ pub(crate) fn resolve(
             }
         },
     }
+}
+
+/// Checks the read-only overlays and rename pins for a symlink at or above
+/// them, below the writable root that holds them.
+///
+/// bwrap resolves a bind destination through links. A relative link moves the
+/// read-only bind onto its target and leaves the link itself replaceable; an
+/// absolute one makes bwrap abort, which auto-detect would turn into a
+/// Landlock-only session without any of the overlays.
+///
+/// For a path in [`Overlays::host_run`] (git persistence and the repository
+/// files agents load, at any depth: nested repositories are in it too), or a
+/// pin above one, this is a refusal: what lands there runs unsandboxed. Any
+/// other overlay, such as a stow-style link to an agent's `settings.json`, is
+/// bound at its resolved target by [`build_bwrap_args`] and gets a warning, so
+/// existing dotfile setups keep working and bwrap never aborts on the link.
+///
+/// Only components below the deepest writable root holding the path are
+/// checked: the agent cannot plant a link above it, and hosts and dotfile
+/// setups legitimately link `/home` or a whole agent config dir. This is a
+/// point-in-time check at launch; a link created later meets the bind already
+/// mounted on the real directory.
+///
+/// Returns the refusal, if any, the warnings, and for each linked overlay the
+/// vetted target to bind instead (`None`: dangling, leave the overlay out).
+/// The caller binds exactly these, so the link is resolved once.
+pub(crate) fn symlinked_overlays(fs_rules: &[FsRule], overlays: Overlays<'_>) -> LinkCheck {
+    let roots: Vec<PathBuf> = fs_rules
+        .iter()
+        .filter(|r| r.access.write || r.access.create_dirs)
+        .flat_map(|r| [Some(r.path.clone()), r.path.canonicalize().ok()])
+        .flatten()
+        // A private tmpfs in the namespace: host links there cannot be replaced.
+        .filter(|p| p != Path::new("/tmp"))
+        .collect();
+    let mut warnings = Vec::new();
+    let mut targets: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    for path in overlays.read_only.iter().chain(overlays.pins) {
+        if targets.iter().any(|(l, _)| l == path) {
+            continue;
+        }
+        // The deepest root only: a linked agent config dir (`~/.copilot` into a
+        // dotfiles repo) is itself a root, and the agent cannot replace it.
+        let Some(root) = roots
+            .iter()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.components().count())
+        else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(Path::new(""));
+        let mut cur = root.clone();
+        for part in rel.components() {
+            cur.push(part);
+            if !std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                continue;
+            }
+            // A pin counts when it holds a host-run path, as `.github` does.
+            if overlays.host_run.iter().any(|h| h.starts_with(path)) {
+                return (
+                    Some(format!(
+                        "`{}` is a symbolic link at or above `{}`, a path whose contents \
+                         run on the host, so cplt will not launch through it. Replace the \
+                         link with a copy, or for a hooks directory remove the link and \
+                         point git at the shared hooks with `git config core.hooksPath <dir>`.",
+                        cur.display(),
+                        path.display()
+                    )),
+                    warnings,
+                    targets,
+                );
+            }
+            let target = match check_link_target(path, &cur, fs_rules, overlays, &roots) {
+                Ok(target) => target,
+                Err(why) => {
+                    return (
+                        Some(format!(
+                            "`{}` is a symbolic link at or above `{}`, which cplt mounts \
+                         read-only, and its target {why}. Replace the link with a copy.",
+                            cur.display(),
+                            path.display()
+                        )),
+                        warnings,
+                        targets,
+                    );
+                }
+            };
+            warnings.push(if target.is_some() {
+                format!(
+                    "`{}` is a symbolic link, so the read-only mount for `{}` lands on its \
+                     target and the link itself stays replaceable. Replace the link with a \
+                     copy to protect it.",
+                    cur.display(),
+                    path.display()
+                )
+            } else {
+                format!(
+                    "`{}` is a symbolic link to nothing, so `{}` is not mounted read-only \
+                     this session. Remove the link or create its target.",
+                    cur.display(),
+                    path.display()
+                )
+            });
+            targets.push((path.clone(), target));
+            break;
+        }
+    }
+    (None, warnings, targets)
+}
+
+/// What [`symlinked_overlays`] found: refusal, warnings, vetted targets.
+pub(crate) type LinkCheck = (Option<String>, Vec<String>, Vec<(PathBuf, Option<PathBuf>)>);
+
+/// `paths` with each linked entry replaced by its vetted target, and dangling
+/// ones dropped.
+fn with_targets(paths: &[PathBuf], targets: &[(PathBuf, Option<PathBuf>)]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|p| match targets.iter().find(|(l, _)| l == p) {
+            Some((_, t)) => t.clone(),
+            None => Some(p.clone()),
+        })
+        .collect()
+}
+
+/// `path` with `.` and `..` folded, without touching the filesystem.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Where a linked overlay may be bound ([`overlay_bind_path`]). The agent can
+/// retarget the link between sessions, so only a plain file or directory of
+/// the user's own, away from everything else the mount plan touches, is
+/// accepted: not `/`, `/proc`, `/dev`, `/sys` or `/tmp` (bwrap's own mounts),
+/// not an ancestor of another bind (it would cover it), and not inside a
+/// writable root (where the agent controls what sits there).
+fn check_link_target(
+    path: &Path,
+    link: &Path,
+    fs_rules: &[FsRule],
+    overlays: Overlays<'_>,
+    roots: &[PathBuf],
+) -> Result<Option<PathBuf>, &'static str> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(target) = path.canonicalize() else {
+        // Dangling: nothing to bind. Refused only where the agent could
+        // create the target and have it bound next time unvetted.
+        let dest = std::fs::read_link(link).map_err(|_| "cannot be read")?;
+        let dest = lexical(&link.parent().unwrap_or(Path::new("/")).join(dest));
+        let dest = dest.join(path.strip_prefix(link).unwrap_or(Path::new("")));
+        if roots.iter().any(|r| dest.starts_with(r)) {
+            return Err("is missing inside a writable grant");
+        }
+        return Ok(None);
+    };
+    if ["/proc", "/dev", "/sys", "/tmp"]
+        .iter()
+        .any(|m| target.starts_with(m))
+        || target == Path::new("/")
+    {
+        return Err("is a system mount");
+    }
+    let mut others = fs_rules
+        .iter()
+        .map(|r| &r.path)
+        .chain(overlays.read_only)
+        .chain(overlays.pins)
+        .chain(overlays.mask_missing);
+    if others.any(|o| {
+        o.canonicalize()
+            .is_ok_and(|c| c != target && c.starts_with(&target))
+    }) {
+        return Err("holds another path in the mount plan");
+    }
+    if roots.iter().any(|r| target.starts_with(r)) {
+        return Err("is inside a writable grant");
+    }
+    let meta = std::fs::metadata(&target).map_err(|_| "cannot be read")?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    // Root-owned and not group- or other-writable: read-only to the agent
+    // anyway (`/nix/store`, `/etc`).
+    let owner_ok = meta.uid() == uid || (meta.uid() == 0 && meta.permissions().mode() & 0o022 == 0);
+    if !(meta.is_file() || meta.is_dir()) || !owner_ok {
+        return Err("is not a plain file or directory owned by you or root");
+    }
+    Ok(Some(target))
 }
 
 /// Whether this bwrap accepts `--disable-userns` (bubblewrap 0.8+).
@@ -1570,6 +1778,20 @@ pub(crate) fn build_wrapper(
             crate::git::TRUSTED_BIN_DIRS.join(", ")
         )
     })?;
+    // `resolve` checked already and printed the warnings; the doctor, probe
+    // and post-#553 rebuild reach here directly. Each link is resolved once,
+    // here, and the probe and the final args bind the same vetted targets.
+    let (refusal, _, targets) = symlinked_overlays(&policy.fs_rules, overlays);
+    if let Some(refusal) = refusal {
+        return Err(refusal);
+    }
+    let read_only = with_targets(overlays.read_only, &targets);
+    let pins = with_targets(overlays.pins, &targets);
+    let overlays = Overlays {
+        read_only: &read_only,
+        pins: &pins,
+        ..overlays
+    };
     let bind_rules = mount_rules(policy);
     let disable_userns = supports_disable_userns(&bwrap_path);
     test_functionality(
@@ -2666,6 +2888,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -2712,6 +2935,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -2792,6 +3016,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -2873,6 +3098,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3096,6 +3322,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3201,6 +3428,273 @@ mod tests {
         );
     }
 
+    fn write_rule(path: &Path) -> FsRule {
+        FsRule {
+            path: path.to_path_buf(),
+            access: FsAccess {
+                write: true,
+                ..FsAccess::default()
+            },
+            nofollow: false,
+        }
+    }
+
+    /// `Err` for a refusal, `Ok(warnings)` otherwise. Every path given is
+    /// host-run, as git persistence paths are.
+    fn check_links(
+        rules: &[FsRule],
+        read_only: &[PathBuf],
+        pins: &[PathBuf],
+    ) -> Result<Vec<String>, String> {
+        let host_run: Vec<PathBuf> = read_only.iter().chain(pins).cloned().collect();
+        check_links_with(rules, read_only, pins, &host_run)
+    }
+
+    fn check_links_with(
+        rules: &[FsRule],
+        read_only: &[PathBuf],
+        pins: &[PathBuf],
+        host_run: &[PathBuf],
+    ) -> Result<Vec<String>, String> {
+        match symlinked_overlays(
+            rules,
+            Overlays {
+                read_only,
+                pins,
+                host_run,
+                mask_missing: &[],
+            },
+        ) {
+            (Some(refusal), _, _) => Err(refusal),
+            (None, warnings, _) => Ok(warnings),
+        }
+    }
+
+    /// A stow-style link to an agent config file keeps working: warned, not refused.
+    #[test]
+    fn symlinked_agent_config_file_warns() {
+        // Not under /tmp: a link into /tmp is refused.
+        let t = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        let cfg = base.join(".claude");
+        std::fs::create_dir(&cfg).unwrap();
+        std::fs::write(base.join("dotfiles-settings.json"), "{}").unwrap();
+        let settings = cfg.join("settings.json");
+        std::os::unix::fs::symlink(base.join("dotfiles-settings.json"), &settings).unwrap();
+        let warnings = check_links_with(
+            &[write_rule(&cfg)],
+            std::slice::from_ref(&settings),
+            &[],
+            &[],
+        )
+        .expect("agent config links must not refuse the launch");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("settings.json"), "{warnings:?}");
+    }
+
+    /// A warn-class link the agent could retarget is refused when its target
+    /// would disturb the mount plan or is not the user's own plain file.
+    #[test]
+    fn linked_overlay_with_unsafe_target_is_refused() {
+        let t = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        let cfg = base.join("cfg");
+        std::fs::create_dir(&cfg).unwrap();
+        std::fs::write(cfg.join("inside.json"), "{}").unwrap();
+        let tmp = tempfile::NamedTempFile::new_in("/tmp").unwrap();
+        let link = cfg.join("settings.json");
+        #[allow(unused_mut)]
+        let mut cases: Vec<(PathBuf, &str)> = vec![
+            (PathBuf::from("/"), "system mount"),
+            (PathBuf::from("/proc/self/status"), "system mount"),
+            (PathBuf::from("/dev/null"), "system mount"),
+            (tmp.path().to_path_buf(), "system mount"),
+            (base.clone(), "another path"),
+            (cfg.join("inside.json"), "writable grant"),
+        ];
+        let fifo = base.join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let sock = base.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        cases.push((PathBuf::from("/sys/kernel"), "system mount"));
+        cases.push((fifo, "plain file"));
+        cases.push((sock, "plain file"));
+        for (target, why) in cases {
+            if !target.exists() {
+                continue;
+            }
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let err = check_links_with(&[write_rule(&cfg)], std::slice::from_ref(&link), &[], &[])
+                .expect_err(&format!("{target:?} must be refused"));
+            assert!(err.contains(why), "{target:?}: {err}");
+            std::fs::remove_file(&link).unwrap();
+        }
+    }
+
+    /// A warned link, absolute included, is bound at its resolved target: bwrap
+    /// never sees the link as a destination, so it cannot abort on it.
+    #[test]
+    fn linked_overlay_is_bound_at_its_target() {
+        let t = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        let cfg = base.join("cfg");
+        std::fs::create_dir(&cfg).unwrap();
+        let target = base.join("dotfiles-settings.json");
+        std::fs::write(&target, "{}").unwrap();
+        let link = cfg.join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let overlays = Overlays {
+            read_only: std::slice::from_ref(&link),
+            pins: std::slice::from_ref(&link),
+            host_run: &[],
+            mask_missing: &[],
+        };
+        let (refusal, _, targets) = symlinked_overlays(&[write_rule(&cfg)], overlays);
+        assert_eq!(refusal, None);
+        assert_eq!(targets, vec![(link.clone(), Some(target.clone()))]);
+        let ro = with_targets(overlays.read_only, &targets);
+        let pins = with_targets(overlays.pins, &targets);
+        let args = build_bwrap_args(
+            &[],
+            Overlays {
+                read_only: &ro,
+                pins: &pins,
+                ..overlays
+            },
+            &DenyMasks::default(),
+        );
+        let t = target.to_string_lossy().into_owned();
+        assert!(
+            args.windows(3)
+                .any(|w| w == ["--ro-bind", t.as_str(), t.as_str()]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(3)
+                .any(|w| w == ["--bind", t.as_str(), t.as_str()]),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| *a == link.to_string_lossy()),
+            "{args:?}"
+        );
+    }
+
+    /// Root-owned, not group- or other-writable targets are accepted
+    /// (home-manager's `/nix/store`, `/etc`); a dangling link is skipped with
+    /// a warning unless its target would be inside a writable grant.
+    #[test]
+    fn linked_overlay_root_targets_and_dangling_links() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        let cfg = base.join("cfg");
+        std::fs::create_dir(&cfg).unwrap();
+        let link = cfg.join("settings.json");
+        let rules = [write_rule(&cfg)];
+        let run = |link: &PathBuf| {
+            symlinked_overlays(
+                &rules,
+                Overlays {
+                    read_only: std::slice::from_ref(link),
+                    ..Overlays::default()
+                },
+            )
+        };
+        let etc = Path::new("/etc/hostname");
+        if let Ok(m) = std::fs::metadata(etc)
+            && m.uid() == 0
+            && m.mode() & 0o022 == 0
+        {
+            std::os::unix::fs::symlink(etc, &link).unwrap();
+            let (refusal, _, targets) = run(&link);
+            assert_eq!(refusal, None);
+            assert_eq!(targets[0].1.as_deref(), Some(etc));
+            std::fs::remove_file(&link).unwrap();
+        }
+        std::os::unix::fs::symlink(base.join("missing.json"), &link).unwrap();
+        let (refusal, warnings, targets) = run(&link);
+        assert_eq!(refusal, None);
+        assert_eq!(targets, vec![(link.clone(), None)]);
+        assert!(warnings[0].contains("to nothing"), "{warnings:?}");
+        assert!(with_targets(std::slice::from_ref(&link), &targets).is_empty());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("missing.json", &link).unwrap();
+        let (refusal, _, _) = run(&link);
+        assert!(refusal.is_some_and(|r| r.contains("missing inside a writable grant")));
+    }
+
+    /// 0e740624: a linked agent config dir that is a writable root of its own is
+    /// not checked from a broader root above it.
+    #[test]
+    fn linked_root_is_checked_only_below_itself() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let base = t.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("dotfiles/copilot/.git/hooks")).unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        let link = base.join("home/.copilot");
+        std::os::unix::fs::symlink(base.join("dotfiles/copilot"), &link).unwrap();
+        let hooks = link.join(".git/hooks");
+        let rules = [write_rule(&base), write_rule(&link)];
+        assert_eq!(
+            check_links(&rules, std::slice::from_ref(&hooks), &[]),
+            Ok(vec![])
+        );
+        // Without the deeper root the link sits below a writable root and refuses.
+        assert!(check_links(&rules[..1], std::slice::from_ref(&hooks), &[]).is_err());
+    }
+
+    /// 221b672e: `/tmp` is a private tmpfs in the namespace, never a root here.
+    #[test]
+    fn tmp_is_not_a_root_for_the_link_check() {
+        let t = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let base = t.path().to_path_buf();
+        std::fs::create_dir_all(base.join("elsewhere/hooks")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), base.join(".github")).unwrap();
+        let hooks = base.join(".github/hooks");
+        let tmp = [write_rule(Path::new("/tmp"))];
+        assert_eq!(
+            check_links(&tmp, std::slice::from_ref(&hooks), &[]),
+            Ok(vec![])
+        );
+        assert!(check_links(&[write_rule(&base)], std::slice::from_ref(&hooks), &[]).is_err());
+    }
+
+    #[test]
+    fn symlinked_protected_paths_are_refused() {
+        let proj = tempfile::tempdir().expect("tempdir");
+        let root = proj.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let rules = [FsRule {
+            path: root.clone(),
+            access: FsAccess {
+                write: true,
+                ..FsAccess::default()
+            },
+            nofollow: false,
+        }];
+        let hooks = root.join(".github/hooks");
+        let check = |read_only: &[PathBuf], pins: &[PathBuf]| check_links(&rules, read_only, pins);
+        std::fs::create_dir(&hooks).unwrap();
+        assert!(check(std::slice::from_ref(&hooks), &[]).is_ok());
+        std::fs::remove_dir(&hooks).unwrap();
+        for target in [PathBuf::from("../elsewhere"), root.join("elsewhere")] {
+            std::os::unix::fs::symlink(&target, &hooks).unwrap();
+            let err = check(std::slice::from_ref(&hooks), &[]).unwrap_err();
+            assert!(err.contains(".github/hooks"), "{err}");
+            assert!(check(&[], std::slice::from_ref(&hooks)).is_err());
+            std::fs::remove_file(&hooks).unwrap();
+        }
+        // A linked ancestor redirects the bind just the same.
+        std::fs::remove_dir(root.join(".github")).unwrap();
+        std::fs::create_dir(root.join("elsewhere/hooks")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.join(".github")).unwrap();
+        assert!(check(std::slice::from_ref(&hooks), &[]).is_err());
+    }
+
     #[test]
     fn nonexistent_git_persistence_paths_are_skipped() {
         // A read-only bind of a missing path would make bwrap error (failing the
@@ -3213,6 +3707,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3250,6 +3745,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3305,6 +3801,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -3369,6 +3866,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &masks,
@@ -4098,6 +4596,7 @@ mod tests {
         let overlays = Overlays {
             read_only: std::slice::from_ref(&ro),
             pins: &[],
+            host_run: &[],
             mask_missing: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &masks);
@@ -4143,6 +4642,7 @@ mod tests {
         let overlays = Overlays {
             read_only: &overlays_vec,
             pins: &[],
+            host_run: &[],
             mask_missing: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &DenyMasks::default());
@@ -4228,6 +4728,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -4239,6 +4740,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                host_run: &[],
                 mask_missing: &ro,
             },
             &DenyMasks::default(),
@@ -4292,6 +4794,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &[],
             },
             &DenyMasks::default(),
@@ -4301,6 +4804,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &masks,
             },
             &DenyMasks::default(),
@@ -4374,6 +4878,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &masks,
             },
             &DenyMasks::default(),
@@ -4428,6 +4933,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                host_run: &[],
                 mask_missing: &masks,
             },
             &DenyMasks::default(),

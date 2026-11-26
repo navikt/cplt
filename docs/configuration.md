@@ -98,6 +98,7 @@ Ids are stable and add-only. A warning without its own id is reported as `warn.u
 | `warn.managed-unsettled` | the managed-config check could not settle at exit |
 | `warn.copilot-trusted-folder` | the session added a Copilot trustedFolders entry |
 | `warn.bubblewrap-unavailable` | bubblewrap unavailable, Landlock + seccomp only |
+| `warn.bubblewrap-overlay-link` | a read-only mount lands on a symlink's target |
 | `warn.session-summary-path-refused` | CPLT_SESSION_SUMMARY path refused |
 | `warn.session-summary-hosts-malformed` | CPLT_SESSION_SUMMARY_HOSTS had malformed entries |
 | `warn.unclassified` | a warning that has no stable id yet |

@@ -78,6 +78,10 @@ pub const MESSAGE_IDS: &[(&str, &str)] = &[
         "bubblewrap unavailable, Landlock + seccomp only",
     ),
     (
+        "warn.bubblewrap-overlay-link",
+        "a read-only mount lands on a symlink's target",
+    ),
+    (
         "warn.session-summary-path-refused",
         "CPLT_SESSION_SUMMARY path refused",
     ),
