@@ -2949,6 +2949,29 @@ fn git_gate_refuses_a_push_redirected_by_git_dir_in_the_environment() {
 }
 
 #[test]
+fn git_gate_refuses_transport_programs_set_in_the_environment() {
+    let launch = temp_repo_live("navikt/cplt", "main", &["feature/x"]);
+    let facts = launch_facts(launch.path());
+    let push = ["push", "origin", "feature/x"];
+    let (_, stderr, ok) = git_gate_protect_default_with_env(launch.path(), &facts, &[], &push);
+    assert!(ok, "a feature push must stay allowed.\n{stderr}");
+    for name in [
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_SSH_VARIANT",
+        "GIT_PROXY_COMMAND",
+    ] {
+        let (_, stderr, ok) = git_gate_protect_default_with_env(
+            launch.path(),
+            &facts,
+            &[(name, std::path::Path::new("/x/ssh"))],
+            &push,
+        );
+        assert_refused(&stderr, ok, name);
+    }
+}
+
+#[test]
 fn git_gate_allows_a_push_from_a_worktree_of_the_launch_repository() {
     // A linked worktree has its own git dir (`.git/worktrees/<name>`) but shares
     // the launch repository's COMMON dir — which is why the check compares
