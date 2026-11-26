@@ -122,16 +122,44 @@ fn non_builtin_decision(command: &str, allowed: &[String]) -> Option<PolicyResul
 /// The plain `gh <name>` form runs a same-named user alias when no extension is
 /// installed, and aliases live in config the agent can write; `extension exec`
 /// ignores aliases and fails when the extension is absent.
-pub fn listed_extension_argv(args: &[&str]) -> Option<Vec<String>> {
+///
+/// gh reads the first word after `extension exec` as the name, so nothing may
+/// precede it: a `-R`/`--repo` before the name comes back as the repository to
+/// pin through `GH_REPO`, and any other word there is refused.
+pub fn listed_extension_argv(args: &[&str]) -> Option<Result<ExtensionRun, String>> {
+    listed_extension_argv_for(args, gh_extensions())
+}
+
+/// A listed extension's argv (`extension exec <name> ...`) and the `-R` repo
+/// given before the name, if any.
+pub type ExtensionRun = (Vec<String>, Option<String>);
+
+fn listed_extension_argv_for(
+    args: &[&str],
+    listed: &[String],
+) -> Option<Result<ExtensionRun, String>> {
     let root = root_command(args).0?;
     let word = args[root];
-    if is_gh_builtin(word) || !gh_extensions().iter().any(|n| n == word) {
+    if is_gh_builtin(word) || !listed.iter().any(|n| n == word) {
         return None;
     }
-    let mut out: Vec<String> = args[..root].iter().map(ToString::to_string).collect();
-    out.extend(["extension".to_string(), "exec".to_string()]);
+    let mut repo = None;
+    let mut prefix = args[..root].iter();
+    while let Some(&a) = prefix.next() {
+        let value = match a {
+            "-R" | "--repo" => prefix.next().copied(),
+            _ => a
+                .strip_prefix("--repo=")
+                .or_else(|| a.strip_prefix("-R").filter(|v| !v.is_empty())),
+        };
+        match value {
+            Some(v) if !v.is_empty() => repo = Some(v.to_string()),
+            _ => return Some(Err(a.to_string())),
+        }
+    }
+    let mut out = vec!["extension".to_string(), "exec".to_string()];
     out.extend(args[root..].iter().map(ToString::to_string));
-    Some(out)
+    Some(Ok((out, repo)))
 }
 
 /// The GitHub hosts the guard accepts; `["github.com"]` unless configured.
@@ -3665,6 +3693,15 @@ fn gate_decision(
             guidance: "gh may read the next word as the flag's value and run another \
                 subcommand than the one the guard checked. Put flags after the subcommand, \
                 for example 'gh auth status --hostname github.com'."
+                .to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+    if let Some(Err(flag)) = listed_extension_argv(args) {
+        return Err(Refusal {
+            headline: format!("'{flag}' before a gh extension name is not allowed."),
+            guidance: "The guard runs a listed extension as 'gh extension exec <name>', where \
+                only -R/--repo can be carried over. Put other flags after the extension name."
                 .to_string(),
             agent_note: &[RESTRICTED, NOTE],
         });
@@ -7856,6 +7893,32 @@ mod tests {
             let p = parse_command(args).unwrap();
             assert_ne!(evaluate(&p).decision, Decision::Block, "{args:?}");
         }
+    }
+
+    #[test]
+    fn listed_extension_argv_puts_the_name_first() {
+        let listed = vec!["dash".to_string()];
+        let run = |a: &[&str]| listed_extension_argv_for(a, &listed);
+        let ok = |a: &[&str], repo: Option<&str>| {
+            let (argv, r) = run(a).unwrap().unwrap();
+            assert_eq!(argv[..3], ["extension", "exec", "dash"], "{a:?}");
+            assert_eq!(r.as_deref(), repo, "{a:?}");
+        };
+        ok(&["dash", "-x"], None);
+        ok(&["-R", "o/r", "dash"], Some("o/r"));
+        ok(&["-Rfoo/bar", "dash"], Some("foo/bar"));
+        ok(&["--repo=o/r", "dash"], Some("o/r"));
+        ok(&["--repo", "o/r", "dash"], Some("o/r"));
+        for a in [
+            &["--", "dash"][..],
+            &["-h", "x", "dash"],
+            &["--hostname=x", "dash"],
+            &["--repo=", "dash"],
+        ] {
+            assert!(run(a).unwrap().is_err(), "{a:?}");
+        }
+        assert!(run(&["pr", "list"]).is_none());
+        assert!(run(&["other"]).is_none());
     }
 
     #[test]

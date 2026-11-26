@@ -6553,9 +6553,13 @@ fn decide_gh_gate(
         Ok((approval, _)) if !approval.graphql_targets.is_empty() => {
             GateEffect::VerifyGraphql(approval.graphql_targets)
         }
-        Ok((approval, None)) if gh_proxy::listed_extension_argv(&arg_refs).is_some() => {
-            let args = gh_proxy::listed_extension_argv(&arg_refs).unwrap_or_default();
-            match approval.repo_scope {
+        Ok((approval, None))
+            if matches!(gh_proxy::listed_extension_argv(&arg_refs), Some(Ok(_))) =>
+        {
+            let Some(Ok((args, repo))) = gh_proxy::listed_extension_argv(&arg_refs) else {
+                unreachable!("checked by the guard above")
+            };
+            match repo.or(approval.repo_scope) {
                 Some(repo) => GateEffect::ExecRewritten { repo, args },
                 None => GateEffect::ExecArgs(args),
             }

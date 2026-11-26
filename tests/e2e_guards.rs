@@ -358,7 +358,7 @@ fn gh_gate_listed_extension_never_runs_same_named_alias() {
         "aliases:\n    dash: '!echo ALIAS-RAN'\n",
     )
     .unwrap();
-    let run = || {
+    let run = |gh_args: &[&str]| {
         let repo = temp_repo("navikt/cplt");
         let out = cplt_cmd()
             .args(["gh-gate", "--real-gh"])
@@ -371,8 +371,8 @@ fn gh_gate_listed_extension_never_runs_same_named_alias() {
                 "--allow-extension",
                 "dash",
                 "--",
-                "dash",
             ])
+            .args(gh_args)
             .env("HOME", tmp.path())
             .env("GH_CONFIG_DIR", &cfg)
             .env("XDG_DATA_HOME", &data)
@@ -391,7 +391,7 @@ fn gh_gate_listed_extension_never_runs_same_named_alias() {
             out.status.success(),
         )
     };
-    let (out, ok) = run();
+    let (out, ok) = run(&["dash"]);
     assert!(
         !ok && !out.contains("ALIAS-RAN"),
         "alias must not run: {out}"
@@ -400,14 +400,25 @@ fn gh_gate_listed_extension_never_runs_same_named_alias() {
 
     let ext = data.join("gh/extensions/gh-dash");
     std::fs::create_dir_all(&ext).unwrap();
-    std::fs::write(ext.join("gh-dash"), "#!/bin/sh\necho EXT-RAN\n").unwrap();
+    std::fs::write(
+        ext.join("gh-dash"),
+        "#!/bin/sh\necho EXT-RAN repo=$GH_REPO\n",
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(ext.join("gh-dash"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let (out, ok) = run();
+    let (out, ok) = run(&["dash"]);
     assert!(
         ok && out.contains("EXT-RAN") && !out.contains("ALIAS-RAN"),
         "{out}"
     );
+    // `-R` before the name is carried over as the GH_REPO pin.
+    let (out, ok) = run(&["-R", "o/r", "dash"]);
+    assert!(ok && out.contains("EXT-RAN repo=o/r"), "{out}");
+    let (out, ok) = run(&["-Rfoo", "dash"]);
+    assert!(ok && out.contains("EXT-RAN repo=foo"), "{out}");
+    let (out, ok) = run(&["--hostname", "x", "dash"]);
+    assert!(!ok && !out.contains("RAN"), "{out}");
 }
 
 /// #1099: only extensions named in `gh_guard.allow_extensions` run, by exact
