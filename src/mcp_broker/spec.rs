@@ -71,9 +71,10 @@ impl Rejected {
 
 /// Drop every spec whose file, or any entry on the way to it, the final
 /// sandbox policy makes writable (`writable` asks the policy about one
-/// path). The same for the credential mechanism's own dirs: the host-side
+/// path: `check::writable_on_or_under`, so a write rule inside it counts
+/// too). The same for the credential mechanism's own dirs: the host-side
 /// server and probe read its login and config there, so a session grant
-/// over them (#1061) would let the agent read the login and rewrite the
+/// over or inside them (#1061, #1112) would let the agent read the login and rewrite the
 /// config. The grant wins and the server is dropped, with a line naming it.
 /// Remote specs (#909) go through the same checks.
 /// Returns the newly rejected, already printed.

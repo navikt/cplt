@@ -530,6 +530,7 @@ pub fn github_mcp_inactive(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn github_mcp(
     session: &mut Session,
     home: &Path,
@@ -538,6 +539,7 @@ pub fn github_mcp(
     proxy_port: Option<u16>,
     token: impl FnOnce() -> Option<crate::agent::SecretToken>,
     spec: Option<&crate::mcp_broker::Spec>,
+    writable: impl Fn(&Path) -> Option<PathBuf>,
 ) -> bool {
     const VAR: &str = "OPENCODE_CONFIG_CONTENT";
     if deny_env.iter().any(|d| d == "GH_TOKEN" || d == VAR) {
@@ -545,6 +547,19 @@ pub fn github_mcp(
     }
     let host_var = |v: &str| reaches(v).then(|| std::env::var_os(v)).flatten();
     let dirs = user_config_dirs(home);
+    // #1057: a config the agent can write, or redirect through a writable
+    // parent or symlink, would let it switch on the token-holding proxy.
+    // `writable` is `check::writable_on_or_under`, so a file grant inside the
+    // dir counts too.
+    if let Some((dir, tree)) = dirs.iter().find_map(|d| writable(d).map(|t| (d, t))) {
+        crate::ui::warn(&format!(
+            "GitHub MCP in OpenCode left as configured: the OpenCode config dir {} is writable \
+             in the sandbox (grant: {}). Move it out of that grant, or drop the grant.",
+            dir.display(),
+            tree.display()
+        ));
+        return false;
+    }
     // The host's own OPENCODE_CONFIG never reaches v2: the session sets its
     // own, naming the global file already read from `dirs` (#806).
     let existing = host_var(VAR).and_then(|v| v.into_string().ok());
@@ -582,6 +597,30 @@ pub fn github_mcp(
             false
         }
     }
+}
+
+/// The writable test for the OpenCode config dir `dir` in
+/// [`github_mcp`]: [`crate::check::writable_on_or_under`], except the exact
+/// file-level write rules cplt's own OpenCode agent dirs put inside `dir`
+/// (legacy `auth.json`, #1057 review). Read from `Agent::config_dirs`, so the
+/// exemption cannot drift from the grant.
+pub fn config_dir_writable(
+    policy: &crate::sandbox::LandlockPolicy,
+    home: &Path,
+    dir: &Path,
+) -> Option<PathBuf> {
+    let own: Vec<PathBuf> = crate::agent::Agent::OpenCode
+        .config_dirs(home)
+        .into_iter()
+        .filter(|d| d.path == dir)
+        .flat_map(|d| {
+            d.write_files
+                .iter()
+                .map(|f| d.path.join(f))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    crate::check::writable_on_or_under_except(policy, home, dir, &own)
 }
 
 /// The user's OpenCode config dir: an absolute `OPENCODE_CONFIG_DIR`, which
@@ -1678,7 +1717,8 @@ mod tests {
                 |_| false,
                 Some(1),
                 never,
-                None
+                None,
+                |_| None
             ));
             // deny.env turns it off, for either variable.
             for d in ["GH_TOKEN", "OPENCODE_CONFIG_CONTENT"] {
@@ -1689,11 +1729,33 @@ mod tests {
                     all,
                     Some(1),
                     never,
-                    None
+                    None,
+                    |_| None
                 ));
             }
+            // #1057: a writable config dir (or one under a writable parent,
+            // or holding a file grant) refuses before the token is asked for.
+            assert!(!github_mcp(
+                &mut s,
+                tmp.path(),
+                &[],
+                all,
+                Some(1),
+                never,
+                None,
+                |d| d.starts_with(tmp.path()).then(|| tmp.path().to_path_buf())
+            ));
             // No proxy: nothing to serve it on.
-            assert!(!github_mcp(&mut s, tmp.path(), &[], all, None, never, None));
+            assert!(!github_mcp(
+                &mut s,
+                tmp.path(),
+                &[],
+                all,
+                None,
+                never,
+                None,
+                |_| None
+            ));
             // No gh login.
             assert!(!github_mcp(
                 &mut s,
@@ -1702,7 +1764,8 @@ mod tests {
                 all,
                 Some(1),
                 || None,
-                None
+                None,
+                |_| None
             ));
             // The same from the user config file.
             std::fs::write(oc.join("opencode.json"), entry).unwrap();
@@ -1713,7 +1776,8 @@ mod tests {
                 |_| false,
                 Some(1),
                 || None,
-                None
+                None,
+                |_| None
             ));
             assert_eq!(s.env.len(), n);
         });

@@ -146,6 +146,7 @@ fn gh_token_spec_filters_opencode_github_mcp() {
         Some(proxy.port),
         || Some(SecretToken::new("TOKEN".into())),
         Some(&spec),
+        |_| None,
     ));
     let content = &session
         .env

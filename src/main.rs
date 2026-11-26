@@ -5812,9 +5812,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         } else {
             opencode_v2
         };
-        let writable = |p: &Path| {
-            cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree)
-        };
+        let writable = |p: &Path| cplt::check::writable_on_or_under(&policy, &home_dir, p);
         // GitHub MCP as a launch would serve it (#909, #1115).
         let (spec, inactive) = if resolved.github_mcp_proxy {
             let reaches = |v: &str| {
@@ -5913,7 +5911,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             cplt::mcp_broker::launch_github(
                 &mcp_found,
                 &home_dir,
-                |p| cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree),
+                |p| cplt::check::writable_on_or_under(&policy, &home_dir, p),
                 |spec| {
                     cplt::opencode_v2::github_mcp(
                         &mut session,
@@ -5923,6 +5921,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                         proxy_handle.as_ref().map(|h| h.port),
                         cplt::discover::stored_gh_secret,
                         spec,
+                        |p| cplt::opencode_v2::config_dir_writable(&policy, &home_dir, p),
                     )
                 },
                 ui::warn,
@@ -8604,7 +8603,7 @@ fn assemble_sandbox(
             ..Default::default()
         };
         cplt::mcp_broker::drop_writable(&mut found, home_dir, |p| {
-            cplt::check::writable_tree_on_path(&policy, home_dir, p).map(|(_, tree)| tree)
+            cplt::check::writable_on_or_under(&policy, home_dir, p)
         });
         for r in &found.rejected {
             ui::warn(&r.line());
@@ -11526,7 +11525,15 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                     keychain_substitute.as_ref(),
                     opencode_v2,
                 )
-                && cplt::agent::opencode_host_login(&home_dir, "probe").is_some(),
+                && cplt::agent::opencode_host_login(
+                    &home_dir,
+                    "probe",
+                    cplt::agent::opencode_auth_store_refusal(&home_dir, |p| {
+                        cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, t)| t)
+                    })
+                    .as_deref(),
+                )
+                .is_some(),
         },
         &home_dir,
     );
