@@ -8589,6 +8589,8 @@ fn assemble_sandbox(
 
     if !opts.inspect_only {
         sandbox::ensure_podman_state_dirs(&sandbox_config);
+    } else if opts.live_probes {
+        note_dirs_a_launch_creates(&sandbox_config, resolved.readonly_host_tool_paths);
     }
     let policy = sandbox::generate_policy(&sandbox_config);
     // The broker socket is added after this, so the policy it is judged by
@@ -8917,6 +8919,32 @@ fn build_sandbox_config<'a>(
         use_bubblewrap: resolved.use_bubblewrap,
         allow_git_config_write: resolved.allow_git_config_write,
     }
+}
+
+/// `cplt check` writes nothing to the host, so it cannot create the dirs a
+/// launch creates before it grants them. Its probes then run without those
+/// grants: say so instead of reporting a policy no launch builds (#1227).
+fn note_dirs_a_launch_creates(config: &sandbox::SandboxConfig, readonly_host_tool_paths: bool) {
+    let mut missing = sandbox::missing_split_tool_dirs(config.home_dir, readonly_host_tool_paths);
+    missing.extend(sandbox::missing_podman_state_dirs(config));
+    if let Some(msg) = dirs_a_launch_creates_message(&missing) {
+        ui::info(&msg);
+    }
+}
+
+fn dirs_a_launch_creates_message(missing: &[PathBuf]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = missing
+        .iter()
+        .map(|p| format!("  {}", p.display()))
+        .collect();
+    Some(format!(
+        "these dirs do not exist yet, so check probes without their grants; \
+         a launch creates and grants them:\n{}",
+        list.join("\n")
+    ))
 }
 
 fn prepare_shell_sandbox(
@@ -16247,6 +16275,15 @@ mod pnpm_doctor_tests {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// #1227: check names the dirs it probed without, and stays quiet otherwise.
+    #[test]
+    fn check_names_dirs_a_launch_creates() {
+        assert_eq!(dirs_a_launch_creates_message(&[]), None);
+        let msg = dirs_a_launch_creates_message(&[PathBuf::from("/h/.m2/repository")]).unwrap();
+        assert!(msg.contains("a launch creates and grants them"), "{msg}");
+        assert!(msg.contains("/h/.m2/repository"), "{msg}");
+    }
+
     /// Review on #846: status must not claim OpenCode when the overlay is skipped.
     #[test]
     fn mcp_status_leaves_opencode_out_when_its_config_var_is_denied() {

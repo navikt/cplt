@@ -160,8 +160,8 @@ pub use policy::{
     exec_write_conflicts, first_party_read_target, gradle_loopback_hint, grant_is_refused,
     home_config_link_targets, home_tool_dirs, host_tool_ro_overlay_links, host_tool_ro_overlays,
     linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, missing_wrapper_dist_hint, nested_alternation, no_cache_env,
-    no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
+    mise_ro_protect_paths, missing_split_tool_dirs, missing_wrapper_dist_hint, nested_alternation,
+    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, passwd_state_dir, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
     readonly_wrapper_lock_files, refused_writable_app_root, relocatable_tool_prefix,
     report_state_pinned, shim_ro_protect_paths, socket_mask_paths, state_pinned_message,
@@ -191,7 +191,7 @@ pub(crate) use exec::which_binary;
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
     FsAccess, FsRule, LandlockPolicy, NetRule, blocked_syscall_names, describe_policy,
-    ensure_podman_state_dirs, generate_policy,
+    ensure_podman_state_dirs, generate_policy, missing_podman_state_dirs,
 };
 // Kernel capability probe — used by integration tests (securityfs is
 // root-only on some hosts, so tests cannot read abi_version from there).

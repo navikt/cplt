@@ -180,12 +180,14 @@ fn stored_gh_credential() -> Option<&'static crate::agent::SecretToken> {
                     return None;
                 }
             };
-            gh_auth_token_in(
-                &crate::git::trusted_binary("gh")?,
-                PROBE_TIMEOUT,
-                Some(&dir),
-            )
-            .map(crate::agent::SecretToken::new)
+            let gh = crate::git::trusted_binary("gh")?;
+            match gh_auth_token_in(&gh, PROBE_TIMEOUT, Some(&dir)) {
+                Ok(token) => token.map(crate::agent::SecretToken::new),
+                Err(why) => {
+                    crate::ui::warn(&gh_lookup_failed_message(&why));
+                    None
+                }
+            }
         })
         .as_ref()
 }
@@ -239,7 +241,55 @@ pub fn gh_token_cache_eligibility(
 /// ambient credential or a GHES login for gh's stored github.com credential.
 #[cfg(test)]
 pub(crate) fn gh_auth_token(gh: &Path, timeout: Duration) -> Option<String> {
-    gh_auth_token_in(gh, timeout, None)
+    gh_auth_token_in(gh, timeout, None).ok().flatten()
+}
+
+/// What a failed lookup tells the user (#1227): the session goes on without
+/// gh's token, which they would otherwise only notice when gh fails inside.
+pub(crate) fn gh_lookup_failed_message(why: &str) -> String {
+    format!(
+        "gh's stored token was not read: {why}. The session has no gh token. \
+         Check that `gh auth token --hostname github.com` works outside cplt; \
+         if gh is a wrapper (a mise shim, say), make the real gh binary first on PATH."
+    )
+}
+
+/// gh's stderr is untrusted: one line, printable ASCII, capped. A line that
+/// looks like it holds a token is withheld.
+fn sanitized_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    // Filter first, so a dropped char cannot split a prefix past the check;
+    // check the uncapped line, so a token cut by the cap is caught too.
+    let filtered: String = line
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    let longest_run = |f: fn(&char) -> bool| {
+        filtered
+            .split(|c: char| !f(&c))
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+    };
+    if ["gho_", "ghp_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+        .iter()
+        .any(|p| filtered.contains(p))
+        || longest_run(char::is_ascii_hexdigit) >= 40
+        || longest_run(char::is_ascii_alphanumeric) >= 30
+    {
+        return "(output withheld)".into();
+    }
+    let clean: String = filtered.chars().take(160).collect();
+    if clean.is_empty() {
+        "(no output)".into()
+    } else {
+        clean
+    }
 }
 
 /// The session's agent-writable trees, set by the launch (and doctor) before
@@ -285,11 +335,28 @@ pub(crate) fn gh_lookup_config_dir(home: &Path, writable: &[PathBuf]) -> Result<
 
 /// `config_dir` pins gh to the dir that was checked, so the lookup reads it.
 #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
-fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> Option<String> {
+///
+/// `Ok(None)`: gh has no github.com login. `Err`: the lookup failed, and why.
+fn gh_auth_token_in(
+    gh: &Path,
+    timeout: Duration,
+    config_dir: Option<&Path>,
+) -> Result<Option<String>, String> {
     // gh writes `$XDG_STATE_HOME/gh/device-id` on any run. A lookup is not a
     // reason to write the host (`--print-profile` writes nothing, #1220), so
     // gh gets a private state dir that is removed after the lookup.
-    let state = tempfile::tempdir().ok()?;
+    gh_auth_token_with_state(gh, timeout, config_dir, tempfile::tempdir())
+}
+
+#[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
+fn gh_auth_token_with_state(
+    gh: &Path,
+    timeout: Duration,
+    config_dir: Option<&Path>,
+    state: std::io::Result<tempfile::TempDir>,
+) -> Result<Option<String>, String> {
+    let state =
+        state.map_err(|e| format!("cannot create a private state dir for gh ({})", e.kind()))?;
     let probe = |no_refresh: bool| {
         let mut cmd = std::process::Command::new(gh);
         cmd.args(["auth", "token", "--hostname", "github.com"]);
@@ -311,19 +378,32 @@ fn gh_auth_token_in(gh: &Path, timeout: Duration, config_dir: Option<&Path>) -> 
     // Retry without the flag only on gh's own unknown-flag error: that gh is
     // older than v2.103.0 and cannot refresh. Any other failure (a denied
     // Keychain read also exits 1) or a timeout hands over nothing.
-    let (ok, mut buf, stderr) = probe(true)?;
+    let no_answer = || {
+        format!(
+            "gh did not run, or did not answer within {}s",
+            timeout.as_secs_f32()
+        )
+    };
+    let failed = |stderr: &[u8]| -> Result<Option<String>, String> {
+        // Not logged in is no failure: there is no token to miss.
+        if String::from_utf8_lossy(stderr).contains("no oauth token") {
+            return Ok(None);
+        }
+        Err(format!("gh failed: {}", sanitized_stderr(stderr)))
+    };
+    let (ok, mut buf, stderr) = probe(true).ok_or_else(no_answer)?;
     if !ok {
         if !rejects_no_refresh_flag(&stderr) {
-            return None;
+            return failed(&stderr);
         }
-        let (ok, retry, _) = probe(false)?;
+        let (ok, retry, stderr) = probe(false).ok_or_else(no_answer)?;
         if !ok {
-            return None;
+            return failed(&stderr);
         }
         buf = retry;
     }
     let token = String::from_utf8_lossy(&buf).trim().to_string();
-    (!token.is_empty()).then_some(token)
+    Ok((!token.is_empty()).then_some(token))
 }
 
 /// gh (cobra) prints exactly this as the first stderr line, then usage.
@@ -2130,6 +2210,87 @@ fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    fn gh_fixture(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let gh = dir.join("gh");
+        std::fs::write(&gh, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gh
+    }
+
+    const T: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// #1227: no private state dir means no lookup, and the user is told.
+    #[test]
+    fn gh_lookup_warns_when_the_state_dir_cannot_be_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = gh_fixture(tmp.path(), "echo gho_x");
+        let err = super::gh_auth_token_with_state(
+            &gh,
+            T,
+            None,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert!(err.contains("private state dir"), "{err}");
+        let msg = super::gh_lookup_failed_message(&err);
+        assert!(msg.contains("gh's stored token was not read"), "{msg}");
+    }
+
+    /// #1227: a wrapper that fails under the private XDG_STATE_HOME (a mise
+    /// shim) is reported with gh's sanitized reason.
+    #[test]
+    fn gh_lookup_warns_when_a_shim_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = gh_fixture(
+            tmp.path(),
+            "printf 'mise ERROR No version is set for shim: gh\\033[0m\\nmore\\n' >&2; exit 1",
+        );
+        let err = super::gh_auth_token_in(&gh, T, None).unwrap_err();
+        assert_eq!(
+            err,
+            "gh failed: mise ERROR No version is set for shim: gh[0m"
+        );
+        assert!(super::gh_lookup_failed_message(&err).contains("mise shim"));
+    }
+
+    #[test]
+    fn gh_lookup_withholds_stderr_that_holds_a_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = gh_fixture(tmp.path(), "echo 'bad gho_secret123' >&2; exit 1");
+        let err = super::gh_auth_token_in(&gh, T, None).unwrap_err();
+        assert!(!err.contains("gho_"), "{err}");
+    }
+
+    #[test]
+    fn sanitizer_checks_prefixes_after_dropping_control_chars() {
+        assert_eq!(
+            super::sanitized_stderr(b"bad gh\x07o_abc"),
+            "(output withheld)"
+        );
+    }
+
+    #[test]
+    fn sanitizer_withholds_long_hex_and_base62_runs() {
+        let hex = format!("err {}", "a1".repeat(20));
+        assert_eq!(super::sanitized_stderr(hex.as_bytes()), "(output withheld)");
+        let b62 = format!("err {}", "Ab9".repeat(10));
+        assert_eq!(super::sanitized_stderr(b62.as_bytes()), "(output withheld)");
+        let short = format!("err {}", "Ab9".repeat(9));
+        assert_eq!(super::sanitized_stderr(short.as_bytes()), short);
+    }
+
+    /// Not logged in is not a failure: nothing to warn about.
+    #[test]
+    fn gh_lookup_without_a_login_is_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = gh_fixture(
+            tmp.path(),
+            "echo 'no oauth token found for github.com' >&2; exit 1",
+        );
+        assert_eq!(super::gh_auth_token_in(&gh, T, None), Ok(None));
+    }
+
     #[test]
     fn gh_lookup_refuses_relative_writable_and_non_regular_config() {
         use crate::untrusted::tests::mkfifo;
