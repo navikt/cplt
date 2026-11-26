@@ -18,7 +18,7 @@ Prints, for the current repo (gh resolves it):
 Needs: gh (authenticated), jq. Two API calls. Maintainer = OWNER/MEMBER/COLLABORATOR.
 USAGE
 }
-case "${1:-}" in -h|--help) usage; exit 0;; --fixture) FIX="$2";; "") ;; *) usage >&2; exit 2;; esac
+case "${1:-}" in -h|--help) usage; exit 0;; --fixture) [ -n "${2:-}" ] || { usage >&2; exit 2; }; FIX="$2";; "") ;; *) usage >&2; exit 2;; esac
 
 PRQ='query($o:String!,$r:String!){repository(owner:$o,name:$r){pullRequests(states:OPEN,first:50){nodes{
 number title createdAt headRefOid mergeStateStatus isInMergeQueue autoMergeRequest{enabledAt}
