@@ -4892,6 +4892,13 @@ fn remote_has_only_branch(real_git: &Path, repo_args: &[&str], remote: &str, nam
     let urls = push_urls(real_git, repo_args, remote);
     !urls.is_empty()
         && urls.iter().all(|url| {
+            // `ls-remote` applies `url.*.insteadOf` to the URL again; `push`
+            // does not. Probe only a URL that ls-remote leaves unchanged.
+            let unchanged = run_git(real_git, repo_args, &["ls-remote", "--get-url", "--", url])
+                .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == url);
+            if !unchanged {
+                return false;
+            }
             let Some(out) = run_git(
                 real_git,
                 repo_args,

@@ -3181,6 +3181,104 @@ fn real_push_deletion_probe_uses_the_push_url() {
     assert_eq!(remote_ref(&push, "refs/heads/y"), None);
 }
 
+/// A bare clone of `src` beside it, named `name`, with tag `t` on main.
+fn bare_with_tag(src: &std::path::Path, name: &str, tag: Option<&str>) -> std::path::PathBuf {
+    let dst = src.with_file_name(name);
+    assert!(git_ok(
+        src,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap()
+        ]
+    ));
+    if let Some(t) = tag {
+        assert!(git_ok(&dst, &["tag", t, "main"]));
+    }
+    dst
+}
+
+#[test]
+fn real_push_deletion_probe_refuses_a_url_insteadof_would_move() {
+    // Push lands on `real` (tag x). A second insteadOf rule would move only
+    // ls-remote's view to `decoy` (branch x). Both config shapes.
+    for shape in ["pushinsteadof", "pushurl-alias"] {
+        let (_t, work, origin) = pushed_repo("main");
+        let facts = launch_facts(&work);
+        let real = bare_with_tag(&origin, "real.git", Some("x"));
+        let decoy = bare_with_tag(&origin, "decoy.git", None);
+        assert!(git_ok(&decoy, &["branch", "x", "main"]));
+        let cfg: Vec<(String, String)> = if shape == "pushinsteadof" {
+            vec![
+                (
+                    format!("url.{}.pushInsteadOf", real.display()),
+                    origin.display().to_string(),
+                ),
+                (
+                    format!("url.{}.insteadOf", decoy.display()),
+                    real.display().to_string(),
+                ),
+            ]
+        } else {
+            vec![
+                ("remote.origin.pushurl".into(), "alias:repo".into()),
+                (
+                    format!("url.{}.insteadOf", real.display()),
+                    "alias:repo".into(),
+                ),
+                (
+                    format!("url.{}.insteadOf", decoy.display()),
+                    real.display().to_string(),
+                ),
+            ]
+        };
+        for (k, v) in &cfg {
+            assert!(git_ok(&work, &["config", k, v]), "{k}");
+        }
+        let (stderr, ok) = real_push_gate(
+            &work,
+            &facts,
+            FORCE_ONLY,
+            &[],
+            &["push", "origin", "--delete", "x"],
+        );
+        assert_refused(&stderr, ok, "not allowed");
+        assert!(remote_ref(&real, "refs/tags/x").is_some(), "{shape}");
+    }
+}
+
+#[test]
+fn real_push_deletion_probe_requires_every_push_url() {
+    let (_t, work, origin) = pushed_repo("main");
+    let facts = launch_facts(&work);
+    let a = bare_with_tag(&origin, "a.git", None);
+    let b = bare_with_tag(&origin, "b.git", Some("x"));
+    assert!(git_ok(&a, &["branch", "x", "main"]));
+    assert!(git_ok(&b, &["branch", "x", "main"]));
+    for url in [&a, &b] {
+        assert!(git_ok(
+            &work,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                url.to_str().unwrap()
+            ]
+        ));
+    }
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts,
+        FORCE_ONLY,
+        &[],
+        &["push", "origin", "--delete", "x"],
+    );
+    assert_refused(&stderr, ok, "not allowed");
+    assert!(remote_ref(&b, "refs/tags/x").is_some());
+}
+
 #[test]
 fn real_push_deletion_refused_under_a_namespace() {
     let (_t, work, origin) = pushed_repo("main");
