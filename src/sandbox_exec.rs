@@ -15,6 +15,19 @@ pub(crate) use crate::discover::bounded_stdout;
 use crate::discover::gh_auth_token;
 use crate::ui;
 
+/// Set the inherited transport vars on `cmd` explicitly, so the git guard
+/// can record the child's value from `cmd` alone (`--inherit-env` leaves
+/// them implicit).
+fn spell_out_inherited_transport_env(cmd: &mut Command) {
+    for name in crate::gh_proxy::TRANSPORT_ENV_VARS {
+        if let Some(v) = std::env::var_os(name)
+            && !cmd.get_envs().any(|(k, _)| k == *name)
+        {
+            cmd.env(name, v);
+        }
+    }
+}
+
 /// Config filenames that mise searches for in ancestor directories.
 const MISE_CONFIG_FILENAMES: &[&str] = &[".tool-versions", ".mise.toml", "mise.toml"];
 
@@ -258,6 +271,7 @@ fn configure_command(
         for (key, val) in &sandbox_env.vars {
             cmd.env(key, val);
         }
+        spell_out_inherited_transport_env(cmd);
     }
 
     // After the filtered env, so a parent `YARN_IGNORE_SCRIPTS=false` that the
@@ -1181,6 +1195,13 @@ fn install_command_wrappers(
         let ask_remote = git_guard.enabled && git_guard.protect_default_branch_only;
         let (mut repo_facts, has_remotes) =
             crate::gh_proxy::session_repo_facts(project_dir, repo_dirs, ask_remote);
+        repo_facts.transport_env = crate::gh_proxy::transport_env(
+            cmd.get_envs()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string()))),
+        );
+        repo_facts.trusted_ssh = crate::git::trusted_binary("ssh")
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_default();
         // Baked, not read from the agent's env, which it can rewrite (#962).
         if let Some(root) = worktree_root {
             repo_facts.worktree_root = root.to_string_lossy().into_owned();
@@ -3154,6 +3175,7 @@ mod gh_config_dir_pin_tests {
                 ("PATH", Some(bin.to_str().unwrap())),
                 ("GH_CONFIG_DIR", None),
                 ("XDG_CONFIG_HOME", None),
+                ("XDG_DATA_HOME", None),
             ],
             || {
                 #[allow(clippy::disallowed_methods)] // absolute path, never run: only carries env
@@ -3177,11 +3199,64 @@ mod gh_config_dir_pin_tests {
             script.contains(&format!(" --gh-config-dir '{h}/.config/gh' ")),
             "{script}"
         );
+        // gh appends `gh` to XDG_DATA_HOME itself, so the wrapper carries the
+        // data dir's parent.
+        assert!(
+            script.contains(&format!(" --gh-xdg-data-home '{h}/.local/share' ")),
+            "{script}"
+        );
         temp_env::with_vars(
             [("HOME", Some("/h")), ("GH_CONFIG_DIR", Some("rel"))],
             || {
                 assert_eq!(super::launch_gh_config_dir(), None);
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_transport_env_record_tests {
+    /// The git wrapper records the transport env vars the agent starts with,
+    /// so the gate can compare them at push time.
+    #[test]
+    fn installed_git_wrapper_records_the_child_transport_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let gh_guard = crate::config::GhGuardPolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        let git_guard = crate::config::GitGuardPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        #[allow(clippy::disallowed_methods)] // absolute path, never run: only carries env
+        let mut cmd = std::process::Command::new("/usr/bin/true");
+        cmd.env("GIT_SSH_COMMAND", "ssh -i key");
+        // Inherited, not set on `cmd`: the `--inherit-env` shape.
+        temp_env::with_var("GIT_SSH", Some("/k/ssh"), || {
+            super::spell_out_inherited_transport_env(&mut cmd);
+        });
+        super::install_command_wrappers(
+            &mut cmd,
+            &scratch,
+            tmp.path(),
+            &[],
+            &gh_guard,
+            &git_guard,
+            true,
+            None,
+            None,
+            None,
+        );
+        let Ok(script) = std::fs::read_to_string(scratch.join("bin/git")) else {
+            return; // no git available
+        };
+        assert!(
+            script
+                .contains(r#""transport_env":{"GIT_SSH":"/k/ssh","GIT_SSH_COMMAND":"ssh -i key"}"#),
+            "{script}"
         );
     }
 }

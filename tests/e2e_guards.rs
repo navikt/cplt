@@ -2949,6 +2949,42 @@ fn git_gate_refuses_a_push_redirected_by_git_dir_in_the_environment() {
 }
 
 #[test]
+fn git_gate_refuses_a_push_when_a_transport_env_var_changed_since_launch() {
+    let launch = temp_repo_live("navikt/cplt", "main", &["feature/x"]);
+    let plain = launch_facts(launch.path());
+    let push = ["push", "origin", "feature/x"];
+    let x = std::path::Path::new("/x/ssh");
+    let y = std::path::Path::new("/y/ssh");
+    for name in [
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_SSH_VARIANT",
+        "GIT_PROXY_COMMAND",
+        "GIT_EXEC_PATH",
+    ] {
+        // Set at launch: the same value pushes, another value is refused.
+        let mut facts: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        facts["transport_env"] = serde_json::json!({ name: "/x/ssh" });
+        let facts = facts.to_string();
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &facts, &[(name, x)], &push);
+        assert!(ok, "{name} unchanged must push.\n{stderr}");
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &facts, &[(name, y)], &push);
+        assert_refused(&stderr, ok, name);
+        let (_, stderr, ok) = git_gate_protect_default_with_env(launch.path(), &facts, &[], &push);
+        assert_refused(&stderr, ok, name);
+        // Unset at launch: setting it refuses the push, nothing else.
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &plain, &[(name, x)], &push);
+        assert_refused(&stderr, ok, name);
+        let (_, stderr, ok) =
+            git_gate_protect_default_with_env(launch.path(), &plain, &[(name, x)], &["status"]);
+        assert!(ok, "{name} must not refuse a non-push.\n{stderr}");
+    }
+}
+
+#[test]
 fn git_gate_allows_a_push_from_a_worktree_of_the_launch_repository() {
     // A linked worktree has its own git dir (`.git/worktrees/<name>`) but shares
     // the launch repository's COMMON dir — which is why the check compares
@@ -3051,6 +3087,101 @@ fn real_push_gate(
 
 const PROTECT: [bool; 3] = [true, true, true];
 const FORCE_ONLY: [bool; 3] = [false, true, false];
+
+/// A fake `ssh` in `dir` that touches `marker` and completes the push into
+/// `origin`, so a run is visible.
+fn fake_ssh(dir: &std::path::Path, marker: &std::path::Path, origin: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let ssh = dir.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexec git-receive-pack '{}'\n",
+            marker.display(),
+            origin.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An approved ssh push runs the ssh recorded at launch, not one the agent
+/// put first on PATH; with none recorded it is refused.
+#[test]
+fn real_push_runs_the_launch_ssh_not_one_planted_on_path() {
+    let (t, work, origin) = pushed_repo("main");
+    assert!(git_ok(
+        &work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://cplt-test.invalid/x.git"
+        ]
+    ));
+    let planted_marker = t.path().join("planted-ran");
+    let trusted_marker = t.path().join("trusted-ran");
+    fake_ssh(&t.path().join("planted"), &planted_marker, &origin);
+    fake_ssh(&t.path().join("trusted"), &trusted_marker, &origin);
+    let path = format!(
+        "{}:{}",
+        t.path().join("planted").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let plain = launch_facts(&work);
+    let push = ["push", "-q", "origin", "feat"];
+
+    let (stderr, ok) = real_push_gate(&work, &plain, PROTECT, &[("PATH", path.as_str())], &push);
+    assert_refused(&stderr, ok, "No trusted ssh");
+    assert!(!planted_marker.exists());
+
+    let mut facts: serde_json::Value = serde_json::from_str(&plain).unwrap();
+    facts["trusted_ssh"] = serde_json::json!(t.path().join("trusted/ssh"));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts.to_string(),
+        PROTECT,
+        &[("PATH", path.as_str())],
+        &push,
+    );
+    assert!(ok, "{stderr}");
+    assert!(!planted_marker.exists(), "the planted ssh ran");
+    assert!(trusted_marker.exists(), "the launch ssh did not run");
+    assert!(remote_ref(&origin, "refs/heads/feat").is_some());
+
+    // A nested push (a pre-push hook's) inherits the pin and is not refused.
+    let pin = format!("'{}'", t.path().join("trusted/ssh").display());
+    assert!(git_ok(
+        &work,
+        &["commit", "-q", "--allow-empty", "-m", "more"]
+    ));
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts.to_string(),
+        PROTECT,
+        &[("PATH", path.as_str()), ("GIT_SSH_COMMAND", pin.as_str())],
+        &push,
+    );
+    assert!(ok, "{stderr}");
+    // Any other value still is.
+    let (stderr, ok) = real_push_gate(
+        &work,
+        &facts.to_string(),
+        PROTECT,
+        &[("GIT_SSH_COMMAND", "'/other/ssh'")],
+        &push,
+    );
+    assert_refused(&stderr, ok, "GIT_SSH_COMMAND");
+}
+
+#[test]
+fn git_gate_refuses_exec_path_flag_under_push_prevention() {
+    let (_, stderr, ok) = git_gate(&["--exec-path=/x", "push", "origin", "f"], true, true);
+    assert_refused(&stderr, ok, "--exec-path");
+    let (_, stderr, ok) = git_gate(&["--exec-path"], true, true);
+    assert!(ok, "bare --exec-path only prints.\n{stderr}");
+}
 
 #[test]
 fn real_push_feature_branch_still_allowed() {
