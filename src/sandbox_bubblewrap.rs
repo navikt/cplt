@@ -1586,6 +1586,9 @@ pub(crate) fn symlinked_overlays(fs_rules: &[FsRule], overlays: Overlays<'_>) ->
     let mut warnings = Vec::new();
     let mut targets: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     for path in overlays.read_only.iter().chain(overlays.pins) {
+        if targets.iter().any(|(l, _)| l == path) {
+            continue;
+        }
         // The deepest root only: a linked agent config dir (`~/.copilot` into a
         // dotfiles repo) is itself a root, and the agent cannot replace it.
         let Some(root) = roots
