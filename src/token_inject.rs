@@ -49,11 +49,13 @@ const EMBEDDING_VARS: &[&str] = &["OPENCODE_AUTH_CONTENT"];
 /// otherwise.
 pub const USER_CA_VARS: &[&str] = &["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO"];
 
-/// System root bundles, first hit wins: macOS / Alpine / Arch, Debian /
-/// Ubuntu, Fedora / RHEL, openSUSE.
+/// System root bundles, first hit wins: macOS / Alpine, Debian / Ubuntu,
+/// Arch, Fedora / RHEL, openSUSE. Arch only links to its bundle from
+/// `/etc/ssl`, and `read_ca_file` refuses symlinks, so list the real file.
 const SYSTEM_BUNDLES: &[&str] = &[
     "/etc/ssl/cert.pem",
     "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
     "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/ca-bundle.pem",
@@ -1017,6 +1019,21 @@ pub(crate) mod tests {
         assert_eq!(out.trim(), cert.trim().replace("\r\n", "\n"));
         assert!(!out.contains("PRIVATE KEY"));
         assert_eq!(certs_only(&key), "");
+    }
+
+    /// Arch only symlinks its bundle into `/etc/ssl` (#1044), so the real
+    /// file must be listed: a symlink, even to a valid bundle, stays refused.
+    #[test]
+    fn arch_bundle_listed_and_symlinks_refused() {
+        assert!(SYSTEM_BUNDLES.contains(&"/etc/ca-certificates/extracted/tls-ca-bundle.pem"));
+        let (_, _, cert) = new_ca().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("tls-ca-bundle.pem");
+        std::fs::write(&real, &cert).unwrap();
+        let link = dir.path().join("cert.pem");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_ca_file(&real).is_some());
+        assert!(read_ca_file(&link).is_none());
     }
 
     #[test]
